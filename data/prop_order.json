@@ -1,0 +1,28 @@
+{
+  "order": [
+    {
+      "id": "prop_flower"
+    },
+    {
+      "id": "prop_grass"
+    },
+    {
+      "id": "prop_tree"
+    },
+    {
+      "id": "prop_fruit"
+    },
+    {
+      "id": "prop_obj"
+    },
+    {
+      "id": "prop_studio_light"
+    },
+    {
+      "id": "prop_outdoor_light"
+    },
+    {
+      "id": "prop_c3301346"
+    }
+  ]
+}

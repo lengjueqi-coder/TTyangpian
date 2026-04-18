@@ -1,0 +1,30 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# User data (keep on local only)
+data/model_config.json
+data/prompt_history.json
+data/image_library.json
+data/queue_data.json
+data/usage_log.json
+data/last_selection.json
+data/*.bak
+backups/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Dev notes (not needed by users)
+修复指令.md

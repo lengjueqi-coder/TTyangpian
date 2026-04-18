@@ -1,0 +1,40 @@
+{
+  "order": [
+    {
+      "type": "category",
+      "id": "cat_001"
+    },
+    {
+      "type": "category",
+      "id": "cat_002"
+    },
+    {
+      "type": "category",
+      "id": "cat_003"
+    },
+    {
+      "type": "category",
+      "id": "cat_004"
+    },
+    {
+      "type": "category",
+      "id": "cat_005"
+    },
+    {
+      "type": "category",
+      "id": "cat_006"
+    },
+    {
+      "type": "category",
+      "id": "cat_007"
+    },
+    {
+      "type": "prefix",
+      "id": "prefix"
+    },
+    {
+      "type": "suffix",
+      "id": "suffix"
+    }
+  ]
+}

@@ -1,0 +1,357 @@
+{
+  "categories": [
+    {
+      "id": "cat_001",
+      "name": "性别",
+      "selection_type": "single",
+      "items": [
+        {
+          "id": "item_001",
+          "name": "女"
+        },
+        {
+          "id": "item_002",
+          "name": "男"
+        },
+        {
+          "id": "item_003",
+          "name": "中性"
+        }
+      ]
+    },
+    {
+      "id": "cat_002",
+      "name": "年龄段",
+      "selection_type": "single",
+      "items": [
+        {
+          "id": "item_004",
+          "name": "12-18岁"
+        },
+        {
+          "id": "item_005",
+          "name": "18-22岁"
+        },
+        {
+          "id": "item_006",
+          "name": "23-28岁"
+        },
+        {
+          "id": "item_007",
+          "name": "29-35岁"
+        },
+        {
+          "id": "item_008",
+          "name": "36-45岁"
+        },
+        {
+          "id": "item_009",
+          "name": "46岁以上"
+        }
+      ]
+    },
+    {
+      "id": "cat_003",
+      "name": "国家/地区",
+      "selection_type": "single",
+      "items": [
+        {
+          "id": "item_010",
+          "name": "中国"
+        },
+        {
+          "id": "item_011",
+          "name": "日本"
+        },
+        {
+          "id": "item_012",
+          "name": "韩国"
+        },
+        {
+          "id": "item_013",
+          "name": "东亚"
+        },
+        {
+          "id": "item_014",
+          "name": "中亚"
+        }
+      ]
+    },
+    {
+      "id": "cat_004",
+      "name": "气质风格",
+      "selection_type": "single",
+      "items": [
+        {
+          "id": "item_015",
+          "name": "俏皮可爱"
+        },
+        {
+          "id": "item_016",
+          "name": "御姐"
+        },
+        {
+          "id": "item_017",
+          "name": "氧气少女"
+        },
+        {
+          "id": "item_018",
+          "name": "甜美可爱"
+        },
+        {
+          "id": "item_019",
+          "name": "贵气千金"
+        },
+        {
+          "id": "item_020",
+          "name": "青春感"
+        },
+        {
+          "id": "item_021",
+          "name": "纯欲"
+        },
+        {
+          "id": "item_022",
+          "name": "清冷"
+        },
+        {
+          "id": "item_023",
+          "name": "温柔"
+        },
+        {
+          "id": "item_024",
+          "name": "知性"
+        },
+        {
+          "id": "item_025",
+          "name": "松弛感"
+        },
+        {
+          "id": "item_026",
+          "name": "邻家感"
+        },
+        {
+          "id": "item_027",
+          "name": "明艳"
+        },
+        {
+          "id": "item_028",
+          "name": "文艺"
+        },
+        {
+          "id": "item_029",
+          "name": "破碎感"
+        }
+      ]
+    },
+    {
+      "id": "cat_005",
+      "name": "妆容风格",
+      "selection_type": "single",
+      "items": [
+        {
+          "id": "item_030",
+          "name": "白开水妆"
+        },
+        {
+          "id": "item_031",
+          "name": "伪素颜妆"
+        },
+        {
+          "id": "item_032",
+          "name": "韩系清透妆"
+        },
+        {
+          "id": "item_033",
+          "name": "日系淡妆"
+        },
+        {
+          "id": "item_034",
+          "name": "清冷淡妆"
+        },
+        {
+          "id": "item_035",
+          "name": "氧气裸妆"
+        },
+        {
+          "id": "item_036",
+          "name": "通勤轻熟妆"
+        },
+        {
+          "id": "item_037",
+          "name": "法式松弛妆"
+        },
+        {
+          "id": "item_038",
+          "name": "明艳精致妆"
+        },
+        {
+          "id": "item_039",
+          "name": "复古氛围妆"
+        },
+        {
+          "id": "item_b4874c4c",
+          "name": "依靠装"
+        }
+      ]
+    },
+    {
+      "id": "cat_006",
+      "name": "瑕疵细节",
+      "selection_type": "multiple",
+      "items": [
+        {
+          "id": "item_040",
+          "name": "断眉"
+        },
+        {
+          "id": "item_041",
+          "name": "眉毛不对称"
+        },
+        {
+          "id": "item_042",
+          "name": "眉毛杂乱"
+        },
+        {
+          "id": "item_043",
+          "name": "雀斑"
+        },
+        {
+          "id": "item_044",
+          "name": "痘印"
+        },
+        {
+          "id": "item_045",
+          "name": "黑眼圈"
+        },
+        {
+          "id": "item_046",
+          "name": "眼袋"
+        },
+        {
+          "id": "item_047",
+          "name": "皱纹"
+        },
+        {
+          "id": "item_048",
+          "name": "肤色不均匀"
+        },
+        {
+          "id": "item_049",
+          "name": "皮肤纹理"
+        },
+        {
+          "id": "item_050",
+          "name": "毛孔可见"
+        },
+        {
+          "id": "item_051",
+          "name": "素颜感皮肤"
+        },
+        {
+          "id": "item_052",
+          "name": "牙齿不整齐"
+        },
+        {
+          "id": "item_053",
+          "name": "小虎牙"
+        },
+        {
+          "id": "item_054",
+          "name": "牙齿缺小角"
+        },
+        {
+          "id": "item_055",
+          "name": "唇部死皮"
+        },
+        {
+          "id": "item_056",
+          "name": "唇部干皮"
+        },
+        {
+          "id": "item_057",
+          "name": "唇纹较深"
+        },
+        {
+          "id": "item_058",
+          "name": "发际线碎绒毛"
+        },
+        {
+          "id": "item_059",
+          "name": "额前碎发"
+        },
+        {
+          "id": "item_060",
+          "name": "睫毛不整齐"
+        },
+        {
+          "id": "item_061",
+          "name": "睫毛缺几根"
+        },
+        {
+          "id": "item_062",
+          "name": "双眼皮"
+        },
+        {
+          "id": "item_063",
+          "name": "单眼皮"
+        },
+        {
+          "id": "item_064",
+          "name": "一双一单"
+        },
+        {
+          "id": "item_065",
+          "name": "内双"
+        }
+      ]
+    },
+    {
+      "id": "cat_007",
+      "name": "表情",
+      "selection_type": "single",
+      "items": [
+        {
+          "id": "item_066",
+          "name": "灵动含笑"
+        },
+        {
+          "id": "item_067",
+          "name": "俏皮眨眼"
+        },
+        {
+          "id": "item_068",
+          "name": "甜感微笑"
+        },
+        {
+          "id": "item_069",
+          "name": "害羞偷笑"
+        },
+        {
+          "id": "item_070",
+          "name": "无辜注视"
+        },
+        {
+          "id": "item_071",
+          "name": "清冷淡颜"
+        },
+        {
+          "id": "item_072",
+          "name": "温柔注视"
+        },
+        {
+          "id": "item_073",
+          "name": "氛围感出神"
+        },
+        {
+          "id": "item_074",
+          "name": "傲娇挑眉"
+        },
+        {
+          "id": "item_075",
+          "name": "青春元气笑"
+        }
+      ]
+    }
+  ]
+}
