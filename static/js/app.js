@@ -147,8 +147,131 @@ function getFileBaseName(filename = '') {
 // 将前端用户操作上报到后端写入日志文件
 // API 生成状态（提前声明，供 api() 函数引用）
 let apiGenerateState = { running: false, taskId: null, pollTimer: null, cancelled: false, abortController: null };
+// 多图列队模式下每个队列独立的生成状态
+let queueGenerateStates = Array.from({length: 10}, () => ({ running: false, cancelled: false, abortController: null }));
+// 判断是否有任何队列正在生成
+function isAnyQueueGenerating() {
+    return queueGenerateStates.some(s => s.running) || apiGenerateState.running;
+}
 // API提示词语言：'en'=用英文, 'cn'=用中文（从localStorage恢复）
 let apiPromptLang = localStorage.getItem('apiPromptLang') || 'en';
+
+// ========== 撤销系统（Ctrl+Z / Cmd+Z）==========
+const MAX_UNDO_STEPS = 10;
+let undoStack = [];
+let _undoEnabled = true; // 可临时禁用（恢复快照时）
+
+function pushUndoSnapshot() {
+    if (!_undoEnabled) return;
+    const snapshot = {
+        slots: JSON.parse(JSON.stringify(imageState.slots)),
+        promptCn: document.getElementById('img-prompt-cn')?.value || '',
+        promptEn: document.getElementById('img-prompt-en')?.value || '',
+        promptedSlotIndices: [...promptedSlotIndices],
+        lastAutoPrompt: lastAutoPrompt,
+        selectedItems: JSON.parse(JSON.stringify(state.selectedItems)),
+        selectedPrefixes: [...state.selectedPrefixes],
+        selectedSuffixes: [...state.selectedSuffixes],
+        generatedPrompt: state.generatedPrompt,
+        queueData: JSON.parse(JSON.stringify(queueData)),
+        activeQueue: activeQueue,
+        queueMode: queueMode,
+        library: JSON.parse(JSON.stringify(imageState.library)),
+        categories: JSON.parse(JSON.stringify(state.categories)),
+    };
+    undoStack.push(snapshot);
+    if (undoStack.length > MAX_UNDO_STEPS) undoStack.shift();
+    updateUndoUI();
+}
+
+function undo() {
+    if (undoStack.length === 0) return;
+    const snapshot = undoStack.pop();
+    _undoEnabled = false;
+    try {
+        // 恢复图片模式状态
+        imageState.slots = snapshot.slots;
+        const promptCnEl = document.getElementById('img-prompt-cn');
+        const promptEnEl = document.getElementById('img-prompt-en');
+        if (promptCnEl) promptCnEl.value = snapshot.promptCn;
+        if (promptEnEl) promptEnEl.value = snapshot.promptEn;
+        imageState.promptCn = snapshot.promptCn;
+        imageState.promptEn = snapshot.promptEn;
+        promptedSlotIndices = new Set(snapshot.promptedSlotIndices);
+        lastAutoPrompt = snapshot.lastAutoPrompt;
+
+        // 恢复文字模式选择状态
+        state.selectedItems = snapshot.selectedItems;
+        state.selectedPrefixes = snapshot.selectedPrefixes;
+        state.selectedSuffixes = snapshot.selectedSuffixes;
+        state.generatedPrompt = snapshot.generatedPrompt;
+
+        // 恢复队列数据
+        queueData = snapshot.queueData;
+        activeQueue = snapshot.activeQueue;
+        queueMode = snapshot.queueMode;
+
+        // 恢复素材库
+        imageState.library = snapshot.library;
+        state.categories = snapshot.categories;
+
+        // 刷新所有 UI
+        renderImageSlots();
+        renderImageLibrary();
+        renderQueueNumberBars();
+        updateGenerateBtnText();
+        // 恢复队列模式按钮状态
+        document.querySelectorAll('.queue-mode-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.queueMode === queueMode);
+        });
+        // 恢复队列数据到当前活动队列
+        if (queueMode === 'multi') {
+            loadQueueData(activeQueue);
+        }
+        // 刷新文字模式 UI
+        if (typeof renderCategoryList === 'function') renderCategoryList();
+        if (typeof renderPresets === 'function') renderPresets();
+        if (typeof updatePreview === 'function') updatePreview();
+        // 恢复批量生成按钮
+        const batchBtn = document.getElementById('btn-api-batch-generate');
+        if (batchBtn) batchBtn.style.display = queueMode === 'multi' ? 'inline-flex' : 'none';
+
+        showToast(`已撤销（剩余${undoStack.length}步）`, 'info');
+    } finally {
+        _undoEnabled = true;
+    }
+    updateUndoUI();
+}
+
+function updateUndoUI() {
+    const indicator = document.getElementById('undo-indicator');
+    if (indicator) {
+        indicator.textContent = undoStack.length > 0 ? `可撤销 ${undoStack.length} 步` : '';
+        indicator.style.opacity = undoStack.length > 0 ? '1' : '0';
+    }
+}
+
+// 键盘监听
+document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+    }
+});
+
+// 提示词 textarea 手动编辑时保存撤销快照
+let _promptCnBeforeEdit = '';
+let _promptEnBeforeEdit = '';
+document.getElementById('img-prompt-cn')?.addEventListener('focus', () => { _promptCnBeforeEdit = document.getElementById('img-prompt-cn')?.value || ''; });
+document.getElementById('img-prompt-cn')?.addEventListener('blur', () => {
+    const cur = document.getElementById('img-prompt-cn')?.value || '';
+    if (cur !== _promptCnBeforeEdit) pushUndoSnapshot();
+});
+document.getElementById('img-prompt-en')?.addEventListener('focus', () => { _promptEnBeforeEdit = document.getElementById('img-prompt-en')?.value || ''; });
+document.getElementById('img-prompt-en')?.addEventListener('blur', () => {
+    const cur = document.getElementById('img-prompt-en')?.value || '';
+    if (cur !== _promptEnBeforeEdit) pushUndoSnapshot();
+});
 
 // API提示词语言切换按钮
 document.getElementById('btn-api-prompt-lang')?.addEventListener('click', () => {
@@ -984,6 +1107,7 @@ function isItemSelected(catId, itemId, isMultiple) {
 }
 
 function selectItem(catId, itemId, isMultiple) {
+    pushUndoSnapshot();
     if (isMultiple) {
         if (!state.selectedItems[catId]) state.selectedItems[catId] = [];
         const idx = state.selectedItems[catId].indexOf(itemId);
@@ -998,6 +1122,7 @@ function selectItem(catId, itemId, isMultiple) {
 }
 
 function toggleExtraSelection(type, itemId) {
+    pushUndoSnapshot();
     const list = type === 'prefix' ? state.selectedPrefixes : state.selectedSuffixes;
     const idx = list.indexOf(itemId);
     if (idx >= 0) list.splice(idx, 1);
@@ -1281,6 +1406,7 @@ $('#btn-generate').addEventListener('click', generatePrompt);
 $('#btn-regenerate').addEventListener('click', generatePrompt);
 
 async function generatePrompt() {
+    pushUndoSnapshot();
     logAction('generate', '生成Prompt', {});
     const promptText = $('#prompt-preview').value.trim();
     if (!promptText) {
@@ -1755,6 +1881,7 @@ function renderPresetFilterTags() {
 }
 
 async function applyPreset(preset) {
+    pushUndoSnapshot();
     // 如果有 prompt_text，直接填入预览区
     if (preset.prompt_text) {
         $('#prompt-preview').value = preset.prompt_text;
@@ -2261,7 +2388,7 @@ const QUEUE_COUNT = 10;
 let queueMode = 'same'; // 'same' = 同图抽卡, 'multi' = 多图队列
 let activeQueue = 0;     // 当前活动的队列编号 (0-9)
 
-// 每个队列独立的数据：{ slots: [...], promptCn: '', promptEn: '' }
+// 每个队列独立的数据：{ slots: [...], promptCn: '', promptEn: '', results: [...], apiPlatform, rhModelId, ... }
 let queueData = [];
 function initQueueData() {
     // 队列数据现在从服务端加载（loadAllData 中处理）
@@ -2270,8 +2397,31 @@ function initQueueData() {
         queueData.push({
             slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考' })),
             promptCn: '',
-            promptEn: ''
+            promptEn: '',
+            results: [],
+            apiPlatform: 'runninghub',
+            rhModelId: '',
+            oaihkModelId: '',
+            rhAspectRatio: '3:4',
+            oaihkAspectRatio: '1:1',
+            rhResolution: '1k',
+            rhCount: 1,
+            rhSeedMode: 'random',
+            rhSeed: ''
         });
+    }
+    // 兼容旧数据：确保每个队列都有新字段
+    for (let q = 0; q < queueData.length; q++) {
+        if (!queueData[q].results) queueData[q].results = [];
+        if (!queueData[q].apiPlatform) queueData[q].apiPlatform = 'runninghub';
+        if (!queueData[q].rhModelId) queueData[q].rhModelId = '';
+        if (!queueData[q].oaihkModelId) queueData[q].oaihkModelId = '';
+        if (!queueData[q].rhAspectRatio) queueData[q].rhAspectRatio = '3:4';
+        if (!queueData[q].oaihkAspectRatio) queueData[q].oaihkAspectRatio = '1:1';
+        if (!queueData[q].rhResolution) queueData[q].rhResolution = '1k';
+        if (queueData[q].rhCount === undefined) queueData[q].rhCount = 1;
+        if (!queueData[q].rhSeedMode) queueData[q].rhSeedMode = 'random';
+        if (queueData[q].rhSeed === undefined) queueData[q].rhSeed = '';
     }
 }
 
@@ -2291,6 +2441,7 @@ function saveQueueData() {
 
 // 从队列1复制到其他队列（默认初始化）
 function copyQueue1ToAll() {
+    pushUndoSnapshot();
     const q1 = queueData[0];
     for (let q = 1; q < QUEUE_COUNT; q++) {
         queueData[q].slots = JSON.parse(JSON.stringify(q1.slots));
@@ -2302,6 +2453,7 @@ function copyQueue1ToAll() {
 
 // 切换到指定队列
 function switchToQueue(qIndex) {
+    pushUndoSnapshot();
     // 保存当前队列数据
     saveCurrentQueueData();
     activeQueue = qIndex;
@@ -2320,7 +2472,48 @@ function saveCurrentQueueData() {
     q.slots = JSON.parse(JSON.stringify(imageState.slots));
     q.promptCn = document.getElementById('img-prompt-cn')?.value || '';
     q.promptEn = document.getElementById('img-prompt-en')?.value || '';
+    // 保存 API 配置
+    q.apiPlatform = document.getElementById('cfg-api-platform')?.value || 'runninghub';
+    q.rhModelId = document.getElementById('cfg-rh-model-inline')?.value || '';
+    q.oaihkModelId = document.getElementById('cfg-oaihk-model-inline')?.value || '';
+    q.rhAspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value || '3:4';
+    q.oaihkAspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '1:1';
+    q.rhResolution = document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
+    q.rhCount = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
+    q.rhSeedMode = document.getElementById('cfg-rh-seed-mode-inline')?.value || 'random';
+    q.rhSeed = document.getElementById('cfg-rh-seed-inline')?.value || '';
     saveQueueData();
+}
+
+// 设置 select 元素的值（如果值不在选项中则选第一个）
+function setSelectValue(id, value) {
+    const el = document.getElementById(id);
+    if (el) {
+        el.value = value;
+        if (el.value !== value && el.options.length > 0) {
+            el.selectedIndex = 0;
+        }
+    }
+}
+
+// 从队列数据恢复 API 配置到 DOM
+function restoreApiConfigToDOM(q) {
+    const platform = q.apiPlatform || 'runninghub';
+    setSelectValue('cfg-api-platform', platform);
+    setSelectValue('cfg-rh-model-inline', q.rhModelId || '');
+    setSelectValue('cfg-oaihk-model-inline', q.oaihkModelId || '');
+    setSelectValue('cfg-rh-aspect-ratio-inline', q.rhAspectRatio || '3:4');
+    setSelectValue('cfg-oaihk-aspect-ratio-inline', q.oaihkAspectRatio || '1:1');
+    setSelectValue('cfg-rh-resolution-inline', q.rhResolution || '1k');
+    const countEl = document.getElementById('cfg-rh-count-inline');
+    if (countEl) countEl.value = q.rhCount || 1;
+    setSelectValue('cfg-rh-seed-mode-inline', q.rhSeedMode || 'random');
+    const seedEl = document.getElementById('cfg-rh-seed-inline');
+    if (seedEl) { seedEl.value = q.rhSeed || ''; seedEl.disabled = (q.rhSeedMode || 'random') !== 'fixed'; }
+    // 触发平台切换，显示/隐藏对应配置区
+    togglePlatformUI(platform);
+    // 触发模型参数适配
+    updateRhModelParamsInline();
 }
 
 // 从队列加载数据到UI
@@ -2341,8 +2534,37 @@ function loadQueueData(qIndex) {
     if (!q.promptCn?.trim()) {
         updateLocalPrompt();
     }
+    // 多图列队模式下，切换队列时也切换生成结果和 API 配置
+    if (queueMode === 'multi') {
+        restoreApiConfigToDOM(q);
+        renderQueueResults(qIndex);
+        // 恢复该队列的生成状态 UI
+        const qs = queueGenerateStates[qIndex];
+        const cancelBtn = document.getElementById('btn-api-cancel');
+        if (qs.running) {
+            setApiProgress(50); // 显示进度条（中间状态，具体进度由轮询更新）
+            if (cancelBtn) cancelBtn.style.display = 'inline-flex';
+        } else {
+            hideApiProgress();
+            if (cancelBtn && !isAnyQueueGenerating()) {
+                cancelBtn.style.display = 'none';
+            }
+        }
+    }
     // 更新生成按钮文字
     updateGenerateBtnText();
+}
+
+// 渲染某个队列的生成结果到结果区
+function renderQueueResults(qIndex) {
+    const grid = document.getElementById('api-result-grid');
+    if (!grid) return;
+    const results = queueData[qIndex]?.results || [];
+    grid.innerHTML = '';
+    if (results.length === 0) return;
+    results.forEach((item, i) => {
+        appendResultCard(item, i);
+    });
 }
 
 // 渲染队列编号按钮行
@@ -2360,7 +2582,10 @@ function renderQueueNumberBars() {
     const html = Array.from({length: QUEUE_COUNT}, (_, i) => {
         const isActive = i === activeQueue;
         const hasData = queueData[i].slots.some(s => s.image || s.label) || queueData[i].promptCn;
-        return `<button class="queue-num-btn ${isActive ? 'active' : ''}" data-queue="${i}" title="队列 ${i+1}${i > 0 ? '（默认复制自队列1）' : ''}">${i+1}${hasData ? ' <span class="dot">●</span>' : ''}</button>`;
+        const isGenerating = queueGenerateStates[i]?.running;
+        const stateClass = isGenerating ? ' generating' : '';
+        const stateIcon = isGenerating ? ' <span class="queue-gen-indicator"></span>' : '';
+        return `<button class="queue-num-btn ${isActive ? 'active' : ''}${stateClass}" data-queue="${i}" title="队列 ${i+1}">${i+1}${hasData ? ' <span class="dot">●</span>' : ''}${stateIcon}</button>`;
     }).join('');
 
     bar1.innerHTML = html;
@@ -2377,6 +2602,7 @@ function renderQueueNumberBars() {
 
 // 队列模式切换
 function switchQueueMode(mode) {
+    pushUndoSnapshot();
     // 先保存当前队列数据（必须在修改 queueMode 之前）
     if (queueMode === 'multi' && mode !== 'multi') {
         saveCurrentQueueData();
@@ -2394,6 +2620,16 @@ function switchQueueMode(mode) {
         queueData[0].slots = JSON.parse(JSON.stringify(imageState.slots));
         queueData[0].promptCn = document.getElementById('img-prompt-cn')?.value || '';
         queueData[0].promptEn = document.getElementById('img-prompt-en')?.value || '';
+        // 保存当前 API 配置到队列0
+        queueData[0].apiPlatform = document.getElementById('cfg-api-platform')?.value || 'runninghub';
+        queueData[0].rhModelId = document.getElementById('cfg-rh-model-inline')?.value || '';
+        queueData[0].oaihkModelId = document.getElementById('cfg-oaihk-model-inline')?.value || '';
+        queueData[0].rhAspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value || '3:4';
+        queueData[0].oaihkAspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '1:1';
+        queueData[0].rhResolution = document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
+        queueData[0].rhCount = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
+        queueData[0].rhSeedMode = document.getElementById('cfg-rh-seed-mode-inline')?.value || 'random';
+        queueData[0].rhSeed = document.getElementById('cfg-rh-seed-inline')?.value || '';
         // 队列2-10：仅当它们没有独立数据时才复制队列1
         for (let q = 1; q < QUEUE_COUNT; q++) {
             const qd = queueData[q];
@@ -2407,10 +2643,12 @@ function switchQueueMode(mode) {
         saveQueueData();
         activeQueue = 0;
     } else {
-        // 切换回同图抽卡：加载队列0
+        // 切换回同图抽卡：从队列0恢复数据（包括 API 配置）
         activeQueue = 0;
         saveQueueData();
         loadQueueData(0);
+        // 恢复队列0的 API 配置到 DOM
+        restoreApiConfigToDOM(queueData[0]);
     }
 
     renderQueueNumberBars();
@@ -2432,6 +2670,7 @@ document.getElementById('btn-clear-current-group')?.addEventListener('click', ()
     const hasImages = imageState.slots.some(s => s.image);
     if (!hasImages) { showToast('当前组没有图片素材', 'info'); return; }
     if (!confirm('确认清除当前组的所有图片素材？（不会删除本地文件）')) return;
+    pushUndoSnapshot();
     logAction('slot', '清除当前组图片', { queue: queueMode === 'multi' ? activeQueue + 1 : 'same' });
     for (let i = 0; i < imageState.slots.length; i++) {
         imageState.slots[i] = { image: '', label: '', prefixTemplate: imageState.slots[i].prefixTemplate || '请参考' };
@@ -2451,6 +2690,7 @@ document.getElementById('btn-clear-all-groups')?.addEventListener('click', () =>
     }
     if (totalImages === 0) { showToast('所有组都没有图片素材', 'info'); return; }
     if (!confirm(`确认清除所有组的图片素材？共${totalImages}张图片（不会删除本地文件）`)) return;
+    pushUndoSnapshot();
     logAction('slot', '清除所有组图片', { totalImages });
     for (let q = 0; q < QUEUE_COUNT; q++) {
         for (let i = 0; i < queueData[q].slots.length; i++) {
@@ -2689,19 +2929,27 @@ async function renderImageLibrary() {
                 grid.appendChild(createLibItemCard(cat, sub, item));
             }
 
-            // 添加素材按钮
+            // 添加素材按钮（支持点击和拖拽）
             const addCard = document.createElement('div');
             addCard.className = 'prop-add-item';
             addCard.textContent = '+ 添加';
+            addCard.title = '点击选择文件或拖拽图片到此处';
             addCard.addEventListener('click', () => addLibSubItem(cat, sub));
+            // 拖拽支持
+            addCard.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); addCard.classList.add('drag-over'); });
+            addCard.addEventListener('dragleave', (e) => { e.preventDefault(); addCard.classList.remove('drag-over'); });
+            addCard.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); addCard.classList.remove('drag-over'); handleLibDrop(e, cat, sub); });
             grid.appendChild(addCard);
 
-            // 批量上传按钮
+            // 批量上传按钮（支持点击和拖拽）
             const addBatchCard = document.createElement('div');
             addBatchCard.className = 'prop-add-item';
             addBatchCard.textContent = '+ 批量';
-            addBatchCard.title = '批量上传到该子分类';
+            addBatchCard.title = '批量上传到该子分类（点击或拖拽）';
             addBatchCard.addEventListener('click', () => addLibSubItem(cat, sub, true));
+            addBatchCard.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); addBatchCard.classList.add('drag-over'); });
+            addBatchCard.addEventListener('dragleave', (e) => { e.preventDefault(); addBatchCard.classList.remove('drag-over'); });
+            addBatchCard.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); addBatchCard.classList.remove('drag-over'); handleLibDrop(e, cat, sub); });
             grid.appendChild(addBatchCard);
 
             subBody.appendChild(grid);
@@ -2843,6 +3091,7 @@ async function editImageLibCategory(cat) {
 }
 
 async function deleteImageLibCategory(cat) {
+    pushUndoSnapshot();
     showConfirm(`删除素材分类"${cat.name}"将同时删除其下所有子分类和素材，确定吗？`, async () => {
         try {
             await api('DELETE', `/api/image-library/${cat.id}`);
@@ -2856,6 +3105,7 @@ async function deleteImageLibCategory(cat) {
 
 // 子分类 CRUD
 async function addLibSubcategory(cat) {
+    pushUndoSnapshot();
     const name = await showPrompt(`在"${cat.name}"下添加子分类`, '', '子分类名称');
     if (!name || !name.trim()) return;
     try {
@@ -2870,6 +3120,7 @@ async function addLibSubcategory(cat) {
 }
 
 async function editLibSubcategory(cat, sub) {
+    pushUndoSnapshot();
     const name = await showPrompt('修改子分类名称', sub.name, '子分类名称');
     if (!name || !name.trim()) return;
     try {
@@ -2894,41 +3145,49 @@ async function deleteLibSubcategory(cat, sub) {
 
 // 子分类下条目 CRUD
 async function addLibSubItem(cat, sub, forceBatch = false) {
-    // 先选子分类（如果该分类下有多个子分类），再上传图片
-    const subcategories = cat.subcategories || [];
-
-    if (subcategories.length > 1) {
-        // 有多个子分类，让用户选择
-        const options = subcategories.map(s => s.name).join('、');
-        const choice = await showPrompt(`选择子分类（${options}），或输入"新建"`, '', '子分类名称');
-        if (!choice || !choice.trim()) return;
-
-        if (choice.trim() === '新建' || choice.trim() === '新建子分类') {
-            const subName = await showPrompt('新子分类名称', '', '子分类名称');
-            if (!subName || !subName.trim()) return;
-            try {
-                const newSub = await api('POST', `/api/image-library/${cat.id}/subcategories`, { name: subName.trim() });
-                cat.subcategories.push(newSub);
-                sub = newSub;
-                imageState.expandedLibSubcategory = newSub.id;
-            } catch (e) { showToast(e.message, 'error'); return; }
-        } else {
-            const found = subcategories.find(s => s.name === choice.trim());
-            if (!found) { showToast('未找到该子分类', 'error'); return; }
-            sub = found;
-        }
-    }
-
-    // 没有子分类时自动创建“默认”子分类，避免首张之后无法继续添加
+    pushUndoSnapshot();
+    // 如果已经在某个子分类内点击添加，直接用该子分类，不再弹出选择
+    // 只有从分类级别（无sub）添加时才需要选择子分类
     if (!sub) {
-        try {
-            const created = await api('POST', `/api/image-library/${cat.id}/subcategories`, { name: '默认' });
-            if (!cat.subcategories) cat.subcategories = [];
-            cat.subcategories.push(created);
-            sub = created;
-        } catch (e) {
-            showToast('请先添加子分类后再上传素材', 'error');
-            return;
+        const subcategories = cat.subcategories || [];
+
+        if (subcategories.length > 1) {
+            // 有多个子分类，让用户选择
+            const options = subcategories.map(s => s.name).join('、');
+            const choice = await showPrompt(`选择子分类（${options}），或输入”新建”`, '', '子分类名称');
+            if (!choice || !choice.trim()) return;
+
+            if (choice.trim() === '新建' || choice.trim() === '新建子分类') {
+                const subName = await showPrompt('新子分类名称', '', '子分类名称');
+                if (!subName || !subName.trim()) return;
+                try {
+                    const newSub = await api('POST', `/api/image-library/${cat.id}/subcategories`, { name: subName.trim() });
+                    cat.subcategories.push(newSub);
+                    sub = newSub;
+                    imageState.expandedLibSubcategory = newSub.id;
+                } catch (e) { showToast(e.message, 'error'); return; }
+            } else {
+                const found = subcategories.find(s => s.name === choice.trim());
+                if (!found) { showToast('未找到该子分类', 'error'); return; }
+                sub = found;
+            }
+        }
+
+        // 没有子分类时自动创建”默认”子分类
+        if (!sub) {
+            if (subcategories.length === 1) {
+                sub = subcategories[0];
+            } else {
+                try {
+                    const created = await api('POST', `/api/image-library/${cat.id}/subcategories`, { name: '默认' });
+                    if (!cat.subcategories) cat.subcategories = [];
+                    cat.subcategories.push(created);
+                    sub = created;
+                } catch (e) {
+                    showToast('请先添加子分类后再上传素材', 'error');
+                    return;
+                }
+            }
         }
     }
 
@@ -2960,8 +3219,23 @@ async function addLibSubItem(cat, sub, forceBatch = false) {
             }
 
             try {
+                // 读取图片用于裁剪
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(file);
+                });
+
+                // 弹出裁剪框
+                const croppedBlob = await new Promise((resolve) => {
+                    showCropModal(dataUrl, (blob) => resolve(blob));
+                });
+
+                if (!croppedBlob) continue; // 用户取消裁剪
+
                 const formData = new FormData();
-                formData.append('file', file);
+                formData.append('file', croppedBlob, file.name.replace(/\.\w+$/, '.jpg'));
                 const imageUrl = await uploadImage(formData);
                 await api('POST', `/api/image-library/${cat.id}/subcategories/${sub.id}/items`, {
                     name: finalName,
@@ -2982,6 +3256,84 @@ async function addLibSubItem(cat, sub, forceBatch = false) {
         }
     };
     input.click();
+}
+
+// 拖拽文件到素材库添加/批量按钮的处理
+async function handleLibDrop(dropEvent, cat, sub) {
+    const files = Array.from(dropEvent.dataTransfer.files || []).filter(f => /\.(jpg|jpeg|png|webp)$/i.test(f.name));
+    if (!files.length) { showToast('请拖入图片文件（jpg/png/webp）', 'error'); return; }
+
+    // 确保子分类存在
+    if (!sub) {
+        const subcategories = cat.subcategories || [];
+        if (subcategories.length === 1) {
+            sub = subcategories[0];
+        } else if (subcategories.length > 1) {
+            showToast('请拖入到具体子分类的添加按钮中', 'error'); return;
+        } else {
+            try {
+                const created = await api('POST', `/api/image-library/${cat.id}/subcategories`, { name: '默认' });
+                if (!cat.subcategories) cat.subcategories = [];
+                cat.subcategories.push(created);
+                sub = created;
+            } catch (e) { showToast('请先添加子分类', 'error'); return; }
+        }
+    }
+
+    const isBatch = files.length > 1;
+    let useDefaultAll = true;
+    if (isBatch) {
+        useDefaultAll = confirm(`将批量导入 ${files.length} 张到「${sub.name}」。\n确定=全部使用文件名命名；取消=逐张确认命名`);
+    }
+
+    let success = 0;
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const defaultName = getFileBaseName(file.name);
+        let finalName = defaultName;
+
+        if (!isBatch || !useDefaultAll) {
+            const nameInput = await showPrompt(`素材名称（${i + 1}/${files.length}）`, defaultName, '名称');
+            if (nameInput === null) continue;
+            finalName = (nameInput || '').trim() || defaultName;
+        }
+
+        try {
+            // 先读取图片用于裁剪
+            const dataUrl = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+
+            // 弹出裁剪框（3:4比例）
+            const croppedBlob = await new Promise((resolve) => {
+                showCropModal(dataUrl, (blob) => resolve(blob));
+            });
+
+            if (!croppedBlob) continue; // 用户取消裁剪
+
+            const formData = new FormData();
+            formData.append('file', croppedBlob, file.name.replace(/\.\w+$/, '.jpg'));
+            const imageUrl = await uploadImage(formData);
+            await api('POST', `/api/image-library/${cat.id}/subcategories/${sub.id}/items`, {
+                name: finalName,
+                image: imageUrl
+            });
+            success++;
+        } catch (err) {
+            showToast(`第${i + 1}张上传失败：${err.message}`, 'error');
+        }
+    }
+
+    if (success > 0) {
+        await reloadImageLibrary();
+        imageState.expandedLibCategory = cat.id;
+        imageState.expandedLibSubcategory = sub.id;
+        renderImageLibrary();
+        showToast(`素材添加成功：${success}/${files.length}`, 'success');
+    }
 }
 
 // 重新从后端加载素材库数据
@@ -3109,6 +3461,7 @@ async function deleteLibItemImage(cat, sub, item) {
 }
 
 async function deleteLibSubItem(cat, sub, item) {
+    pushUndoSnapshot();
     showConfirm(`确定删除素材"${item.name}"吗？`, async () => {
         try {
             await api('DELETE', `/api/image-library/${cat.id}/subcategories/${sub.id}/items/${item.id}`);
@@ -3361,15 +3714,19 @@ function renderImageSlots() {
 // 实时拼接本地Prompt（无AI）
 // 记录上次拼接的内容，用于增量更新
 let lastAutoPrompt = '';
+// 记录已经参与提示词拼接的图片槽位索引集合
+let promptedSlotIndices = new Set();
 
 function updateLocalPrompt() {
     const parts = [];
+    const currentSlotIndices = new Set();
     for (let i = 0; i < SLOT_COUNT; i++) {
         const slot = imageState.slots[i];
         if (slot.label || slot.image) {
             const prefix = slot.prefixTemplate || '请参考';
             const semantic = slot.label || '参考图';
             parts.push(`${prefix}图${i+1}的${semantic}`);
+            currentSlotIndices.add(i);
         }
     }
     const promptCn = document.getElementById('img-prompt-cn');
@@ -3381,6 +3738,7 @@ function updateLocalPrompt() {
         if (!currentVal) {
             promptCn.value = newVal;
             lastAutoPrompt = newVal;
+            promptedSlotIndices = new Set(currentSlotIndices);
             return;
         }
 
@@ -3389,17 +3747,24 @@ function updateLocalPrompt() {
         if (isAutoContent) {
             promptCn.value = newVal;
             lastAutoPrompt = newVal;
+            promptedSlotIndices = new Set(currentSlotIndices);
             return;
         }
 
-        // 已被AI改写过：增量追加新增的图片描述
-        // 检查newVal中是否有在currentVal中不存在的图片描述
-        const newParts = parts.filter(p => !currentVal.includes(p));
-        if (newParts.length > 0) {
-            // 在末尾追加新图片描述
+        // 已被AI改写过：只追加新增图片槽位的描述（不重复已有槽位）
+        const newSlotIndices = [...currentSlotIndices].filter(i => !promptedSlotIndices.has(i));
+        if (newSlotIndices.length > 0) {
+            const newParts = [];
+            for (const i of newSlotIndices) {
+                const slot = imageState.slots[i];
+                const prefix = slot.prefixTemplate || '请参考';
+                const semantic = slot.label || '参考图';
+                newParts.push(`${prefix}图${i+1}的${semantic}`);
+            }
             const updatedVal = currentVal + '，' + newParts.join('，');
             promptCn.value = updatedVal;
-            lastAutoPrompt = updatedVal; // 更新追踪状态
+            lastAutoPrompt = updatedVal;
+            promptedSlotIndices = new Set([...promptedSlotIndices, ...newSlotIndices]);
             // 同时更新队列数据
             if (queueMode === 'multi') {
                 queueData[activeQueue].promptCn = promptCn.value;
@@ -3866,6 +4231,7 @@ function updateGenerateBtnText() {
 }
 
 document.getElementById('btn-img-generate').addEventListener('click', async () => {
+    pushUndoSnapshot();
     logAction('generate', '生成提示词', {});
     // 多图队列模式下，先保存当前队列数据，防止切换队列时覆盖其他队列
     if (queueMode === 'multi') saveCurrentQueueData();
@@ -3910,6 +4276,12 @@ document.getElementById('btn-img-generate').addEventListener('click', async () =
             queueData[activeQueue].promptCn = document.getElementById('img-prompt-cn').value;
             queueData[activeQueue].promptEn = result.prompt_en || document.getElementById('img-prompt-en').value;
             saveQueueData();
+        }
+        // 提示词生成后，标记所有当前图片槽位已参与提示词
+        promptedSlotIndices = new Set();
+        for (let i = 0; i < SLOT_COUNT; i++) {
+            const slot = imageState.slots[i];
+            if (slot.label || slot.image) promptedSlotIndices.add(i);
         }
 
         document.getElementById('btn-img-refresh-en').disabled = false;
@@ -4820,6 +5192,7 @@ document.getElementById('btn-confirm-save-image-preset').addEventListener('click
 
 // 应用预设
 function applyImagePreset(preset) {
+    pushUndoSnapshot();
     // 恢复 Prompt
     if (preset.prompt_cn) document.getElementById('img-prompt-cn').value = preset.prompt_cn;
     if (preset.prompt_en) {
@@ -5305,19 +5678,30 @@ document.getElementById('btn-crop-confirm')?.addEventListener('click', () => {
     const srcW = cropW * scaleX;
     const srcH = cropH * scaleY;
 
-    // 在离屏canvas上绘制裁剪区域（原始分辨率）
+    // 裁剪后如果像素过大（超过4000万像素），先缩小到合理尺寸再输出
+    // 防止超大图（如8000x10000）裁剪后生成的JPEG过大导致上传失败
+    const MAX_CROP_PIXELS = 40_000_000;
+    let outW = Math.round(srcW);
+    let outH = Math.round(srcH);
+    if (outW * outH > MAX_CROP_PIXELS) {
+        const shrinkScale = Math.sqrt(MAX_CROP_PIXELS / (outW * outH));
+        outW = Math.round(outW * shrinkScale);
+        outH = Math.round(outH * shrinkScale);
+    }
+
+    // 在离屏canvas上绘制裁剪区域
     const cropCanvas = document.createElement('canvas');
-    cropCanvas.width = Math.round(srcW);
-    cropCanvas.height = Math.round(srcH);
+    cropCanvas.width = outW;
+    cropCanvas.height = outH;
     const cropCtx = cropCanvas.getContext('2d');
     cropCtx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, cropCanvas.width, cropCanvas.height);
 
-    // 直接输出JPEG blob，服务端统一做缩放+压缩
-    cropCanvas.toBlob((blob) => {
+    // 输出JPEG blob，用compressToUnder2MB确保不超过上传限制
+    compressToUnder2MB(cropCanvas, (blob) => {
         closeModal('modal-crop');
         cropState = null;
         if (callback) callback(blob);
-    }, 'image/jpeg', 0.95);
+    });
 });
 
 // Compress canvas to JPEG blob under 2MB (上传时压缩，API生成时不再压缩)
@@ -5507,6 +5891,10 @@ document.getElementById('cfg-oaihk-model-inline')?.addEventListener('change', ()
 // 平台切换事件
 document.getElementById('cfg-api-platform')?.addEventListener('change', (e) => {
     togglePlatformUI(e.target.value);
+    // 多图列队模式下，切换平台时自动保存到当前队列配置
+    if (queueMode === 'multi') {
+        saveCurrentQueueData();
+    }
 });
 
 // 内联模型切换时自动适配参数
@@ -5555,18 +5943,21 @@ document.getElementById('cfg-rh-model-inline')?.addEventListener('change', (e) =
     api('PUT', '/api/model-config', { rh_model: modelId, rh_aspect_ratio: document.getElementById('cfg-rh-aspect-ratio-inline')?.value || '3:4' }).catch(() => {});
     state.modelConfig.rh_model = modelId;
     logAction('config', '切换RH模型', { model: modelId });
+    if (queueMode === 'multi') saveCurrentQueueData();
 });
 
 // 持久化内联宽高比选择
 document.getElementById('cfg-rh-aspect-ratio-inline')?.addEventListener('change', (e) => {
     api('PUT', '/api/model-config', { rh_aspect_ratio: e.target.value }).catch(() => {});
     state.modelConfig.rh_aspect_ratio = e.target.value;
+    if (queueMode === 'multi') saveCurrentQueueData();
 });
 
 // 持久化内联分辨率选择
 document.getElementById('cfg-rh-resolution-inline')?.addEventListener('change', (e) => {
     api('PUT', '/api/model-config', { rh_resolution: e.target.value }).catch(() => {});
     state.modelConfig.rh_resolution = e.target.value;
+    if (queueMode === 'multi') saveCurrentQueueData();
 });
 
 // 持久化内联HK模型选择
@@ -5574,6 +5965,7 @@ document.getElementById('cfg-oaihk-model-inline')?.addEventListener('change', ()
     const modelId = document.getElementById('cfg-oaihk-model-inline')?.value;
     api('PUT', '/api/model-config', { oaihk_model: modelId }).catch(() => {});
     state.modelConfig.oaihk_model = modelId;
+    if (queueMode === 'multi') saveCurrentQueueData();
 });
 
 updateRhModelParamsInline();
@@ -5583,6 +5975,18 @@ document.getElementById('cfg-rh-seed-mode-inline')?.addEventListener('change', (
     const seedInput = document.getElementById('cfg-rh-seed-inline');
     seedInput.disabled = e.target.value === 'random';
     if (e.target.value === 'random') seedInput.value = '';
+    if (queueMode === 'multi') saveCurrentQueueData();
+});
+
+// 多图列队模式下，其他配置变更也自动保存到当前队列
+document.getElementById('cfg-oaihk-aspect-ratio-inline')?.addEventListener('change', () => {
+    if (queueMode === 'multi') saveCurrentQueueData();
+});
+document.getElementById('cfg-rh-count-inline')?.addEventListener('change', () => {
+    if (queueMode === 'multi') saveCurrentQueueData();
+});
+document.getElementById('cfg-rh-seed-inline')?.addEventListener('change', () => {
+    if (queueMode === 'multi') saveCurrentQueueData();
 });
 
 // ⚙设置按钮 → 打开模型配置弹窗
@@ -6136,9 +6540,227 @@ if (apiGenBtn && apiGenBtn.parentNode) {
     apiGenBtn.parentNode.replaceChild(newBtn, apiGenBtn);
 }
 
+// 多图列队模式：单队列独立生成（异步，不阻塞其他队列）
+async function runSingleQueueGenerate() {
+    pushUndoSnapshot();
+    const qi = activeQueue; // 捕获当前队列索引
+    const qs = queueGenerateStates[qi];
+    if (qs.running) return;
+
+    saveCurrentQueueData(); // 确保最新配置已保存
+    const qd = queueData[qi];
+    const platform = qd.apiPlatform || 'runninghub';
+    logAction('api', '单队列生图开始', { platform, queue: qi + 1 });
+
+    // 构建任务（从队列数据读取配置）
+    const count = qd.rhCount || 1;
+    const tasks = [];
+
+    if (platform === 'oaihk') {
+        const modelId = qd.oaihkModelId;
+        const model = OAIHK_MODELS[modelId];
+        if (!model) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
+        const prompt = apiPromptLang === 'cn' ? (qd?.promptCn?.trim()) : (qd?.promptEn?.trim());
+        const images = qd ? qd.slots.filter(s => s.image) : [];
+        if (!prompt || images.length === 0) {
+            showToast(`队列${qi+1}没有有效的Prompt或图片`, 'error'); return;
+        }
+        const imageUrls = images.map(s => s.image);
+        for (let i = 0; i < count; i++) {
+            tasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${qi+1} 第${i+1}张` : `队列${qi+1}` });
+        }
+    } else {
+        const modelId = qd.rhModelId;
+        const model = RH_MODELS[modelId];
+        if (!model) { showToast('请选择模型', 'error'); return; }
+        const prompt = qd?.promptEn?.trim();
+        const images = qd ? qd.slots.filter(s => s.image) : [];
+        if (!prompt || (model.type === 'image-to-image' && images.length === 0)) {
+            showToast(`队列${qi+1}没有有效的英文Prompt或图片`, 'error'); return;
+        }
+        const imageUrls = images.map(s => {
+            if (s.image.startsWith('/')) return window.location.origin + s.image;
+            return s.image;
+        });
+        for (let i = 0; i < count; i++) {
+            tasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${qi+1} 第${i+1}张` : `队列${qi+1}` });
+        }
+    }
+
+    // 设置队列生成状态
+    qs.running = true;
+    qs.cancelled = false;
+    qs.abortController = new AbortController();
+    // 同步到全局状态（轮询函数依赖 apiGenerateState.cancelled）
+    apiGenerateState.running = true;
+    apiGenerateState.cancelled = false;
+    apiGenerateState.abortController = qs.abortController;
+
+    const btn = document.getElementById('btn-api-generate');
+    const cancelBtn = document.getElementById('btn-api-cancel');
+    if (activeQueue === qi) {
+        btn.innerHTML = `<span class="loading"></span> 队列${qi+1}生成中...`;
+    }
+    cancelBtn.style.display = 'inline-flex';
+    // 刷新队列按钮状态（显示生成指示器）
+    renderQueueNumberBars();
+
+    // 如果当前显示的是这个队列的结果区，清空并显示占位
+    const allResults = [];
+    if (activeQueue === qi) {
+        const resultGrid = document.getElementById('api-result-grid');
+        if (resultGrid) {
+            resultGrid.innerHTML = `<div id="api-generating-placeholder-queue${qi}" style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--text-muted);font-size:12px;"><span class="loading" style="display:inline-block;"></span> 队列${qi+1}正在生成...</div>`;
+        }
+    }
+
+    // 执行每个任务
+    for (let round = 0; round < tasks.length; round++) {
+        if (qs.cancelled) break;
+        const task = tasks[round];
+        if (activeQueue === qi) {
+            btn.innerHTML = `<span class="loading"></span> 队列${qi+1} ${round+1}/${tasks.length}`;
+        }
+
+        try {
+            if (platform === 'oaihk') {
+                const modelId = qd.oaihkModelId;
+                const model = OAIHK_MODELS[modelId];
+                const aspectRatio = qd.oaihkAspectRatio || '3:4';
+                const shortEdge = model.shortEdge || 1536;
+
+                // 预处理图片
+                const publicUrls = [];
+                for (const url of task.imageUrls) {
+                    if (qs.cancelled) break;
+                    publicUrls.push(await uploadToTmpfiles(url, aspectRatio, shortEdge));
+                }
+                if (qs.cancelled) break;
+
+                const payload = { prompt: task.prompt, image_urls: publicUrls, num_images: 1, aspect_ratio: aspectRatio };
+                if (model.modelId) payload.model = model.modelId;
+
+                const submitData = await api('POST', '/api/oaihk-proxy', {
+                    action: 'submit', api_key: '', base_url: '', endpoint: model.endpoint, model_id: modelId, params: payload
+                }, 120000);
+
+                if (!submitData.request_id) {
+                    showToast(`${task.queueLabel}提交失败: ${submitData.error || '未返回request_id'}`, 'error');
+                    continue;
+                }
+
+                const result = await pollOAIHK('', '', model.pollEndpoint, submitData.request_id);
+                if (qs.cancelled) break;
+
+                if (result && result.images) {
+                    for (const img of result.images) {
+                        if (img.url) {
+                            let displayUrl = img.url;
+                            try {
+                                const dlResp = await api('POST', '/api/download-image', { url: img.url });
+                                if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                            } catch (dlErr) {}
+                            allResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${allResults.length+1}.png`, outputType: 'png' });
+                        }
+                    }
+                }
+            } else {
+                // RH通道
+                const modelId = qd.rhModelId;
+                const model = RH_MODELS[modelId];
+                const rhApiKey = document.getElementById('cfg-rh-api-key')?.value || state.modelConfig.rh_api_key || '';
+                const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
+
+                const payload = { prompt: task.prompt };
+                if (model.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
+                if (model.hasResolution) payload.resolution = qd.rhResolution || '1k';
+                const aspectRatio = qd.rhAspectRatio;
+                if (aspectRatio) payload.aspectRatio = aspectRatio;
+
+                const data = await api('POST', '/api/rh-proxy', {
+                    action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
+                });
+
+                if (data.status === 'FAILED') {
+                    showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
+                    continue;
+                }
+
+                const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, Date.now());
+                if (qs.cancelled) break;
+
+                if (result && result.results) {
+                    for (const r of result.results) {
+                        if (r.url) {
+                            allResults.push({ url: r.url, checked: false, filename: `AI生图_${task.queueLabel}_${allResults.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' });
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            if (!qs.cancelled) showToast(`${task.queueLabel}生成失败: ${e.message}`, 'error');
+        }
+    }
+
+    // 重置状态
+    qs.running = false;
+    qs.cancelled = false;
+    qs.abortController = null;
+    // 如果没有其他队列在生成，重置全局状态
+    if (!queueGenerateStates.some(s => s.running)) {
+        apiGenerateState.running = false;
+        apiGenerateState.cancelled = false;
+        apiGenerateState.abortController = null;
+    }
+
+    // 存储结果到队列
+    if (allResults.length > 0) {
+        queueData[qi].results = allResults;
+        saveQueueData();
+        // 如果当前显示的是这个队列，渲染结果
+        if (activeQueue === qi) {
+            renderQueueResults(qi);
+        }
+        logAction('api', '单队列生图完成', { queue: qi + 1, count: allResults.length });
+        showToast(`队列${qi+1}生成完成！共${allResults.length}张`, 'success');
+        if (document.getElementById('cfg-rh-auto-backup')?.checked) {
+            autoDownloadResults(allResults.map(r => ({ url: r.url, outputType: r.outputType })));
+        }
+    }
+
+    // 更新UI
+    if (activeQueue === qi) {
+        btn.disabled = false;
+        updateGenerateBtnText();
+    }
+    // 如果没有其他队列在生成，隐藏取消按钮
+    if (!queueGenerateStates.some(s => s.running)) {
+        cancelBtn.style.display = 'none';
+    }
+    // 刷新队列按钮状态（移除生成指示器）
+    renderQueueNumberBars();
+}
+
 document.getElementById('btn-api-generate')?.addEventListener('click', async () => {
+    // 多图列队模式下，检查当前队列是否正在生成
+    if (queueMode === 'multi' && queueGenerateStates[activeQueue].running) {
+        showToast(`队列${activeQueue+1}正在生成中`, 'error');
+        return;
+    }
+    // 批量生成进行中不允许
     if (apiGenerateState.running) {
+        showToast('批量生成正在进行中', 'error');
+        return;
+    }
+    // 同图抽卡模式，检查全局状态
+    if (queueMode !== 'multi' && apiGenerateState.running) {
         showToast('正在生成中，请等待', 'error');
+        return;
+    }
+
+    // 多图列队模式：异步执行，不阻塞其他队列
+    if (queueMode === 'multi') {
+        runSingleQueueGenerate();
         return;
     }
 
@@ -6166,38 +6788,20 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
 
     if (queueMode === 'multi') {
         saveCurrentQueueData();
-        // 先收集所有有效队列
-        const validQueues = [];
-        for (let q = 0; q < QUEUE_COUNT; q++) {
-            const qd = queueData[q];
-            const prompt = qd.promptEn?.trim();
-            if (!prompt) continue;
-            const images = qd.slots.filter(s => s.image);
-            if (model.type === 'image-to-image' && images.length === 0) continue;
-            const imageUrls = images.map(s => {
-                if (s.image.startsWith('/')) return window.location.origin + s.image;
-                return s.image;
-            });
-            validQueues.push({ prompt, imageUrls, queueLabel: `队列${q+1}` });
-        }
-        if (validQueues.length === 0) {
-            showToast('多图队列模式下没有有效的队列数据（需要英文Prompt和图片）', 'error');
+        // 单组生成：只生成当前选中队列，张数随便填
+        const qd = queueData[activeQueue];
+        const prompt = qd?.promptEn?.trim();
+        const images = qd ? qd.slots.filter(s => s.image) : [];
+        if (!prompt || (model.type === 'image-to-image' && images.length === 0)) {
+            showToast(`队列${activeQueue+1}没有有效的英文Prompt或图片`, 'error');
             return;
         }
-        if (count === validQueues.length) {
-            // 张数=有效队列数：每个队列生成1张
-            tasks.push(...validQueues);
-        } else if (count > validQueues.length && count % validQueues.length === 0) {
-            // 张数是有效队列数的倍数：每个队列生成 count/validQueues.length 张
-            const perQueue = count / validQueues.length;
-            for (const vq of validQueues) {
-                for (let i = 0; i < perQueue; i++) {
-                    tasks.push({ prompt: vq.prompt, imageUrls: vq.imageUrls, queueLabel: `${vq.queueLabel} 第${i+1}张` });
-                }
-            }
-        } else {
-            showToast(`多图列队模式下，张数须为有效队列数(${validQueues.length})的倍数（如${validQueues.length}、${validQueues.length*2}、${validQueues.length*3}...）`, 'error');
-            return;
+        const imageUrls = images.map(s => {
+            if (s.image.startsWith('/')) return window.location.origin + s.image;
+            return s.image;
+        });
+        for (let i = 0; i < count; i++) {
+            tasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${activeQueue+1} 第${i+1}张` : `队列${activeQueue+1}` });
         }
     } else {
         // 同图抽卡模式：同一组数据生成N张
@@ -6300,6 +6904,11 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
     if (allResults.length > 0) {
         logAction('api', 'RH生图完成', { count: allResults.length });
         showToast(`生成完成！共${allResults.length}张`, 'success');
+        // 多图列队模式下，将结果存到当前队列
+        if (queueMode === 'multi') {
+            queueData[activeQueue].results = allResults;
+            saveQueueData();
+        }
         // 自动备份
         if (document.getElementById('cfg-rh-auto-backup')?.checked) {
             autoDownloadResults(allResults.map(r => ({ url: r.url, outputType: r.outputType })));
@@ -6342,25 +6951,60 @@ async function pollUntilDone(apiKey, baseUrl, taskId, startTime = Date.now()) {
 
 // 取消按钮
 document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
-    if (apiGenerateState.running) {
-        logAction('api', '取消生成', {});
-        apiGenerateState.cancelled = true;
-        // 中止所有正在进行的网络请求
-        if (apiGenerateState.abortController) {
-            apiGenerateState.abortController.abort();
-            apiGenerateState.abortController = null;
+    logAction('api', '取消生成', {});
+
+    if (queueMode === 'multi') {
+        // 多图列队模式：只取消当前活动队列的生成
+        const qi = activeQueue;
+        const qs = queueGenerateStates[qi];
+        if (qs.running) {
+            qs.cancelled = true;
+            if (qs.abortController) {
+                qs.abortController.abort();
+            }
+            qs.running = false;
+            // 同步到全局状态，让轮询函数也能检测到取消
+            apiGenerateState.cancelled = true;
+            if (apiGenerateState.abortController === qs.abortController) {
+                apiGenerateState.abortController = null;
+            }
+            if (!queueGenerateStates.some(s => s.running)) {
+                apiGenerateState.running = false;
+            }
         }
-        // 清除旧的轮询定时器
-        if (apiGenerateState.pollTimer) {
-            clearTimeout(apiGenerateState.pollTimer);
-            apiGenerateState.pollTimer = null;
+        // 更新当前队列的 UI
+        const btn = document.getElementById('btn-api-generate');
+        if (btn) { btn.disabled = false; updateGenerateBtnText(); }
+        // 如果没有其他队列在生成，隐藏取消按钮
+        const cancelBtn = document.getElementById('btn-api-cancel');
+        if (cancelBtn && !isAnyQueueGenerating()) {
+            cancelBtn.style.display = 'none';
         }
-        // 立即重置UI状态
-        apiGenerateState.running = false;
-        apiGenerateState.taskId = null;
+        // 移除当前队列的生成中占位
+        const placeholder = document.getElementById(`api-generating-placeholder-queue${qi}`);
+        if (placeholder) placeholder.remove();
+        hideApiProgress();
+        renderQueueNumberBars();
+        showToast(`已取消队列${qi+1}的生成`, 'info');
+    } else {
+        // 同图抽卡模式：取消全局状态
+        if (apiGenerateState.running) {
+            apiGenerateState.cancelled = true;
+            if (apiGenerateState.abortController) {
+                apiGenerateState.abortController.abort();
+                apiGenerateState.abortController = null;
+            }
+            if (apiGenerateState.pollTimer) {
+                clearTimeout(apiGenerateState.pollTimer);
+                apiGenerateState.pollTimer = null;
+            }
+            apiGenerateState.running = false;
+            apiGenerateState.taskId = null;
+        }
+        // 重置UI
         const btn = document.getElementById('btn-api-generate');
         const cancelBtn = document.getElementById('btn-api-cancel');
-        if (btn) { btn.disabled = false; btn.textContent = 'API生成'; }
+        if (btn) { btn.disabled = false; updateGenerateBtnText(); }
         if (cancelBtn) cancelBtn.style.display = 'none';
         showApiRegenerateBtn();
         // 移除生成中占位
@@ -6370,9 +7014,9 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
         const resultGrid = document.getElementById('api-result-grid');
         if (resultGrid && !resultGrid.querySelector('.api-result-card')) {
             resultGrid.innerHTML = `<div id="api-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;">
-                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.2" style="opacity:0.4;margin-bottom:8px;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
-                <div>选择模型后点击「API生成」开始</div>
-            </div>`;
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.2" style="opacity:0.4;margin-bottom:8px;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                    <div>选择模型后点击「API生成」开始</div>
+                </div>`;
         }
         hideApiProgress();
         showToast('已取消生成', 'info');
@@ -6482,6 +7126,7 @@ async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId) {
 
 // OpenAI-HK 通道：核心生图函数
 async function generateViaOpenAIHK() {
+    pushUndoSnapshot();
     const oaihkApiKey = document.getElementById('cfg-oaihk-api-key')?.value || state.modelConfig.oaihk_api_key || '';
     if (!oaihkApiKey) { showToast('请先点击⚙设置填写 OpenAI-HK API Key', 'error'); return; }
 
@@ -6497,35 +7142,17 @@ async function generateViaOpenAIHK() {
 
     if (queueMode === 'multi') {
         saveCurrentQueueData();
-        // 先收集所有有效队列
-        const validQueues = [];
-        for (let q = 0; q < QUEUE_COUNT; q++) {
-            const qd = queueData[q];
-            const prompt = apiPromptLang === 'cn' ? (qd.promptCn?.trim()) : (qd.promptEn?.trim());
-            if (!prompt) continue;
-            const images = qd.slots.filter(s => s.image);
-            if (images.length === 0) continue;
-            const imageUrls = images.map(s => s.image);
-            validQueues.push({ prompt, imageUrls, queueLabel: `队列${q+1}` });
-        }
-        if (validQueues.length === 0) {
-            showToast('多图队列模式下没有有效的队列数据', 'error');
+        // 单组生成：只生成当前选中队列，张数随便填
+        const qd = queueData[activeQueue];
+        const prompt = apiPromptLang === 'cn' ? (qd?.promptCn?.trim()) : (qd?.promptEn?.trim());
+        const images = qd ? qd.slots.filter(s => s.image) : [];
+        if (!prompt || images.length === 0) {
+            showToast(`队列${activeQueue+1}没有有效的${apiPromptLang === 'cn' ? '中文' : '英文'}Prompt或图片`, 'error');
             return;
         }
-        if (count === validQueues.length) {
-            // 张数=有效队列数：每个队列生成1张
-            tasks.push(...validQueues);
-        } else if (count > validQueues.length && count % validQueues.length === 0) {
-            // 张数是有效队列数的倍数：每个队列生成 count/validQueues.length 张
-            const perQueue = count / validQueues.length;
-            for (const vq of validQueues) {
-                for (let i = 0; i < perQueue; i++) {
-                    tasks.push({ prompt: vq.prompt, imageUrls: vq.imageUrls, queueLabel: `${vq.queueLabel} 第${i+1}张` });
-                }
-            }
-        } else {
-            showToast(`多图列队模式下，张数须为有效队列数(${validQueues.length})的倍数（如${validQueues.length}、${validQueues.length*2}、${validQueues.length*3}...）`, 'error');
-            return;
+        const imageUrls = images.map(s => s.image);
+        for (let i = 0; i < count; i++) {
+            tasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${activeQueue+1} 第${i+1}张` : `队列${activeQueue+1}` });
         }
     } else {
         // 根据语言切换选择中文或英文提示词
@@ -6695,6 +7322,11 @@ async function generateViaOpenAIHK() {
     if (allResults.length > 0) {
         logAction('api', 'HK生图完成', { count: allResults.length });
         showToast(`生成完成！共${allResults.length}张`, 'success');
+        // 多图列队模式下，将结果存到当前队列
+        if (queueMode === 'multi') {
+            queueData[activeQueue].results = allResults;
+            saveQueueData();
+        }
         if (document.getElementById('cfg-rh-auto-backup')?.checked) {
             autoDownloadResults(allResults.map(r => ({ url: r.url, outputType: r.outputType })));
         }
@@ -6703,6 +7335,7 @@ async function generateViaOpenAIHK() {
 
 // ========== 批量并行生成（多图列队模式） ==========
 async function batchGenerateAll() {
+    pushUndoSnapshot();
     if (apiGenerateState.running) {
         showToast('正在生成中，请等待', 'error');
         return;
@@ -6713,47 +7346,64 @@ async function batchGenerateAll() {
 
     // 收集所有有效队列的任务
     saveCurrentQueueData();
-    const tasks = [];
+    const count = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
+    const baseTasks = [];
 
+    // 校验模型
     if (platform === 'oaihk') {
         const modelId = document.getElementById('cfg-oaihk-model-inline')?.value;
         const model = OAIHK_MODELS[modelId];
         if (!model) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
-
-        for (let q = 0; q < QUEUE_COUNT; q++) {
-            const qd = queueData[q];
-            const prompt = apiPromptLang === 'cn' ? (qd?.promptCn?.trim()) : (qd?.promptEn?.trim());
-            if (!prompt) continue;
-            const images = qd ? qd.slots.filter(s => s.image) : [];
-            if (images.length === 0) continue;
-            const imageUrls = images.map(s => s.image);
-            tasks.push({ prompt, imageUrls, queueLabel: `队列${q+1}`, queueIndex: q });
-        }
-        if (tasks.length < 2) {
-            showToast('至少需要2组有效数据（含Prompt和图片）才能批量生成', 'error');
-            return;
-        }
     } else {
         const modelId = document.getElementById('cfg-rh-model-inline')?.value;
         const model = RH_MODELS[modelId];
         if (!model) { showToast('请选择模型', 'error'); return; }
+    }
 
-        for (let q = 0; q < QUEUE_COUNT; q++) {
-            const qd = queueData[q];
-            const prompt = qd?.promptEn?.trim();
-            if (!prompt) continue;
-            const images = qd ? qd.slots.filter(s => s.image) : [];
-            if (model.type === 'image-to-image' && images.length === 0) continue;
-            const imageUrls = images.map(s => {
-                if (s.image.startsWith('/')) return window.location.origin + s.image;
-                return s.image;
-            });
-            tasks.push({ prompt, imageUrls, queueLabel: `队列${q+1}`, queueIndex: q });
+    // 收集有效队列
+    for (let q = 0; q < QUEUE_COUNT; q++) {
+        const qd = queueData[q];
+        let prompt;
+        if (platform === 'oaihk') {
+            prompt = apiPromptLang === 'cn' ? (qd?.promptCn?.trim()) : (qd?.promptEn?.trim());
+        } else {
+            prompt = qd?.promptEn?.trim();
         }
-        if (tasks.length < 2) {
-            showToast('至少需要2组有效数据（含英文Prompt和图片）才能批量生成', 'error');
-            return;
+        if (!prompt) continue;
+        const images = qd ? qd.slots.filter(s => s.image) : [];
+        if (images.length === 0) continue;
+        if (platform !== 'oaihk') {
+            const modelId = document.getElementById('cfg-rh-model-inline')?.value;
+            const model = RH_MODELS[modelId];
+            if (model?.type === 'image-to-image' && images.length === 0) continue;
         }
+        const imageUrls = images.map(s => {
+            if (s.image.startsWith('/')) return window.location.origin + s.image;
+            return s.image;
+        });
+        baseTasks.push({ prompt, imageUrls, queueLabel: `队列${q+1}`, queueIndex: q });
+    }
+
+    if (baseTasks.length === 0) {
+        showToast('没有有效的队列数据（需要Prompt和图片）', 'error');
+        return;
+    }
+
+    // 张数倍数校验：批量生成时张数必须是有效队列数的倍数
+    let tasks;
+    if (count === baseTasks.length) {
+        tasks = baseTasks;
+    } else if (count > baseTasks.length && count % baseTasks.length === 0) {
+        const perQueue = count / baseTasks.length;
+        tasks = [];
+        for (const bt of baseTasks) {
+            for (let i = 0; i < perQueue; i++) {
+                tasks.push({ prompt: bt.prompt, imageUrls: bt.imageUrls, queueLabel: perQueue > 1 ? `${bt.queueLabel} 第${i+1}张` : bt.queueLabel, queueIndex: bt.queueIndex });
+            }
+        }
+    } else {
+        showToast(`批量生成时，张数须为有效队列数(${baseTasks.length})的倍数（如${baseTasks.length}、${baseTasks.length*2}、${baseTasks.length*3}...）`, 'error');
+        return;
     }
 
     // 设置UI状态
@@ -6928,6 +7578,14 @@ async function batchGenerateAll() {
     if (allResults.length > 0) {
         logAction('api', platform === 'oaihk' ? 'HK批量生图完成' : 'RH批量生图完成', { count: allResults.length, tasks: totalTasks });
         showToast(`批量生成完成！共${allResults.length}张（${completedCount}组）`, 'success');
+        // 按队列存储结果
+        for (let q = 0; q < QUEUE_COUNT; q++) {
+            const qResults = allResults.filter((_, idx) => tasks[idx]?.queueIndex === q);
+            if (qResults.length > 0) {
+                queueData[q].results = qResults;
+            }
+        }
+        saveQueueData();
         if (document.getElementById('cfg-rh-auto-backup')?.checked) {
             autoDownloadResults(allResults.map(r => ({ url: r.url, outputType: r.outputType })));
         }

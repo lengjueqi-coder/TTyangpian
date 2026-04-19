@@ -994,6 +994,22 @@ body {
     gap: 6px;
 }
 
+.undo-indicator {
+    position: fixed;
+    bottom: 16px;
+    right: 16px;
+    z-index: 1500;
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 8px;
+    opacity: 0;
+    transition: opacity 0.3s;
+    pointer-events: none;
+}
+
 .toast {
     padding: 8px 14px;
     border-radius: var(--radius-sm);
@@ -2104,6 +2120,39 @@ body {
     color: var(--success);
 }
 
+.queue-num-btn.generating {
+    animation: queueGenPulse 1.5s ease-in-out infinite;
+    border-color: #2563eb;
+    color: #2563eb;
+}
+.queue-num-btn.active.generating {
+    background: #2563eb;
+    border-color: #2563eb;
+    color: #fff;
+}
+@keyframes queueGenPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+}
+.queue-gen-indicator {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border: 1.5px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: queueGenSpin 0.8s linear infinite;
+    margin-left: 2px;
+    vertical-align: middle;
+}
+.queue-num-btn.active .queue-gen-indicator {
+    border-color: #fff;
+    border-top-color: transparent;
+}
+@keyframes queueGenSpin {
+    to { transform: rotate(360deg); }
+}
+
 /* API生成按钮蓝色hover */
 #btn-api-generate {
     background: #2563eb !important;
@@ -2259,4 +2308,12 @@ body {
 @keyframes updatePulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
+}
+
+/* 素材添加按钮拖拽高亮 */
+.prop-add-item.drag-over {
+    background: #dbeafe;
+    border: 2px dashed #2563eb;
+    color: #2563eb;
+    transform: scale(1.05);
 }

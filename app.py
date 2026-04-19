@@ -25,7 +25,7 @@ Image.MAX_IMAGE_PIXELS = 100_000_000
 app = Flask(__name__)
 
 # 上传大小限制 10MB
-app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024  # 15MB，支持 base64 图片传输
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB，支持超大原图上传（前端裁剪后仍可能较大）
 
 # 全局数据锁，防止并发读写竞态
 data_lock = threading.Lock()
@@ -714,6 +714,16 @@ def compress_image(file_stream, ext):
     img = ImageOps.exif_transpose(img)
 
     w, h = img.size
+
+    # 超大图保护：如果像素总数超过 4000万像素（如8000x10000=8000万），先缩小到合理尺寸
+    # 防止内存溢出和后续处理过慢
+    MAX_PIXELS = 40_000_000
+    if w * h > MAX_PIXELS:
+        scale = (MAX_PIXELS / (w * h)) ** 0.5
+        w = int(w * scale)
+        h = int(h * scale)
+        img = img.resize((w, h), Image.LANCZOS)
+        warning = f'原图过大已自动缩小至{w}×{h}'
 
     # 统一缩放：短边缩放到配置值（前端已保证3:4比例，无需再裁剪）
     short_edge = min(w, h)
@@ -2360,7 +2370,7 @@ def oaihk_proxy():
     # 从服务端配置读取真实密钥（前端可能传遮蔽值，不可信）
     config = load_json('model_config.json') or {}
     api_key = config.get('oaihk_api_key', '').strip()
-    base_url = config.get('oaihk_base_url', 'https://api.openai-hk.com').rstrip('/')
+    base_url = (config.get('oaihk_base_url') or 'https://api.openai-hk.com').rstrip('/')
     # 允许前端覆盖 base_url（但不覆盖 api_key）
     if body.get('base_url', '').strip():
         base_url = body['base_url'].strip().rstrip('/')
