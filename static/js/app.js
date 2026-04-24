@@ -1,4 +1,6 @@
 // ========== 全局状态 ==========
+const SLOT_COUNT = 10;
+const QUEUE_COUNT = 10;
 const DEFAULT_PRESET_TAGS = ['肖像', '写真', '日系写真', '纯欲写真', '私房写真', '外景写真', '樱花写真', '新中式', '古风', '旗袍', '韩杂', '日杂', '杂志', '氛围感肖像', '胶片写真', '暗黑写真', '欧美肖像', '商业写真', '复古写真', '纪实写真'];
 
 const state = {
@@ -97,14 +99,21 @@ function showPrompt(title, defaultText = '', placeholder = '') {
     });
 }
 
-async function api(method, url, body, timeoutMs = 60000) {
+async function api(method, url, body, timeoutMs = 60000, cancelSignal, skipGlobalAbort = false) {
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
     if (body) opts.body = JSON.stringify(body);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     opts.signal = controller.signal;
-    // 如果有全局取消控制器，也关联上
-    if (apiGenerateState?.abortController) {
+    // 如果传入了取消signal（按列队），关联上
+    if (cancelSignal) {
+        if (cancelSignal.aborted) { controller.abort(); clearTimeout(timer); }
+        else {
+            const onCancel = () => { controller.abort(); clearTimeout(timer); };
+            cancelSignal.addEventListener('abort', onCancel, { once: true });
+        }
+    } else if (!skipGlobalAbort && apiGenerateState?.abortController) {
+        // 仅对生成类请求绑定全局取消信号，数据保存类请求不绑定（防止取消生成时误杀保存）
         const globalSignal = apiGenerateState.abortController.signal;
         if (globalSignal.aborted) { controller.abort(); clearTimeout(timer); }
         else {
@@ -168,6 +177,7 @@ function pushUndoSnapshot() {
         promptCn: document.getElementById('img-prompt-cn')?.value || '',
         promptEn: document.getElementById('img-prompt-en')?.value || '',
         promptedSlotIndices: [...promptedSlotIndices],
+        // pinnedSlotIndices is global, not in per-queue snapshot
         lastAutoPrompt: lastAutoPrompt,
         selectedItems: JSON.parse(JSON.stringify(state.selectedItems)),
         selectedPrefixes: [...state.selectedPrefixes],
@@ -198,6 +208,7 @@ function undo() {
         imageState.promptCn = snapshot.promptCn;
         imageState.promptEn = snapshot.promptEn;
         promptedSlotIndices = new Set(snapshot.promptedSlotIndices);
+        // pinnedSlotIndices is global, not restored from snapshot
         lastAutoPrompt = snapshot.lastAutoPrompt;
 
         // 恢复文字模式选择状态
@@ -237,6 +248,8 @@ function undo() {
         if (batchBtn) batchBtn.style.display = queueMode === 'multi' ? 'inline-flex' : 'none';
 
         showToast(`已撤销（剩余${undoStack.length}步）`, 'info');
+        // 持久化撤销后的状态到服务器
+        saveQueueData();
     } finally {
         _undoEnabled = true;
     }
@@ -468,13 +481,13 @@ async function loadAllData() {
 
         renderAll();
 
-        // 恢复平台选择状态
-        if (state.modelConfig.api_platform) {
-            const platformSelect = document.getElementById('cfg-api-platform');
-            if (platformSelect) {
+        // 恢复平台选择状态（始终调用，确保UI与下拉框一致）
+        const platformSelect = document.getElementById('cfg-api-platform');
+        if (platformSelect) {
+            if (state.modelConfig.api_platform) {
                 platformSelect.value = state.modelConfig.api_platform;
-                togglePlatformUI(state.modelConfig.api_platform);
             }
+            togglePlatformUI(platformSelect.value);
         }
 
         // 恢复RH内联模型选择 + 宽高比
@@ -1496,7 +1509,7 @@ async function saveSelection() {
             selected_prefixes: state.selectedPrefixes,
             selected_items: getSelectedItemIds(),
             selected_suffixes: state.selectedSuffixes
-        });
+        }, 60000, undefined, true); // skipGlobalAbort: 不绑定取消生成信号
     } catch (e) { console.error('保存选择状态失败:', e); }
 }
 
@@ -2018,7 +2031,7 @@ document.getElementById('btn-confirm-export')?.addEventListener('click', async (
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);
-        URL.revokeObjectURL(url);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
         setTimeout(() => showToast('导出完成，请查看下载文件', 'success'), 500);
     } catch (err) {
         showToast('导出失败：' + err.message, 'error');
@@ -2251,7 +2264,7 @@ document.addEventListener('click', (e) => {
         const modalId = e.target.dataset.close;
         if (modalId) closeModal(modalId);
     }
-    if (e.target.classList.contains('modal-overlay')) e.target.style.display = 'none';
+    if (e.target.classList.contains('modal-overlay')) closeModal(e.target.id);
 });
 
 // ========== 面板拖拽调整宽度 ==========
@@ -2384,7 +2397,7 @@ const imageState = {
 };
 
 // ---------- 多图队列系统 ----------
-const QUEUE_COUNT = 10;
+// QUEUE_COUNT 已在文件顶部声明
 let queueMode = 'same'; // 'same' = 同图抽卡, 'multi' = 多图队列
 let activeQueue = 0;     // 当前活动的队列编号 (0-9)
 
@@ -2399,9 +2412,9 @@ function initQueueData() {
             promptCn: '',
             promptEn: '',
             results: [],
-            apiPlatform: 'runninghub',
+            apiPlatform: 'oaihk',
             rhModelId: '',
-            oaihkModelId: '',
+            oaihkModelId: 'fal-ai/banana/v3.1/flash/2k',
             rhAspectRatio: '3:4',
             oaihkAspectRatio: '1:1',
             rhResolution: '1k',
@@ -2413,9 +2426,9 @@ function initQueueData() {
     // 兼容旧数据：确保每个队列都有新字段
     for (let q = 0; q < queueData.length; q++) {
         if (!queueData[q].results) queueData[q].results = [];
-        if (!queueData[q].apiPlatform) queueData[q].apiPlatform = 'runninghub';
+        if (!queueData[q].apiPlatform) queueData[q].apiPlatform = 'oaihk';
         if (!queueData[q].rhModelId) queueData[q].rhModelId = '';
-        if (!queueData[q].oaihkModelId) queueData[q].oaihkModelId = '';
+        if (!queueData[q].oaihkModelId) queueData[q].oaihkModelId = 'fal-ai/banana/v3.1/flash/2k';
         if (!queueData[q].rhAspectRatio) queueData[q].rhAspectRatio = '3:4';
         if (!queueData[q].oaihkAspectRatio) queueData[q].oaihkAspectRatio = '1:1';
         if (!queueData[q].rhResolution) queueData[q].rhResolution = '1k';
@@ -2427,6 +2440,8 @@ function initQueueData() {
 
 let _saveQueueTimer = null;
 function saveQueueData() {
+    // 保存全局 pinnedSlotIndices
+    try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
     // 防抖：300ms 内的多次调用只执行一次
     if (_saveQueueTimer) clearTimeout(_saveQueueTimer);
     _saveQueueTimer = setTimeout(() => {
@@ -2435,8 +2450,19 @@ function saveQueueData() {
             activeQueue: activeQueue,
             queueMode: queueMode,
             slots: queueMode === 'same' ? imageState.slots : []
-        }).catch(e => console.error('保存队列数据失败:', e));
+        }, 60000, undefined, true).catch(e => console.error('保存队列数据失败:', e)); // skipGlobalAbort
     }, 300);
+}
+// 立即保存队列数据（无防抖），返回 Promise
+async function saveQueueDataNow() {
+    if (_saveQueueTimer) { clearTimeout(_saveQueueTimer); _saveQueueTimer = null; }
+    try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
+    await api('PUT', '/api/queue-data', {
+        queues: queueData,
+        activeQueue: activeQueue,
+        queueMode: queueMode,
+        slots: queueMode === 'same' ? imageState.slots : []
+    }, 60000, undefined, true);
 }
 
 // 从队列1复制到其他队列（默认初始化）
@@ -2452,28 +2478,42 @@ function copyQueue1ToAll() {
 }
 
 // 切换到指定队列
-function switchToQueue(qIndex) {
+async function switchToQueue(qIndex) {
     pushUndoSnapshot();
     // 保存当前队列数据
     saveCurrentQueueData();
+    // 立即持久化到服务器，确保切换前数据已保存
+    await saveQueueDataNow();
     activeQueue = qIndex;
     saveQueueData();
     // 加载目标队列数据
     loadQueueData(qIndex);
     renderQueueNumberBars();
     updateGenerateBtnText();
+    // 切换队列时更新进度条和取消按钮
+    const qs = queueGenerateStates[activeQueue];
+    const cancelBtn = document.getElementById('btn-api-cancel');
+    if (qs?.running) {
+        cancelBtn && (cancelBtn.style.display = 'inline-flex');
+    } else {
+        hideApiProgress();
+        if (!queueGenerateStates.some(s => s.running)) {
+            cancelBtn && (cancelBtn.style.display = 'none');
+        }
+    }
 }
 
 // 保存当前编辑中的数据到队列
-function saveCurrentQueueData() {
+function saveCurrentQueueData(qi) {
     if (queueMode !== 'multi') return;
-    const q = queueData[activeQueue];
+    const idx = (qi !== undefined && qi !== null) ? qi : activeQueue;
+    const q = queueData[idx];
     if (!q) return; // 防御性检查
     q.slots = JSON.parse(JSON.stringify(imageState.slots));
     q.promptCn = document.getElementById('img-prompt-cn')?.value || '';
     q.promptEn = document.getElementById('img-prompt-en')?.value || '';
     // 保存 API 配置
-    q.apiPlatform = document.getElementById('cfg-api-platform')?.value || 'runninghub';
+    q.apiPlatform = document.getElementById('cfg-api-platform')?.value || 'oaihk';
     q.rhModelId = document.getElementById('cfg-rh-model-inline')?.value || '';
     q.oaihkModelId = document.getElementById('cfg-oaihk-model-inline')?.value || '';
     q.rhAspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value || '3:4';
@@ -2482,6 +2522,17 @@ function saveCurrentQueueData() {
     q.rhCount = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
     q.rhSeedMode = document.getElementById('cfg-rh-seed-mode-inline')?.value || 'random';
     q.rhSeed = document.getElementById('cfg-rh-seed-inline')?.value || '';
+    // 保存前缀/后缀/预设状态
+    q.selectedPrefixIds = [...selectedPrefixIds];
+    q.selectedSuffixIds = [...selectedSuffixIds];
+    q.activePromptPresetIds = [...activePromptPresetIds];
+    q.prevPromptCn = prevPromptCn;
+    q.promptedSlotIndices = [...promptedSlotIndices];
+    // q.pinnedSlotIndices is global, not saved per-queue
+    // 保存语言/前缀/自动prompt状态
+    q.promptLang = apiPromptLang;
+    q.activePrefix = activePrefix;
+    q.lastAutoPrompt = lastAutoPrompt;
     saveQueueData();
 }
 
@@ -2498,10 +2549,10 @@ function setSelectValue(id, value) {
 
 // 从队列数据恢复 API 配置到 DOM
 function restoreApiConfigToDOM(q) {
-    const platform = q.apiPlatform || 'runninghub';
+    const platform = q.apiPlatform || 'oaihk';
     setSelectValue('cfg-api-platform', platform);
     setSelectValue('cfg-rh-model-inline', q.rhModelId || '');
-    setSelectValue('cfg-oaihk-model-inline', q.oaihkModelId || '');
+    setSelectValue('cfg-oaihk-model-inline', q.oaihkModelId || 'fal-ai/banana/v3.1/flash/2k');
     setSelectValue('cfg-rh-aspect-ratio-inline', q.rhAspectRatio || '3:4');
     setSelectValue('cfg-oaihk-aspect-ratio-inline', q.oaihkAspectRatio || '1:1');
     setSelectValue('cfg-rh-resolution-inline', q.rhResolution || '1k');
@@ -2529,6 +2580,32 @@ function loadQueueData(qIndex) {
     const promptEn = document.getElementById('img-prompt-en');
     if (promptCn) promptCn.value = q.promptCn || '';
     if (promptEn) promptEn.value = q.promptEn || '';
+    // 恢复前缀/后缀/预设状态
+    selectedPrefixIds = new Set(q.selectedPrefixIds || []);
+    selectedSuffixIds = new Set(q.selectedSuffixIds || []);
+    activePromptPresetIds = new Set(q.activePromptPresetIds || []);
+    prevPromptCn = q.prevPromptCn || '';
+    promptedSlotIndices = new Set(q.promptedSlotIndices || []);
+    // pinnedSlotIndices is global, not restored per-queue
+    // 恢复语言/前缀/自动prompt
+    apiPromptLang = q.promptLang || 'en';
+    const langBtn = document.getElementById('btn-api-prompt-lang');
+    if (langBtn) {
+        if (apiPromptLang === 'cn') {
+            langBtn.textContent = '使用中文提示词';
+            langBtn.style.color = '#22c55e';
+            langBtn.style.borderColor = '#22c55e';
+        } else {
+            langBtn.textContent = '使用英文提示词';
+            langBtn.style.color = '';
+            langBtn.style.borderColor = '';
+        }
+    }
+    activePrefix = q.activePrefix || '请参考';
+    renderPrefixBatchBar();
+    lastAutoPrompt = q.lastAutoPrompt || '';
+    renderTemplateButtons();
+    renderPromptPresetButtons();
     renderImageSlots();
     // 仅在中文prompt为空时自动拼接，有已保存内容时不覆盖
     if (!q.promptCn?.trim()) {
@@ -2668,43 +2745,64 @@ function updateClearButtonsVisibility() {
 
 document.getElementById('btn-clear-current-group')?.addEventListener('click', () => {
     const hasImages = imageState.slots.some(s => s.image);
-    if (!hasImages) { showToast('当前组没有图片素材', 'info'); return; }
-    if (!confirm('确认清除当前组的所有图片素材？（不会删除本地文件）')) return;
+    const promptCn = document.getElementById('img-prompt-cn')?.value || '';
+    const promptEn = document.getElementById('img-prompt-en')?.value || '';
+    if (!hasImages && !promptCn && !promptEn) { showToast('当前组没有图片素材和提示词', 'info'); return; }
+    if (!confirm('确认清除当前组的所有图片素材和提示词？（不会删除本地文件）')) return;
     pushUndoSnapshot();
-    logAction('slot', '清除当前组图片', { queue: queueMode === 'multi' ? activeQueue + 1 : 'same' });
+    logAction('slot', '清除当前组图片和提示词', { queue: queueMode === 'multi' ? activeQueue + 1 : 'same' });
     for (let i = 0; i < imageState.slots.length; i++) {
         imageState.slots[i] = { image: '', label: '', prefixTemplate: imageState.slots[i].prefixTemplate || '请参考' };
     }
+    // 清除提示词
+    imageState.promptCn = '';
+    imageState.promptEn = '';
+    const promptCnEl = document.getElementById('img-prompt-cn');
+    const promptEnEl = document.getElementById('img-prompt-en');
+    if (promptCnEl) promptCnEl.value = '';
+    if (promptEnEl) promptEnEl.value = '';
     if (queueMode === 'multi') {
         queueData[activeQueue].slots = JSON.parse(JSON.stringify(imageState.slots));
+        queueData[activeQueue].promptCn = '';
+        queueData[activeQueue].promptEn = '';
     }
     saveQueueData();
     renderImageSlots();
-    showToast('已清除当前组图片素材', 'success');
+    showToast('已清除当前组图片素材和提示词', 'success');
 });
 
 document.getElementById('btn-clear-all-groups')?.addEventListener('click', () => {
     let totalImages = 0;
+    let totalPrompts = 0;
     for (let q = 0; q < QUEUE_COUNT; q++) {
         totalImages += queueData[q].slots.filter(s => s.image).length;
+        if (queueData[q].promptCn || queueData[q].promptEn) totalPrompts++;
     }
-    if (totalImages === 0) { showToast('所有组都没有图片素材', 'info'); return; }
-    if (!confirm(`确认清除所有组的图片素材？共${totalImages}张图片（不会删除本地文件）`)) return;
+    if (totalImages === 0 && totalPrompts === 0) { showToast('所有组都没有图片素材和提示词', 'info'); return; }
+    if (!confirm(`确认清除所有组的图片素材和提示词？共${totalImages}张图片（不会删除本地文件）`)) return;
     pushUndoSnapshot();
-    logAction('slot', '清除所有组图片', { totalImages });
+    logAction('slot', '清除所有组图片和提示词', { totalImages });
     for (let q = 0; q < QUEUE_COUNT; q++) {
         for (let i = 0; i < queueData[q].slots.length; i++) {
             queueData[q].slots[i] = { image: '', label: '', prefixTemplate: queueData[q].slots[i].prefixTemplate || '请参考' };
         }
+        queueData[q].promptCn = '';
+        queueData[q].promptEn = '';
     }
     // 同步当前显示
     imageState.slots = JSON.parse(JSON.stringify(queueData[activeQueue].slots));
     while (imageState.slots.length < SLOT_COUNT) {
         imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考' });
     }
+    imageState.promptCn = '';
+    imageState.promptEn = '';
+    const promptCnEl = document.getElementById('img-prompt-cn');
+    const promptEnEl = document.getElementById('img-prompt-en');
+    if (promptCnEl) promptCnEl.value = '';
+    if (promptEnEl) promptEnEl.value = '';
     saveQueueData();
     renderImageSlots();
-    showToast('已清除所有组图片素材', 'success');
+    showToast('已清除所有组图片素材和提示词', 'success');
 });
 
 updateClearButtonsVisibility();
@@ -2877,15 +2975,22 @@ async function renderImageLibrary() {
             const addCard = document.createElement('div');
             addCard.className = 'prop-add-item';
             addCard.textContent = '+ 添加';
+            addCard.title = '点击选择文件或拖拽图片到此处';
             addCard.addEventListener('click', () => addLibSubItem(cat, defaultSub));
+            addCard.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); addCard.classList.add('drag-over'); });
+            addCard.addEventListener('dragleave', (e) => { e.preventDefault(); addCard.classList.remove('drag-over'); });
+            addCard.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); addCard.classList.remove('drag-over'); handleLibDrop(e, cat, defaultSub); });
             grid.appendChild(addCard);
 
             // 批量上传按钮
             const addBatchCard = document.createElement('div');
             addBatchCard.className = 'prop-add-item';
             addBatchCard.textContent = '+ 批量';
-            addBatchCard.title = '批量上传到该子分类';
+            addBatchCard.title = '批量上传到该子分类（点击或拖拽）';
             addBatchCard.addEventListener('click', () => addLibSubItem(cat, defaultSub, true));
+            addBatchCard.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); addBatchCard.classList.add('drag-over'); });
+            addBatchCard.addEventListener('dragleave', (e) => { e.preventDefault(); addBatchCard.classList.remove('drag-over'); });
+            addBatchCard.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); addBatchCard.classList.remove('drag-over'); handleLibDrop(e, cat, defaultSub); });
             grid.appendChild(addBatchCard);
 
             body.appendChild(grid);
@@ -2967,8 +3072,29 @@ async function renderImageLibrary() {
 
         catEl.appendChild(header);
         catEl.appendChild(body);
+
+        // 分类级别拖拽：拖到分类区域任意位置都能添加到默认子分类
+        if (defaultSub) {
+            catEl.addEventListener('dragover', (e) => { e.preventDefault(); catEl.classList.add('drag-over'); });
+            catEl.addEventListener('dragleave', (e) => { if (!catEl.contains(e.relatedTarget)) catEl.classList.remove('drag-over'); });
+            catEl.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); catEl.classList.remove('drag-over'); handleLibDrop(e, cat, defaultSub); });
+        }
+
         container.appendChild(catEl);
     }
+
+    // 素材库面板级别拖拽兜底：拖到面板空白区域添加到当前展开分类
+    container.addEventListener('dragover', (e) => { e.preventDefault(); container.style.outline = '2px dashed var(--accent)'; container.style.outlineOffset = '-4px'; });
+    container.addEventListener('dragleave', () => { container.style.outline = ''; container.style.outlineOffset = ''; });
+    container.addEventListener('drop', (e) => {
+        e.preventDefault(); container.style.outline = ''; container.style.outlineOffset = '';
+        // 找到当前展开的分类，或第一个分类
+        const targetCat = imageState.library.find(c => c.id === imageState.expandedLibCategory) || imageState.library[0];
+        if (!targetCat) return;
+        const subs = targetCat.subcategories || [];
+        const targetSub = subs.find(s => s.name === '默认' || s._isDefault) || subs[0];
+        if (targetSub) handleLibDrop(e, targetCat, targetSub);
+    });
 }
 
 // 创建素材卡片（子分类版本）
@@ -3499,7 +3625,7 @@ document.getElementById('btn-add-img-lib-category').addEventListener('click', as
 });
 
 // ---------- 图片槽渲染（10个并排一排） ----------
-const SLOT_COUNT = 10;
+// SLOT_COUNT 已在文件顶部声明
 
 // 初始化队列数据
 try { initQueueData(); } catch(e) { console.error('initQueueData error:', e); queueData = []; initQueueData(); }
@@ -3565,12 +3691,22 @@ function renderImageSlots() {
         const prefix = slot.prefixTemplate || '请参考';
         const semantic = slot.label || '';
 
+        const pinBtn = (queueMode === 'multi' && slot.image) ? `<button class="slot-pin-btn ${pinnedSlotIndices.has(i) ? 'pinned' : ''}" title="${pinnedSlotIndices.has(i) ? '取消全列队' : '应用全列队'}">${pinnedSlotIndices.has(i) ? '📌' : '📍'}</button>` : '';
         slotEl.innerHTML = `
-            <div class="slot-compact-image-area">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}</div>
+            <div class="slot-compact-image-area">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}</div>
             <div class="slot-compact-label">
                 <span class="slot-prefix" title="点击编辑前缀">${escHtml(prefix)}</span><span class="slot-auto-text">图${i+1}${semantic ? '的' + escHtml(semantic) : ''}</span>
             </div>
         `;
+
+        // 应用全列队按钮
+        const pinEl = slotEl.querySelector('.slot-pin-btn');
+        if (pinEl) {
+            pinEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                togglePinSlotToAllQueues(i);
+            });
+        }
 
         // 前缀点击编辑
         const prefixEl = slotEl.querySelector('.slot-prefix');
@@ -3604,7 +3740,7 @@ function renderImageSlots() {
         let clickTimer = null;
         imgArea.addEventListener('click', (e) => {
             e.stopPropagation();
-            if (e.target.closest('.slot-change-btn')) return;
+            if (e.target.closest('.slot-change-btn') || e.target.closest('.slot-pin-btn')) return;
             if (imageState.activeSlotIndex !== i) {
                 imageState.activeSlotIndex = i;
                 renderImageSlots();
@@ -3695,7 +3831,9 @@ function renderImageSlots() {
             e.stopPropagation();
             const choice = confirm('确定清除该图片槽？\n\n取消 = 选择本地上传图片');
             if (choice) {
+                pushUndoSnapshot();
                 imageState.slots[i] = { image: '', label: '', prefixTemplate: '请参考' };
+                compactAndRenumber();
                 renderImageSlots();
                 updateLocalPrompt();
             } else {
@@ -3716,6 +3854,67 @@ function renderImageSlots() {
 let lastAutoPrompt = '';
 // 记录已经参与提示词拼接的图片槽位索引集合
 let promptedSlotIndices = new Set();
+// 记录已应用全列队的图片槽位索引
+let pinnedSlotIndices = new Set(JSON.parse(localStorage.getItem('pinnedSlotIndices') || '[]'));
+// 记录固定前其他队列的原始槽位数据，用于取消固定时恢复
+let pinnedSlotOriginals = {}; // { slotIndex: { queueIndex: slotData } }
+
+// 应用/取消全列队：将当前槽位图片复制到所有列队的同一槽位
+function togglePinSlotToAllQueues(slotIndex) {
+    if (queueMode !== 'multi') return;
+    const currentSlot = imageState.slots[slotIndex];
+    if (!currentSlot.image && !currentSlot.label) return;
+
+    // 确保queueData有QUEUE_COUNT个队列
+    while (queueData.length < QUEUE_COUNT) {
+        queueData.push({
+            slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考' })),
+            promptCn: '', promptEn: '', results: []
+        });
+    }
+
+    if (pinnedSlotIndices.has(slotIndex)) {
+        // 取消：恢复其他列队该槽位的原始数据
+        const originals = pinnedSlotOriginals[slotIndex] || {};
+        for (let q = 0; q < QUEUE_COUNT; q++) {
+            if (q === activeQueue) continue;
+            if (!queueData[q].slots) queueData[q].slots = [];
+            while (queueData[q].slots.length <= slotIndex) {
+                queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+            }
+            if (originals[q]) {
+                queueData[q].slots[slotIndex] = JSON.parse(JSON.stringify(originals[q]));
+            } else {
+                queueData[q].slots[slotIndex] = { image: '', label: '', prefixTemplate: '请参考' };
+            }
+        }
+        delete pinnedSlotOriginals[slotIndex];
+        pinnedSlotIndices.delete(slotIndex);
+        try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
+        saveQueueData();
+        renderImageSlots();
+        showToast(`已取消图${slotIndex + 1}的全列队应用`, 'info');
+    } else {
+        // 应用：先保存其他列队的原始数据，再复制
+        const slotCopy = JSON.parse(JSON.stringify(currentSlot));
+        pinnedSlotOriginals[slotIndex] = {};
+        for (let q = 0; q < QUEUE_COUNT; q++) {
+            if (q === activeQueue) continue;
+            if (!queueData[q].slots) queueData[q].slots = [];
+            while (queueData[q].slots.length <= slotIndex) {
+                queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+            }
+            // 保存原始数据
+            pinnedSlotOriginals[slotIndex][q] = JSON.parse(JSON.stringify(queueData[q].slots[slotIndex]));
+            queueData[q].slots[slotIndex] = slotCopy;
+        }
+        pinnedSlotIndices.add(slotIndex);
+        try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
+        saveQueueData();
+        renderImageSlots();
+        showToast(`已将图${slotIndex + 1}应用到所有列队`, 'success');
+    }
+}
 
 function updateLocalPrompt() {
     const parts = [];
@@ -4223,10 +4422,17 @@ function updateGenerateBtnText() {
         const promptEn = document.getElementById('img-prompt-en')?.value?.trim();
         btn.textContent = promptEn ? '再次生成提示词' : '生成提示词';
     }
-    // API生成按钮：多图列队模式下显示当前队列号
+    // API生成按钮：多图列队模式下显示当前队列号和状态
     const apiBtn = document.getElementById('btn-api-generate');
-    if (apiBtn && !apiGenerateState.running) {
-        apiBtn.textContent = queueMode === 'multi' ? `生成队列${activeQueue+1}` : '生成';
+    if (apiBtn) {
+        const qs = queueGenerateStates[activeQueue];
+        if (qs?.running) {
+            apiBtn.innerHTML = `<span class="loading"></span> 队列${activeQueue+1}生成中...`;
+            apiBtn.disabled = true;
+        } else {
+            apiBtn.textContent = queueMode === 'multi' ? `生成队列${activeQueue+1}` : '生成';
+            apiBtn.disabled = false;
+        }
     }
 }
 
@@ -4348,75 +4554,227 @@ document.getElementById('btn-img-copy-cn').addEventListener('click', () => {
     });
 });
 
-// ========== 前缀/后缀模板系统 ==========
-// 数据结构：{ prefixes: [{id, name, text, isDefault}], suffixes: [{id, name, text, isDefault}] }
+// ========== 前缀/后缀模板系统（服务器持久化 + 按钮直接操作提示词） ==========
+// 数据结构：{ prefixes: [{id, name, text}], suffixes: [{id, name, text}] }
+// 按钮点击 → 前缀插入提示词最前方，后缀插入提示词最后方；再点击取消移除
 let promptTemplates = { prefixes: [], suffixes: [] };
+let selectedPrefixIds = new Set();
+let selectedSuffixIds = new Set();
 
-// 从localStorage加载模板
-function loadPromptTemplates() {
+// 显示顺序：localStorage存储勾选的ID列表（按勾选顺序），默认前10个
+function getDisplayedTemplateIds(type) {
     try {
-        const saved = localStorage.getItem('promptTemplates');
-        if (saved) promptTemplates = JSON.parse(saved);
+        const saved = localStorage.getItem(`displayed_${type}_ids`);
+        if (saved) return JSON.parse(saved);
     } catch {}
-    // 确保结构完整
+    return null; // null表示未设置，用默认前10个
+}
+function setDisplayedTemplateIds(type, ids) {
+    localStorage.setItem(`displayed_${type}_ids`, JSON.stringify(ids.slice(0, 10)));
+}
+
+async function loadPromptTemplates() {
+    try {
+        const data = await api('GET', '/api/prompt-templates');
+        if (data && (data.prefixes?.length > 0 || data.suffixes?.length > 0)) {
+            promptTemplates.prefixes = data.prefixes || [];
+            promptTemplates.suffixes = data.suffixes || [];
+            if (selectedPrefixIds.size === 0 && selectedSuffixIds.size === 0) {
+                selectedPrefixIds = new Set(data.selectedPrefixIds || []);
+                selectedSuffixIds = new Set(data.selectedSuffixIds || []);
+            }
+            if (queueData[0] && (!queueData[0].selectedPrefixIds || queueData[0].selectedPrefixIds.length === 0)) {
+                queueData[0].selectedPrefixIds = [...selectedPrefixIds];
+                queueData[0].selectedSuffixIds = [...selectedSuffixIds];
+            }
+        } else {
+            try {
+                const saved = localStorage.getItem('promptTemplates');
+                if (saved) {
+                    const local = JSON.parse(saved);
+                    if (local.prefixes?.length > 0 || local.suffixes?.length > 0) {
+                        promptTemplates = local;
+                        await savePromptTemplates();
+                        localStorage.removeItem('promptTemplates');
+                    }
+                }
+            } catch {}
+        }
+    } catch {
+        try {
+            const saved = localStorage.getItem('promptTemplates');
+            if (saved) promptTemplates = JSON.parse(saved);
+        } catch {}
+    }
     if (!Array.isArray(promptTemplates.prefixes)) promptTemplates.prefixes = [];
     if (!Array.isArray(promptTemplates.suffixes)) promptTemplates.suffixes = [];
 }
-function savePromptTemplates() {
-    localStorage.setItem('promptTemplates', JSON.stringify(promptTemplates));
+
+async function savePromptTemplates() {
+    const data = {
+        prefixes: promptTemplates.prefixes,
+        suffixes: promptTemplates.suffixes,
+        selectedPrefixIds: [...selectedPrefixIds],
+        selectedSuffixIds: [...selectedSuffixIds]
+    };
+    try { localStorage.setItem('promptTemplates', JSON.stringify(data)); } catch {}
+    try { await api('PUT', '/api/prompt-templates', data); } catch {}
 }
 
-// 刷新前缀/后缀下拉框
-function refreshTemplateSelects() {
-    const prefixSel = document.getElementById('prompt-prefix-select');
-    const suffixSel = document.getElementById('prompt-suffix-select');
-    if (!prefixSel || !suffixSel) return;
+function _getVisibleItems(type) {
+    const items = type === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
+    const displayed = getDisplayedTemplateIds(type);
+    if (displayed) {
+        // 按用户勾选顺序显示
+        return displayed.map(id => items.find(t => t.id === id)).filter(Boolean);
+    }
+    // 默认：前10个
+    return items.slice(0, 10);
+}
 
-    const curPrefix = prefixSel.value;
-    const curSuffix = suffixSel.value;
+function renderTemplateButtons() {
+    const prefixGroup = document.getElementById('prefix-btn-group');
+    const suffixGroup = document.getElementById('suffix-btn-group');
+    if (!prefixGroup || !suffixGroup) return;
 
-    prefixSel.innerHTML = '<option value="">无</option>';
-    promptTemplates.prefixes.forEach(t => {
-        const opt = document.createElement('option');
-        opt.value = t.id;
-        opt.textContent = t.name + (t.isDefault ? ' ★' : '');
-        prefixSel.appendChild(opt);
+    const visiblePrefixes = _getVisibleItems('prefix');
+    const visibleSuffixes = _getVisibleItems('suffix');
+
+    prefixGroup.innerHTML = visiblePrefixes.map(t => {
+        const sel = selectedPrefixIds.has(t.id) ? 'selected' : '';
+        return `<button class="template-btn ${sel}" data-id="${t.id}" title="${escHtml(t.text)}">${escHtml(t.name)}</button>`;
+    }).join('');
+
+    suffixGroup.innerHTML = visibleSuffixes.map(t => {
+        const sel = selectedSuffixIds.has(t.id) ? 'selected' : '';
+        return `<button class="template-btn ${sel}" data-id="${t.id}" title="${escHtml(t.text)}">${escHtml(t.name)}</button>`;
+    }).join('');
+
+    // 前缀按钮事件
+    prefixGroup.querySelectorAll('.template-btn').forEach(btn => {
+        btn.addEventListener('click', () => _toggleTemplate('prefix', btn.dataset.id, btn));
+        btn.addEventListener('contextmenu', (e) => _showTemplateContextMenu(e, 'prefix', btn.dataset.id));
     });
-
-    suffixSel.innerHTML = '<option value="">无</option>';
-    promptTemplates.suffixes.forEach(t => {
-        const opt = document.createElement('option');
-        opt.value = t.id;
-        opt.textContent = t.name + (t.isDefault ? ' ★' : '');
-        suffixSel.appendChild(opt);
+    // 后缀按钮事件
+    suffixGroup.querySelectorAll('.template-btn').forEach(btn => {
+        btn.addEventListener('click', () => _toggleTemplate('suffix', btn.dataset.id, btn));
+        btn.addEventListener('contextmenu', (e) => _showTemplateContextMenu(e, 'suffix', btn.dataset.id));
     });
+}
 
-    // 恢复选中
-    prefixSel.value = curPrefix;
-    suffixSel.value = curSuffix;
+// 点击按钮：激活→插入提示词，取消→移除提示词
+function _toggleTemplate(type, id, btnEl) {
+    const textarea = document.getElementById('img-prompt-cn');
+    if (!textarea) return;
+    const items = type === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
+    const t = items.find(x => x.id === id);
+    if (!t || !t.text) return;
+
+    const selectedSet = type === 'prefix' ? selectedPrefixIds : selectedSuffixIds;
+
+    if (selectedSet.has(id)) {
+        // 取消：从提示词中移除该文本
+        selectedSet.delete(id);
+        btnEl.classList.remove('selected');
+        let val = textarea.value;
+        if (type === 'prefix') {
+            // 尝试从最前方移除
+            const trimmed = val.trimStart();
+            if (trimmed.startsWith(t.text)) {
+                val = trimmed.slice(t.text.length).trimStart();
+            } else {
+                // 回退：移除任意位置的首次出现
+                const idx = val.indexOf(t.text);
+                if (idx >= 0) val = (val.slice(0, idx) + val.slice(idx + t.text.length)).replace(/\s{2,}/g, ' ').trim();
+            }
+        } else {
+            // 尝试从最后方移除
+            const trimmed = val.trimEnd();
+            if (trimmed.endsWith(t.text)) {
+                val = trimmed.slice(0, -t.text.length).trimEnd();
+            } else {
+                // 回退：移除最后一次出现
+                const idx = val.lastIndexOf(t.text);
+                if (idx >= 0) val = (val.slice(0, idx) + val.slice(idx + t.text.length)).replace(/\s{2,}/g, ' ').trim();
+            }
+        }
+        textarea.value = val;
+        imageState.promptCn = val;
+        showToast(`已取消${type === 'prefix' ? '前缀' : '后缀'}：${t.name}`, 'info');
+    } else {
+        // 激活：插入提示词
+        selectedSet.add(id);
+        btnEl.classList.add('selected');
+        if (type === 'prefix') {
+            textarea.value = t.text + ' ' + textarea.value;
+        } else {
+            textarea.value = textarea.value + ' ' + t.text;
+        }
+        imageState.promptCn = textarea.value;
+        showToast(`已应用${type === 'prefix' ? '前缀' : '后缀'}：${t.name}`, 'success');
+    }
+    savePromptTemplates();
+    if (queueMode === 'multi') saveCurrentQueueData();
     updateTemplatePreviews();
 }
 
-// 更新前缀/后缀预览
+function _showTemplateContextMenu(e, type, id) {
+    e.preventDefault();
+    e.stopPropagation();
+    const items = type === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
+    const t = items.find(x => x.id === id);
+    if (!t) return;
+    showContextMenu(e.clientX, e.clientY, [
+        { label: '编辑', action: () => openTemplateEditModal(type, id) },
+        { label: '重命名', action: () => {
+            showPrompt('输入新名称', t.name, (newName) => {
+                if (newName && newName.trim()) {
+                    t.name = newName.trim();
+                    savePromptTemplates();
+                    renderTemplateButtons();
+                    showToast('已重命名', 'success');
+                }
+            });
+        }},
+        { label: '删除', action: () => {
+            showConfirm(`确定删除${type === 'prefix' ? '前缀' : '后缀'}"${t.name}"吗？`, () => {
+                pushUndoSnapshot();
+                const idx = items.findIndex(x => x.id === id);
+                if (idx >= 0) {
+                    items.splice(idx, 1);
+                    if (type === 'prefix') selectedPrefixIds.delete(id);
+                    else selectedSuffixIds.delete(id);
+                    // 从显示列表中也移除
+                    const displayed = getDisplayedTemplateIds(type);
+                    if (displayed) {
+                        setDisplayedTemplateIds(type, displayed.filter(x => x !== id));
+                    }
+                    savePromptTemplates();
+                    renderTemplateButtons();
+                    updateTemplatePreviews();
+                    showToast('已删除', 'info');
+                }
+            });
+        }, danger: true }
+    ]);
+}
+
 function updateTemplatePreviews() {
-    const prefixSel = document.getElementById('prompt-prefix-select');
-    const suffixSel = document.getElementById('prompt-suffix-select');
     const prefixPreview = document.getElementById('prefix-preview');
     const suffixPreview = document.getElementById('suffix-preview');
-
-    if (prefixSel && prefixPreview) {
-        const t = promptTemplates.prefixes.find(p => p.id === prefixSel.value);
-        if (t && t.text) {
-            prefixPreview.textContent = t.text;
+    if (prefixPreview) {
+        const texts = [...selectedPrefixIds].map(id => promptTemplates.prefixes.find(p => p.id === id)?.text).filter(Boolean);
+        if (texts.length > 0) {
+            prefixPreview.textContent = texts.join(' ');
             prefixPreview.style.display = 'block';
         } else {
             prefixPreview.style.display = 'none';
         }
     }
-    if (suffixSel && suffixPreview) {
-        const t = promptTemplates.suffixes.find(p => p.id === suffixSel.value);
-        if (t && t.text) {
-            suffixPreview.textContent = t.text;
+    if (suffixPreview) {
+        const texts = [...selectedSuffixIds].map(id => promptTemplates.suffixes.find(p => p.id === id)?.text).filter(Boolean);
+        if (texts.length > 0) {
+            suffixPreview.textContent = texts.join(' ');
             suffixPreview.style.display = 'block';
         } else {
             suffixPreview.style.display = 'none';
@@ -4424,61 +4782,94 @@ function updateTemplatePreviews() {
     }
 }
 
-// 获取完整提示词（前缀 + 正文 + 后缀）
 function getFullPromptCn() {
-    const base = document.getElementById('img-prompt-cn')?.value || '';
-    const prefixSel = document.getElementById('prompt-prefix-select');
-    const suffixSel = document.getElementById('prompt-suffix-select');
-    const prefix = prefixSel ? (promptTemplates.prefixes.find(p => p.id === prefixSel.value)?.text || '') : '';
-    const suffix = suffixSel ? (promptTemplates.suffixes.find(p => p.id === suffixSel.value)?.text || '') : '';
-    return (prefix ? prefix + ' ' : '') + base + (suffix ? ' ' + suffix : '');
+    return document.getElementById('img-prompt-cn')?.value || '';
 }
 
-// 打开模板管理弹窗
-let templateEditType = 'prefix'; // 'prefix' or 'suffix'
+// 管理弹窗：勾选显示哪些 + 添加/编辑/删除
+let templateEditType = 'prefix';
+let editingTemplateId = null;
+
 function openTemplateManager(type) {
     templateEditType = type;
-    const modal = document.getElementById('modal-prompt-template');
+    editingTemplateId = null;
     const title = document.getElementById('prompt-template-modal-title');
     if (title) title.textContent = type === 'prefix' ? '管理前缀模板' : '管理后缀模板';
     renderTemplateList();
-    if (modal) modal.style.display = 'flex';
+    openModal('modal-prompt-template');
+}
+
+function openTemplateEditModal(type, id) {
+    const arr = type === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
+    const t = arr.find(x => x.id === id);
+    if (t) {
+        editingTemplateId = id;
+        templateEditType = type;
+        document.getElementById('prompt-template-new-name').value = t.name;
+        document.getElementById('prompt-template-new-text').value = t.text;
+        const title = document.getElementById('prompt-template-modal-title');
+        if (title) title.textContent = (type === 'prefix' ? '编辑前缀' : '编辑后缀') + `: ${t.name}`;
+        renderTemplateList();
+        openModal('modal-prompt-template');
+    }
 }
 
 function renderTemplateList() {
     const list = document.getElementById('prompt-template-list');
     if (!list) return;
     const items = templateEditType === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
+    const displayed = getDisplayedTemplateIds(templateEditType);
+    // 如果没有设置过，默认前10个
+    const displayedSet = displayed ? new Set(displayed) : new Set(items.slice(0, 10).map(t => t.id));
+
     if (items.length === 0) {
         list.innerHTML = '<div style="color:var(--text-muted);font-size:11px;padding:8px 0;">暂无模板，请在下方添加</div>';
         return;
     }
-    list.innerHTML = items.map(t => `
+    list.innerHTML = `<div style="font-size:10px;color:var(--text-muted);margin-bottom:4px;">勾选显示在按钮区（最多10个，按勾选顺序排列）</div>` +
+        items.map(t => {
+        const isDisplayed = displayedSet.has(t.id);
+        return `
         <div style="display:flex;align-items:center;gap:4px;padding:3px 0;border-bottom:1px solid var(--border-light);">
-            <label style="display:flex;align-items:center;gap:2px;font-size:10px;cursor:pointer;white-space:nowrap;" title="设为默认">
-                <input type="checkbox" class="template-default-cb" data-id="${t.id}" ${t.isDefault ? 'checked' : ''} style="width:12px;height:12px;"> ★
-            </label>
-            <span style="font-size:11px;font-weight:500;min-width:50px;">${t.name}</span>
-            <span style="font-size:10px;color:var(--text-muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${t.text}">${t.text}</span>
+            <input type="checkbox" class="template-display-cb" data-id="${t.id}" ${isDisplayed ? 'checked' : ''} style="width:12px;height:12px;cursor:pointer;">
+            <span style="font-size:11px;font-weight:500;min-width:50px;">${escHtml(t.name)}</span>
+            <span style="font-size:10px;color:var(--text-muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(t.text)}">${escHtml(t.text)}</span>
             <button class="btn btn-outline btn-compact template-edit-btn" data-id="${t.id}" style="font-size:9px;padding:1px 4px;">编辑</button>
             <button class="btn btn-outline btn-compact template-del-btn" data-id="${t.id}" style="font-size:9px;padding:1px 4px;color:var(--danger);">删除</button>
-        </div>
-    `).join('');
+        </div>`;
+    }).join('');
 
-    // 绑定事件
-    list.querySelectorAll('.template-default-cb').forEach(cb => {
+    // 勾选显示
+    list.querySelectorAll('.template-display-cb').forEach(cb => {
         cb.addEventListener('change', () => {
-            const arr = templateEditType === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
-            arr.forEach(t => t.isDefault = (t.id === cb.dataset.id && cb.checked));
-            savePromptTemplates();
-            refreshTemplateSelects();
+            let ids = getDisplayedTemplateIds(templateEditType);
+            if (!ids) ids = items.slice(0, 10).map(t => t.id);
+            if (cb.checked) {
+                if (ids.length >= 10) { showToast('最多显示10个', 'error'); cb.checked = false; return; }
+                if (!ids.includes(cb.dataset.id)) ids.push(cb.dataset.id);
+            } else {
+                ids = ids.filter(id => id !== cb.dataset.id);
+            }
+            setDisplayedTemplateIds(templateEditType, ids);
+            renderTemplateButtons();
         });
     });
     list.querySelectorAll('.template-del-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             const arr = templateEditType === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
             const idx = arr.findIndex(t => t.id === btn.dataset.id);
-            if (idx >= 0) { arr.splice(idx, 1); savePromptTemplates(); renderTemplateList(); refreshTemplateSelects(); }
+            if (idx >= 0) {
+                const id = arr[idx].id;
+                arr.splice(idx, 1);
+                if (templateEditType === 'prefix') selectedPrefixIds.delete(id);
+                else selectedSuffixIds.delete(id);
+                const displayed = getDisplayedTemplateIds(templateEditType);
+                if (displayed) setDisplayedTemplateIds(templateEditType, displayed.filter(x => x !== id));
+                savePromptTemplates();
+                renderTemplateList();
+                renderTemplateButtons();
+                updateTemplatePreviews();
+            }
         });
     });
     list.querySelectorAll('.template-edit-btn').forEach(btn => {
@@ -4486,55 +4877,237 @@ function renderTemplateList() {
             const arr = templateEditType === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
             const t = arr.find(t => t.id === btn.dataset.id);
             if (t) {
+                editingTemplateId = t.id;
                 document.getElementById('prompt-template-new-name').value = t.name;
                 document.getElementById('prompt-template-new-text').value = t.text;
-                // 删除旧的，添加时用新值
-                const idx = arr.findIndex(x => x.id === btn.dataset.id);
-                if (idx >= 0) arr.splice(idx, 1);
-                savePromptTemplates();
-                renderTemplateList();
-                refreshTemplateSelects();
             }
         });
     });
 }
 
-// 初始化
-loadPromptTemplates();
-refreshTemplateSelects();
-
-// 自动选中默认模板
-(function autoSelectDefaults() {
-    const prefixSel = document.getElementById('prompt-prefix-select');
-    const suffixSel = document.getElementById('prompt-suffix-select');
-    const defPrefix = promptTemplates.prefixes.find(t => t.isDefault);
-    const defSuffix = promptTemplates.suffixes.find(t => t.isDefault);
-    if (defPrefix && prefixSel) prefixSel.value = defPrefix.id;
-    if (defSuffix && suffixSel) suffixSel.value = defSuffix.id;
+loadPromptTemplates().then(() => {
+    renderTemplateButtons();
     updateTemplatePreviews();
-})();
+});
 
-// 下拉框切换事件
-document.getElementById('prompt-prefix-select')?.addEventListener('change', updateTemplatePreviews);
-document.getElementById('prompt-suffix-select')?.addEventListener('change', updateTemplatePreviews);
-
-// 管理按钮
 document.getElementById('btn-prefix-manage')?.addEventListener('click', () => openTemplateManager('prefix'));
 document.getElementById('btn-suffix-manage')?.addEventListener('click', () => openTemplateManager('suffix'));
 
-// 添加模板按钮
+document.getElementById('btn-add-prefix')?.addEventListener('click', () => {
+    templateEditType = 'prefix';
+    editingTemplateId = null;
+    document.getElementById('prompt-template-new-name').value = '';
+    document.getElementById('prompt-template-new-text').value = '';
+    const title = document.getElementById('prompt-template-modal-title');
+    if (title) title.textContent = '添加前缀模板';
+    renderTemplateList();
+    openModal('modal-prompt-template');
+});
+document.getElementById('btn-add-suffix')?.addEventListener('click', () => {
+    templateEditType = 'suffix';
+    editingTemplateId = null;
+    document.getElementById('prompt-template-new-name').value = '';
+    document.getElementById('prompt-template-new-text').value = '';
+    const title = document.getElementById('prompt-template-modal-title');
+    if (title) title.textContent = '添加后缀模板';
+    renderTemplateList();
+    openModal('modal-prompt-template');
+});
+
 document.getElementById('btn-prompt-template-add')?.addEventListener('click', () => {
     const name = document.getElementById('prompt-template-new-name')?.value.trim();
     const text = document.getElementById('prompt-template-new-text')?.value.trim();
     if (!name || !text) { showToast('请填写模板名称和内容', 'error'); return; }
     const arr = templateEditType === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
-    arr.push({ id: 'tpl_' + Date.now(), name, text, isDefault: arr.length === 0 });
+    if (editingTemplateId) {
+        const t = arr.find(x => x.id === editingTemplateId);
+        if (t) { t.name = name; t.text = text; }
+        editingTemplateId = null;
+    } else {
+        arr.push({ id: 'tpl_' + Date.now(), name, text });
+        // 新添加的自动加入显示列表
+        let ids = getDisplayedTemplateIds(templateEditType);
+        if (!ids) ids = arr.slice(0, 10).map(t => t.id);
+        if (ids.length < 10) {
+            ids.push(arr[arr.length - 1].id);
+            setDisplayedTemplateIds(templateEditType, ids);
+        }
+    }
     savePromptTemplates();
     renderTemplateList();
-    refreshTemplateSelects();
+    renderTemplateButtons();
+    updateTemplatePreviews();
     document.getElementById('prompt-template-new-name').value = '';
     document.getElementById('prompt-template-new-text').value = '';
-    showToast('模板已添加', 'success');
+    showToast(editingTemplateId ? '已更新' : '模板已添加', 'success');
+});
+
+// ========== 提示词预设系统 ==========
+let promptPresets = [];
+let activePromptPresetIds = new Set();
+let prevPromptCn = '';
+
+async function loadPromptPresets() {
+    try {
+        const data = await api('GET', '/api/prompt-presets');
+        promptPresets = data.presets || [];
+    } catch {
+        promptPresets = [];
+    }
+}
+
+async function savePromptPresets() {
+    try {
+        await api('PUT', '/api/prompt-presets', { presets: promptPresets });
+    } catch {}
+}
+
+function getPinnedPresetIds() {
+    try {
+        const saved = localStorage.getItem('pinnedPresetIds');
+        if (saved) return JSON.parse(saved);
+    } catch {}
+    return [];
+}
+function setPinnedPresetIds(ids) {
+    localStorage.setItem('pinnedPresetIds', JSON.stringify(ids.slice(0, 10)));
+}
+
+function renderPromptPresetButtons() {
+    const group = document.getElementById('prompt-preset-btn-group');
+    if (!group) return;
+    const pinnedIds = getPinnedPresetIds();
+    const pinned = promptPresets.filter(p => pinnedIds.includes(p.id));
+    group.innerHTML = pinned.map(p => {
+        const isActive = activePromptPresetIds.has(p.id);
+        return `<button class="template-btn ${isActive ? 'selected' : ''}" data-preset-id="${p.id}" title="${escHtml(p.text)}">${escHtml(p.name)}</button>`;
+    }).join('');
+    group.querySelectorAll('.template-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation(); // 阻止冒泡到折叠header
+            const id = btn.dataset.presetId;
+            const textarea = document.getElementById('img-prompt-cn');
+            if (!textarea) return;
+            const preset = promptPresets.find(p => p.id === id);
+            if (!preset || !preset.text) return;
+
+            if (activePromptPresetIds.has(id)) {
+                // 取消：从提示词中移除该预设文本
+                activePromptPresetIds.delete(id);
+                btn.classList.remove('selected');
+                let val = textarea.value;
+                // 尝试从末尾移除
+                const trimmed = val.trimEnd();
+                if (trimmed.endsWith(preset.text)) {
+                    val = trimmed.slice(0, -preset.text.length).trimEnd();
+                } else {
+                    // 回退：移除最后一次出现
+                    const idx = val.lastIndexOf(preset.text);
+                    if (idx >= 0) val = (val.slice(0, idx) + val.slice(idx + preset.text.length)).replace(/\s{2,}/g, ' ').trim();
+                }
+                textarea.value = val;
+                imageState.promptCn = val;
+                showToast(`已取消预设：${preset.name}`, 'info');
+            } else {
+                // 激活：在提示词末尾追加
+                activePromptPresetIds.add(id);
+                btn.classList.add('selected');
+                const current = textarea.value.trim();
+                textarea.value = current ? current + ' ' + preset.text : preset.text;
+                imageState.promptCn = textarea.value;
+                showToast(`已追加预设：${preset.name}`, 'success');
+            }
+            if (queueMode === 'multi') saveCurrentQueueData();
+        });
+    });
+}
+
+function renderPromptPresetList() {
+    const list = document.getElementById('prompt-preset-list');
+    if (!list) return;
+    const pinnedIds = getPinnedPresetIds();
+    if (promptPresets.length === 0) {
+        list.innerHTML = '<div style="color:var(--text-muted);font-size:11px;padding:8px 0;">暂无预设，请在下方添加</div>';
+        return;
+    }
+    list.innerHTML = promptPresets.map((p, idx) => {
+        const isPinned = pinnedIds.includes(p.id);
+        return `
+        <div style="display:flex;align-items:center;gap:4px;padding:4px 0;border-bottom:1px solid var(--border-light);">
+            <label style="display:flex;align-items:center;gap:2px;font-size:10px;cursor:pointer;white-space:nowrap;" title="勾选后显示在按钮区">
+                <input type="checkbox" class="preset-pin-cb" data-id="${p.id}" ${isPinned ? 'checked' : ''} style="width:12px;height:12px;"> 📌
+            </label>
+            <span style="font-size:11px;font-weight:500;min-width:50px;">${escHtml(p.name)}</span>
+            <span style="font-size:10px;color:var(--text-muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(p.text)}">${escHtml(p.text)}</span>
+            <button class="btn btn-outline btn-compact preset-edit-btn" data-idx="${idx}" style="font-size:9px;padding:1px 4px;">编辑</button>
+            <button class="btn btn-outline btn-compact preset-del-btn" data-idx="${idx}" style="font-size:9px;padding:1px 4px;color:var(--danger);">删除</button>
+        </div>`;
+    }).join('');
+
+    list.querySelectorAll('.preset-pin-cb').forEach(cb => {
+        cb.addEventListener('change', () => {
+            let ids = getPinnedPresetIds();
+            if (cb.checked) {
+                if (ids.length >= 10) { showToast('最多显示10个', 'error'); cb.checked = false; return; }
+                if (!ids.includes(cb.dataset.id)) ids.push(cb.dataset.id);
+            } else {
+                ids = ids.filter(id => id !== cb.dataset.id);
+            }
+            setPinnedPresetIds(ids);
+            renderPromptPresetButtons();
+        });
+    });
+    list.querySelectorAll('.preset-del-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const idx = parseInt(btn.dataset.idx);
+            const preset = promptPresets[idx];
+            if (preset) {
+                if (activePromptPresetIds.has(preset.id)) activePromptPresetIds.delete(preset.id);
+                promptPresets.splice(idx, 1);
+                savePromptPresets();
+                renderPromptPresetList();
+                renderPromptPresetButtons();
+                showToast('已删除', 'info');
+            }
+        });
+    });
+    list.querySelectorAll('.preset-edit-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const idx = parseInt(btn.dataset.idx);
+            const preset = promptPresets[idx];
+            if (preset) {
+                document.getElementById('prompt-preset-new-name').value = preset.name;
+                document.getElementById('prompt-preset-new-text').value = preset.text;
+                promptPresets.splice(idx, 1);
+                savePromptPresets();
+                renderPromptPresetList();
+                renderPromptPresetButtons();
+            }
+        });
+    });
+}
+
+loadPromptPresets().then(() => {
+    renderPromptPresetButtons();
+});
+
+document.getElementById('btn-prompt-preset')?.addEventListener('click', (e) => {
+    e.stopPropagation(); // 阻止冒泡到折叠header
+    renderPromptPresetList();
+    openModal('modal-prompt-preset');
+});
+
+document.getElementById('btn-prompt-preset-add')?.addEventListener('click', () => {
+    const name = document.getElementById('prompt-preset-new-name')?.value.trim();
+    const text = document.getElementById('prompt-preset-new-text')?.value.trim();
+    if (!name || !text) { showToast('请填写预设名称和内容', 'error'); return; }
+    promptPresets.push({ id: 'pp_' + Date.now(), name, text });
+    savePromptPresets();
+    renderPromptPresetList();
+    renderPromptPresetButtons();
+    document.getElementById('prompt-preset-new-name').value = '';
+    document.getElementById('prompt-preset-new-text').value = '';
+    showToast('预设已添加', 'success');
 });
 
 // 弹窗关闭
@@ -4764,22 +5337,32 @@ function createCollage(imgs) {
 // 将任意图片Blob转为PNG Blob（兼容Clipboard API）
 function convertBlobToPng(blob) {
     return new Promise((resolve) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (!settled) { settled = true; URL.revokeObjectURL(img.src); resolve(blob); }
+        }, 10000);
         const img = new Image();
         img.onload = () => {
+            if (settled) return;
             const canvas = document.createElement('canvas');
             canvas.width = img.naturalWidth;
             canvas.height = img.naturalHeight;
             const ctx = canvas.getContext('2d');
             ctx.drawImage(img, 0, 0);
-            URL.revokeObjectURL(img.src); // 释放ObjectURL
+            URL.revokeObjectURL(img.src);
+            clearTimeout(timer);
             canvas.toBlob((pngBlob) => {
+                settled = true;
                 if (pngBlob) resolve(pngBlob);
-                else resolve(blob); // 转换失败就用原blob
+                else resolve(blob);
             }, 'image/png');
         };
         img.onerror = () => {
-            URL.revokeObjectURL(img.src); // 释放ObjectURL
-            resolve(blob); // 加载失败就用原blob
+            if (settled) return;
+            URL.revokeObjectURL(img.src);
+            clearTimeout(timer);
+            settled = true;
+            resolve(blob);
         };
         img.src = URL.createObjectURL(blob);
     });
@@ -5762,37 +6345,37 @@ if (seedModeSelect && seedInput) {
 // ---------- RunningHub 模型配置系统（内联版） ----------
 const RH_MODELS = {
     'rhart-image-v1/edit': {
-        name: 'V1-图生图-低价渠道版', price: '¥0.05', type: 'image-to-image',
+        name: 'V1-图生图-低价渠道版', price: '0.05', type: 'image-to-image',
         maxImages: 5, maxImageMB: 10, hasResolution: false,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: true
     },
     'rhart-image-v1-official/edit': {
-        name: 'V1-图生图-官方稳定版', price: '¥0.2', type: 'image-to-image',
+        name: 'V1-图生图-官方稳定版', price: '0.2', type: 'image-to-image',
         maxImages: 5, maxImageMB: 10, hasResolution: false,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: true
     },
     'rhart-image-n-g31-flash/image-to-image': {
-        name: 'V2-图生图-低价渠道版', price: '¥0.16', type: 'image-to-image',
+        name: 'V2-图生图-低价渠道版', price: '0.16', type: 'image-to-image',
         maxImages: 10, maxImageMB: 30, hasResolution: true,
         aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
     },
     'rhart-image-n-g31-flash-official/image-to-image': {
-        name: 'V2-图生图-官方稳定版', price: '¥0.74', type: 'image-to-image',
+        name: 'V2-图生图-官方稳定版', price: '0.74', type: 'image-to-image',
         maxImages: 14, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
     },
     'rhart-image-n-pro/edit': {
-        name: 'PRO-图生图-低价渠道版', price: '¥0.4', type: 'image-to-image',
+        name: 'PRO-图生图-低价渠道版', price: '0.4', type: 'image-to-image',
         maxImages: 10, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
     },
     'rhart-image-n-pro-official/edit': {
-        name: 'PRO-图生图-官方稳定版', price: '¥1', type: 'image-to-image',
+        name: 'PRO-图生图-官方稳定版', price: '1', type: 'image-to-image',
         maxImages: 10, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
@@ -5802,42 +6385,42 @@ const RH_MODELS = {
 // OpenAI-HK 模型配置
 const OAIHK_MODELS = {
     'fal-ai/banana/v2': {
-        name: 'proK', price: '¥0.48',
+        name: 'proK', price: '0.48',
         endpoint: 'fal-ai/banana/v2',
         modelId: 'fal-ai/banana/v2',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 1024
     },
     'fal-ai/banana/v2/2k': {
-        name: 'pro2K', price: '¥0.48',
+        name: 'pro2K', price: '0.48',
         endpoint: 'fal-ai/banana/v2/2k',
         modelId: 'fal-ai/banana/v2/2k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 1536
     },
     'fal-ai/banana/v2/4k': {
-        name: 'pro4K', price: '¥0.48',
+        name: 'pro4K', price: '0.48',
         endpoint: 'fal-ai/banana/v2/4k',
         modelId: 'fal-ai/banana/v2/4k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 2048
     },
     'fal-ai/banana/v3.1/flash': {
-        name: 'nano2-3.1 1K', price: '¥0.2',
+        name: 'nano2-3.1 1K', price: '0.2',
         endpoint: 'fal-ai/banana/v3.1/flash',
         modelId: 'fal-ai/banana/v3.1/flash',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 1024
     },
     'fal-ai/banana/v3.1/flash/2k': {
-        name: 'nano2-3.1 2K', price: '¥0.3',
+        name: 'nano2-3.1 2K', price: '0.3',
         endpoint: 'fal-ai/banana/v3.1/flash/2k',
         modelId: 'fal-ai/banana/v3.1/flash/2k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 1536
     },
     'fal-ai/banana/v3.1/flash/4k': {
-        name: 'nano2-3.1 4K', price: '¥0.48',
+        name: 'nano2-3.1 4K', price: '0.48',
         endpoint: 'fal-ai/banana/v3.1/flash/4k',
         modelId: 'fal-ai/banana/v3.1/flash/4k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
@@ -6190,18 +6773,40 @@ const DEFAULT_DOWNLOAD_PATH = '~/Downloads/AI生图/';
 
 async function downloadImage(url, filename) {
     try {
-        const resp = await fetch(url);
-        const blob = await resp.blob();
-        const blobUrl = URL.createObjectURL(blob);
+        // 确保文件名扩展名为.jpg
+        const namePart = filename.replace(/\.\w+$/, '');
+        const jpgFilename = namePart + '.jpg';
 
-        const a = document.createElement('a');
-        a.href = blobUrl;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(blobUrl);
-        showToast(`已下载: ${filename}`, 'success');
+        // 通过后端转JPG后下载
+        const resp = await fetch('/api/convert-download', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, filename: jpgFilename })
+        });
+        if (!resp.ok) {
+            // 后端转换失败，降级直接下载
+            const fallbackResp = await fetch(url);
+            const blob = await fallbackResp.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = jpgFilename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        } else {
+            const blob = await resp.blob();
+            const blobUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            a.download = jpgFilename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        }
+        showToast(`已下载: ${jpgFilename}`, 'success');
     } catch (e) {
         // 降级：新窗口打开
         window.open(url, '_blank');
@@ -6214,7 +6819,7 @@ async function autoDownloadResults(results) {
     let count = 0;
     for (const result of results) {
         if (!result.url) continue;
-        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.${result.outputType || 'png'}`;
+        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.jpg`;
         await downloadImage(result.url, filename);
         count++;
         // 间隔下载避免浏览器拦截
@@ -6236,7 +6841,7 @@ document.getElementById('btn-download-all')?.addEventListener('click', async () 
     let count = 0;
     for (const img of cards) {
         const url = img.src;
-        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.png`;
+        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.jpg`;
         await downloadImage(url, filename);
         count++;
         if (count < cards.length) await new Promise(r => setTimeout(r, 1000));
@@ -6270,7 +6875,7 @@ document.getElementById('btn-download-checked')?.addEventListener('click', async
         const img = card.querySelector('img');
         if (!img) continue;
         const url = img.src;
-        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.png`;
+        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.jpg`;
         await downloadImage(url, filename);
         count++;
         if (count < checkedCards.length) await new Promise(r => setTimeout(r, 1000));
@@ -6286,6 +6891,20 @@ document.getElementById('btn-download-to-folder')?.addEventListener('click', asy
         showToast('下载路径已更新，后续图片将下载到浏览器默认目录\n如需更改浏览器下载目录，请在浏览器设置中修改', 'info');
         // 触发全部下载
         document.getElementById('btn-download-all')?.click();
+    }
+});
+
+document.getElementById('btn-open-download-folder')?.addEventListener('click', async () => {
+    const downloadPath = document.getElementById('cfg-rh-download-path')?.value || DEFAULT_DOWNLOAD_PATH;
+    try {
+        const resp = await api('POST', '/api/open-download-folder', { path: downloadPath });
+        if (resp.ok) {
+            showToast(`已打开文件夹: ${resp.path}`, 'success');
+        } else {
+            showToast(resp.error || '打开文件夹失败', 'error');
+        }
+    } catch (e) {
+        showToast('打开文件夹失败: ' + e.message, 'error');
     }
 });
 
@@ -6306,7 +6925,7 @@ function openImageViewer(images, startIndex = 0) {
     viewerState.images = images.map((img, i) => ({
         url: img.url || img,
         checked: img.checked || false,
-        filename: img.filename || `AI生图_${i+1}.png`
+        filename: img.filename || `AI生图_${i+1}.jpg`
     }));
     viewerState.currentIndex = startIndex || 0;
     viewerState.scale = 1;
@@ -6495,7 +7114,7 @@ function drawViewerCanvas() {
                 cards.forEach(c => {
                     const img = c.querySelector('img');
                     const cb = c.querySelector('.result-checkbox');
-                    images.push({ url: img?.src || '', checked: cb?.checked || false, filename: `AI生图_${images.length+1}.png` });
+                    images.push({ url: img?.src || '', checked: cb?.checked || false, filename: `AI生图_${images.length+1}.jpg` });
                 });
                 if (images.length === 0) return;
                 // 左键从第一张开始，右键从最后一张开始
@@ -6543,11 +7162,11 @@ if (apiGenBtn && apiGenBtn.parentNode) {
 // 多图列队模式：单队列独立生成（异步，不阻塞其他队列）
 async function runSingleQueueGenerate() {
     pushUndoSnapshot();
-    const qi = activeQueue; // 捕获当前队列索引
+    const qi = activeQueue; // 立即捕获当前队列索引，防止异步期间被切换
     const qs = queueGenerateStates[qi];
     if (qs.running) return;
 
-    saveCurrentQueueData(); // 确保最新配置已保存
+    saveCurrentQueueData(qi); // 传入捕获的索引，确保数据存到正确的队列
     const qd = queueData[qi];
     const platform = qd.apiPlatform || 'runninghub';
     logAction('api', '单队列生图开始', { platform, queue: qi + 1 });
@@ -6560,7 +7179,8 @@ async function runSingleQueueGenerate() {
         const modelId = qd.oaihkModelId;
         const model = OAIHK_MODELS[modelId];
         if (!model) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
-        const prompt = apiPromptLang === 'cn' ? (qd?.promptCn?.trim()) : (qd?.promptEn?.trim());
+        const promptLang = qd.promptLang || 'en';
+        const prompt = promptLang === 'cn' ? (qd?.promptCn?.trim()) : (qd?.promptEn?.trim());
         const images = qd ? qd.slots.filter(s => s.image) : [];
         if (!prompt || images.length === 0) {
             showToast(`队列${qi+1}没有有效的Prompt或图片`, 'error'); return;
@@ -6573,10 +7193,11 @@ async function runSingleQueueGenerate() {
         const modelId = qd.rhModelId;
         const model = RH_MODELS[modelId];
         if (!model) { showToast('请选择模型', 'error'); return; }
-        const prompt = qd?.promptEn?.trim();
+        const promptLang = qd.promptLang || 'en';
+        const prompt = promptLang === 'cn' ? (qd?.promptCn?.trim() || qd?.promptEn?.trim()) : (qd?.promptEn?.trim() || qd?.promptCn?.trim());
         const images = qd ? qd.slots.filter(s => s.image) : [];
         if (!prompt || (model.type === 'image-to-image' && images.length === 0)) {
-            showToast(`队列${qi+1}没有有效的英文Prompt或图片`, 'error'); return;
+            showToast(`队列${qi+1}没有有效的Prompt或图片`, 'error'); return;
         }
         const imageUrls = images.map(s => {
             if (s.image.startsWith('/')) return window.location.origin + s.image;
@@ -6591,15 +7212,13 @@ async function runSingleQueueGenerate() {
     qs.running = true;
     qs.cancelled = false;
     qs.abortController = new AbortController();
-    // 同步到全局状态（轮询函数依赖 apiGenerateState.cancelled）
-    apiGenerateState.running = true;
-    apiGenerateState.cancelled = false;
-    apiGenerateState.abortController = qs.abortController;
+    const queueSignal = qs.abortController.signal;
 
     const btn = document.getElementById('btn-api-generate');
     const cancelBtn = document.getElementById('btn-api-cancel');
     if (activeQueue === qi) {
         btn.innerHTML = `<span class="loading"></span> 队列${qi+1}生成中...`;
+        setApiProgress(5);
     }
     cancelBtn.style.display = 'inline-flex';
     // 刷新队列按钮状态（显示生成指示器）
@@ -6642,14 +7261,16 @@ async function runSingleQueueGenerate() {
 
                 const submitData = await api('POST', '/api/oaihk-proxy', {
                     action: 'submit', api_key: '', base_url: '', endpoint: model.endpoint, model_id: modelId, params: payload
-                }, 120000);
+                }, 120000, queueSignal);
 
                 if (!submitData.request_id) {
                     showToast(`${task.queueLabel}提交失败: ${submitData.error || '未返回request_id'}`, 'error');
                     continue;
                 }
 
-                const result = await pollOAIHK('', '', model.pollEndpoint, submitData.request_id);
+                if (activeQueue === qi) setApiProgress(25);
+                const result = await pollOAIHK('', '', model.pollEndpoint, submitData.request_id, qi, queueSignal);
+                if (activeQueue === qi && result) setApiProgress(100);
                 if (qs.cancelled) break;
 
                 if (result && result.images) {
@@ -6657,10 +7278,10 @@ async function runSingleQueueGenerate() {
                         if (img.url) {
                             let displayUrl = img.url;
                             try {
-                                const dlResp = await api('POST', '/api/download-image', { url: img.url });
+                                const dlResp = await api('POST', '/api/download-image', { url: img.url }, undefined, queueSignal);
                                 if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
                             } catch (dlErr) {}
-                            allResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${allResults.length+1}.png`, outputType: 'png' });
+                            allResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${allResults.length+1}.jpg`, outputType: 'png' });
                         }
                     }
                 }
@@ -6679,14 +7300,16 @@ async function runSingleQueueGenerate() {
 
                 const data = await api('POST', '/api/rh-proxy', {
                     action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
-                });
+                }, undefined, queueSignal);
 
                 if (data.status === 'FAILED') {
                     showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
                     continue;
                 }
 
-                const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, Date.now());
+                if (activeQueue === qi) setApiProgress(10);
+                const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, Date.now(), qi, queueSignal);
+                if (activeQueue === qi && result) setApiProgress(100);
                 if (qs.cancelled) break;
 
                 if (result && result.results) {
@@ -6706,12 +7329,7 @@ async function runSingleQueueGenerate() {
     qs.running = false;
     qs.cancelled = false;
     qs.abortController = null;
-    // 如果没有其他队列在生成，重置全局状态
-    if (!queueGenerateStates.some(s => s.running)) {
-        apiGenerateState.running = false;
-        apiGenerateState.cancelled = false;
-        apiGenerateState.abortController = null;
-    }
+    apiGenerateState.running = isAnyQueueGenerating();
 
     // 存储结果到队列
     if (allResults.length > 0) {
@@ -6732,34 +7350,27 @@ async function runSingleQueueGenerate() {
     if (activeQueue === qi) {
         btn.disabled = false;
         updateGenerateBtnText();
+        hideApiProgress();
     }
-    // 如果没有其他队列在生成，隐藏取消按钮
+    // 如果没有其他队列在生成，隐藏取消按钮和进度条
     if (!queueGenerateStates.some(s => s.running)) {
         cancelBtn.style.display = 'none';
+        hideApiProgress();
     }
+    // 移除该队列的占位符
+    const qPlaceholder = document.getElementById(`api-generating-placeholder-queue${qi}`);
+    if (qPlaceholder) qPlaceholder.remove();
     // 刷新队列按钮状态（移除生成指示器）
     renderQueueNumberBars();
 }
 
 document.getElementById('btn-api-generate')?.addEventListener('click', async () => {
-    // 多图列队模式下，检查当前队列是否正在生成
-    if (queueMode === 'multi' && queueGenerateStates[activeQueue].running) {
-        showToast(`队列${activeQueue+1}正在生成中`, 'error');
-        return;
-    }
-    // 批量生成进行中不允许
-    if (apiGenerateState.running) {
-        showToast('批量生成正在进行中', 'error');
-        return;
-    }
-    // 同图抽卡模式，检查全局状态
-    if (queueMode !== 'multi' && apiGenerateState.running) {
-        showToast('正在生成中，请等待', 'error');
-        return;
-    }
-
-    // 多图列队模式：异步执行，不阻塞其他队列
+    // 多图列队模式下，只检查当前队列是否正在生成（允许其他队列并行）
     if (queueMode === 'multi') {
+        if (queueGenerateStates[activeQueue].running) {
+            showToast(`队列${activeQueue+1}正在生成中`, 'error');
+            return;
+        }
         runSingleQueueGenerate();
         return;
     }
@@ -6917,35 +7528,36 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
 });
 
 // 轮询直到完成
-async function pollUntilDone(apiKey, baseUrl, taskId, startTime = Date.now()) {
+async function pollUntilDone(apiKey, baseUrl, taskId, startTime = Date.now(), qi, signal) {
     const maxPolls = 120; // 最多轮询120次（6分钟）
+    const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
     for (let i = 0; i < maxPolls; i++) {
-        if (apiGenerateState.cancelled) return null;
+        if (isCancelled()) return null;
         await new Promise(r => setTimeout(r, 3000));
-        if (apiGenerateState.cancelled) return null;
+        if (isCancelled()) return null;
         // 更新进度和状态文本
         const elapsed = Math.round((Date.now() - startTime) / 1000);
-        const ph = document.getElementById('api-generating-placeholder');
+        const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
         if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中... (${elapsed}秒，第${i+1}次查询)`;
-        setApiProgress(10 + 80 * ((i + 1) / maxPolls));
+        if (activeQueue === qi) setApiProgress(10 + 80 * ((i + 1) / maxPolls));
         try {
             const data = await api('POST', '/api/rh-proxy', {
                 action: 'query',
                 api_key: apiKey,
                 base_url: baseUrl,
                 task_id: taskId
-            });
+            }, undefined, signal);
             if (data.status === 'SUCCESS') return data;
             if (data.status === 'FAILED') {
                 showToast('生成失败: ' + (data.errorMessage || '未知错误'), 'error');
                 return null;
             }
         } catch (e) {
-            if (apiGenerateState.cancelled) return null;
+            if (isCancelled()) return null;
             console.warn('轮询出错:', e);
         }
     }
-    if (!apiGenerateState.cancelled) showToast('生成超时', 'error');
+    if (!isCancelled()) showToast('生成超时', 'error');
     return null;
 }
 
@@ -6954,24 +7566,17 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
     logAction('api', '取消生成', {});
 
     if (queueMode === 'multi') {
-        // 多图列队模式：只取消当前活动队列的生成
-        const qi = activeQueue;
-        const qs = queueGenerateStates[qi];
-        if (qs.running) {
-            qs.cancelled = true;
-            if (qs.abortController) {
-                qs.abortController.abort();
-            }
-            qs.running = false;
-            // 同步到全局状态，让轮询函数也能检测到取消
-            apiGenerateState.cancelled = true;
-            if (apiGenerateState.abortController === qs.abortController) {
-                apiGenerateState.abortController = null;
-            }
-            if (!queueGenerateStates.some(s => s.running)) {
-                apiGenerateState.running = false;
+        // 多图列队模式：取消所有正在生成的队列
+        for (let qi = 0; qi < QUEUE_COUNT; qi++) {
+            const qs = queueGenerateStates[qi];
+            if (qs.running) {
+                qs.cancelled = true;
+                if (qs.abortController) {
+                    qs.abortController.abort();
+                }
             }
         }
+        apiGenerateState.running = isAnyQueueGenerating();
         // 更新当前队列的 UI
         const btn = document.getElementById('btn-api-generate');
         if (btn) { btn.disabled = false; updateGenerateBtnText(); }
@@ -6980,12 +7585,14 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
         if (cancelBtn && !isAnyQueueGenerating()) {
             cancelBtn.style.display = 'none';
         }
-        // 移除当前队列的生成中占位
-        const placeholder = document.getElementById(`api-generating-placeholder-queue${qi}`);
-        if (placeholder) placeholder.remove();
+        // 移除所有队列的生成中占位
+        for (let qi2 = 0; qi2 < QUEUE_COUNT; qi2++) {
+            const placeholder = document.getElementById(`api-generating-placeholder-queue${qi2}`);
+            if (placeholder) placeholder.remove();
+        }
         hideApiProgress();
         renderQueueNumberBars();
-        showToast(`已取消队列${qi+1}的生成`, 'info');
+        showToast('已取消所有正在生成的队列', 'info');
     } else {
         // 同图抽卡模式：取消全局状态
         if (apiGenerateState.running) {
@@ -7086,16 +7693,17 @@ async function uploadToTmpfiles(localUrl, aspectRatio = '3:4', shortEdge = 0) {
 }
 
 // OpenAI-HK 轮询直到完成
-async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId) {
+async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId, qi, signal) {
     const maxPolls = 120; // 最多轮询120次（6分钟）
+    const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
     let queueCount = 0;
     for (let i = 0; i < maxPolls; i++) {
-        if (apiGenerateState.cancelled) return null;
+        if (isCancelled()) return null;
         await new Promise(r => setTimeout(r, 3000));
-        if (apiGenerateState.cancelled) return null;
-        const ph = document.getElementById('api-generating-placeholder');
+        if (isCancelled()) return null;
+        const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
         const elapsed = Math.round((i + 1) * 3);
-        setApiProgress(40 + Math.min(55, 30 * Math.log10(i + 1)));
+        if (activeQueue === qi) setApiProgress(40 + Math.min(55, 30 * Math.log10(i + 1)));
         try {
             const data = await api('POST', '/api/oaihk-proxy', {
                 action: 'poll',
@@ -7103,7 +7711,7 @@ async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId) {
                 base_url: baseUrl,
                 poll_endpoint: pollEndpoint,
                 request_id: requestId
-            });
+            }, undefined, signal);
             if (data.images && data.images.length > 0) return data;
             if (data.status === 'FAILED') {
                 showToast('生成失败: ' + (data.error || '未知错误'), 'error');
@@ -7116,11 +7724,11 @@ async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId) {
                 if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（${elapsed}秒，第${i+1}次查询）`;
             }
         } catch (e) {
-            if (apiGenerateState.cancelled) return null;
+            if (isCancelled()) return null;
             console.warn('OpenAI-HK 轮询出错:', e);
         }
     }
-    if (!apiGenerateState.cancelled) showToast('OpenAI-HK 生成超时（排队过久），建议稍后重试', 'error');
+    if (!isCancelled()) showToast('OpenAI-HK 生成超时（排队过久），建议稍后重试', 'error');
     return null;
 }
 
@@ -7283,7 +7891,7 @@ async function generateViaOpenAIHK() {
                         } catch (dlErr) {
                             console.warn('代理下载失败，使用原始URL:', dlErr);
                         }
-                        const item = { url: displayUrl, checked: false, filename: `AI生图_HK_${allResults.length+1}.png`, outputType: 'png' };
+                        const item = { url: displayUrl, checked: false, filename: `AI生图_HK_${allResults.length+1}.jpg`, outputType: 'png' };
                         allResults.push(item);
                         appendResultCard(item, allResults.length - 1);
                     }
@@ -7341,47 +7949,46 @@ async function batchGenerateAll() {
         return;
     }
 
-    const platform = document.getElementById('cfg-api-platform')?.value || 'runninghub';
-    logAction('api', '批量生图开始', { platform, queueMode });
+    logAction('api', '批量生图开始', { queueMode });
 
-    // 收集所有有效队列的任务
+    // 收集所有有效队列的任务（每个队列用自己的平台/模型/配置）
     saveCurrentQueueData();
-    const count = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
     const baseTasks = [];
-
-    // 校验模型
-    if (platform === 'oaihk') {
-        const modelId = document.getElementById('cfg-oaihk-model-inline')?.value;
-        const model = OAIHK_MODELS[modelId];
-        if (!model) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
-    } else {
-        const modelId = document.getElementById('cfg-rh-model-inline')?.value;
-        const model = RH_MODELS[modelId];
-        if (!model) { showToast('请选择模型', 'error'); return; }
-    }
 
     // 收集有效队列
     for (let q = 0; q < QUEUE_COUNT; q++) {
         const qd = queueData[q];
+        if (!qd) continue;
+        const platform = qd.apiPlatform || 'runninghub';
+        const count = qd.rhCount || 1;
         let prompt;
         if (platform === 'oaihk') {
-            prompt = apiPromptLang === 'cn' ? (qd?.promptCn?.trim()) : (qd?.promptEn?.trim());
+            prompt = (qd.promptLang || 'en') === 'cn' ? (qd.promptCn?.trim()) : (qd.promptEn?.trim());
         } else {
-            prompt = qd?.promptEn?.trim();
+            prompt = qd.promptEn?.trim();
         }
         if (!prompt) continue;
-        const images = qd ? qd.slots.filter(s => s.image) : [];
+        const images = qd.slots.filter(s => s.image);
         if (images.length === 0) continue;
-        if (platform !== 'oaihk') {
-            const modelId = document.getElementById('cfg-rh-model-inline')?.value;
+        // 校验模型
+        if (platform === 'oaihk') {
+            const modelId = qd.oaihkModelId;
+            const model = OAIHK_MODELS[modelId];
+            if (!model) continue; // 跳过无效模型
+        } else {
+            const modelId = qd.rhModelId;
             const model = RH_MODELS[modelId];
-            if (model?.type === 'image-to-image' && images.length === 0) continue;
+            if (!model) continue;
+            if (model.type === 'image-to-image' && images.length === 0) continue;
         }
         const imageUrls = images.map(s => {
             if (s.image.startsWith('/')) return window.location.origin + s.image;
             return s.image;
         });
-        baseTasks.push({ prompt, imageUrls, queueLabel: `队列${q+1}`, queueIndex: q });
+        // 每个队列生成 count 张
+        for (let i = 0; i < count; i++) {
+            baseTasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${q+1} 第${i+1}张` : `队列${q+1}`, queueIndex: q, platform, rhModelId: qd.rhModelId, oaihkModelId: qd.oaihkModelId, rhAspectRatio: qd.rhAspectRatio, oaihkAspectRatio: qd.oaihkAspectRatio, rhResolution: qd.rhResolution });
+        }
     }
 
     if (baseTasks.length === 0) {
@@ -7389,22 +7996,7 @@ async function batchGenerateAll() {
         return;
     }
 
-    // 张数倍数校验：批量生成时张数必须是有效队列数的倍数
-    let tasks;
-    if (count === baseTasks.length) {
-        tasks = baseTasks;
-    } else if (count > baseTasks.length && count % baseTasks.length === 0) {
-        const perQueue = count / baseTasks.length;
-        tasks = [];
-        for (const bt of baseTasks) {
-            for (let i = 0; i < perQueue; i++) {
-                tasks.push({ prompt: bt.prompt, imageUrls: bt.imageUrls, queueLabel: perQueue > 1 ? `${bt.queueLabel} 第${i+1}张` : bt.queueLabel, queueIndex: bt.queueIndex });
-            }
-        }
-    } else {
-        showToast(`批量生成时，张数须为有效队列数(${baseTasks.length})的倍数（如${baseTasks.length}、${baseTasks.length*2}、${baseTasks.length*3}...）`, 'error');
-        return;
-    }
+    const tasks = baseTasks;
 
     // 设置UI状态
     apiGenerateState.running = true;
@@ -7434,10 +8026,11 @@ async function batchGenerateAll() {
     async function executeOneTask(task) {
         const localResults = [];
         try {
-            if (platform === 'oaihk') {
-                const modelId = document.getElementById('cfg-oaihk-model-inline')?.value;
+            const taskPlatform = task.platform || platform;
+            if (taskPlatform === 'oaihk') {
+                const modelId = task.oaihkModelId || document.getElementById('cfg-oaihk-model-inline')?.value;
                 const model = OAIHK_MODELS[modelId];
-                const aspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
+                const aspectRatio = task.oaihkAspectRatio || document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
                 const shortEdge = model.shortEdge || 1536;
 
                 // 预处理图片
@@ -7463,7 +8056,7 @@ async function batchGenerateAll() {
                     api_key: '',
                     base_url: '',
                     endpoint: model.endpoint,
-                    model_id: modelId,
+                    model_id: task.oaihkModelId || modelId,
                     params: payload
                 }, 120000);
 
@@ -7487,26 +8080,26 @@ async function batchGenerateAll() {
                                 const dlResp = await api('POST', '/api/download-image', { url: img.url });
                                 if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
                             } catch (dlErr) { console.warn('代理下载失败:', dlErr); }
-                            localResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${localResults.length+1}.png`, outputType: 'png' });
+                            localResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${localResults.length+1}.jpg`, outputType: 'png', queueIndex: task.queueIndex });
                         }
                     }
                 }
             } else {
                 // RH通道
-                const modelId = document.getElementById('cfg-rh-model-inline')?.value;
+                const modelId = task.rhModelId || document.getElementById('cfg-rh-model-inline')?.value;
                 const model = RH_MODELS[modelId];
 
                 const payload = { prompt: task.prompt };
                 if (model.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
-                if (model.hasResolution) payload.resolution = document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
-                const aspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value;
+                if (model.hasResolution) payload.resolution = task.rhResolution || document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
+                const aspectRatio = task.rhAspectRatio || document.getElementById('cfg-rh-aspect-ratio-inline')?.value;
                 if (aspectRatio) payload.aspectRatio = aspectRatio;
 
                 const data = await api('POST', '/api/rh-proxy', {
                     action: 'submit',
                     api_key: '',
                     base_url: '',
-                    model_id: modelId,
+                    model_id: task.rhModelId || modelId,
                     params: payload
                 });
 
@@ -7521,7 +8114,7 @@ async function batchGenerateAll() {
                 if (result && result.results) {
                     for (const r of result.results) {
                         if (r.url) {
-                            localResults.push({ url: r.url, checked: false, filename: `AI生图_${task.queueLabel}_${localResults.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' });
+                            localResults.push({ url: r.url, checked: false, filename: `AI生图_${task.queueLabel}_${localResults.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png', queueIndex: task.queueIndex });
                         }
                     }
                 }
@@ -7580,7 +8173,7 @@ async function batchGenerateAll() {
         showToast(`批量生成完成！共${allResults.length}张（${completedCount}组）`, 'success');
         // 按队列存储结果
         for (let q = 0; q < QUEUE_COUNT; q++) {
-            const qResults = allResults.filter((_, idx) => tasks[idx]?.queueIndex === q);
+            const qResults = allResults.filter(r => r.queueIndex === q);
             if (qResults.length > 0) {
                 queueData[q].results = qResults;
             }
@@ -7641,7 +8234,7 @@ function appendResultCard(item, index) {
         allCards.forEach(c => {
             const img = c.querySelector('img');
             const cb = c.querySelector('.result-checkbox');
-            images.push({ url: img?.src || '', checked: cb?.checked || false, filename: `AI生图_${images.length+1}.png` });
+            images.push({ url: img?.src || '', checked: cb?.checked || false, filename: `AI生图_${images.length+1}.jpg` });
         });
         openImageViewer(images, index);
     });
@@ -7867,12 +8460,22 @@ renderImageSlots = function renderImageSlotsDynamic() {
         const prefix = slot.prefixTemplate || '请参考';
         const semantic = slot.label || '';
 
+        const pinBtn = (queueMode === 'multi' && slot.image) ? `<button class="slot-pin-btn ${pinnedSlotIndices.has(i) ? 'pinned' : ''}" title="${pinnedSlotIndices.has(i) ? '取消全列队' : '应用全列队'}">${pinnedSlotIndices.has(i) ? '📌' : '📍'}</button>` : '';
         slotEl.innerHTML = `
-            <div class="slot-compact-image-area">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}</div>
+            <div class="slot-compact-image-area">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}</div>
             <div class="slot-compact-label">
                 <span class="slot-prefix" title="点击编辑前缀">${escHtml(prefix)}</span><span class="slot-auto-text">图${i+1}${semantic ? '的' + escHtml(semantic) : ''}</span>
             </div>
         `;
+
+        // 应用全列队按钮
+        const pinEl = slotEl.querySelector('.slot-pin-btn');
+        if (pinEl) {
+            pinEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                togglePinSlotToAllQueues(i);
+            });
+        }
 
         const prefixEl = slotEl.querySelector('.slot-prefix');
         prefixEl.addEventListener('click', async (e) => {
@@ -7902,7 +8505,7 @@ renderImageSlots = function renderImageSlotsDynamic() {
         let clickTimer = null;
         imgArea.addEventListener('click', (e) => {
             e.stopPropagation();
-            if (e.target.closest('.slot-change-btn')) return;
+            if (e.target.closest('.slot-change-btn') || e.target.closest('.slot-pin-btn')) return;
             // 仅切换active状态，不重新渲染DOM（避免dblclick事件丢失）
             if (imageState.activeSlotIndex !== i) {
                 imageState.activeSlotIndex = i;
@@ -7994,8 +8597,9 @@ renderImageSlots = function renderImageSlotsDynamic() {
             e.stopPropagation();
             const choice = confirm('确定清除该图片槽？\n\n取消 = 选择本地上传图片');
             if (choice) {
+                pushUndoSnapshot();
                 imageState.slots[i] = { image: '', label: '', prefixTemplate: '请参考' };
-                compactSlots();
+                compactAndRenumber();
                 renderImageSlots();
                 updateLocalPrompt();
             } else {
@@ -8021,6 +8625,7 @@ renderImageSlots = function renderImageSlotsDynamic() {
 };
 
 function compactSlots() {
+    // 旧版：仅移除尾部空槽
     while (imageState.slots.length > 1 &&
            !imageState.slots[imageState.slots.length - 1].image &&
            !imageState.slots[imageState.slots.length - 2].image) {
@@ -8028,6 +8633,73 @@ function compactSlots() {
     }
     if (imageState.slots.length === 0) {
         imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+    }
+}
+
+// 删除图片后：将有图槽位前移补位，并更新提示词中的图片编号
+function compactAndRenumber() {
+    const promptCn = document.getElementById('img-prompt-cn');
+    const oldVal = promptCn ? promptCn.value : '';
+
+    // 记录旧编号→新编号的映射
+    const oldToNew = {};
+    const newSlots = [];
+    let newIndex = 0;
+    for (let i = 0; i < imageState.slots.length; i++) {
+        if (imageState.slots[i].image || imageState.slots[i].label) {
+            oldToNew[i + 1] = newIndex + 1; // 图1→图1, 图3→图2 等
+            newSlots.push(imageState.slots[i]);
+            newIndex++;
+        }
+    }
+    // 补齐到 SLOT_COUNT
+    while (newSlots.length < SLOT_COUNT) {
+        newSlots.push({ image: '', label: '', prefixTemplate: '请参考' });
+    }
+    imageState.slots = newSlots;
+
+    // 更新提示词中的图片编号
+    if (promptCn && oldVal) {
+        let newVal = oldVal;
+        // 从大到小替换，避免图1→图2后再被图2→图3覆盖
+        const oldNums = Object.keys(oldToNew).map(Number).sort((a, b) => b - a);
+        for (const oldNum of oldNums) {
+            const newNum = oldToNew[oldNum];
+            if (oldNum !== newNum) {
+                // 替换"图N"为临时标记，避免连锁替换
+                newVal = newVal.replace(new RegExp(`图${oldNum}`, 'g'), `图TMP${newNum}`);
+            }
+        }
+        // 还原临时标记
+        newVal = newVal.replace(/图TMP(\d+)/g, '图$1');
+        promptCn.value = newVal;
+        imageState.promptCn = newVal;
+    }
+
+    // 更新 promptedSlotIndices
+    const newPromptedIndices = new Set();
+    for (const old of promptedSlotIndices) {
+        const newIdx = oldToNew[old + 1];
+        if (newIdx !== undefined) newPromptedIndices.add(newIdx - 1);
+    }
+    promptedSlotIndices = newPromptedIndices;
+
+    // 更新 pinnedSlotIndices
+    const newPinnedIndices = new Set();
+    for (const old of pinnedSlotIndices) {
+        const newIdx = oldToNew[old + 1];
+        if (newIdx !== undefined) newPinnedIndices.add(newIdx - 1);
+    }
+    pinnedSlotIndices = newPinnedIndices;
+    try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
+
+    // 同步到当前队列数据
+    const q = queueData[activeQueue];
+    if (q) {
+        q.slots = JSON.parse(JSON.stringify(imageState.slots));
+        q.promptCn = imageState.promptCn;
+        q.promptedSlotIndices = [...promptedSlotIndices];
+        // q.pinnedSlotIndices is global, not saved per-queue
     }
 }
 
@@ -8150,49 +8822,51 @@ const POLL_DELAYS = [500, 1000, 2000, 3000];
 
 // Replace pollUntilDone with exponential backoff version
 const _origPollUntilDone = pollUntilDone;
-pollUntilDone = async function pollUntilDoneBackoff(apiKey, baseUrl, taskId, startTime = Date.now()) {
+pollUntilDone = async function pollUntilDoneBackoff(apiKey, baseUrl, taskId, startTime = Date.now(), qi, signal) {
     const maxPolls = 120;
+    const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
     for (let i = 0; i < maxPolls; i++) {
-        if (apiGenerateState.cancelled) return null;
+        if (isCancelled()) return null;
         const delay = POLL_DELAYS[Math.min(i, POLL_DELAYS.length - 1)];
         await new Promise(r => setTimeout(r, delay));
-        if (apiGenerateState.cancelled) return null;
+        if (isCancelled()) return null;
         const elapsed = Math.round((Date.now() - startTime) / 1000);
-        const ph = document.getElementById('api-generating-placeholder');
+        const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
         if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中... (${elapsed}秒，第${i+1}次查询)`;
-        setApiProgress(10 + 80 * ((i + 1) / maxPolls));
+        if (activeQueue === qi) setApiProgress(10 + 80 * ((i + 1) / maxPolls));
         try {
             const data = await api('POST', '/api/rh-proxy', {
                 action: 'query',
                 api_key: apiKey,
                 base_url: baseUrl,
                 task_id: taskId
-            });
+            }, undefined, signal);
             if (data.status === 'SUCCESS') return data;
             if (data.status === 'FAILED') {
                 showToast('生成失败: ' + (data.errorMessage || '未知错误'), 'error');
                 return null;
             }
         } catch (e) {
-            if (apiGenerateState.cancelled) return null;
+            if (isCancelled()) return null;
             console.warn('轮询出错:', e);
         }
     }
-    if (!apiGenerateState.cancelled) showToast('生成超时', 'error');
+    if (!isCancelled()) showToast('生成超时', 'error');
     return null;
 };
 
 // Replace pollOAIHK with exponential backoff version
 const _origPollOAIHK = pollOAIHK;
-pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, requestId) {
+pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, requestId, qi, signal) {
     const maxPolls = 120;
+    const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
     let queueCount = 0;
     for (let i = 0; i < maxPolls; i++) {
-        if (apiGenerateState.cancelled) return null;
+        if (isCancelled()) return null;
         const delay = POLL_DELAYS[Math.min(i, POLL_DELAYS.length - 1)];
         await new Promise(r => setTimeout(r, delay));
-        if (apiGenerateState.cancelled) return null;
-        const ph = document.getElementById('api-generating-placeholder');
+        if (isCancelled()) return null;
+        const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
         const elapsed = Math.round((i + 1) * 3);
         try {
             const data = await api('POST', '/api/oaihk-proxy', {
@@ -8201,7 +8875,7 @@ pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, reque
                 base_url: baseUrl,
                 poll_endpoint: pollEndpoint,
                 request_id: requestId
-            });
+            }, undefined, signal);
             if (data.images && data.images.length > 0) return data;
             if (data.status === 'FAILED') {
                 showToast('生成失败: ' + (data.error || '未知错误'), 'error');
@@ -8214,13 +8888,13 @@ pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, reque
             } else {
                 if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（${elapsed}秒，第${i+1}次查询）`;
             }
-            setApiProgress(40 + Math.min(55, 30 * Math.log10(i + 1)));
+            if (activeQueue === qi) setApiProgress(40 + Math.min(55, 30 * Math.log10(i + 1)));
         } catch (e) {
-            if (apiGenerateState.cancelled) return null;
+            if (isCancelled()) return null;
             console.warn('OpenAI-HK 轮询出错:', e);
         }
     }
-    if (!apiGenerateState.cancelled) showToast('OpenAI-HK 生成超时（排队过久），建议稍后重试', 'error');
+    if (!isCancelled()) showToast('OpenAI-HK 生成超时（排队过久），建议稍后重试', 'error');
     return null;
 };
 
@@ -8267,6 +8941,7 @@ function _startPollWithBackoff(apiKey, baseUrl, attempt) {
     }
     function closeModal() {
         updateModal.style.display = 'none';
+        if (_updatePollInterval) { clearInterval(_updatePollInterval); _updatePollInterval = null; }
     }
 
     // 关闭按钮
@@ -8278,6 +8953,7 @@ function _startPollWithBackoff(apiKey, baseUrl, attempt) {
 
     // 存储最新检查结果
     let lastCheckResult = null;
+    let _updatePollInterval = null;
 
     // 检查更新
     async function checkUpdate() {
@@ -8331,28 +9007,28 @@ function _startPollWithBackoff(apiKey, baseUrl, attempt) {
             await api('POST', '/api/do-update', { download_url: lastCheckResult.download_url });
             // 开始轮询更新进度
             let pollCount = 0;
-            const pollInterval = setInterval(async () => {
+            _updatePollInterval = setInterval(async () => {
                 pollCount++;
                 try {
                     const status = await api('GET', '/api/update-status');
                     const text = document.getElementById('update-progress-text');
                     if (text) text.textContent = status.progress || '正在更新...';
                     if (!status.running && status.error) {
-                        clearInterval(pollInterval);
+                        clearInterval(_updatePollInterval); _updatePollInterval = null;
                         showPanel('error');
                         document.getElementById('update-error-msg').textContent = '更新失败: ' + status.error;
                         btnClose.style.display = 'inline-flex';
                     }
                     // 如果更新完成，服务会重启，页面会断开连接
                     if (pollCount > 60) {
-                        clearInterval(pollInterval);
+                        clearInterval(_updatePollInterval); _updatePollInterval = null;
                         showPanel('error');
                         document.getElementById('update-error-msg').textContent = '更新超时，请手动重启软件';
                         btnClose.style.display = 'inline-flex';
                     }
                 } catch (e) {
                     // 连接断开说明服务正在重启
-                    clearInterval(pollInterval);
+                    clearInterval(_updatePollInterval); _updatePollInterval = null;
                     const text = document.getElementById('update-progress-text');
                     if (text) text.textContent = '更新完成，正在重启...';
                     setTimeout(() => {

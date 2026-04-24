@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import uuid
@@ -12,6 +13,7 @@ import hashlib
 import re
 import base64
 import subprocess
+import socket
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,7 +30,7 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB，支持超大原图上传（前端裁剪后仍可能较大）
 
 # 全局数据锁，防止并发读写竞态
-data_lock = threading.Lock()
+data_lock = threading.RLock()
 
 # 日志配置：控制台 + 轮转文件
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
@@ -60,6 +62,101 @@ logging.getLogger().addHandler(file_handler)
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'images')
 BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backups')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ========== 安全辅助函数 ==========
+
+# 允许代理下载的图片域名白名单
+ALLOWED_IMAGE_DOMAINS = {
+    'runninghub.cn', 'www.runninghub.cn',
+    'openai-hk.com', 'api.openai-hk.com',
+    'fal.media', 'v3.fal.media', 'storage.fal.media',
+    'replicate.com', 'api.replicate.com',
+    'pbxt.replicate.delivery',
+}
+
+# 允许代理 API 的 base_url 域名白名单
+ALLOWED_API_DOMAINS = {
+    'runninghub.cn', 'www.runninghub.cn',
+    'openai-hk.com', 'api.openai-hk.com',
+    'deepseek.com', 'api.deepseek.com',
+    'bigmodel.cn', 'open.bigmodel.cn',
+}
+
+# 自更新允许的 GitHub release 域名
+ALLOWED_UPDATE_DOMAINS = {'github.com', 'api.github.com', 'githubusercontent.com', 'objects.githubusercontent.com'}
+
+
+def _validate_url(url, allowed_domains):
+    """验证URL是否在允许的域名白名单内，防止SSRF攻击
+    返回 (ok, error_or_none, resolved_ip_or_none)"""
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return False, f"不允许的协议: {parsed.scheme}", None
+        hostname = parsed.hostname
+        if not hostname:
+            return False, "URL缺少主机名", None
+        # 拒绝私有IP/链路本地地址，并缓存解析结果防止DNS重绑定
+        resolved_ip = None
+        try:
+            addrinfos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for family, _, _, _, sockaddr in addrinfos:
+                addr = sockaddr[0]
+                if isinstance(addr, bytes):
+                    continue
+                try:
+                    ip_obj = ipaddress.ip_address(addr)
+                    if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local or ip_obj.is_multicast:
+                        return False, f"不允许访问内网地址: {addr}", None
+                    # 使用第一个有效的公网IP
+                    if resolved_ip is None:
+                        resolved_ip = addr
+                except ValueError:
+                    continue
+        except socket.gaierror:
+            pass  # 域名无法解析，让requests处理
+        # 检查域名白名单
+        host_lower = hostname.lower()
+        for domain in allowed_domains:
+            if host_lower == domain or host_lower.endswith('.' + domain):
+                return True, None, resolved_ip
+        return False, f"域名不在白名单中: {hostname}", None
+    except Exception as e:
+        return False, f"URL解析失败: {e}", None
+
+
+def _validate_base_path(path):
+    """验证保存路径是否在允许的目录内，防止任意文件写入"""
+    expanded = os.path.expanduser(path)
+    real = os.path.realpath(expanded)
+    # 允许的根目录：用户主目录和项目目录
+    home = os.path.realpath(os.path.expanduser('~'))
+    allowed_roots = [home, BASE_DIR]
+    for root in allowed_roots:
+        if real.startswith(root + os.sep) or real == root:
+            return True, None
+    return False, f"路径不在允许范围内: {path}"
+
+
+def _safe_extract_zip(zf, extract_dir, max_size_mb=200, max_entries=1000):
+    """安全解压ZIP文件，防止ZIP炸弹和ZipSlip"""
+    total_size = 0
+    entry_count = 0
+    for info in zf.infolist():
+        entry_count += 1
+        if entry_count > max_entries:
+            raise ValueError(f"ZIP条目数超过限制({max_entries})")
+        # 防止ZipSlip：确保解压路径在目标目录内
+        target_path = os.path.realpath(os.path.join(extract_dir, info.filename))
+        if not target_path.startswith(os.path.realpath(extract_dir) + os.sep):
+            raise ValueError(f"ZIP路径遍历: {info.filename}")
+        # 累计未压缩大小
+        total_size += info.file_size
+        if total_size > max_size_mb * 1024 * 1024:
+            raise ValueError(f"ZIP解压后大小超过限制({max_size_mb}MB)")
+    zf.extractall(extract_dir)
 
 
 def ensure_data_dir():
@@ -177,52 +274,53 @@ def _build_category_hash_index(lib_data):
 
 
 def _supplement_library_from_image_presets():
-    """将图生图预设中的图片自动补入素材库（同分类+同hash去重）"""
-    presets_data = load_json('image_presets.json') or {"presets": []}
-    if not presets_data.get('presets'):
-        return {"added": 0, "skipped_same_hash": 0}
+    """将图生图预设中的图片自动补入素材库（同分类+同hash去重），加锁防并发写入损坏"""
+    with data_lock:
+        presets_data = load_json('image_presets.json') or {"presets": []}
+        if not presets_data.get('presets'):
+            return {"added": 0, "skipped_same_hash": 0}
 
-    lib_data = load_json('image_library.json') or {"categories": []}
-    hash_idx = _build_category_hash_index(lib_data)
-    added = 0
-    skipped = 0
+        lib_data = load_json('image_library.json') or {"categories": []}
+        hash_idx = _build_category_hash_index(lib_data)
+        added = 0
+        skipped = 0
 
-    for preset in presets_data.get('presets', []):
-        for slot in preset.get('images', []):
-            img_url = (slot.get('path') or '').strip()
-            if not img_url.startswith('/static/images/'):
-                continue
-            img_name = img_url.replace('/static/images/', '')
-            img_path = os.path.join(IMAGES_DIR, img_name)
-            if not os.path.exists(img_path):
-                continue
+        for preset in presets_data.get('presets', []):
+            for slot in preset.get('images', []):
+                img_url = (slot.get('path') or '').strip()
+                if not img_url.startswith('/static/images/'):
+                    continue
+                img_name = img_url.replace('/static/images/', '')
+                img_path = os.path.join(IMAGES_DIR, img_name)
+                if not os.path.exists(img_path):
+                    continue
 
-            cat_name = (slot.get('label') or '导入补全').strip() or '导入补全'
-            item_name = (slot.get('label') or os.path.splitext(img_name)[0]).strip() or os.path.splitext(img_name)[0]
+                cat_name = (slot.get('label') or '导入补全').strip() or '导入补全'
+                item_name = (slot.get('label') or os.path.splitext(img_name)[0]).strip() or os.path.splitext(img_name)[0]
 
-            try:
-                img_hash = _file_sha256(img_path)
-            except Exception:
-                continue
+                try:
+                    img_hash = _file_sha256(img_path)
+                except Exception:
+                    continue
 
-            cat_hashes = hash_idx.setdefault(cat_name, set())
-            # A+B策略：仅同分类+同hash去重；跨分类允许同图共存
-            if img_hash in cat_hashes:
-                skipped += 1
-                continue
+                cat_hashes = hash_idx.setdefault(cat_name, set())
+                # A+B策略：仅同分类+同hash去重；跨分类允许同图共存
+                if img_hash in cat_hashes:
+                    skipped += 1
+                    continue
 
-            cat = _ensure_library_category(lib_data, cat_name)
-            sub = _ensure_default_subcategory(cat)
-            sub.setdefault('items', []).append({
-                "id": gen_id('libitem'),
-                "name": item_name,
-                "image": img_url
-            })
-            cat_hashes.add(img_hash)
-            added += 1
+                cat = _ensure_library_category(lib_data, cat_name)
+                sub = _ensure_default_subcategory(cat)
+                sub.setdefault('items', []).append({
+                    "id": gen_id('libitem'),
+                    "name": item_name,
+                    "image": img_url
+                })
+                cat_hashes.add(img_hash)
+                added += 1
 
-    save_json('image_library.json', lib_data)
-    return {"added": added, "skipped_same_hash": skipped}
+        save_json('image_library.json', lib_data)
+        return {"added": added, "skipped_same_hash": skipped}
 
 
 # ========== 页面路由 ==========
@@ -288,7 +386,7 @@ def update_category(cat_id):
             if cat['id'] == cat_id:
                 if name:
                     cat['name'] = name
-                if selection_type:
+                if selection_type is not None:
                     cat['selection_type'] = selection_type
                 save_json('categories.json', data)
                 logger.info(f"更新大分类: {cat_id} -> {name}")
@@ -306,7 +404,6 @@ def delete_category(cat_id):
 
         data['categories'] = [c for c in data['categories'] if c['id'] != cat_id]
         save_json('categories.json', data)
-        # 同步清理排序数据
         _remove_from_order('category', cat_id)
 
     logger.info(f"删除大分类: {cat_id}")
@@ -327,9 +424,10 @@ def _save_order(data):
 
 
 def _remove_from_order(item_type, item_id):
-    order_data = _load_order()
-    order_data['order'] = [o for o in order_data['order'] if not (o.get('type') == item_type and o.get('id') == item_id)]
-    _save_order(order_data)
+    with data_lock:
+        order_data = _load_order()
+        order_data['order'] = [o for o in order_data['order'] if not (o.get('type') == item_type and o.get('id') == item_id)]
+        _save_order(order_data)
 
 
 @app.route('/api/category-order', methods=['GET'])
@@ -594,6 +692,65 @@ def update_prefix_templates():
     return jsonify({"success": True})
 
 
+# ========== 提示词模板（前缀/后缀）API ==========
+
+@app.route('/api/prompt-templates', methods=['GET'])
+def get_prompt_templates():
+    """获取图生图提示词前缀/后缀模板及选中状态"""
+    data = load_json('prompt_templates.json')
+    if data is None:
+        data = {
+            "prefixes": [],
+            "suffixes": [],
+            "selectedPrefixIds": [],
+            "selectedSuffixIds": []
+        }
+    # 确保结构完整
+    if 'prefixes' not in data: data['prefixes'] = []
+    if 'suffixes' not in data: data['suffixes'] = []
+    if 'selectedPrefixIds' not in data: data['selectedPrefixIds'] = []
+    if 'selectedSuffixIds' not in data: data['selectedSuffixIds'] = []
+    return jsonify(data)
+
+
+@app.route('/api/prompt-templates', methods=['PUT'])
+def update_prompt_templates():
+    """保存图生图提示词前缀/后缀模板及选中状态"""
+    body = request.get_json()
+    with data_lock:
+        save_json('prompt_templates.json', {
+            "prefixes": body.get('prefixes', []),
+            "suffixes": body.get('suffixes', []),
+            "selectedPrefixIds": body.get('selectedPrefixIds', []),
+            "selectedSuffixIds": body.get('selectedSuffixIds', [])
+        })
+    logger.info(f"更新提示词模板: {len(body.get('prefixes', []))}个前缀, {len(body.get('suffixes', []))}个后缀")
+    return jsonify({"success": True})
+
+
+# ========== 提示词预设 API（图生图中文提示词快捷预设） ==========
+
+@app.route('/api/prompt-presets', methods=['GET'])
+def get_prompt_presets():
+    """获取提示词预设列表"""
+    data = load_json('prompt_presets.json')
+    if data is None:
+        data = {"presets": []}
+    if 'presets' not in data:
+        data['presets'] = []
+    return jsonify(data)
+
+
+@app.route('/api/prompt-presets', methods=['PUT'])
+def update_prompt_presets():
+    """保存提示词预设列表"""
+    body = request.get_json()
+    with data_lock:
+        save_json('prompt_presets.json', {"presets": body.get('presets', [])})
+    logger.info(f"更新提示词预设: {len(body.get('presets', []))}个")
+    return jsonify({"success": True})
+
+
 # ========== 预设 API ==========
 
 @app.route('/api/presets', methods=['GET'])
@@ -704,6 +861,84 @@ def get_upload_settings():
     return short_edge, 90
 
 
+def convert_to_jpg(image_bytes):
+    """将任意格式的图片字节转为JPG格式，保持像素和尺寸不变。
+    返回 (jpg_bytes, '.jpg')，转换失败时返回原数据。"""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)
+        # RGBA/P/LA 等模式需转为 RGB
+        if img.mode in ('RGBA', 'P', 'LA', 'L', 'PA', 'I', 'F'):
+            if img.mode == 'RGBA':
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])
+                img = background
+            else:
+                img = img.convert('RGB')
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=95, optimize=True)
+        return buf.getvalue(), '.jpg'
+    except Exception as e:
+        logger.warning(f"JPG转换失败，保留原格式: {e}")
+        return image_bytes, None
+
+
+@app.route('/api/convert-download', methods=['POST'])
+def convert_download():
+    """将任意URL的图片转为JPG后作为附件下载，确保所有下载都是JPG格式"""
+    body = request.get_json(silent=True) or {}
+    image_url = body.get('url', '')
+    filename = body.get('filename', 'AI生图.jpg')
+
+    if not image_url:
+        return jsonify({"error": "缺少图片URL"}), 400
+
+    # 处理本地路径（/static/images/xxx.jpg）
+    if image_url.startswith('/'):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        local_path = os.path.join(base_dir, image_url.lstrip('/'))
+        if not os.path.realpath(local_path).startswith(os.path.realpath(base_dir)):
+            return jsonify({"error": "路径不允许"}), 403
+        if not os.path.exists(local_path):
+            return jsonify({"error": "文件不存在"}), 404
+        with open(local_path, 'rb') as f:
+            data = f.read()
+    else:
+        # 远程URL：SSRF防护
+        ok, err, _ = _validate_url(image_url, ALLOWED_IMAGE_DOMAINS)
+        if not ok:
+            return jsonify({"error": f"URL不允许: {err}"}), 403
+        try:
+            resp = requests.get(image_url, timeout=60, stream=True)
+            if resp.status_code != 200:
+                return jsonify({"error": f"下载失败: HTTP {resp.status_code}"}), 502
+            max_size = 30 * 1024 * 1024
+            buf = io.BytesIO()
+            for chunk in resp.iter_content(chunk_size=8192):
+                buf.write(chunk)
+                if buf.tell() > max_size:
+                    return jsonify({"error": "图片超过30MB限制"}), 413
+            data = buf.getvalue()
+        except requests.exceptions.Timeout:
+            return jsonify({"error": "下载超时"}), 504
+
+    # 转为JPG
+    jpg_data, jpg_ext = convert_to_jpg(data)
+    if jpg_ext:
+        data = jpg_data
+        name_part, ext_part = os.path.splitext(filename)
+        if ext_part.lower() not in ('.jpg', '.jpeg'):
+            filename = name_part + '.jpg'
+
+    from io import BytesIO
+    return send_file(
+        BytesIO(data),
+        mimetype='image/jpeg',
+        as_attachment=True,
+        download_name=filename
+    )
+
+
 def compress_image(file_stream, ext):
     """统一缩放+压缩图片（单流架构：前端已裁剪为3:4，服务端只做缩放+压缩）
     返回 (buf, '.jpg', warning) 其中warning为上采样警告字符串或None"""
@@ -735,8 +970,8 @@ def compress_image(file_stream, ext):
         if short_edge < short_edge_target:
             warning = f'图片短边({short_edge}px)不足预设({short_edge_target}px)，已上采样放大，可能影响画质'
 
-    # 统一转为 JPG
-    if img.mode in ('RGBA', 'P', 'LA'):
+    # 统一转为 JPG（非RGB模式均需转换）
+    if img.mode != 'RGB':
         img = img.convert('RGB')
 
     buf = io.BytesIO()
@@ -750,13 +985,15 @@ def compress_image(file_stream, ext):
         img.save(buf, format='JPEG', quality=quality, optimize=True)
 
     # 如果质量压缩到 60 仍超过 2MB，逐步缩小分辨率
-    while buf.tell() > 2 * 1024 * 1024:
+    resize_attempts = 0
+    while buf.tell() > 2 * 1024 * 1024 and resize_attempts < 10:
         w, h = img.size
+        if w <= 200 or h <= 200:
+            break
         img = img.resize((int(w * 0.8), int(h * 0.8)), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format='JPEG', quality=quality, optimize=True)
-        if w <= 200 or h <= 200:
-            break
+        resize_attempts += 1
 
     buf.seek(0)
     return buf, '.jpg', warning
@@ -827,10 +1064,10 @@ def upload_image():
 # ========== 模型配置 API ==========
 
 def _mask_api_key(key):
-    """遮蔽API密钥，只显示前4位和后4位"""
-    if not key or len(key) <= 8:
+    """遮蔽API密钥，只显示前2位和后2位"""
+    if not key or len(key) <= 4:
         return '****' if key else ''
-    return key[:4] + '****' + key[-4:]
+    return key[:2] + '****' + key[-2:]
 
 
 @app.route('/api/model-config', methods=['GET'])
@@ -843,7 +1080,7 @@ def get_model_config():
             "base_url": "",
             "model_name": "",
             "timeout_ms": 30000,
-            "retry_count": 1
+            "retry_count": 2
         }
     # 填充默认系统提示词（如果用户没有自定义）
     if not data.get('system_prompt_prompt'):
@@ -881,6 +1118,15 @@ def get_model_config():
 @app.route('/api/model-config', methods=['PUT'])
 def update_model_config():
     body = request.get_json()
+    # 只允许已知字段，防止注入任意键
+    ALLOWED_FIELDS = {
+        'provider', 'api_key', 'base_url', 'model_name', 'timeout_ms', 'retry_count',
+        'system_prompt_prompt', 'system_prompt_translate',
+        'rh_api_key', 'rh_base_url', 'rh_model', 'rh_aspect_ratio', 'rh_resolution', 'rh_count', 'rh_seed_mode', 'rh_seed',
+        'oaihk_api_key', 'oaihk_base_url', 'oaihk_model', 'oaihk_aspect_ratio',
+        'api_platform',
+    }
+    body = {k: v for k, v in body.items() if k in ALLOWED_FIELDS}
     # 自动去除关键字段的空格
     for key in ['api_key', 'base_url', 'model_name']:
         if key in body and isinstance(body[key], str):
@@ -897,7 +1143,12 @@ def update_model_config():
         existing.update(body)
         save_json('model_config.json', existing)
     logger.info(f"更新模型配置: provider={existing.get('provider')}")
-    return jsonify(existing)
+    # 返回遮蔽后的配置，避免泄露 API 密钥
+    masked = dict(existing)
+    for key_field in ['api_key', 'rh_api_key', 'oaihk_api_key']:
+        if key_field in masked and masked[key_field]:
+            masked[key_field] = _mask_api_key(masked[key_field])
+    return jsonify(masked)
 
 
 @app.route('/api/test-connection', methods=['POST'])
@@ -1215,7 +1466,7 @@ def call_llm(prompt_text, config):
     base_url = (config.get('base_url') or '').strip()
     model_name = (config.get('model_name') or '').strip()
     timeout_ms = config.get('timeout_ms', 30000)
-    retry_count = config.get('retry_count', 1)
+    retry_count = config.get('retry_count', 2)
 
     if not api_key:
         return None, "API Key 未配置"
@@ -1261,7 +1512,7 @@ def call_llm(prompt_text, config):
     }
 
     last_error = None
-    for i in range(retry_count):
+    for i in range(max(retry_count, 1)):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout_ms / 1000)
             if resp.status_code == 200:
@@ -1300,12 +1551,14 @@ def generate_prompt():
     selected_suffixes = body.get('selected_suffixes', [])
     selected_props = body.get('selected_props', [])
 
-    categories_data = load_json('categories.json') or {"categories": []}
-    prefixes_data = load_json('prefixes.json') or {"prefixes": []}
-    suffixes_data = load_json('suffixes.json') or {"suffixes": []}
-    props_data = load_json('props.json') or {"props": []}
-    model_config = load_json('model_config.json') or {}
-    category_order = load_json('category_order.json') or {"order": []}
+    # 在锁内读取所有数据文件，确保一致性
+    with data_lock:
+        categories_data = load_json('categories.json') or {"categories": []}
+        prefixes_data = load_json('prefixes.json') or {"prefixes": []}
+        suffixes_data = load_json('suffixes.json') or {"suffixes": []}
+        props_data = load_json('props.json') or {"props": []}
+        model_config = load_json('model_config.json') or {}
+        category_order = load_json('category_order.json') or {"order": []}
 
     # 1. 先生成本地兜底版本
     local_prompt = build_local_prompt(
@@ -1374,7 +1627,8 @@ DATA_FILES = [
     'props.json', 'presets.json', 'preset_tags.json',
     'category_order.json', 'prop_order.json', 'last_selection.json',
     'image_library.json', 'image_presets.json', 'queue_data.json',
-    'model_config.json', 'usage_log.json', 'prefix_templates.json'
+    'model_config.json', 'usage_log.json', 'prefix_templates.json',
+    'prompt_templates.json', 'prompt_presets.json'
 ]
 
 
@@ -1388,7 +1642,7 @@ def export_data():
     FILE_CATEGORY_MAP = {
         'image_library': ['image_library.json'],
         'image_presets': ['image_presets.json', 'queue_data.json'],
-        'prefixes_suffixes': ['prefixes.json', 'suffixes.json', 'prefix_templates.json'],
+        'prefixes_suffixes': ['prefixes.json', 'suffixes.json', 'prefix_templates.json', 'prompt_templates.json', 'prompt_presets.json'],
         'categories': ['categories.json', 'category_order.json', 'props.json', 'prop_order.json', 'last_selection.json', 'preset_tags.json'],
         'presets': ['presets.json'],
         'model_config': ['model_config.json'],
@@ -1400,41 +1654,38 @@ def export_data():
         if selected.get(cat, True):
             export_files.update(files)
 
+    # 先在锁内快速读取所有需要的数据，再在锁外生成ZIP
     with data_lock:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # 1. 写入选中的 JSON 数据文件
-            for filename in export_files:
-                data_content = load_json(filename)
-                if data_content is not None:
-                    # 导出模型配置时去除 API 密钥字段
-                    if filename == 'model_config.json':
-                        export_data = dict(data_content)  # shallow copy
-                        for key_field in ['api_key', 'rh_api_key', 'oaihk_api_key']:
-                            export_data.pop(key_field, None)
-                        zf.writestr(f'data/{filename}', json.dumps(export_data, ensure_ascii=False, indent=2))
-                    else:
-                        zf.writestr(f'data/{filename}', json.dumps(data_content, ensure_ascii=False, indent=2))
+        export_data_map = {}
+        for filename in export_files:
+            data_content = load_json(filename)
+            if data_content is not None:
+                if filename == 'model_config.json':
+                    safe_copy = dict(data_content)
+                    for key_field in ['api_key', 'rh_api_key', 'oaihk_api_key']:
+                        safe_copy.pop(key_field, None)
+                    export_data_map[filename] = safe_copy
+                else:
+                    export_data_map[filename] = data_content
 
-            # 2. 收集所有被引用的图片文件名（仅从导出的文件中收集）
-            referenced_images = set()
-            for filename in export_files:
-                data_content = load_json(filename)
-                if data_content is not None:
-                    _collect_image_refs(data_content, referenced_images)
+    # 在锁外生成ZIP（I/O密集操作不阻塞其他写操作）
+    referenced_images = set()
+    for filename, data_content in export_data_map.items():
+        _collect_image_refs(data_content, referenced_images)
 
-            # 3. 写入引用的图片
-            for img_name in referenced_images:
-                img_path = os.path.join(IMAGES_DIR, img_name)
-                if os.path.exists(img_path):
-                    zf.write(img_path, f'images/{img_name}')
-
-            # 4. 写入导出选项清单，供导入时参考
-            zf.writestr('data/export_manifest.json', json.dumps({
-                'selected': {k: v for k, v in selected.items() if v},
-                'exported_files': list(export_files),
-                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-            }, ensure_ascii=False, indent=2))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for filename, data_content in export_data_map.items():
+            zf.writestr(f'data/{filename}', json.dumps(data_content, ensure_ascii=False, indent=2))
+        for img_name in referenced_images:
+            img_path = os.path.join(IMAGES_DIR, img_name)
+            if os.path.exists(img_path):
+                zf.write(img_path, f'images/{img_name}')
+        zf.writestr('data/export_manifest.json', json.dumps({
+            'selected': {k: v for k, v in selected.items() if v},
+            'exported_files': list(export_files),
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+        }, ensure_ascii=False, indent=2))
 
     buf.seek(0)
     timestamp = time.strftime('%Y%m%d_%H%M%S')
@@ -1525,7 +1776,7 @@ def import_data():
     FILE_CATEGORY_MAP = {
         'image_library': ['image_library.json'],
         'image_presets': ['image_presets.json', 'queue_data.json'],
-        'prefixes_suffixes': ['prefixes.json', 'suffixes.json', 'prefix_templates.json'],
+        'prefixes_suffixes': ['prefixes.json', 'suffixes.json', 'prefix_templates.json', 'prompt_templates.json', 'prompt_presets.json'],
         'categories': ['categories.json', 'category_order.json', 'props.json', 'prop_order.json', 'last_selection.json', 'preset_tags.json'],
         'presets': ['presets.json'],
         'model_config': ['model_config.json'],
@@ -1553,6 +1804,12 @@ def import_data():
 
         with data_lock:
             with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zf:
+                # ZIP炸弹防护：检查总大小和条目数
+                total_size = 0
+                for info in zf.infolist():
+                    total_size += info.file_size
+                    if total_size > 200 * 1024 * 1024:  # 200MB限制
+                        return jsonify({"error": "ZIP解压后超过200MB限制"}), 413
                 names = zf.namelist()
 
                 # 导入 JSON 数据文件
@@ -1776,7 +2033,7 @@ def generate_bilingual():
     base_url = (model_config.get('base_url') or '').strip()
     model_name = (model_config.get('model_name') or '').strip()
     timeout_ms = model_config.get('timeout_ms', 30000)
-    retry_count = model_config.get('retry_count', 1)
+    retry_count = model_config.get('retry_count', 2)
 
     if not api_key:
         return jsonify({"error": "API Key 未配置，请先在模型配置中设置"}), 400
@@ -1807,7 +2064,7 @@ def generate_bilingual():
     }
 
     last_error = None
-    for i in range(retry_count):
+    for i in range(max(retry_count, 1)):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout_ms / 1000)
             if resp.status_code == 200:
@@ -1871,7 +2128,7 @@ def translate_to_en():
     base_url = (model_config.get('base_url') or '').strip()
     model_name = (model_config.get('model_name') or '').strip()
     timeout_ms = model_config.get('timeout_ms', 30000)
-    retry_count = model_config.get('retry_count', 1)
+    retry_count = model_config.get('retry_count', 2)
 
     if not api_key:
         return jsonify({"error": "API Key 未配置"}), 400
@@ -1898,7 +2155,7 @@ def translate_to_en():
     }
 
     last_error = None
-    for i in range(retry_count):
+    for i in range(max(retry_count, 1)):
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout_ms / 1000)
             if resp.status_code == 200:
@@ -1947,6 +2204,7 @@ def get_image_library():
         save_json('image_library.json', data)
     else:
         # 向后兼容：旧数据有 items 字段，迁移到 subcategories
+        needs_save = False
         for cat in data.get('categories', []):
             if 'items' in cat and 'subcategories' not in cat:
                 cat['subcategories'] = [{
@@ -1955,7 +2213,9 @@ def get_image_library():
                     "items": cat['items']
                 }]
                 del cat['items']
-        save_json('image_library.json', data)
+                needs_save = True
+        if needs_save:
+            save_json('image_library.json', data)
     return jsonify(data)
 
 
@@ -2273,9 +2533,14 @@ def rh_proxy():
     config = load_json('model_config.json') or {}
     rh_api_key = config.get('rh_api_key', '').strip()
     rh_base_url = config.get('rh_base_url', 'https://www.runninghub.cn/openapi/v2').rstrip('/')
-    # 允许前端覆盖 base_url（但不覆盖 api_key）
+    # 允许前端覆盖 base_url（但不覆盖 api_key），需验证域名
     if body.get('base_url', '').strip():
-        rh_base_url = body['base_url'].strip().rstrip('/')
+        custom_base = body['base_url'].strip().rstrip('/')
+        ok, err, _ = _validate_url(custom_base + '/', ALLOWED_API_DOMAINS)
+        if ok:
+            rh_base_url = custom_base
+        else:
+            logger.warning(f'[rh-proxy] base_url拦截: {err}')
 
     if not rh_api_key:
         return jsonify({"error": "RunningHub API Key 未配置"}), 400
@@ -2315,7 +2580,14 @@ def rh_proxy():
                 return jsonify({"error": "没有文件"}), 400
             file = request.files['file']
             rh_api_key_upload = rh_api_key  # 始终使用服务端配置的真实密钥
-            rh_base_url_upload = request.form.get('base_url', rh_base_url).rstrip('/')
+            rh_base_url_upload = rh_base_url  # 默认使用已验证的base_url
+            custom_upload_base = request.form.get('base_url', '').strip().rstrip('/')
+            if custom_upload_base:
+                ok, err, _ = _validate_url(custom_upload_base + '/', ALLOWED_API_DOMAINS)
+                if ok:
+                    rh_base_url_upload = custom_upload_base
+                else:
+                    logger.warning(f'[rh-proxy upload] base_url拦截: {err}')
             url = f"{rh_base_url_upload}/media/upload/binary"
             headers = {
                 'Authorization': f'Bearer {rh_api_key_upload}'
@@ -2342,15 +2614,28 @@ def rh_download():
     if not url:
         return jsonify({"error": "URL不能为空"}), 400
 
+    # SSRF防护：验证URL域名
+    ok, err, _ = _validate_url(url, ALLOWED_IMAGE_DOMAINS)
+    if not ok:
+        logger.warning(f'[rh-download] SSRF拦截: {err}')
+        return jsonify({"error": f"URL不允许: {err}"}), 403
+
     try:
         resp = requests.get(url, timeout=60)
         if resp.status_code == 200:
             from io import BytesIO
+            # 自动转为JPG格式（保持像素和尺寸不变）
+            jpg_data, jpg_ext = convert_to_jpg(resp.content)
+            download_name = body.get('filename', 'AI生图.jpg')
+            if jpg_ext:
+                name_part, ext_part = os.path.splitext(download_name)
+                if ext_part.lower() not in ('.jpg', '.jpeg'):
+                    download_name = name_part + '.jpg'
             return send_file(
-                BytesIO(resp.content),
-                mimetype=resp.headers.get('Content-Type', 'image/png'),
+                BytesIO(jpg_data if jpg_ext else resp.content),
+                mimetype='image/jpeg',
                 as_attachment=True,
-                download_name=body.get('filename', 'AI生图.png')
+                download_name=download_name
             )
         else:
             return jsonify({"error": f"下载失败: HTTP {resp.status_code}"}), resp.status_code
@@ -2371,9 +2656,14 @@ def oaihk_proxy():
     config = load_json('model_config.json') or {}
     api_key = config.get('oaihk_api_key', '').strip()
     base_url = (config.get('oaihk_base_url') or 'https://api.openai-hk.com').rstrip('/')
-    # 允许前端覆盖 base_url（但不覆盖 api_key）
+    # 允许前端覆盖 base_url（但不覆盖 api_key），需验证域名
     if body.get('base_url', '').strip():
-        base_url = body['base_url'].strip().rstrip('/')
+        custom_base = body['base_url'].strip().rstrip('/')
+        ok, err, _ = _validate_url(custom_base + '/', ALLOWED_API_DOMAINS)
+        if ok:
+            base_url = custom_base
+        else:
+            logger.warning(f'[oaihk-proxy] base_url拦截: {err}')
 
     if not api_key:
         logger.warning('[oaihk] API Key 未配置')
@@ -2725,6 +3015,12 @@ def download_image():
     if not image_url:
         return jsonify({"error": "缺少url参数"}), 400
 
+    # SSRF防护：验证URL域名
+    ok, err, _ = _validate_url(image_url, ALLOWED_IMAGE_DOMAINS)
+    if not ok:
+        logger.warning(f'[download-proxy] SSRF拦截: {err}')
+        return jsonify({"error": f"URL不允许: {err}"}), 403
+
     logger.info(f'[download-proxy] 代理下载: {image_url[:100]}')
 
     try:
@@ -2734,13 +3030,20 @@ def download_image():
             return jsonify({"error": f"下载失败: HTTP {resp.status_code}"}), 502
 
         content_type = resp.headers.get('Content-Type', 'image/png')
-        # 限制最大30MB
+        # 限制最大30MB，使用BytesIO避免内存碎片
         max_size = 30 * 1024 * 1024
-        data = b''
+        buf = io.BytesIO()
         for chunk in resp.iter_content(chunk_size=8192):
-            data += chunk
-            if len(data) > max_size:
+            buf.write(chunk)
+            if buf.tell() > max_size:
                 return jsonify({"error": "图片超过30MB限制"}), 413
+        data = buf.getvalue()
+
+        # 自动转为JPG格式（保持像素和尺寸不变，方便Mac Finder预览大图）
+        jpg_data, jpg_ext = convert_to_jpg(data)
+        if jpg_ext:
+            data = jpg_data
+            content_type = 'image/jpeg'
 
         b64_str = base64.b64encode(data).decode('ascii')
         data_uri = f'data:{content_type};base64,{b64_str}'
@@ -2754,6 +3057,110 @@ def download_image():
     except Exception as e:
         logger.error(f'[download-proxy] 下载异常: {e}', exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/save-image-to-path', methods=['POST'])
+def save_image_to_path():
+    """将图片下载保存到用户指定的本地路径，自动创建日期子文件夹"""
+    body = request.get_json(silent=True) or {}
+    image_url = body.get('url', '')
+    base_path = body.get('path', '')
+    filename = body.get('filename', '')
+
+    if not image_url:
+        return jsonify({"error": "缺少图片URL"}), 400
+    if not base_path:
+        return jsonify({"error": "缺少保存路径"}), 400
+
+    # SSRF防护：验证URL域名
+    ok, err, _ = _validate_url(image_url, ALLOWED_IMAGE_DOMAINS)
+    if not ok:
+        logger.warning(f'[save-image] SSRF拦截: {err}')
+        return jsonify({"error": f"URL不允许: {err}"}), 403
+
+    # 路径安全：验证base_path在允许范围内
+    ok, err = _validate_base_path(base_path)
+    if not ok:
+        logger.warning(f'[save-image] 路径拦截: {err}')
+        return jsonify({"error": f"路径不允许: {err}"}), 403
+
+    # 展开 ~ 为用户主目录
+    base_path = os.path.expanduser(base_path)
+
+    # 创建以当前日期命名的子文件夹
+    date_folder = datetime.now().strftime('%Y-%m-%d')
+    target_dir = os.path.join(base_path, date_folder)
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": f"无法创建目录 {target_dir}: {e}"}), 400
+
+    # 生成文件名
+    if not filename:
+        timestamp = datetime.now().strftime('%H%M%S')
+        filename = f"AI生图_{timestamp}.jpg"
+
+    # 确保文件名扩展名为 .jpg（下载时统一转JPG）
+    name_part, ext_part = os.path.splitext(filename)
+    if ext_part.lower() not in ('.jpg', '.jpeg'):
+        filename = name_part + '.jpg'
+
+    # 确保文件名安全
+    filename = re.sub(r'[^\w\-.]', '_', filename)
+    filepath = os.path.join(target_dir, filename)
+
+    # 避免文件名冲突：如果文件已存在，加序号
+    if os.path.exists(filepath):
+        name, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(os.path.join(target_dir, f"{name}_{counter}{ext}")):
+            counter += 1
+        filepath = os.path.join(target_dir, f"{name}_{counter}{ext}")
+
+    logger.info(f'[save-image] 下载图片到: {filepath}')
+
+    try:
+        resp = requests.get(image_url, timeout=120, stream=True)
+        if resp.status_code != 200:
+            logger.error(f'[save-image] 下载失败: HTTP {resp.status_code}')
+            return jsonify({"error": f"下载图片失败: HTTP {resp.status_code}"}), 502
+
+        # 限制最大30MB，使用BytesIO避免内存碎片
+        max_size = 30 * 1024 * 1024
+        buf = io.BytesIO()
+        for chunk in resp.iter_content(chunk_size=8192):
+            buf.write(chunk)
+            if buf.tell() > max_size:
+                return jsonify({"error": "图片超过30MB限制"}), 413
+        data = buf.getvalue()
+
+        # 自动转为JPG格式（保持像素和尺寸不变，方便Mac Finder预览大图）
+        jpg_data, jpg_ext = convert_to_jpg(data)
+        if jpg_ext:
+            data = jpg_data
+            # 确保文件名扩展名为 .jpg
+            name_part, ext_part = os.path.splitext(filename)
+            if ext_part.lower() not in ('.jpg', '.jpeg'):
+                filename = name_part + '.jpg'
+                filepath = os.path.join(target_dir, filename)
+
+        with open(filepath, 'wb') as f:
+            f.write(data)
+
+        logger.info(f'[save-image] 保存成功: {filepath} ({len(data)//1024}KB)')
+        return jsonify({
+            "ok": True,
+            "path": filepath,
+            "size_kb": len(data) // 1024
+        }), 200
+
+    except requests.exceptions.Timeout:
+        logger.error('[save-image] 下载超时')
+        return jsonify({"error": "下载图片超时"}), 504
+    except Exception as e:
+        logger.error(f'[save-image] 保存异常: {e}', exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route('/api/log-action', methods=['POST'])
 def log_action():
@@ -2817,12 +3224,15 @@ def copy_images_to_sys_clipboard():
             return jsonify({'success': False, 'message': '文件不存在'})
 
         # 用 AppleScript 将多个文件写入系统剪贴板
-        # 转义路径中的特殊字符，防止命令注入
-        safe_paths = []
+        # 转义路径中的双引号和反斜杠，防止 AppleScript 注入
+        def _escape_applescript_path(p):
+            p = p.replace('\\', '\\\\').replace('"', '\\"')
+            return p
+        applescript_parts = []
         for p in abs_paths:
-            escaped = p.replace('\\', '\\\\').replace('"', '\\"')
-            safe_paths.append(f'POSIX file "{escaped}"')
-        applescript_files = ", ".join(safe_paths)
+            safe_p = _escape_applescript_path(p)
+            applescript_parts.append(f'POSIX file "{safe_p}"')
+        applescript_files = ", ".join(applescript_parts)
         script = f'set the clipboard to {{{applescript_files}}}'
         subprocess.run(['osascript', '-e', script], check=True)
         logger.info(f"已将{len(abs_paths)}张图片写入系统剪贴板")
@@ -3022,26 +3432,40 @@ def check_update():
 
 # 更新状态（内存中）
 _update_state = {"running": False, "progress": "", "error": None}
+_update_state_lock = threading.Lock()
 
 
 @app.route('/api/do-update', methods=['POST'])
 def do_update():
     """执行一键更新：下载最新 release zip → 解压覆盖 → 重启"""
     global _update_state
-    if _update_state["running"]:
-        return jsonify({"ok": False, "error": "更新正在进行中"})
+    with _update_state_lock:
+        if _update_state["running"]:
+            return jsonify({"ok": False, "error": "更新正在进行中"})
 
     body = request.get_json(silent=True) or {}
     download_url = body.get('download_url', '')
     if not download_url:
         return jsonify({"ok": False, "error": "缺少下载链接"})
 
+    # 安全：限制下载URL必须来自GitHub
+    ok, err, _ = _validate_url(download_url, ALLOWED_UPDATE_DOMAINS)
+    if not ok:
+        logger.warning(f'[更新] URL拦截: {err}')
+        return jsonify({"ok": False, "error": f"下载链接不安全: {err}"})
+
+    def _set_update_state(**kwargs):
+        global _update_state
+        with _update_state_lock:
+            _update_state.update(kwargs)
+
     def _run_update():
         global _update_state
-        _update_state = {"running": True, "progress": "正在下载...", "error": None}
+        with _update_state_lock:
+            _update_state = {"running": True, "progress": "正在下载...", "error": None}
         try:
             # 1. 下载 zip
-            _update_state["progress"] = "正在下载更新包..."
+            _set_update_state(progress="正在下载更新包...")
             logger.info(f"[更新] 开始下载: {download_url}")
             resp = requests.get(download_url, timeout=120, stream=True)
             resp.raise_for_status()
@@ -3057,7 +3481,7 @@ def do_update():
             if os.path.exists(extract_dir):
                 shutil.rmtree(extract_dir, ignore_errors=True)
             with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.extractall(extract_dir)
+                _safe_extract_zip(zf, extract_dir)
             logger.info(f"[更新] 解压完成: {extract_dir}")
 
             # 找到实际项目目录（zip 内可能有一层根目录）
@@ -3069,7 +3493,7 @@ def do_update():
 
             # 3. 覆盖本地文件（保留用户数据）
             _update_state["progress"] = "正在替换文件..."
-            preserve = {'venv', 'data', 'logs', 'backups', '__pycache__', '.DS_Store', '.claude', '.git'}
+            preserve = {'venv', 'data', 'logs', 'backups', '__pycache__', '.DS_Store', '.claude', '.git', 'static'}
             for item in os.listdir(src_dir):
                 if item in preserve:
                     continue
@@ -3114,6 +3538,58 @@ def update_status():
     return jsonify(_update_state)
 
 
+@app.route('/api/open-download-folder', methods=['POST'])
+def open_download_folder():
+    """打开API生图保存文件夹"""
+    body = request.get_json(silent=True) or {}
+    base_path = body.get('path', '~/Downloads/AI生图/')
+    base_path = os.path.expanduser(base_path)
+
+    # 路径安全校验：只允许打开用户目录下的路径
+    abs_base = os.path.abspath(base_path)
+    home_dir = os.path.expanduser('~')
+    if not abs_base.startswith(home_dir):
+        return jsonify({"error": "路径必须在用户主目录下"}), 400
+
+    # 创建日期子文件夹（与save-image-to-path一致）
+    date_folder = datetime.now().strftime('%Y-%m-%d')
+    target_dir = os.path.join(base_path, date_folder)
+
+    # 校验最终路径也在用户目录下
+    abs_target = os.path.abspath(target_dir)
+    if not abs_target.startswith(home_dir):
+        return jsonify({"error": "路径必须在用户主目录下"}), 400
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": f"无法创建目录: {e}"}), 400
+
+    try:
+        subprocess.run(['open', abs_target], check=True)
+        logger.info(f'[open-folder] 打开文件夹: {abs_target}')
+        return jsonify({"ok": True, "path": abs_target})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+def find_free_port(start_port=5800, max_tries=20):
+    """从 start_port 开始寻找可用端口，避免与 Clash 等代理软件冲突"""
+    for port in range(start_port, start_port + max_tries):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('0.0.0.0', port))
+                # 绑定成功说明端口可用
+                return port
+        except OSError:
+            logger.warning(f"端口 {port} 已被占用，尝试下一个端口...")
+            continue
+    logger.error(f"在 {start_port}-{start_port + max_tries - 1} 范围内未找到可用端口")
+    return None
+
+
 # ========== 启动 ==========
 
 if __name__ == '__main__':
@@ -3126,10 +3602,25 @@ if __name__ == '__main__':
             shutil.rmtree(_d, ignore_errors=True)
         except Exception:
             pass
+
+    # 自动检测可用端口（避免与 Clash/小龙虾等代理软件冲突）
+    port = find_free_port(5800)
+    if port is None:
+        print("\n❌ 错误：找不到可用端口（5800-5819 均被占用）")
+        print("   请检查是否有其他程序（如 Clash/小龙虾代理）占用了这些端口")
+        print("   或手动修改 app.py 中的端口号")
+        import sys
+        sys.exit(1)
+
     logger.info("=" * 50)
     logger.info("人像 Prompt 生成器 PRO 启动中...")
     logger.info(f"数据目录: {DATA_DIR}")
     logger.info(f"图片目录: {IMAGES_DIR}")
-    logger.info("访问地址: http://localhost:5800")
+    logger.info(f"访问地址: http://localhost:{port}")
     logger.info("=" * 50)
-    app.run(host='0.0.0.0', port=5800, debug=True)
+
+    if port != 5800:
+        print(f"\n⚠️  端口 5800 已被占用（可能是 Clash/小龙虾代理），已自动切换到端口 {port}")
+        print(f"   请访问: http://localhost:{port}\n")
+
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

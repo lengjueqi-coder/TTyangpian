@@ -29,13 +29,20 @@ echo ""
 python app.py &
 SERVER_PID=$!
 
-# 等待服务启动
-sleep 2
+# 等待服务启动并检测实际端口
+sleep 3
 
-# 打开浏览器
-open http://localhost:5800
+# 从日志或进程中获取实际端口
+ACTUAL_PORT=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | grep "$SERVER_PID" | grep -oE ':\K[0-9]+' | head -1)
 
-echo "已打开浏览器！"
+if [ -n "$ACTUAL_PORT" ]; then
+    open "http://localhost:$ACTUAL_PORT"
+    echo "已打开浏览器！访问地址: http://localhost:$ACTUAL_PORT"
+else
+    open http://localhost:5800
+    echo "已打开浏览器！如果无法访问，请查看终端中的实际端口号"
+fi
+
 echo "关闭此窗口将停止服务"
 echo ""
 

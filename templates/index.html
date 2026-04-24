@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>人像 Prompt 生成器 PRO</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=27">
+    <link rel="stylesheet" href="/static/css/style.css?v=30">
 </head>
 <body>
     <!-- 初始加载指示器 -->
@@ -215,7 +215,7 @@
                         <div class="prefix-batch-bar" id="prefix-batch-bar">
                             <!-- 动态渲染，由JS填充 -->
                         </div>
-                        <button class="btn btn-outline btn-compact" id="btn-add-prefix" title="添加自定义前缀" style="font-size:10px;padding:2px 6px;">+</button>
+                        <button class="btn btn-outline btn-compact" id="btn-add-prefix-old" title="添加自定义前缀" style="font-size:10px;padding:2px 6px;">+</button>
                         <div class="slot-zoom-row">
                             <span class="prop-zoom-label">大</span>
                             <input type="range" id="slot-zoom-slider" min="40" max="120" step="10" value="70">
@@ -241,20 +241,27 @@
                         <span class="prompt-collapse-arrow expanded">▶</span>
                         <label>中文 Prompt</label>
                         <button class="btn btn-outline btn-sm" id="btn-system-prompt-edit" title="编辑大模型改写标准" style="margin-left:6px;padding:1px 5px;font-size:9px;">改写标准</button>
+                        <button class="btn btn-outline btn-compact" id="btn-prompt-preset" title="提示词预设" style="font-size:9px;padding:1px 4px;margin-left:4px;">提示词预设</button>
+                        <div id="prompt-preset-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;margin-left:2px;"></div>
                     </div>
                     <div class="prompt-collapsible-body expanded">
                         <!-- 前缀/后缀模板 -->
-                        <div style="display:flex;gap:4px;margin-bottom:3px;align-items:center;flex-wrap:wrap;">
-                            <span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">前缀</span>
-                            <select id="prompt-prefix-select" style="font-size:10px;padding:1px 2px;border:1px solid var(--border);border-radius:3px;max-width:160px;min-width:60px;">
-                                <option value="">无</option>
-                            </select>
-                            <button class="btn btn-outline btn-compact" id="btn-prefix-manage" style="font-size:9px;padding:1px 4px;color:var(--text-muted);" title="管理前缀模板">⚙</button>
-                            <span style="font-size:9px;color:var(--text-muted);white-space:nowrap;margin-left:4px;">后缀</span>
-                            <select id="prompt-suffix-select" style="font-size:10px;padding:1px 2px;border:1px solid var(--border);border-radius:3px;max-width:160px;min-width:60px;">
-                                <option value="">无</option>
-                            </select>
-                            <button class="btn btn-outline btn-compact" id="btn-suffix-manage" style="font-size:9px;padding:1px 4px;color:var(--text-muted);" title="管理后缀模板">⚙</button>
+                        <div style="margin-bottom:3px;">
+                            <!-- 前缀行 -->
+                            <div style="display:flex;gap:2px;align-items:center;flex-wrap:wrap;margin-bottom:2px;">
+                                <span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">前缀</span>
+                                <div id="prefix-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;"></div>
+                                <button class="btn btn-outline btn-compact" id="btn-add-prefix" title="添加前缀" style="font-size:10px;padding:2px 6px;">+</button>
+                                <button class="btn btn-outline btn-compact" id="btn-prefix-manage" style="font-size:9px;padding:1px 4px;color:var(--text-muted);" title="管理前缀：勾选显示哪些">⚙</button>
+                            </div>
+                            <!-- 后缀行 -->
+                            <div style="display:flex;gap:2px;align-items:center;flex-wrap:wrap;">
+                                <span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">后缀</span>
+                                <div id="suffix-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;"></div>
+                                <button class="btn btn-outline btn-compact" id="btn-add-suffix" title="添加后缀" style="font-size:10px;padding:2px 6px;">+</button>
+                                <button class="btn btn-outline btn-compact" id="btn-suffix-manage" style="font-size:9px;padding:1px 4px;color:var(--text-muted);" title="管理后缀：勾选显示哪些">⚙</button>
+                            </div>
+
                         </div>
                         <!-- 前缀内容预览 -->
                         <div id="prefix-preview" style="display:none;font-size:10px;color:#2563eb;background:#eff6ff;padding:2px 6px;border-radius:3px;margin-bottom:2px;word-break:break-all;"></div>
@@ -315,33 +322,33 @@
                     <span style="font-size:10px;font-weight:500;color:var(--text-secondary);white-space:nowrap;">平台</span>
                     <select id="cfg-api-platform" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
                         <option value="runninghub">通道一 RH</option>
-                        <option value="oaihk">通道二 HK</option>
+                        <option value="oaihk" selected>通道二 HK</option>
                     </select>
                     <span style="font-size:10px;font-weight:500;color:var(--text-secondary);white-space:nowrap;">模型</span>
                     <select id="cfg-rh-model-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;max-width:220px;">
                         <optgroup label="V1 系列">
-                            <option value="rhart-image-v1/edit">V1-图生图-低价 ¥0.05</option>
-                            <option value="rhart-image-v1-official/edit">V1-图生图-官方 ¥0.2</option>
+                            <option value="rhart-image-v1/edit">V1-图生图-低价 0.05</option>
+                            <option value="rhart-image-v1-official/edit">V1-图生图-官方 0.2</option>
                         </optgroup>
                         <optgroup label="V2 系列">
-                            <option value="rhart-image-n-g31-flash/image-to-image">V2-图生图-低价 ¥0.16</option>
-                            <option value="rhart-image-n-g31-flash-official/image-to-image" selected>V2-图生图-官方 ¥0.74</option>
+                            <option value="rhart-image-n-g31-flash/image-to-image">V2-图生图-低价 0.16</option>
+                            <option value="rhart-image-n-g31-flash-official/image-to-image">V2-图生图-官方 0.74</option>
                         </optgroup>
                         <optgroup label="PRO 系列">
-                            <option value="rhart-image-n-pro/edit">PRO-图生图-低价 ¥0.4</option>
-                            <option value="rhart-image-n-pro-official/edit">PRO-图生图-官方 ¥1</option>
+                            <option value="rhart-image-n-pro/edit">PRO-图生图-低价 0.4</option>
+                            <option value="rhart-image-n-pro-official/edit">PRO-图生图-官方 1</option>
                         </optgroup>
                     </select>
-                    <span id="rh-price-tag" style="font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">¥0.74</span>
+                    <span id="rh-price-tag" style="font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">0.05</span>
                     <select id="cfg-oaihk-model-inline" style="display:none;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;max-width:220px;">
-                        <option value="fal-ai/banana/v2">proK ¥0.48</option>
-                        <option value="fal-ai/banana/v2/2k">pro2K ¥0.48</option>
-                        <option value="fal-ai/banana/v2/4k">pro4K ¥0.48</option>
-                        <option value="fal-ai/banana/v3.1/flash">nano2-3.1 1K ¥0.2</option>
-                        <option value="fal-ai/banana/v3.1/flash/2k">nano2-3.1 2K ¥0.3</option>
-                        <option value="fal-ai/banana/v3.1/flash/4k">nano2-3.1 4K ¥0.48</option>
+                        <option value="fal-ai/banana/v2">proK 0.48</option>
+                        <option value="fal-ai/banana/v2/2k">pro2K 0.48</option>
+                        <option value="fal-ai/banana/v2/4k">pro4K 0.48</option>
+                        <option value="fal-ai/banana/v3.1/flash">nano2-3.1 1K 0.2</option>
+                        <option value="fal-ai/banana/v3.1/flash/2k" selected>nano2-3.1 2K 0.3</option>
+                        <option value="fal-ai/banana/v3.1/flash/4k">nano2-3.1 4K 0.48</option>
                     </select>
-                    <span id="oaihk-price-tag" style="display:none;font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">¥0.05</span>
+                    <span id="oaihk-price-tag" style="display:none;font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">0.3</span>
                     <div id="oaihk-aspect-ratio-group" style="display:none;align-items:center;gap:3px;">
                         <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">比例</span>
                         <select id="cfg-oaihk-aspect-ratio-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
@@ -401,6 +408,7 @@
                             <button class="btn btn-outline btn-compact" id="btn-download-checked" style="font-size:10px;padding:2px 6px;">下载勾选</button>
                             <button class="btn btn-outline btn-compact" id="btn-download-all" style="font-size:10px;padding:2px 6px;">全部下载</button>
                             <button class="btn btn-outline btn-compact" id="btn-download-to-folder" style="font-size:10px;padding:2px 6px;">指定文件夹</button>
+                            <button class="btn btn-outline btn-compact" id="btn-open-download-folder" style="font-size:10px;padding:2px 6px;" title="打开API生图保存文件夹">打开文件夹</button>
                         </div>
                     </div>
                     <!-- 生成进度条 -->
@@ -420,17 +428,36 @@
 
     <!-- 前缀/后缀模板管理弹窗 -->
     <div class="modal-overlay" id="modal-prompt-template" style="display:none;">
-        <div class="modal" style="width:440px;">
+        <div class="modal" style="width:520px;">
             <div class="modal-header">
                 <h3 id="prompt-template-modal-title">管理前缀模板</h3>
                 <button class="modal-close" data-close="modal-prompt-template">&times;</button>
             </div>
             <div class="modal-body" style="padding:12px;">
                 <div id="prompt-template-list" style="margin-bottom:8px;"></div>
-                <div style="display:flex;gap:4px;align-items:center;">
+                <div style="display:flex;gap:4px;align-items:flex-start;">
                     <input type="text" id="prompt-template-new-name" placeholder="模板名称" style="flex:1;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;">
-                    <input type="text" id="prompt-template-new-text" placeholder="模板内容" style="flex:2;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;">
+                    <textarea id="prompt-template-new-text" placeholder="模板内容" rows="2" style="flex:2;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;resize:vertical;min-height:40px;"></textarea>
                     <button class="btn btn-primary btn-compact" id="btn-prompt-template-add" style="font-size:10px;padding:3px 8px;">添加</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 提示词预设弹窗 -->
+    <div class="modal-overlay" id="modal-prompt-preset" style="display:none;">
+        <div class="modal" style="width:520px;">
+            <div class="modal-header">
+                <h3>提示词预设</h3>
+                <button class="modal-close" data-close="modal-prompt-preset">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:12px;">
+                <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px;">勾选前10个将显示在标题栏按钮区，点击按钮可快速应用/取消预设</div>
+                <div id="prompt-preset-list" style="margin-bottom:8px;"></div>
+                <div style="display:flex;gap:4px;align-items:flex-start;border-top:1px solid var(--border-light);padding-top:8px;">
+                    <input type="text" id="prompt-preset-new-name" placeholder="预设名称" style="flex:1;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;">
+                    <textarea id="prompt-preset-new-text" placeholder="预设提示词内容" rows="3" style="flex:2;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;resize:vertical;min-height:60px;"></textarea>
+                    <button class="btn btn-primary btn-compact" id="btn-prompt-preset-add" style="font-size:10px;padding:3px 8px;">添加</button>
                 </div>
             </div>
         </div>
@@ -909,7 +936,7 @@
                 <div id="update-progress" style="display:none;">
                     <div style="font-size:13px;margin-bottom:8px;"><span class="loading" style="display:inline-block;"></span> <span id="update-progress-text">正在下载...</span></div>
                     <div style="height:6px;background:var(--border-light);border-radius:3px;overflow:hidden;">
-                        <div id="update-progress-bar" style="height:100%;width:60%;background:linear-gradient(90deg,#22c55e,#16a34a);border-radius:3px;animation:updatePulse 1.5s ease-in-out infinite;"></div>
+                        <div id="update-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#16a34a);border-radius:3px;transition:width 0.3s ease;"></div>
                     </div>
                 </div>
                 <div id="update-error" style="display:none;">
@@ -929,6 +956,6 @@
     <!-- 撤销指示器 -->
     <div id="undo-indicator" class="undo-indicator"></div>
 
-    <script src="/static/js/app.js?v=28"></script>
+    <script src="/static/js/app.js?v=45"></script>
 </body>
 </html>
