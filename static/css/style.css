@@ -1865,6 +1865,11 @@ body {
     cursor: pointer;
 }
 
+.api-result-card .api-result-actions .delete-single:hover {
+    background: #ef4444;
+    color: #fff;
+}
+
 /* ========== 垂直拖拽分隔条（素材库 vs 预设） ========== */
 .resize-handle-vertical {
     height: 6px;

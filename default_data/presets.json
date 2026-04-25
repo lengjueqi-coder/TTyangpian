@@ -1,0 +1,70 @@
+{
+  "presets": [
+    {
+      "id": "preset_5975fccf",
+      "name": "日本少女",
+      "cover_image": "",
+      "effect_image": "/static/images/img_12957f02.jpg",
+      "prompt_text": "女，23-28岁，中国，清冷，白开水妆，断眉，眉毛不对称，眉毛杂乱，雀斑，眼袋，皱纹，小虎牙，一双一单，清冷淡颜，正脸近景人像，避免过度完美对称，",
+      "tags": [],
+      "selected_prefixes": [
+        "prefix_001"
+      ],
+      "selected_items": [
+        "item_001",
+        "item_006",
+        "item_010",
+        "item_022",
+        "item_030",
+        "item_040",
+        "item_041",
+        "item_042",
+        "item_043",
+        "item_046",
+        "item_047",
+        "item_053",
+        "item_064",
+        "item_071"
+      ],
+      "selected_suffixes": [
+        "suffix_004"
+      ],
+      "created_at": "2026-04-13 04:39:14",
+      "updated_at": "2026-04-13 04:59:23"
+    },
+    {
+      "id": "preset_8c74ab60",
+      "name": "中式",
+      "cover_image": "",
+      "effect_image": "/static/images/img_9686f8ee.webp",
+      "prompt_text": "女，23-28岁，中国，清冷，白开水妆，断眉，眉毛不对称，眉毛杂乱，雀斑，眼袋，皱纹，小虎牙，一双一单，清冷淡颜，正脸近景人像，避免过度完美对称",
+      "tags": [
+        "新中式"
+      ],
+      "selected_prefixes": [
+        "prefix_001"
+      ],
+      "selected_items": [
+        "item_001",
+        "item_006",
+        "item_010",
+        "item_022",
+        "item_030",
+        "item_040",
+        "item_041",
+        "item_042",
+        "item_043",
+        "item_046",
+        "item_047",
+        "item_053",
+        "item_064",
+        "item_071"
+      ],
+      "selected_suffixes": [
+        "suffix_004"
+      ],
+      "created_at": "2026-04-13 05:40:41",
+      "updated_at": "2026-04-13 05:40:41"
+    }
+  ]
+}

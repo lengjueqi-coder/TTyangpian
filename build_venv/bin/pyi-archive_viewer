@@ -1,0 +1,6 @@
+#!/Users/Apple/Downloads/AI人脸提示词/build_venv/bin/python3
+import sys
+from PyInstaller.utils.cliutils.archive_viewer import run
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(run())

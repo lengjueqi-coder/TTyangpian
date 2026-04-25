@@ -1,0 +1,420 @@
+{
+  "categories": [
+    {
+      "id": "lib_8abe5909",
+      "name": "人物面部与五官",
+      "subcategories": [
+        {
+          "id": "sub_c87d62c6",
+          "name": "默认",
+          "items": [
+            {
+              "id": "libitem_ba11a98dbbea",
+              "name": "大气",
+              "image": "/static/images/img_9404b2647e80.jpg"
+            },
+            {
+              "id": "libitem_ef3043c724d8",
+              "name": "紫柔7",
+              "image": "/static/images/img_c658e8a4b0d4.jpg"
+            },
+            {
+              "id": "libitem_7812085a7bce",
+              "name": "紫柔发型",
+              "image": "/static/images/img_ee784af87f30.jpg"
+            }
+          ]
+        },
+        {
+          "id": "sub_a4495b84a152",
+          "name": "大气长相",
+          "items": [
+            {
+              "id": "libitem_c85c5127f2fb",
+              "name": "氧气少女",
+              "image": "/static/images/img_beb2d6bd.jpg"
+            }
+          ]
+        },
+        {
+          "id": "sub_93c4462c5aee",
+          "name": "少女",
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "lib_c6e71e1c",
+      "name": "发型",
+      "subcategories": [
+        {
+          "id": "sub_300a764d",
+          "name": "默认",
+          "items": [
+            {
+              "id": "libitem_0c5ab4b8",
+              "name": "齐刘海",
+              "image": "/static/images/img_074e13d9.jpg"
+            },
+            {
+              "id": "libitem_f9d3d70731a0",
+              "name": "发型1",
+              "image": "/static/images/img_25b8ecb474ba.jpg"
+            },
+            {
+              "id": "libitem_d6c148de0dac",
+              "name": "发型2",
+              "image": "/static/images/img_905bd8bb5388.jpg"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lib_805fba96",
+      "name": "肢体动作与画面构图",
+      "subcategories": [
+        {
+          "id": "sub_51a85a2a",
+          "name": "默认",
+          "items": [
+            {
+              "id": "libitem_2bfb77b8",
+              "name": "肖像",
+              "image": "/static/images/img_ef3141c5.jpg"
+            },
+            {
+              "id": "libitem_e2cb1b348124",
+              "name": "坐姿",
+              "image": "/static/images/img_2e505a85413b.jpg"
+            },
+            {
+              "id": "libitem_574fdec3c0e6",
+              "name": "坐姿",
+              "image": "/static/images/img_83a3bf49a9ad.jpg"
+            },
+            {
+              "id": "libitem_87bbe47b649a",
+              "name": "俏皮站姿",
+              "image": "/static/images/img_b7dcbf1aa059.jpg"
+            },
+            {
+              "id": "libitem_e41a2a80e060",
+              "name": "新中式魅力 - Martin",
+              "image": "/static/images/img_aa8eb8f0dd3c.jpg"
+            },
+            {
+              "id": "libitem_843d8f65a862",
+              "name": "哇塞！超温柔的杂志感肖像 - 小红书 (8)",
+              "image": "/static/images/img_fbf63f480e06.jpg"
+            },
+            {
+              "id": "libitem_7cb1f8197135",
+              "name": "“打翻了鎏金的颜料盘”｜辣妹写真 - 小红书 (5)",
+              "image": "/static/images/img_67a2fcf1709a.jpg"
+            }
+          ]
+        },
+        {
+          "id": "sub_ed7df440",
+          "name": "肖像",
+          "items": []
+        },
+        {
+          "id": "sub_8928d01a3af6",
+          "name": "站姿",
+          "items": []
+        },
+        {
+          "id": "sub_6c02ff06527b",
+          "name": "俏皮站姿",
+          "items": []
+        },
+        {
+          "id": "sub_c88f909ac819",
+          "name": "蹲姿",
+          "items": []
+        }
+      ]
+    },
+    {
+      "id": "lib_e7711b59",
+      "name": "背景",
+      "subcategories": [
+        {
+          "id": "sub_018e27fe",
+          "name": "默认",
+          "items": [
+            {
+              "id": "libitem_40088425",
+              "name": "黄色油画",
+              "image": "/static/images/img_0b52fa69.jpeg"
+            },
+            {
+              "id": "libitem_7a36adaefd91",
+              "name": "黄色肌理感",
+              "image": "/static/images/img_c356ee298351.jpg"
+            },
+            {
+              "id": "libitem_30efdd8cb4ae",
+              "name": "黄色水泥墙",
+              "image": "/static/images/img_9bc48f29b926.jpg"
+            },
+            {
+              "id": "libitem_e97336b0a135",
+              "name": "蓝色肌理背景",
+              "image": "/static/images/img_233de05442f5.jpg"
+            },
+            {
+              "id": "libitem_46aaa5f7bc89",
+              "name": "荷花中式",
+              "image": "/static/images/img_7f3a90f933b7.jpg"
+            },
+            {
+              "id": "libitem_5c441225b37f",
+              "name": "荷花中景",
+              "image": "/static/images/img_697fd16cb2f7.jpg"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lib_3f035d62",
+      "name": "服装",
+      "subcategories": [
+        {
+          "id": "sub_c68dd9c9",
+          "name": "默认",
+          "items": [
+            {
+              "id": "libitem_36d999d4",
+              "name": "鲜花草群",
+              "image": "/static/images/img_e8a4eb47.jpg"
+            },
+            {
+              "id": "libitem_c07586702eec",
+              "name": "绿色旗袍2",
+              "image": "/static/images/img_c93092c7317e.jpg"
+            },
+            {
+              "id": "libitem_eac8df06fa15",
+              "name": "绿色旗袍3",
+              "image": "/static/images/img_5d959086750a.jpg"
+            },
+            {
+              "id": "libitem_fe3134863bbb",
+              "name": "绿色旗袍5",
+              "image": "/static/images/img_d86fff53c59f.jpg"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lib_6f80b13b",
+      "name": "表情神态映射",
+      "subcategories": [
+        {
+          "id": "sub_26aa9c66",
+          "name": "默认",
+          "items": [
+            {
+              "id": "libitem_58341919",
+              "name": "露牙笑",
+              "image": "/static/images/img_54c47778.jpg"
+            }
+          ]
+        },
+        {
+          "id": "sub_197bed972396",
+          "name": "俏皮",
+          "items": [
+            {
+              "id": "libitem_f801bb1404fb",
+              "name": "俏皮",
+              "image": "/static/images/img_02b64eac83a3.jpg"
+            },
+            {
+              "id": "libitem_f7b855bfa3a1",
+              "name": "生成灵动表情图片 (1)",
+              "image": "/static/images/img_2480541231cc.jpg"
+            },
+            {
+              "id": "libitem_9d4206a47bff",
+              "name": "生成灵动表情图片",
+              "image": "/static/images/img_a4aa58c8cf15.jpg"
+            },
+            {
+              "id": "libitem_989870a7e80a",
+              "name": "邮箱网址查询 (35)",
+              "image": "/static/images/img_1b9f9c5cc5a1.jpg"
+            },
+            {
+              "id": "libitem_e677df174aa3",
+              "name": "邮箱网址查询 (36)",
+              "image": "/static/images/img_eb34aa37b8ec.jpg"
+            },
+            {
+              "id": "libitem_f326973018fd",
+              "name": "邮箱网址查询 (37)",
+              "image": "/static/images/img_8bae1272a9cf.jpg"
+            },
+            {
+              "id": "libitem_3371fbccf863",
+              "name": "邮箱网址查询 (38)",
+              "image": "/static/images/img_62af82327965.jpg"
+            },
+            {
+              "id": "libitem_1ca7c222ecad",
+              "name": "邮箱网址查询 (39)",
+              "image": "/static/images/img_09ed8f265027.jpg"
+            },
+            {
+              "id": "libitem_37c0751a0b33",
+              "name": "邮箱网址查询 (40)",
+              "image": "/static/images/img_2cb61de1e5db.jpg"
+            },
+            {
+              "id": "libitem_d74c5f4382c8",
+              "name": "邮箱网址查询 (41)",
+              "image": "/static/images/img_579f322f3f72.jpg"
+            },
+            {
+              "id": "libitem_a0fc870f3f44",
+              "name": "邮箱网址查询 (42)",
+              "image": "/static/images/img_1710883e58a8.jpg"
+            },
+            {
+              "id": "libitem_183a441636a9",
+              "name": "邮箱网址查询 (43)",
+              "image": "/static/images/img_b3c1279d7182.jpg"
+            },
+            {
+              "id": "libitem_42d7f41517e8",
+              "name": "邮箱网址查询 (44)",
+              "image": "/static/images/img_148c5516d240.jpg"
+            },
+            {
+              "id": "libitem_edb3d86df27e",
+              "name": "邮箱网址查询 (45)",
+              "image": "/static/images/img_af0f4e56eaf0.jpg"
+            },
+            {
+              "id": "libitem_d4bd32d07de9",
+              "name": "邮箱网址查询 (46)",
+              "image": "/static/images/img_600d300b0ab9.jpg"
+            },
+            {
+              "id": "libitem_805a8a279a14",
+              "name": "邮箱网址查询 (47)",
+              "image": "/static/images/img_22a1e6b6ca6c.jpg"
+            },
+            {
+              "id": "libitem_f42eb766f539",
+              "name": "邮箱网址查询 (48)",
+              "image": "/static/images/img_87e809f22ac0.jpg"
+            },
+            {
+              "id": "libitem_4f2e82b264d3",
+              "name": "邮箱网址查询 (49)",
+              "image": "/static/images/img_4ba7c1db8c00.jpg"
+            },
+            {
+              "id": "libitem_c798e6fa2598",
+              "name": "邮箱网址查询 (50)",
+              "image": "/static/images/img_37f2432d57b4.jpg"
+            },
+            {
+              "id": "libitem_b3dbea971e7f",
+              "name": "邮箱网址查询 (51)",
+              "image": "/static/images/img_94eaf0e1227a.jpg"
+            },
+            {
+              "id": "libitem_699a5088f865",
+              "name": "邮箱网址查询 (52)",
+              "image": "/static/images/img_44062c12146f.jpg"
+            },
+            {
+              "id": "libitem_7264cc3f73b5",
+              "name": "邮箱网址查询 (53)",
+              "image": "/static/images/img_d20ab335d8ae.jpg"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lib_cf9c05b9c58c",
+      "name": "摄影风格与场景氛围",
+      "subcategories": [
+        {
+          "id": "sub_1e98e480be63",
+          "name": "默认",
+          "items": [
+            {
+              "id": "libitem_ccf4693f1755",
+              "name": "中式",
+              "image": "/static/images/img_4401197a7fb8.jpg"
+            },
+            {
+              "id": "libitem_145759e47271",
+              "name": "粉色",
+              "image": "/static/images/img_a41282c2e34c.jpg"
+            },
+            {
+              "id": "libitem_8aaac78b03bc",
+              "name": "春日韩杂",
+              "image": "/static/images/img_0fe439977259.jpg"
+            },
+            {
+              "id": "libitem_dc6be3c43e4d",
+              "name": "chatgpt-image-latest-high-fidelity-20251216_a_让图一的人物做出跟图二的人物的动作和表情 (4)",
+              "image": "/static/images/img_50a902d502a5.jpg"
+            },
+            {
+              "id": "libitem_a7404b15bbc7",
+              "name": "中式",
+              "image": "/static/images/img_7765fe241125.jpg"
+            },
+            {
+              "id": "libitem_99dec711f657",
+              "name": "904d0b345c4461099676aadb5e2ecbc2",
+              "image": "/static/images/img_55c186b3977a.jpg"
+            },
+            {
+              "id": "libitem_cf8c3b9a91a4",
+              "name": "935d58ea677e38b998d66852580e01bc",
+              "image": "/static/images/img_19bf450a7fd1.jpg"
+            },
+            {
+              "id": "libitem_0abada8a5cd3",
+              "name": "ad9e27079c879423638407bcd0446e6c",
+              "image": "/static/images/img_cf2628e9a21b.jpg"
+            },
+            {
+              "id": "libitem_d800a5558484",
+              "name": "c5d2f13162b0597014b98b4ddac26453",
+              "image": "/static/images/img_a258887eacf3.jpg"
+            },
+            {
+              "id": "libitem_ee585944dd81",
+              "name": "cd36cf6bc777360039f16177d1c73d49",
+              "image": "/static/images/img_b54d578769d3.jpg"
+            },
+            {
+              "id": "libitem_28a5a60917e2",
+              "name": "e29a6a3c7469fefd67fc9d957db63a10",
+              "image": "/static/images/img_95aee0e9a44e.jpg"
+            },
+            {
+              "id": "libitem_0402face5f0d",
+              "name": "微信图片_2026-04-21_173553_306",
+              "image": "/static/images/img_7e25a8164096.jpg"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

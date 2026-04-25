@@ -3162,6 +3162,124 @@ def save_image_to_path():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/backup-result-image', methods=['POST'])
+def backup_result_image():
+    """将生成的结果图片备份到本地（转JPG），返回本地URL供前端持久化引用。
+    图片保存到用户配置的备份路径下的日期子文件夹，
+    同时在 static/images/backup/ 下创建副本供Web访问。"""
+    body = request.get_json(silent=True) or {}
+    image_url = body.get('url', '')
+    filename = body.get('filename', '')
+
+    if not image_url:
+        return jsonify({"error": "缺少图片URL"}), 400
+
+    # 读取用户配置的备份路径
+    config = load_json('model_config.json') or {}
+    base_path = config.get('rh_download_path', '').strip() or '~/Downloads/AI生图/'
+    base_path = os.path.expanduser(base_path)
+
+    # 路径安全校验
+    ok, err = _validate_base_path(base_path)
+    if not ok:
+        return jsonify({"error": f"备份路径不允许: {err}"}), 403
+
+    # 创建日期子文件夹
+    date_folder = datetime.now().strftime('%Y-%m-%d')
+    target_dir = os.path.join(base_path, date_folder)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": f"无法创建目录: {e}"}), 400
+
+    # 生成文件名
+    if not filename:
+        timestamp = datetime.now().strftime('%H%M%S')
+        filename = f"AI生图_{timestamp}.jpg"
+    name_part, ext_part = os.path.splitext(filename)
+    if ext_part.lower() not in ('.jpg', '.jpeg', '.png', '.webp'):
+        filename = name_part + '.jpg'
+    filename = re.sub(r'[^\w\-.]', '_', filename)
+    filepath = os.path.join(target_dir, filename)
+
+    # 避免文件名冲突
+    if os.path.exists(filepath):
+        name, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(os.path.join(target_dir, f"{name}_{counter}{ext}")):
+            counter += 1
+        filepath = os.path.join(target_dir, f"{name}_{counter}{ext}")
+
+    # 下载图片
+    try:
+        if image_url.startswith('/'):
+            local_path = _resolve_local_path(image_url)
+            base_dir = _resolve_base_for_path_check(image_url)
+            if not os.path.realpath(local_path).startswith(os.path.realpath(base_dir)):
+                return jsonify({"error": "路径不允许"}), 403
+            if not os.path.exists(local_path):
+                return jsonify({"error": "文件不存在"}), 404
+            with open(local_path, 'rb') as f:
+                data = f.read()
+        else:
+            ok, err, _ = _validate_url(image_url, ALLOWED_IMAGE_DOMAINS)
+            if not ok:
+                return jsonify({"error": f"URL不允许: {err}"}), 403
+            resp = requests.get(image_url, timeout=120, stream=True)
+            if resp.status_code != 200:
+                return jsonify({"error": f"下载失败: HTTP {resp.status_code}"}), 502
+            max_size = 30 * 1024 * 1024
+            buf = io.BytesIO()
+            for chunk in resp.iter_content(chunk_size=8192):
+                buf.write(chunk)
+                if buf.tell() > max_size:
+                    return jsonify({"error": "图片超过30MB限制"}), 413
+            data = buf.getvalue()
+
+        # 转JPG
+        jpg_data, jpg_ext = convert_to_jpg(data)
+        if jpg_data:
+            data = jpg_data
+            name_part2, ext_part2 = os.path.splitext(os.path.basename(filepath))
+            if ext_part2.lower() not in ('.jpg', '.jpeg'):
+                filepath = os.path.splitext(filepath)[0] + '.jpg'
+
+        with open(filepath, 'wb') as f:
+            f.write(data)
+
+        # 同时复制到 static/images/backup/ 供Web访问
+        backup_web_dir = os.path.join(IMAGES_DIR, 'backup')
+        os.makedirs(backup_web_dir, exist_ok=True)
+        web_filename = os.path.basename(filepath)
+        web_filepath = os.path.join(backup_web_dir, web_filename)
+        # 避免冲突
+        if os.path.exists(web_filepath) and os.path.getsize(web_filepath) != len(data):
+            name_w, ext_w = os.path.splitext(web_filename)
+            counter = 1
+            while os.path.exists(os.path.join(backup_web_dir, f"{name_w}_{counter}{ext_w}")):
+                counter += 1
+            web_filename = f"{name_w}_{counter}{ext_w}"
+            web_filepath = os.path.join(backup_web_dir, web_filename)
+        if not os.path.exists(web_filepath):
+            with open(web_filepath, 'wb') as f:
+                f.write(data)
+
+        local_url = f'/static/images/backup/{web_filename}'
+        logger.info(f'[backup] 图片备份成功: {filepath} -> {local_url} ({len(data)//1024}KB)')
+        return jsonify({
+            "ok": True,
+            "path": filepath,
+            "local_url": local_url,
+            "size_kb": len(data) // 1024
+        }), 200
+
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "下载超时"}), 504
+    except Exception as e:
+        logger.error(f'[backup] 备份异常: {e}', exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/log-action', methods=['POST'])
 def log_action():
     """接收前端上报的用户操作日志"""

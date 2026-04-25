@@ -1,0 +1,962 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>人像 Prompt 生成器 PRO</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=30">
+</head>
+<body>
+    <!-- 初始加载指示器 -->
+    <div id="app-loading" style="position:fixed;top:0;left:0;width:100%;height:100%;background:#fff;z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+        <div class="loading-spinner" style="width:40px;height:40px;border:3px solid #e5e7eb;border-top-color:#1A1A1A;border-radius:50%;animation:spin 0.8s linear infinite;"></div>
+        <p style="margin-top:16px;color:#666;font-size:14px;">加载中...</p>
+    </div>
+
+    <!-- 顶部栏 -->
+    <header class="header-bar">
+        <div class="header-left">
+            <h1 class="header-title">人像 Prompt 生成器 PRO</h1>
+            <div id="mode-switch">
+                <button class="mode-btn active" data-mode="prompt">文生图</button>
+                <button class="mode-btn" data-mode="image">图生图</button>
+            </div>
+        </div>
+        <div class="header-right">
+            <button class="btn btn-outline" id="btn-export" title="导出数据">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                导出
+            </button>
+            <button class="btn btn-outline" id="btn-import" title="导入数据">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                导入
+            </button>
+            <button class="btn btn-outline" id="btn-cleanup-images" title="清理未被引用的孤立图片">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                清理图片
+            </button>
+            <span id="usage-badge" class="usage-badge" title="今日生成统计" style="display:none;">今日: <span id="usage-badge-count">0</span>张</span>
+            <button class="btn btn-outline" id="btn-model-config" title="模型配置">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                模型配置
+            </button>
+            <button class="btn btn-outline" id="btn-check-update" title="检查更新" style="position:relative;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+                更新
+                <span id="update-dot" style="display:none;position:absolute;top:2px;right:2px;width:8px;height:8px;background:#ef4444;border-radius:50%;"></span>
+            </button>
+        </div>
+    </header>
+
+    <!-- 主体内容：三栏布局 -->
+    <main class="main-content">
+        <!-- 左侧：词库配置 -->
+        <section class="config-panel" id="config-panel">
+            <div class="config-header" style="display:flex;align-items:center;justify-content:space-between;">
+                <h2>词库配置</h2>
+                <button class="btn btn-add-category" id="btn-add-category" style="font-size:11px;padding:2px 8px;">+ 添加大类</button>
+            </div>
+            <div class="config-body" id="config-body">
+                <!-- 动态渲染分类列表 -->
+            </div>
+        </section>
+
+        <!-- 拖拽分隔条1 -->
+        <div class="resize-handle" id="resize-handle"></div>
+
+        <!-- 中间：生成预览 + 预设 -->
+        <section class="result-panel">
+            <!-- 生成预览 -->
+            <div class="generate-section">
+                <h2>生成预览</h2>
+                <div class="generate-preview">
+                    <textarea id="prompt-preview" rows="4" placeholder="选择左侧词库后，拼接预览将实时显示在这里，可直接编辑..."></textarea>
+                </div>
+                <div class="prompt-result" id="prompt-result" style="display:none;">
+                    <div class="prompt-result-label">生成结果</div>
+                    <textarea id="prompt-text" rows="3" placeholder="生成的 Prompt 将显示在这里..."></textarea>
+                    <div class="prompt-source" id="prompt-source"></div>
+                </div>
+                <div class="generate-actions">
+                    <button class="btn btn-primary" id="btn-generate">立即生成</button>
+                    <button class="btn btn-outline" id="btn-regenerate" disabled>重新生成</button>
+                    <button class="btn btn-outline" id="btn-copy" disabled>复制结果</button>
+                    <button class="btn btn-outline" id="btn-reset">重置</button>
+                </div>
+            </div>
+
+            <!-- 我的预设 -->
+            <div class="preset-section" id="preset-section">
+                <div class="preset-section-header">
+                    <span class="preset-collapse-arrow" id="preset-collapse-arrow" title="折叠/展开">▼</span>
+                    <h2>我的预设</h2>
+                    <div class="preset-filter-tags" id="preset-filter-tags">
+                        <!-- 动态渲染筛选标签 -->
+                    </div>
+                </div>
+                <div class="preset-toolbar" id="preset-toolbar">
+                    <div class="preset-search-row">
+                        <input type="text" id="preset-search-input" placeholder="搜索名称或提示词...">
+                        <select id="preset-sort-select" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                            <option value="default">默认排序</option>
+                            <option value="name">按名称</option>
+                            <option value="created_at">按创建时间</option>
+                            <option value="updated_at">按更新时间</option>
+                        </select>
+                        <button class="btn btn-outline btn-sm" id="btn-add-preset-direct">+ 添加预设</button>
+                    </div>
+                    <div class="preset-zoom-row">
+                        <span class="preset-zoom-label">大</span>
+                        <input type="range" id="preset-zoom-slider" min="2" max="8" step="1" value="4">
+                        <span class="preset-zoom-label">小</span>
+                    </div>
+                </div>
+                <div class="preset-scroll-wrapper" id="preset-scroll-wrapper">
+                    <div class="preset-grid" id="preset-grid">
+                        <p class="empty-hint">你还没有保存任何预设<br>保存喜欢的配置，下次可快速复用</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 拖拽分隔条2 -->
+        <div class="resize-handle" id="resize-handle-2"></div>
+
+        <!-- 右侧：道具参考图库 -->
+        <section class="prop-panel" id="prop-panel">
+            <div class="prop-panel-header">
+                <h2>道具参考</h2>
+                <button class="btn btn-outline btn-sm" id="btn-add-prop">+ 添加道具类</button>
+            </div>
+            <div class="prop-search-box">
+                <input type="text" id="prop-search-input" placeholder="搜索道具...">
+            </div>
+            <div class="prop-panel-body" id="prop-panel-body">
+                <!-- 动态渲染道具列表 -->
+            </div>
+        </section>
+    </main>
+
+    <!-- 图生图模式 -->
+    <div id="image-mode" class="main-content" style="display:none">
+        <!-- 左侧：素材库 / 图生图预设 Tab切换 -->
+        <section id="image-library-panel" class="config-panel" style="width:200px;min-width:80px;flex-direction:column;">
+            <!-- Tab 切换栏 -->
+            <div class="lib-tab-bar">
+                <button class="lib-tab-btn active" id="tab-lib" data-tab="library">素材库</button>
+                <button class="lib-tab-btn" id="tab-preset" data-tab="preset">图生图预设</button>
+            </div>
+
+            <!-- 素材库面板 -->
+            <div id="image-library-top" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;min-height:100px;">
+                <div class="config-header" style="display:flex;justify-content:space-between;align-items:center;">
+                    <button class="btn btn-outline btn-sm" id="btn-add-img-lib-category">+ 添加</button>
+                </div>
+                <div class="prop-search-box">
+                    <input type="text" id="img-lib-search" placeholder="搜索素材...">
+                </div>
+                <!-- 素材缩放滑杆 -->
+                <div class="prop-zoom-row" style="padding:2px 12px 4px;">
+                    <span class="prop-zoom-label">大</span>
+                    <input type="range" id="lib-zoom-slider" min="1" max="5" step="1" value="2">
+                    <span class="prop-zoom-label">小</span>
+                </div>
+                <div class="config-body" id="image-library-body" style="flex:1;overflow-y:auto;">
+                    <!-- 动态渲染素材分类 -->
+                </div>
+            </div>
+
+            <!-- 图生图预设面板（默认隐藏） -->
+            <div id="image-preset-bottom" style="display:none;flex:1;overflow-y:auto;flex-direction:column;min-height:100px;">
+                <div class="preset-search-row" style="padding:4px 12px;">
+                    <input type="text" id="img-preset-search-input" placeholder="搜索名称或提示词...">
+                    <select id="img-preset-sort-select" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                        <option value="default">默认排序</option>
+                        <option value="name">按名称</option>
+                        <option value="created_at">按创建时间</option>
+                        <option value="updated_at">按更新时间</option>
+                    </select>
+                    <button class="btn btn-outline btn-sm" id="btn-add-img-preset-direct">+ 添加预设</button>
+                </div>
+                <!-- 预设分类标签筛选 -->
+                <div id="img-preset-filter-tags" style="padding:2px 12px 4px;display:flex;gap:3px;flex-wrap:wrap;"></div>
+                <!-- 预设缩放滑杆 -->
+                <div class="prop-zoom-row" style="padding:2px 12px 4px;">
+                    <span class="prop-zoom-label">大</span>
+                    <input type="range" id="img-preset-zoom-slider" min="2" max="6" step="1" value="3">
+                    <span class="prop-zoom-label">小</span>
+                </div>
+                <div id="image-presets-body" style="flex:1;overflow-y:auto;padding:4px 12px;">
+                    <p class="empty-hint">你还没有保存任何预设</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- 拖拽分隔条 -->
+        <div class="resize-handle" id="resize-handle-img"></div>
+
+        <!-- 中间：核心工作区（占 2/3+） -->
+        <section id="image-workspace" class="result-panel" style="flex:1;min-width:60%;">
+            <!-- 图片槽区域：队列模式切换 + 批量前缀按钮 + 10个并排 + 缩放滑杆 -->
+            <div class="img-workspace-section">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <h2 style="margin:0;">图片槽</h2>
+                        <!-- 队列模式切换 -->
+                        <div class="queue-mode-switch" style="display:flex;gap:2px;margin-left:8px;">
+                            <button class="queue-mode-btn active" data-queue-mode="same" title="同一组图片/提示词，生成N张（抽卡）" style="padding:2px 6px;font-size:10px;border-radius:3px 0 0 3px;">同图抽卡</button>
+                            <button class="queue-mode-btn" data-queue-mode="multi" title="每轮用不同图片/提示词，批量出图" style="padding:2px 6px;font-size:10px;border-radius:0 3px 3px 0;">多图队列</button>
+                        </div>
+                        <!-- 清除按钮 -->
+                        <button class="btn btn-outline btn-compact" id="btn-clear-current-group" style="font-size:10px;padding:2px 6px;color:var(--danger);border-color:var(--danger);" title="清除当前组的图片素材（不删除本地文件）">清除本组</button>
+                        <button class="btn btn-outline btn-compact" id="btn-clear-all-groups" style="display:none;font-size:10px;padding:2px 6px;color:var(--danger);border-color:var(--danger);" title="清除所有组的图片素材（不删除本地文件）">清除所有组</button>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <div class="prefix-batch-bar" id="prefix-batch-bar">
+                            <!-- 动态渲染，由JS填充 -->
+                        </div>
+                        <button class="btn btn-outline btn-compact" id="btn-add-prefix-old" title="添加自定义前缀" style="font-size:10px;padding:2px 6px;">+</button>
+                        <div class="slot-zoom-row">
+                            <span class="prop-zoom-label">大</span>
+                            <input type="range" id="slot-zoom-slider" min="40" max="120" step="10" value="70">
+                            <span class="prop-zoom-label">小</span>
+                        </div>
+                        <button class="btn btn-outline btn-compact" id="btn-img-save-preset" style="font-size:10px;padding:2px 6px;">保存预设</button>
+                    </div>
+                </div>
+                <!-- 队列编号按钮行（多图队列模式时显示） -->
+                <div id="queue-number-bar" style="display:none;margin-bottom:4px;gap:3px;flex-wrap:wrap;"></div>
+                <div id="image-slots" class="image-slots-row">
+                    <!-- 动态渲染10个图片槽 -->
+                </div>
+            </div>
+
+            <!-- Prompt 区域（可折叠） -->
+            <div class="img-workspace-section" style="padding:10px 14px;">
+                <!-- 队列编号按钮行（多图队列模式时显示，在Prompt上方） -->
+                <div id="queue-prompt-bar" style="display:none;margin-bottom:4px;gap:3px;flex-wrap:wrap;"></div>
+                <!-- 中文 Prompt（默认展开） -->
+                <div class="prompt-collapsible" id="prompt-cn-block">
+                    <div class="prompt-collapsible-header" data-target="prompt-cn-block">
+                        <span class="prompt-collapse-arrow expanded">▶</span>
+                        <label>中文 Prompt</label>
+                        <button class="btn btn-outline btn-sm" id="btn-system-prompt-edit" title="编辑大模型改写标准" style="margin-left:6px;padding:1px 5px;font-size:9px;">改写标准</button>
+                        <button class="btn btn-outline btn-compact" id="btn-prompt-preset" title="提示词预设" style="font-size:9px;padding:1px 4px;margin-left:4px;">提示词预设</button>
+                        <div id="prompt-preset-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;margin-left:2px;"></div>
+                    </div>
+                    <div class="prompt-collapsible-body expanded">
+                        <!-- 前缀/后缀模板 -->
+                        <div style="margin-bottom:3px;">
+                            <!-- 前缀行 -->
+                            <div style="display:flex;gap:2px;align-items:center;flex-wrap:wrap;margin-bottom:2px;">
+                                <span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">前缀</span>
+                                <div id="prefix-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;"></div>
+                                <button class="btn btn-outline btn-compact" id="btn-add-prefix" title="添加前缀" style="font-size:10px;padding:2px 6px;">+</button>
+                                <button class="btn btn-outline btn-compact" id="btn-prefix-manage" style="font-size:9px;padding:1px 4px;color:var(--text-muted);" title="管理前缀：勾选显示哪些">⚙</button>
+                            </div>
+                            <!-- 后缀行 -->
+                            <div style="display:flex;gap:2px;align-items:center;flex-wrap:wrap;">
+                                <span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">后缀</span>
+                                <div id="suffix-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;"></div>
+                                <button class="btn btn-outline btn-compact" id="btn-add-suffix" title="添加后缀" style="font-size:10px;padding:2px 6px;">+</button>
+                                <button class="btn btn-outline btn-compact" id="btn-suffix-manage" style="font-size:9px;padding:1px 4px;color:var(--text-muted);" title="管理后缀：勾选显示哪些">⚙</button>
+                            </div>
+
+                        </div>
+                        <!-- 前缀内容预览 -->
+                        <div id="prefix-preview" style="display:none;font-size:10px;color:#2563eb;background:#eff6ff;padding:2px 6px;border-radius:3px;margin-bottom:2px;word-break:break-all;"></div>
+                        <textarea id="img-prompt-cn" rows="3" placeholder="输入中文描述，或点击「生成提示词」自动生成..."></textarea>
+                        <!-- 后缀内容预览 -->
+                        <div id="suffix-preview" style="display:none;font-size:10px;color:#8b5cf6;background:#f5f3ff;padding:2px 6px;border-radius:3px;margin-top:2px;word-break:break-all;"></div>
+                    </div>
+                </div>
+                <!-- 英文 Prompt（默认折叠） -->
+                <div class="prompt-collapsible" id="prompt-en-block">
+                    <div class="prompt-collapsible-header" data-target="prompt-en-block">
+                        <span class="prompt-collapse-arrow">▶</span>
+                        <label>英文 Prompt</label>
+                    </div>
+                    <div class="prompt-collapsible-body">
+                        <textarea id="img-prompt-en" rows="3" placeholder="英文 Prompt 将自动生成..."></textarea>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 操作按钮（一横排：左生成组 + 右复制组） -->
+            <div class="image-actions-compact" style="padding:0 14px 1px;">
+                <div class="action-group-left">
+                    <button class="btn btn-primary btn-compact" id="btn-img-generate">生成提示词</button>
+                    <button class="btn btn-outline btn-compact" id="btn-img-refresh-en" disabled>刷新英文</button>
+                    <button class="btn btn-outline btn-compact" id="btn-api-prompt-lang" title="当前：使用英文提示词提交API（点击切换为中文）" style="color:#f59e0b;border-color:#f59e0b;font-size:10px;padding:2px 6px;">使用英文提示词</button>
+                    <button class="btn btn-primary btn-compact" id="btn-api-generate" style="background:#2563eb;">生成</button>
+                    <button class="btn btn-primary btn-compact" id="btn-api-batch-generate" style="background:#7c3aed;display:none;">批量生成</button>
+                    <button class="btn btn-outline btn-compact" id="btn-api-cancel" style="display:none;color:var(--danger);border-color:var(--danger);">取消</button>
+                </div>
+                <div class="action-group-right">
+                    <button class="btn btn-outline btn-compact" id="btn-copy-images" disabled>复制图片组</button>
+                    <button class="btn btn-outline btn-compact" id="btn-export-clipboard" title="将所有图片写入系统剪贴板，Cmd+V粘贴到任意应用" style="color:#2563eb;">写入剪贴板</button>
+                    <button class="btn btn-outline btn-compact" id="btn-reveal-folder" title="将所有图片聚合到一个文件夹并打开访达，方便全选拖拽" style="color:#2563eb;">聚合打开</button>
+                    <button class="btn btn-outline btn-compact" id="btn-img-copy-en" disabled>复制英文</button>
+                    <button class="btn btn-outline btn-compact" id="btn-img-copy-cn">复制中文</button>
+                </div>
+            </div>
+
+            <!-- 网址栏 + 模式切换（极紧凑一横排） -->
+            <div class="url-mode-bar" style="margin:0 14px 1px;padding:2px 6px;display:flex;align-items:center;gap:6px;flex-wrap:nowrap;">
+                <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">网址</span>
+                <input type="text" id="browser-url-input" class="browser-url-input" value="https://gemini.google.com" placeholder="输入网址" style="flex:1;min-width:80px;font-size:11px;padding:2px 6px;">
+                <button class="btn btn-outline btn-sm" id="btn-browser-new-window" title="在新窗口打开" style="padding:2px 8px;font-size:10px;">↗打开</button>
+                <span style="font-size:10px;color:var(--text-muted);margin-left:4px;white-space:nowrap;">模式</span>
+                <div class="gemini-mode-switch" style="display:flex;gap:2px;">
+                    <button class="gemini-mode-btn active" data-gemini-mode="manual" style="padding:2px 6px;font-size:10px;">半自动</button>
+                    <button class="gemini-mode-btn" data-gemini-mode="auto" style="padding:2px 6px;font-size:10px;">自动</button>
+                </div>
+                <div class="gemini-mode-hint hint-safe" id="gemini-mode-hint" style="font-size:9px;">风控=0</div>
+                <button class="btn btn-primary btn-compact" id="btn-auto-fill-gemini" disabled style="margin-left:auto;padding:2px 8px;font-size:10px;">自动填入</button>
+            </div>
+
+            <!-- API 生成区域（替代原浏览器区域） -->
+            <div id="api-generate-panel" style="flex:1;margin:0 14px 4px;overflow-y:auto;min-height:120px;">
+                <!-- 模型选择 + 参数（一横排） -->
+                <div class="api-params-bar" style="display:flex;align-items:center;gap:6px;padding:4px 8px;background:var(--card-bg);border:1px solid var(--border-light);border-radius:var(--radius-sm);margin-bottom:4px;flex-wrap:wrap;">
+                    <span style="font-size:10px;font-weight:500;color:var(--text-secondary);white-space:nowrap;">平台</span>
+                    <select id="cfg-api-platform" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                        <option value="runninghub">通道一 RH</option>
+                        <option value="oaihk" selected>通道二 HK</option>
+                    </select>
+                    <span style="font-size:10px;font-weight:500;color:var(--text-secondary);white-space:nowrap;">模型</span>
+                    <select id="cfg-rh-model-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;max-width:220px;">
+                        <optgroup label="V1 系列">
+                            <option value="rhart-image-v1/edit">V1-图生图-低价 0.05</option>
+                            <option value="rhart-image-v1-official/edit">V1-图生图-官方 0.2</option>
+                        </optgroup>
+                        <optgroup label="V2 系列">
+                            <option value="rhart-image-n-g31-flash/image-to-image">V2-图生图-低价 0.16</option>
+                            <option value="rhart-image-n-g31-flash-official/image-to-image">V2-图生图-官方 0.74</option>
+                        </optgroup>
+                        <optgroup label="PRO 系列">
+                            <option value="rhart-image-n-pro/edit">PRO-图生图-低价 0.4</option>
+                            <option value="rhart-image-n-pro-official/edit">PRO-图生图-官方 1</option>
+                        </optgroup>
+                    </select>
+                    <span id="rh-price-tag" style="font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">0.05</span>
+                    <select id="cfg-oaihk-model-inline" style="display:none;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;max-width:220px;">
+                        <option value="fal-ai/banana/v2">proK 0.48</option>
+                        <option value="fal-ai/banana/v2/2k">pro2K 0.48</option>
+                        <option value="fal-ai/banana/v2/4k">pro4K 0.48</option>
+                        <option value="fal-ai/banana/v3.1/flash">nano2-3.1 1K 0.2</option>
+                        <option value="fal-ai/banana/v3.1/flash/2k" selected>nano2-3.1 2K 0.3</option>
+                        <option value="fal-ai/banana/v3.1/flash/4k">nano2-3.1 4K 0.48</option>
+                    </select>
+                    <span id="oaihk-price-tag" style="display:none;font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">0.3</span>
+                    <div id="oaihk-aspect-ratio-group" style="display:none;align-items:center;gap:3px;">
+                        <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">比例</span>
+                        <select id="cfg-oaihk-aspect-ratio-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                            <option value="3:4">3:4</option>
+                            <option value="2:3">2:3</option>
+                            <option value="1:1">1:1</option>
+                            <option value="9:16">9:16</option>
+                            <option value="4:3">4:3</option>
+                            <option value="16:9">16:9</option>
+                        </select>
+                    </div>
+                    <div id="rh-resolution-group-inline" style="display:flex;align-items:center;gap:3px;">
+                        <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">分辨率</span>
+                        <select id="cfg-rh-resolution-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                            <option value="1k">1K</option>
+                            <option value="2k">2K</option>
+                            <option value="4k">4K</option>
+                        </select>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:3px;">
+                        <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">比例</span>
+                        <select id="cfg-rh-aspect-ratio-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                            <option value="3:4">3:4</option>
+                        </select>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:3px;">
+                        <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">种子</span>
+                        <select id="cfg-rh-seed-mode-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:50px;">
+                            <option value="random">随机</option>
+                            <option value="fixed">固定</option>
+                        </select>
+                        <input type="number" id="cfg-rh-seed-inline" placeholder="种子" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:60px;" disabled>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:3px;">
+                        <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">张数</span>
+                        <input type="number" id="cfg-rh-count-inline" value="1" min="1" max="20" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:40px;">
+                    </div>
+                    <div style="display:flex;align-items:center;gap:3px;">
+                        <label style="font-size:10px;color:var(--text-muted);white-space:nowrap;cursor:pointer;" title="生成的图自动备份到软件目录">
+                            <input type="checkbox" id="cfg-rh-auto-backup" checked style="vertical-align:middle;"> 自动备份
+                        </label>
+                    </div>
+                    <button class="btn btn-outline btn-sm" id="btn-rh-settings" title="API Key等高级设置" style="padding:2px 6px;font-size:10px;margin-left:auto;">⚙设置</button>
+                </div>
+
+                <!-- 生成结果区 -->
+                <div id="api-result-section" style="display:block;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;padding:0 2px;">
+                        <div style="display:flex;align-items:center;gap:4px;">
+                            <span style="font-size:10px;font-weight:500;color:var(--text-secondary);">生成结果</span>
+                            <button class="btn btn-outline btn-compact" id="btn-api-regenerate" style="display:none;color:#2563eb;border-color:#2563eb;font-size:10px;padding:2px 6px;" title="使用当前提示词再生成一次">再生成一次</button>
+                            <button class="btn btn-outline btn-compact" id="btn-save-preset" disabled style="font-size:10px;padding:2px 6px;">保存预设</button>
+                        </div>
+                        <div style="display:flex;gap:4px;align-items:center;">
+                            <span style="font-size:9px;color:var(--text-muted);">预览大小</span>
+                            <input type="range" id="preview-size-slider" min="80" max="400" value="140" style="width:70px;height:12px;cursor:pointer;accent-color:#2563eb;" title="拖动调整预览图大小">
+                            <button class="btn btn-outline btn-compact" id="btn-download-checked" style="font-size:10px;padding:2px 6px;">下载勾选</button>
+                            <button class="btn btn-outline btn-compact" id="btn-download-all" style="font-size:10px;padding:2px 6px;">全部下载</button>
+                            <button class="btn btn-outline btn-compact" id="btn-download-to-folder" style="font-size:10px;padding:2px 6px;">指定文件夹</button>
+                            <button class="btn btn-outline btn-compact" id="btn-open-download-folder" style="font-size:10px;padding:2px 6px;" title="打开API生图保存文件夹">打开文件夹</button>
+                            <button class="btn btn-outline btn-compact" id="btn-clear-results" style="font-size:10px;padding:2px 6px;color:var(--danger);border-color:var(--danger);" title="清除当前队列所有生成结果">清除结果</button>
+                        </div>
+                    </div>
+                    <!-- 生成进度条 -->
+                    <div id="api-progress-bar-wrap" style="display:none;height:6px;background:var(--border-light);border-radius:3px;margin-bottom:4px;overflow:hidden;">
+                        <div id="api-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#16a34a);border-radius:3px;transition:width 0.4s ease;"></div>
+                    </div>
+                    <div id="api-result-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:4px;">
+                        <div id="api-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;">
+                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.2" style="opacity:0.4;margin-bottom:8px;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                            <div>选择模型后点击「API生成」开始</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <!-- 前缀/后缀模板管理弹窗 -->
+    <div class="modal-overlay" id="modal-prompt-template" style="display:none;">
+        <div class="modal" style="width:520px;">
+            <div class="modal-header">
+                <h3 id="prompt-template-modal-title">管理前缀模板</h3>
+                <button class="modal-close" data-close="modal-prompt-template">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:12px;">
+                <div id="prompt-template-list" style="margin-bottom:8px;"></div>
+                <div style="display:flex;gap:4px;align-items:flex-start;">
+                    <input type="text" id="prompt-template-new-name" placeholder="模板名称" style="flex:1;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;">
+                    <textarea id="prompt-template-new-text" placeholder="模板内容" rows="2" style="flex:2;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;resize:vertical;min-height:40px;"></textarea>
+                    <button class="btn btn-primary btn-compact" id="btn-prompt-template-add" style="font-size:10px;padding:3px 8px;">添加</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 提示词预设弹窗 -->
+    <div class="modal-overlay" id="modal-prompt-preset" style="display:none;">
+        <div class="modal" style="width:520px;">
+            <div class="modal-header">
+                <h3>提示词预设</h3>
+                <button class="modal-close" data-close="modal-prompt-preset">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:12px;">
+                <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px;">勾选前10个将显示在标题栏按钮区，点击按钮可快速应用/取消预设</div>
+                <div id="prompt-preset-list" style="margin-bottom:8px;"></div>
+                <div style="display:flex;gap:4px;align-items:flex-start;border-top:1px solid var(--border-light);padding-top:8px;">
+                    <input type="text" id="prompt-preset-new-name" placeholder="预设名称" style="flex:1;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;">
+                    <textarea id="prompt-preset-new-text" placeholder="预设提示词内容" rows="3" style="flex:2;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;resize:vertical;min-height:60px;"></textarea>
+                    <button class="btn btn-primary btn-compact" id="btn-prompt-preset-add" style="font-size:10px;padding:3px 8px;">添加</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 保存图生图预设弹窗 -->
+    <div class="modal-overlay" id="modal-save-image-preset" style="display:none;">
+        <div class="modal" style="width:480px;">
+            <div class="modal-header">
+                <h3>保存为预设</h3>
+                <button class="modal-close" data-close="modal-save-image-preset">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>预设名称</label>
+                    <input type="text" id="img-preset-name" placeholder="输入预设名称">
+                </div>
+                <div class="form-group">
+                    <label>预设分类 <span style="font-weight:normal;color:var(--text-muted);">（可多选）</span></label>
+                    <div class="preset-tag-list" id="img-preset-tag-list">
+                        <!-- 动态渲染标签 -->
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>当前参数摘要</label>
+                    <div id="img-preset-slots-info" class="config-summary"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-save-image-preset">取消</button>
+                <button class="btn btn-primary" id="btn-confirm-save-image-preset">保存预设</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 系统提示词编辑弹窗 -->
+    <div class="modal-overlay" id="modal-system-prompt" style="display:none;">
+        <div class="modal" style="width:560px;">
+            <div class="modal-header">
+                <h3>大模型改写标准</h3>
+                <button class="modal-close" data-close="modal-system-prompt">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>文生图 Prompt 整理提示词</label>
+                    <textarea id="cfg-system-prompt-prompt" rows="5" style="font-size:11px;"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>双语生成提示词</label>
+                    <textarea id="cfg-system-prompt-bilingual" rows="5" style="font-size:11px;"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>英文翻译提示词</label>
+                    <textarea id="cfg-system-prompt-translate" rows="5" style="font-size:11px;"></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-system-prompt">取消</button>
+                <button class="btn btn-primary" id="btn-save-system-prompt">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 选择性导出弹窗 -->
+    <div class="modal-overlay" id="modal-export" style="display:none;">
+        <div class="modal" style="width:400px;">
+            <div class="modal-header">
+                <h3>选择性导出</h3>
+                <button class="modal-close" data-close="modal-export">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">勾选需要导出的数据类别：</p>
+                <div id="export-options" style="display:flex;flex-direction:column;gap:6px;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="export-check" data-key="image_library" checked> 素材库
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="export-check" data-key="image_presets" checked> 图生图预设
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="export-check" data-key="prefixes_suffixes" checked> 前缀/后缀模板
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="export-check" data-key="categories" checked> 文生图词库（大类/选项）
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="export-check" data-key="presets" checked> 文生图预设
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="export-check" data-key="model_config" checked> 模型配置（不含密钥）
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-export">取消</button>
+                <button class="btn btn-primary" id="btn-confirm-export">导出</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 选择性导入弹窗 -->
+    <div class="modal-overlay" id="modal-import" style="display:none;">
+        <div class="modal" style="width:400px;">
+            <div class="modal-header">
+                <h3>选择性导入</h3>
+                <button class="modal-close" data-close="modal-import">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">勾选需要导入的数据类别：</p>
+                <div id="import-options" style="display:flex;flex-direction:column;gap:6px;">
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="import-check" data-key="image_library" checked> 素材库
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="import-check" data-key="image_presets" checked> 图生图预设
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="import-check" data-key="prefixes_suffixes" checked> 前缀/后缀模板
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="import-check" data-key="categories" checked> 文生图词库
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="import-check" data-key="presets" checked> 文生图预设
+                    </label>
+                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                        <input type="checkbox" class="import-check" data-key="model_config" checked> 模型配置（不含密钥）
+                    </label>
+                </div>
+                <p style="font-size:10px;color:var(--text-muted);margin-top:8px;">同名数据将自动添加"新"后缀避免覆盖</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-import">取消</button>
+                <button class="btn btn-primary" id="btn-confirm-import">选择文件并导入</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 素材编辑弹窗（完整编辑：图片/子分类/名字） -->
+    <div class="modal-overlay" id="modal-edit-material" style="display:none;">
+        <div class="modal" style="width:480px;">
+            <div class="modal-header">
+                <h3>编辑素材</h3>
+                <button class="modal-close" data-close="modal-edit-material">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>素材名称</label>
+                    <input type="text" id="edit-material-name" placeholder="素材名称">
+                </div>
+                <div class="form-group">
+                    <label>所属子分类</label>
+                    <select id="edit-material-subcategory" style="width:100%;"></select>
+                </div>
+                <div class="form-group">
+                    <label>素材图片</label>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <div id="edit-material-preview" style="width:80px;height:80px;border:1px solid var(--border-light);border-radius:var(--radius-sm);overflow:hidden;display:flex;align-items:center;justify-content:center;background:var(--bg);">
+                            <span style="color:var(--text-muted);font-size:11px;">无图片</span>
+                        </div>
+                        <div style="display:flex;flex-direction:column;gap:4px;">
+                            <button class="btn btn-outline btn-sm" id="btn-edit-material-upload">更换图片</button>
+                            <button class="btn btn-outline btn-sm" id="btn-edit-material-delete-img" style="color:var(--danger);display:none;">删除图片</button>
+                        </div>
+                    </div>
+                    <input type="file" id="edit-material-file" accept=".jpg,.jpeg,.png,.webp" style="display:none;">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-edit-material">取消</button>
+                <button class="btn btn-primary" id="btn-confirm-edit-material">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 素材选择弹窗（先选分类，再选素材，或本地上传） -->
+    <div class="modal-overlay" id="modal-select-material" style="display:none;">
+        <div class="modal" style="width:600px;">
+            <div class="modal-header">
+                <h3>选择素材</h3>
+                <button class="modal-close" data-close="modal-select-material">&times;</button>
+            </div>
+            <div class="modal-body" id="select-material-body">
+                <!-- 第一步：选分类 -->
+                <div id="material-step1">
+                    <p style="font-size:12px;color:var(--text-secondary);margin-bottom:8px;">选择素材分类：</p>
+                    <div id="material-category-list" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+                    <div style="margin-top:12px;padding-top:8px;border-top:1px solid var(--border-light);">
+                        <button class="btn btn-outline" id="btn-material-local-upload">从本地上传图片</button>
+                    </div>
+                </div>
+                <!-- 第二步：选素材 -->
+                <div id="material-step2" style="display:none;">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+                        <button class="btn btn-outline btn-sm" id="btn-material-back">← 返回分类</button>
+                        <span id="material-step2-title" style="font-size:12px;font-weight:500;"></span>
+                    </div>
+                    <div id="material-items-grid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模型配置弹窗（精简版：只保留API Key和接口配置） -->
+    <div class="modal-overlay" id="modal-model-config" style="display:none;">
+        <div class="modal" style="width:460px;">
+            <div class="modal-header">
+                <h3>API 配置</h3>
+                <button class="modal-close" data-close="modal-model-config">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- 大模型改写 API -->
+                <div class="config-section-title">Prompt优化模型</div>
+                <div class="form-group">
+                    <label>模型提供方</label>
+                    <select id="cfg-provider">
+                        <option value="deepseek">DeepSeek</option>
+                        <option value="glm">GLM</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>API Key</label>
+                    <input type="password" id="cfg-api-key" placeholder="输入 API Key">
+                </div>
+                <div class="form-group">
+                    <label>接口地址</label>
+                    <input type="text" id="cfg-base-url" placeholder="留空使用默认地址">
+                </div>
+                <div class="form-group">
+                    <label>模型名称</label>
+                    <input type="text" id="cfg-model-name" placeholder="DeepSeek: deepseek-chat | GLM: glm-4-flash">
+                </div>
+                <div class="form-group">
+                    <label>超时时间 (ms)</label>
+                    <input type="number" id="cfg-timeout" value="30000">
+                </div>
+                <div class="form-group">
+                    <label>重试次数</label>
+                    <input type="number" id="cfg-retry" value="1" min="0" max="5">
+                </div>
+
+                <!-- RunningHub API -->
+                <div class="config-section-title" style="margin-top:16px;">RunningHub API 引擎</div>
+                <div class="form-group">
+                    <label>API Key</label>
+                    <input type="password" id="cfg-rh-api-key" placeholder="输入 RunningHub API Key">
+                </div>
+                <div class="form-group">
+                    <label>接口地址</label>
+                    <input type="text" id="cfg-rh-base-url" placeholder="留空使用默认 https://www.runninghub.cn/openapi/v2">
+                </div>
+
+                <!-- OpenAI-HK API -->
+                <div class="config-section-title" style="margin-top:16px;">OpenAI-HK API 通道</div>
+                <div class="form-group">
+                    <label>API Key</label>
+                    <input type="password" id="cfg-oaihk-api-key" placeholder="输入 OpenAI-HK API Key">
+                </div>
+                <div class="form-group">
+                    <label>接口地址</label>
+                    <input type="text" id="cfg-oaihk-base-url" placeholder="留空使用默认 https://api.openai-hk.com">
+                </div>
+
+                <!-- 上传素材压缩设置 -->
+                <div class="config-section-title" style="margin-top:16px;">素材上传压缩</div>
+                <div class="form-group">
+                    <label>压缩档位 <span style="font-size:9px;color:var(--text-muted);">（3:4比例，短边×长边）</span></label>
+                    <div id="cfg-upload-preset-group" style="display:flex;gap:6px;">
+                        <button type="button" class="upload-preset-btn" data-value="768" title="768×1024">1K</button>
+                        <button type="button" class="upload-preset-btn" data-value="1536" title="1536×2048">2K</button>
+                        <button type="button" class="upload-preset-btn" data-value="2304" title="2304×3072">3K</button>
+                        <button type="button" class="upload-preset-btn" data-value="3072" title="3072×4096">4K</button>
+                    </div>
+                    <input type="hidden" id="cfg-upload-short-edge" value="1536">
+                </div>
+
+                <!-- 隐藏字段（保留ID供JS引用，但不显示） -->
+                <input type="hidden" id="cfg-rh-model" value="">
+                <input type="hidden" id="cfg-rh-resolution" value="1k">
+                <input type="hidden" id="cfg-rh-aspect-ratio" value="3:4">
+                <input type="hidden" id="cfg-rh-seed-mode" value="random">
+                <input type="hidden" id="cfg-rh-seed" value="">
+                <input type="hidden" id="cfg-rh-download-path" value="">
+
+                <!-- 快捷键设置 (3.7) -->
+                <div class="config-section-title" style="margin-top:16px;">快捷键设置</div>
+                <div class="shortcut-settings" id="shortcut-settings-container">
+                    <!-- Dynamically rendered by JS -->
+                </div>
+                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">点击快捷键列可设置，右键可清除</div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" id="btn-test-connection">测试连接</button>
+                <button class="btn btn-outline" data-close="modal-model-config">取消</button>
+                <button class="btn btn-primary" id="btn-save-config">保存配置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 保存预设弹窗 -->
+    <div class="modal-overlay" id="modal-save-preset" style="display:none;">
+        <div class="modal" style="width:520px;">
+            <div class="modal-header">
+                <h3>保存为预设</h3>
+                <button class="modal-close" data-close="modal-save-preset">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>预设名称</label>
+                    <input type="text" id="preset-name" placeholder="输入预设名称">
+                </div>
+                <div class="form-group">
+                    <label>预设分类 <span style="font-weight:normal;color:var(--text-muted);">（可多选）</span></label>
+                    <div class="preset-tag-list" id="preset-tag-list">
+                        <!-- 动态渲染标签 -->
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>提示词 <span style="font-weight:normal;color:var(--text-muted);">（可手动编辑或粘贴）</span></label>
+                    <textarea id="preset-prompt-text" rows="3" placeholder="当前预览区内容已自动填入，也可手动粘贴提示词..."></textarea>
+                </div>
+                <div class="preset-upload-row">
+                    <div class="form-group" style="flex:1;">
+                        <label>预设封面</label>
+                        <div class="upload-area upload-area-sm" id="upload-area">
+                            <input type="file" id="preset-cover-input" accept=".jpg,.jpeg,.png,.webp" style="display:none;">
+                            <div class="upload-placeholder" id="upload-placeholder">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#999" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                <p style="font-size:11px;">上传封面</p>
+                            </div>
+                            <img id="upload-preview" src="" alt="" style="display:none; max-width:100%; border-radius:6px;">
+                        </div>
+                    </div>
+                    <div class="form-group" style="flex:1;">
+                        <label>效果图 <span style="font-weight:normal;color:var(--text-muted);">（可选）</span></label>
+                        <div class="upload-area upload-area-sm" id="upload-area-effect">
+                            <input type="file" id="preset-effect-input" accept=".jpg,.jpeg,.png,.webp" style="display:none;">
+                            <div class="upload-placeholder" id="upload-placeholder-effect">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#999" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                <p style="font-size:11px;">上传效果图</p>
+                            </div>
+                            <img id="upload-preview-effect" src="" alt="" style="display:none; max-width:100%; border-radius:6px;">
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-save-preset">取消</button>
+                <button class="btn btn-primary" id="btn-confirm-save-preset">保存预设</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 确认弹窗 -->
+    <div class="modal-overlay" id="modal-confirm-delete" style="display:none;">
+        <div class="modal modal-sm">
+            <div class="modal-header">
+                <h3 id="confirm-title">确认</h3>
+                <button class="modal-close" data-close="modal-confirm-delete">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="delete-message">确定要删除吗？</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-confirm-delete">取消</button>
+                <button class="btn btn-danger" id="btn-confirm-delete">确认</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 大图预览器弹窗 -->
+    <div class="modal-overlay" id="modal-image-viewer" style="display:none;">
+        <div class="modal modal-image" style="width:90vw;height:90vh;max-width:1200px;max-height:900px;position:relative;display:flex;flex-direction:column;">
+            <button class="modal-close" data-close="modal-image-viewer" style="position:absolute;top:8px;right:12px;z-index:10;font-size:20px;">&times;</button>
+            <!-- 顶部工具栏 -->
+            <div style="flex-shrink:0;padding:8px 12px;display:flex;align-items:center;gap:8px;z-index:10;">
+                <button class="btn btn-outline btn-sm" id="viewer-prev" style="padding:2px 8px;">←</button>
+                <span id="viewer-counter" style="font-size:11px;color:var(--text-secondary);">1/1</span>
+                <button class="btn btn-outline btn-sm" id="viewer-next" style="padding:2px 8px;">→</button>
+                <label style="font-size:11px;cursor:pointer;margin-left:12px;display:flex;align-items:center;gap:3px;">
+                    <input type="checkbox" id="viewer-check" style="vertical-align:middle;"> 勾选下载
+                </label>
+                <span id="viewer-filename" style="font-size:10px;color:var(--text-muted);margin-left:auto;"></span>
+                <span style="font-size:9px;color:var(--text-muted);">点击图片区域退出 | 滚轮缩放 | 拖动平移</span>
+            </div>
+            <!-- 画布区域 -->
+            <canvas id="viewer-canvas" style="flex:1;width:100%;cursor:grab;display:block;min-height:0;"></canvas>
+            <!-- 底部缩略图栏 -->
+            <div id="viewer-thumbnails" style="flex-shrink:0;display:flex;gap:4px;padding:4px 8px;overflow-x:auto;background:rgba(0,0,0,0.03);border-top:1px solid var(--border-light);max-height:80px;"></div>
+        </div>
+    </div>
+
+    <!-- 3:4 裁剪弹窗 -->
+    <div class="modal-overlay" id="modal-crop" style="display:none;">
+        <div class="modal" style="width:520px;">
+            <div class="modal-header">
+                <h3>裁剪图片（3:4比例）</h3>
+                <span id="crop-progress-indicator" style="display:none;font-size:12px;color:var(--accent);margin-left:8px;font-weight:500;"></span>
+                <button class="modal-close" data-close="modal-crop">&times;</button>
+            </div>
+            <div class="modal-body" style="text-align:center;">
+                <canvas id="crop-canvas" width="480" height="400" style="border:1px solid var(--border);cursor:move;max-width:100%;"></canvas>
+                <p style="font-size:11px;color:var(--text-muted);margin-top:6px;">拖动选框调整位置，拖角点或滚轮等比例缩放选框</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-crop">取消</button>
+                <button class="btn btn-primary" id="btn-crop-confirm">确认裁剪</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 裁剪后分配素材弹窗 -->
+    <div class="modal-overlay" id="modal-assign-material" style="display:none;">
+        <div class="modal modal-sm">
+            <div class="modal-header">
+                <h3>分配到素材库</h3>
+                <button class="modal-close" data-close="modal-assign-material">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div style="margin-bottom:12px;">
+                    <label style="display:block;font-size:13px;font-weight:500;margin-bottom:4px;">素材分类（可多选）</label>
+                    <div id="assign-material-categories" style="max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:13px;"></div>
+                </div>
+                <div style="margin-bottom:8px;">
+                    <label style="display:block;font-size:13px;font-weight:500;margin-bottom:4px;">素材名称</label>
+                    <input type="text" id="assign-material-name" style="width:100%;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:13px;" placeholder="输入素材名称">
+                </div>
+                <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">勾选的分类将自动作为图片槽标签显示</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-assign-material">跳过（仅加载到槽位）</button>
+                <button class="btn btn-primary" id="btn-assign-material-confirm">确认分配</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 自定义输入弹窗（替代原生 prompt()） -->
+    <div class="modal-overlay" id="modal-custom-prompt" style="display:none;">
+        <div class="modal modal-sm">
+            <div class="modal-header">
+                <h3 id="custom-prompt-title">输入</h3>
+                <button class="modal-close" data-close="modal-custom-prompt">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group" style="margin-bottom:0;">
+                    <input type="text" id="custom-prompt-input" placeholder="">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" id="custom-prompt-cancel">取消</button>
+                <button class="btn btn-primary" id="custom-prompt-confirm">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 更新弹窗 -->
+    <div class="modal-overlay" id="modal-update" style="display:none;">
+        <div class="modal modal-sm">
+            <div class="modal-header">
+                <h3>软件更新</h3>
+                <button class="modal-close" data-close="modal-update">&times;</button>
+            </div>
+            <div class="modal-body" style="text-align:center;padding:20px;">
+                <div id="update-checking" style="display:none;">
+                    <span class="loading" style="display:inline-block;"></span> 正在检查更新...
+                </div>
+                <div id="update-available" style="display:none;">
+                    <div style="font-size:14px;font-weight:600;margin-bottom:8px;">发现新版本 <span id="update-new-ver" style="color:#2563eb;"></span></div>
+                    <div style="font-size:11px;color:var(--text-muted);margin-bottom:12px;">当前版本: <span id="update-cur-ver"></span></div>
+                    <div id="update-notes" style="font-size:11px;color:var(--text-secondary);background:var(--bg-secondary);padding:8px 12px;border-radius:6px;text-align:left;max-height:120px;overflow-y:auto;margin-bottom:12px;white-space:pre-wrap;"></div>
+                </div>
+                <div id="update-latest" style="display:none;">
+                    <div style="font-size:20px;margin-bottom:8px;">✓</div>
+                    <div style="font-size:13px;">已是最新版本 <span id="update-latest-ver"></span></div>
+                </div>
+                <div id="update-progress" style="display:none;">
+                    <div style="font-size:13px;margin-bottom:8px;"><span class="loading" style="display:inline-block;"></span> <span id="update-progress-text">正在下载...</span></div>
+                    <div style="height:6px;background:var(--border-light);border-radius:3px;overflow:hidden;">
+                        <div id="update-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#22c55e,#16a34a);border-radius:3px;transition:width 0.3s ease;"></div>
+                    </div>
+                </div>
+                <div id="update-error" style="display:none;">
+                    <div style="font-size:13px;color:#ef4444;" id="update-error-msg"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" id="btn-update-close">关闭</button>
+                <button class="btn btn-primary" id="btn-update-do" style="display:none;">立即更新</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast 提示 -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <!-- 撤销指示器 -->
+    <div id="undo-indicator" class="undo-indicator"></div>
+
+    <script src="/static/js/app.js?v=45"></script>
+</body>
+</html>

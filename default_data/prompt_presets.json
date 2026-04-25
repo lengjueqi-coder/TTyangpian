@@ -1,0 +1,14 @@
+{
+  "presets": [
+    {
+      "id": "pp_1776614143868",
+      "name": "换图二动作图三脸",
+      "text": "“请严格执行三图要素重组，优先级如下：\n1. 物理空间与骨架（绝对参考图2）：1:1强制复刻图2的肢体摆姿、面部表情肌状态、构图景别与镜头角度，确保主体居中。\n2. 面部身份特征（绝对参考图3）：在完美贴合上述表情的前提下，将人物五官与长相替换为图3的身份特征。\n3. 视觉风格与外围要素（绝对参考图1）：画面中所有的服装穿搭、发型设计、场景背景、道具、光影质感及整体摄影风格，必须严格提取并100%保留图1的视觉元素，拒绝其他参考图的特征污染。”"
+    },
+    {
+      "id": "pp_1776863173777",
+      "name": "记住图2五官",
+      "text": "Subject Identity Chain (Identity Priority 100%)\n请深度解析并绝对保持 图2 的面部特征，将其视为唯一的“身份真值（Truth Identity）”。\n必须提取并 100% 精准复刻图1的以下特征（Micro-Feature Chaining）：\n骨相与眼型 (Bone Structure & Eyes):: [Almond eye geometry (杏仁眼几何形状)], [Pupil color & orientation (瞳孔颜色和朝向)], [Defined jawline curvature (清晰的下颌线弧度)].\n鼻型与唇形 (Nose & Lips):: [Precise nasal profile bridge depth (精准的鼻梁起伏深度)], [Specific cupid's bow shape of lips (嘴唇特定的唇峰形状)].\n微观纹理 (Micro-Textures):: 必须复刻自然的皮肤纹理（皮肤纹理（Real skin texture），拒绝任何 AI 平滑平滑），复刻特定的痣特定的痣（例如左眼下的痣）。"
+    }
+  ]
+}

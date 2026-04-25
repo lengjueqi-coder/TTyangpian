@@ -1,0 +1,808 @@
+{
+  "queues": [
+    {
+      "activePrefix": "参考",
+      "activePromptPresetId": "pp_1776863173777",
+      "apiPlatform": "oaihk",
+      "lastAutoPrompt": "请参考图1的发型，请参考图2的服装，请参考图3的人物面部与五官，请参考图4的背景",
+      "oaihkAspectRatio": "3:4",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [
+        0
+      ],
+      "prevPromptCn": "“请严格执行三图要素重组，优先级如下：\n1. 物理空间与骨架（绝对参考图2）：1:1强制复刻图2的肢体摆姿、面部表情肌状态、构图景别与镜头角度，确保主体居中。\n2. 面部身份特征（绝对参考图3）：在完美贴合上述表情的前提下，将人物五官与长相替换为图3的身份特征。\n3. 视觉风格与外围要素（绝对参考图1）：画面中所有的服装穿搭、发型设计、场景背景、道具、光影质感及整体摄影风格，必须严格提取并100%保留图1的视觉元素，拒绝其他参考图的特征污染。”",
+      "promptCn": "将图1中人物的发型与图3人物的五官特征融合，替换服装为图2中的服装，背景采用图示背景，并在人物身后添加一簇荷花与荷叶，荷花素材取自图4，注意适当留白，避免过多。人物脸颊两侧、鬓角、脸旁两缕碎发、龙须刘海及耳边垂发应随风轻微飘动在脸上，自然不刻意，无假发感。整体画面真实自然，皮肤细节真实，避免油腻AI感。人物双手举着一只大荷叶当雨伞，歪头看向镜头，上半身构图。确保生成的人物面部与五官细节（如唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛骨相、皮肤质感及五官比例）与图3高度一致。",
+      "promptEn": "Use the provided reference images. Image 1 for hairstyle, Image 2 for clothing, Image 3 for facial features and details, Image 4 for background and lotus elements. Replace the person in Image 1 with the facial features of Image 3, and replace the clothing with that of Image 2. Set the background as shown, adding a cluster of lotus flowers and leaves behind the person, sourced from Image 4, with appropriate negative space to avoid overcrowding. The hair strands at the temples, sideburns, two wisps beside the face, dragon whisker bangs, and ear-hanging hair should gently blow across the face with the wind, appearing natural and unforced, without a wig-like feel. The overall image should be realistic and natural, with detailed skin texture, avoiding an oily AI aesthetic. The person holds a large lotus leaf as an umbrella with both hands, tilts their head to look at the camera, in a half-body composition. Ensure the generated face and facial details (such as lip shape, eye shape, nose shape, eyebrow shape, pupils, eyelashes, brow bone structure, skin texture, and facial proportions) are highly consistent with Image 3.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "results": [
+        {
+          "checked": false,
+          "filename": "AI生图_HK_队列1_1.png",
+          "outputType": "png",
+          "url": "https://pro.filesystem.site/cdn/20260421/14de99c6-e1c8-4912-8a24-3a00c941622b.jpeg"
+        }
+      ],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "rhart-image-n-g31-flash-official/image-to-image",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [
+        "tpl_1776939718044",
+        "tpl_1776939964923"
+      ],
+      "slots": [
+        {
+          "image": "/static/images/img_905bd8bb5388.jpg",
+          "label": "发型",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_04856d82f686.jpg",
+          "label": "服装",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_c658e8a4b0d4.jpg",
+          "label": "人物面部与五官",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_697fd16cb2f7.jpg",
+          "label": "背景",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "参考",
+      "activePromptPresetId": null,
+      "apiPlatform": "oaihk",
+      "lastAutoPrompt": "请参考图1的人物面部与五官，请参考图2的服装，请参考图3的背景",
+      "oaihkAspectRatio": "3:4",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "请参考图1的摄影风格与场景氛围，请参考图2的肢体动作与画面构图，请参考图3的人物面部与五官",
+      "promptCn": "让图1的人物穿上图2的服装，站在图3的背景中，采用七分身构图。模特的肢体动作为一只手放在身前，另一只手放在身后，人脸轻轻歪头，微笑看向镜头。画面需真实自然，皮肤真实，避免油腻AI感。确保生成的人物面部五官特征（如脸型、唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛、骨相、皮肤和五官比例）与图1高度一致。",
+      "promptEn": "Use the provided reference images. Image 1 for the character's facial features and proportions, Image 2 for the clothing, Image 3 for the background. The character is in a seven-tenths body composition, with one hand in front and the other behind. The face gently tilts with a slight smile, looking at the camera. The image must be realistic and natural, with rich skin details and no oily AI feel. Ensure high consistency with Image 1 in facial features including face shape, lip shape, eye shape, nose shape, eyebrow shape, pupils, eyelashes, brow bone, skin texture, and facial proportions.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [
+        0,
+        1,
+        2
+      ],
+      "results": [
+        {
+          "url": "https://pro.filesystem.site/cdn/20260423/6229ff95-faf6-4b2e-8365-948a8052f5c9.jpeg",
+          "checked": false,
+          "filename": "AI生图_HK_队列2_1.jpg",
+          "outputType": "png"
+        }
+      ],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "rhart-image-n-g31-flash-official/image-to-image",
+      "rhResolution": "2k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [
+        "tpl_1776939964923",
+        "tpl_1776939718044"
+      ],
+      "slots": [
+        {
+          "image": "/static/images/img_e3e1dda98024.jpg",
+          "label": "人物面部与五官",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_d86fff53c59f.jpg",
+          "label": "服装",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_697fd16cb2f7.jpg",
+          "label": "背景",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "请参考",
+      "activePromptPresetId": null,
+      "apiPlatform": "oaihk",
+      "lastAutoPrompt": "请参考图1的人物面部与五官，请参考图2的服装，请参考图3的背景",
+      "oaihkAspectRatio": "3:4",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "",
+      "promptCn": " 提取图 1人物的人脸包含它的脸型五官特征，如唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛骨相皮肤让他穿上图2的衣服，站在图3的背景竹筏上一只手背在身后，一只手放在身前人物人头倒向一边，淡淡的微笑的看着镜头\n画面是全身构图 要确保生成出来的图片人物面部五官特征，如脸型、唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛骨相皮肤和五官比例高度和图 保持一致\n 脸颊两侧、鬓角、脸旁两缕头发、龙须刘海、耳边垂发、随风飘向一边，自然不刻意、不假发感。 画面真实自然，皮肤细节丰富，不油腻AI感",
+      "promptEn": "Use the provided reference images, Image 1 for facial features and facial structure, Image 2 for body posture and composition. In a studio setting with a wind machine, create a scene where the subject's hair is voluminous, messy, and flowing in the wind. Ensure consistency in pose, lighting, and composition.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [
+        0,
+        1,
+        2
+      ],
+      "results": [
+        {
+          "url": "https://pro.filesystem.site/cdn/20260423/ea30c29a-8b63-4bbd-a8ed-aaa51f9f99cc.jpeg",
+          "checked": false,
+          "filename": "AI生图_HK_队列3_1.jpg",
+          "outputType": "png"
+        }
+      ],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [
+        "tpl_1776765479910",
+        "tpl_1776939638119",
+        "tpl_1776939718044",
+        "tpl_1776940537227",
+        "tpl_1776939964923"
+      ],
+      "slots": [
+        {
+          "image": "/static/images/img_c658e8a4b0d4.jpg",
+          "label": "人物面部与五官",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_d86fff53c59f.jpg",
+          "label": "服装",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_7f3a90f933b7.jpg",
+          "label": "背景",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "请参考",
+      "activePromptPresetId": "pp_1776863173777",
+      "apiPlatform": "oaihk",
+      "lastAutoPrompt": "",
+      "oaihkAspectRatio": "3:4",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "Subject Identity Chain (Identity Priority 100%)\n请深度解析并绝对保持 图2 的面部特征，将其视为唯一的“身份真值（Truth Identity）”。\n必须提取并 100% 精准复刻图1的以下特征（Micro-Feature Chaining）：\n骨相与眼型 (Bone Structure & Eyes):: [Almond eye geometry (杏仁眼几何形状)], [Pupil color & orientation (瞳孔颜色和朝向)], [Defined jawline curvature (清晰的下颌线弧度)].\n鼻型与唇形 (Nose & Lips):: [Precise nasal profile bridge depth (精准的鼻梁起伏深度)], [Specific cupid's bow shape of lips (嘴唇特定的唇峰形状)].\n微观纹理 (Micro-Textures):: 必须复刻自然的皮肤纹理（皮肤纹理（Real skin texture），拒绝任何 AI 平滑平滑），复刻特定的痣特定的痣（例如左眼下的痣）。",
+      "promptCn": "Subject Identity Chain (Identity Priority 100%)\n请深度解析并绝对保持 图2 的面部特征，将其视为唯一的“身份真值（Truth Identity）”。\n必须提取并 100% 精准复刻图1的以下特征（Micro-Feature Chaining）：\n骨相与眼型 (Bone Structure & Eyes):: [Almond eye geometry (杏仁眼几何形状)], [Pupil color & orientation (瞳孔颜色和朝向)], [Defined jawline curvature (清晰的下颌线弧度)].\n鼻型与唇形 (Nose & Lips):: [Precise nasal profile bridge depth (精准的鼻梁起伏深度)], [Specific cupid's bow shape of lips (嘴唇特定的唇峰形状)].\n微观纹理 (Micro-Textures):: 必须复刻自然的皮肤纹理（皮肤纹理（Real skin texture），拒绝任何 AI 平滑平滑），复刻特定的痣特定的痣（例如左眼下的痣）。",
+      "promptEn": "",
+      "promptLang": "cn",
+      "promptedSlotIndices": [],
+      "results": [
+        {
+          "checked": false,
+          "filename": "AI生图_HK_队列4_1.png",
+          "outputType": "png",
+          "url": "https://pro.filesystem.site/cdn/20260421/5190cb82-9ecf-4483-937a-a39fa6bcd975.jpeg"
+        }
+      ],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [],
+      "slots": [
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "请参考",
+      "activePromptPresetId": null,
+      "apiPlatform": "runninghub",
+      "lastAutoPrompt": "",
+      "oaihkAspectRatio": "1:1",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "",
+      "promptCn": "",
+      "promptEn": "Use the provided reference images: Image 1 for facial features, Image 2 for hairstyle library, Image 3 for background library, Image 4 for clothing library, and Image 5 for expression. Ensure consistency in style, balanced composition, and natural lighting and shadow effects.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [],
+      "slots": [
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "请参考",
+      "activePromptPresetId": null,
+      "apiPlatform": "runninghub",
+      "lastAutoPrompt": "",
+      "oaihkAspectRatio": "1:1",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "",
+      "promptCn": "将图1中人物的发型与图3人物的五官特征融合，替换服装为图2中的服装，背景采用图示背景，并在人物身后添加一簇荷花与荷叶，荷花素材取自图4，注意适当留白，避免过多。人物脸颊两侧、鬓角、脸旁两缕碎发、龙须刘海及耳边垂发应随风轻微飘动在脸上，自然不刻意，无假发感。整体画面真实自然，皮肤细节真实，避免油腻AI感。人物双手举着一只大荷叶当雨伞，歪头看向镜头，上半身构图。确保生成的人物面部与五官细节（如唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛骨相、皮肤质感及五官比例）与图3高度一致。",
+      "promptEn": "Use the provided reference images. Image 1 for hairstyle, Image 2 for clothing, Image 3 for facial features and details, Image 4 for background and lotus elements. Replace the person in Image 1 with the facial features of Image 3, and replace the clothing with that of Image 2. Set the background as shown, adding a cluster of lotus flowers and leaves behind the person, sourced from Image 4, with appropriate negative space to avoid overcrowding. The hair strands at the temples, sideburns, two wisps beside the face, dragon whisker bangs, and ear-hanging hair should gently blow across the face with the wind, appearing natural and unforced, without a wig-like feel. The overall image should be realistic and natural, with detailed skin texture, avoiding an oily AI aesthetic. The person holds a large lotus leaf as an umbrella with both hands, tilts their head to look at the camera, in a half-body composition. Ensure the generated face and facial details (such as lip shape, eye shape, nose shape, eyebrow shape, pupils, eyelashes, brow bone structure, skin texture, and facial proportions) are highly consistent with Image 3.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [],
+      "slots": [
+        {
+          "image": "/static/images/img_905bd8bb5388.jpg",
+          "label": "发型",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_04856d82f686.jpg",
+          "label": "服装",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_c658e8a4b0d4.jpg",
+          "label": "人物面部与五官",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_697fd16cb2f7.jpg",
+          "label": "背景",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "请参考",
+      "activePromptPresetId": null,
+      "apiPlatform": "runninghub",
+      "lastAutoPrompt": "",
+      "oaihkAspectRatio": "1:1",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "",
+      "promptCn": "将图1中人物的发型与图3人物的五官特征融合，替换服装为图2中的服装，背景采用图示背景，并在人物身后添加一簇荷花与荷叶，荷花素材取自图4，注意适当留白，避免过多。人物脸颊两侧、鬓角、脸旁两缕碎发、龙须刘海及耳边垂发应随风轻微飘动在脸上，自然不刻意，无假发感。整体画面真实自然，皮肤细节真实，避免油腻AI感。人物双手举着一只大荷叶当雨伞，歪头看向镜头，上半身构图。确保生成的人物面部与五官细节（如唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛骨相、皮肤质感及五官比例）与图3高度一致。",
+      "promptEn": "Use the provided reference images. Image 1 for hairstyle, Image 2 for clothing, Image 3 for facial features and details, Image 4 for background and lotus elements. Replace the person in Image 1 with the facial features of Image 3, and replace the clothing with that of Image 2. Set the background as shown, adding a cluster of lotus flowers and leaves behind the person, sourced from Image 4, with appropriate negative space to avoid overcrowding. The hair strands at the temples, sideburns, two wisps beside the face, dragon whisker bangs, and ear-hanging hair should gently blow across the face with the wind, appearing natural and unforced, without a wig-like feel. The overall image should be realistic and natural, with detailed skin texture, avoiding an oily AI aesthetic. The person holds a large lotus leaf as an umbrella with both hands, tilts their head to look at the camera, in a half-body composition. Ensure the generated face and facial details (such as lip shape, eye shape, nose shape, eyebrow shape, pupils, eyelashes, brow bone structure, skin texture, and facial proportions) are highly consistent with Image 3.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [
+        "tpl_1776614758280"
+      ],
+      "slots": [
+        {
+          "image": "/static/images/img_905bd8bb5388.jpg",
+          "label": "发型",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_04856d82f686.jpg",
+          "label": "服装",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_c658e8a4b0d4.jpg",
+          "label": "人物面部与五官",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_697fd16cb2f7.jpg",
+          "label": "背景",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "请参考",
+      "activePromptPresetId": null,
+      "apiPlatform": "runninghub",
+      "lastAutoPrompt": "",
+      "oaihkAspectRatio": "1:1",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "",
+      "promptCn": "将图1中人物的发型与图3人物的五官特征融合，替换服装为图2中的服装，背景采用图示背景，并在人物身后添加一簇荷花与荷叶，荷花素材取自图4，注意适当留白，避免过多。人物脸颊两侧、鬓角、脸旁两缕碎发、龙须刘海及耳边垂发应随风轻微飘动在脸上，自然不刻意，无假发感。整体画面真实自然，皮肤细节真实，避免油腻AI感。人物双手举着一只大荷叶当雨伞，歪头看向镜头，上半身构图。确保生成的人物面部与五官细节（如唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛骨相、皮肤质感及五官比例）与图3高度一致。",
+      "promptEn": "Use the provided reference images. Image 1 for hairstyle, Image 2 for clothing, Image 3 for facial features and details, Image 4 for background and lotus elements. Replace the person in Image 1 with the facial features of Image 3, and replace the clothing with that of Image 2. Set the background as shown, adding a cluster of lotus flowers and leaves behind the person, sourced from Image 4, with appropriate negative space to avoid overcrowding. The hair strands at the temples, sideburns, two wisps beside the face, dragon whisker bangs, and ear-hanging hair should gently blow across the face with the wind, appearing natural and unforced, without a wig-like feel. The overall image should be realistic and natural, with detailed skin texture, avoiding an oily AI aesthetic. The person holds a large lotus leaf as an umbrella with both hands, tilts their head to look at the camera, in a half-body composition. Ensure the generated face and facial details (such as lip shape, eye shape, nose shape, eyebrow shape, pupils, eyelashes, brow bone structure, skin texture, and facial proportions) are highly consistent with Image 3.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [],
+      "slots": [
+        {
+          "image": "/static/images/img_905bd8bb5388.jpg",
+          "label": "发型",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_04856d82f686.jpg",
+          "label": "服装",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_c658e8a4b0d4.jpg",
+          "label": "人物面部与五官",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_697fd16cb2f7.jpg",
+          "label": "背景",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "请参考",
+      "activePromptPresetId": null,
+      "apiPlatform": "runninghub",
+      "lastAutoPrompt": "",
+      "oaihkAspectRatio": "1:1",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "",
+      "promptCn": "将图1中人物的发型与图3人物的五官特征融合，替换服装为图2中的服装，背景采用图示背景，并在人物身后添加一簇荷花与荷叶，荷花素材取自图4，注意适当留白，避免过多。人物脸颊两侧、鬓角、脸旁两缕碎发、龙须刘海及耳边垂发应随风轻微飘动在脸上，自然不刻意，无假发感。整体画面真实自然，皮肤细节真实，避免油腻AI感。人物双手举着一只大荷叶当雨伞，歪头看向镜头，上半身构图。确保生成的人物面部与五官细节（如唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛骨相、皮肤质感及五官比例）与图3高度一致。",
+      "promptEn": "Use the provided reference images. Image 1 for hairstyle, Image 2 for clothing, Image 3 for facial features and details, Image 4 for background and lotus elements. Replace the person in Image 1 with the facial features of Image 3, and replace the clothing with that of Image 2. Set the background as shown, adding a cluster of lotus flowers and leaves behind the person, sourced from Image 4, with appropriate negative space to avoid overcrowding. The hair strands at the temples, sideburns, two wisps beside the face, dragon whisker bangs, and ear-hanging hair should gently blow across the face with the wind, appearing natural and unforced, without a wig-like feel. The overall image should be realistic and natural, with detailed skin texture, avoiding an oily AI aesthetic. The person holds a large lotus leaf as an umbrella with both hands, tilts their head to look at the camera, in a half-body composition. Ensure the generated face and facial details (such as lip shape, eye shape, nose shape, eyebrow shape, pupils, eyelashes, brow bone structure, skin texture, and facial proportions) are highly consistent with Image 3.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [],
+      "slots": [
+        {
+          "image": "/static/images/img_905bd8bb5388.jpg",
+          "label": "发型",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_04856d82f686.jpg",
+          "label": "服装",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_c658e8a4b0d4.jpg",
+          "label": "人物面部与五官",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_697fd16cb2f7.jpg",
+          "label": "背景",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    },
+    {
+      "activePrefix": "请参考",
+      "activePromptPresetId": null,
+      "apiPlatform": "runninghub",
+      "lastAutoPrompt": "",
+      "oaihkAspectRatio": "1:1",
+      "oaihkModelId": "fal-ai/banana/v3.1/flash/2k",
+      "pinnedSlotIndices": [],
+      "prevPromptCn": "",
+      "promptCn": "将图1中人物的发型与图3人物的五官特征融合，替换服装为图2中的服装，背景采用图示背景，并在人物身后添加一簇荷花与荷叶，荷花素材取自图4，注意适当留白，避免过多。人物脸颊两侧、鬓角、脸旁两缕碎发、龙须刘海及耳边垂发应随风轻微飘动在脸上，自然不刻意，无假发感。整体画面真实自然，皮肤细节真实，避免油腻AI感。人物双手举着一只大荷叶当雨伞，歪头看向镜头，上半身构图。确保生成的人物面部与五官细节（如唇形、眼形、鼻形、眉形、瞳孔、睫毛、眉毛骨相、皮肤质感及五官比例）与图3高度一致。",
+      "promptEn": "Use the provided reference images. Image 1 for hairstyle, Image 2 for clothing, Image 3 for facial features and details, Image 4 for background and lotus elements. Replace the person in Image 1 with the facial features of Image 3, and replace the clothing with that of Image 2. Set the background as shown, adding a cluster of lotus flowers and leaves behind the person, sourced from Image 4, with appropriate negative space to avoid overcrowding. The hair strands at the temples, sideburns, two wisps beside the face, dragon whisker bangs, and ear-hanging hair should gently blow across the face with the wind, appearing natural and unforced, without a wig-like feel. The overall image should be realistic and natural, with detailed skin texture, avoiding an oily AI aesthetic. The person holds a large lotus leaf as an umbrella with both hands, tilts their head to look at the camera, in a half-body composition. Ensure the generated face and facial details (such as lip shape, eye shape, nose shape, eyebrow shape, pupils, eyelashes, brow bone structure, skin texture, and facial proportions) are highly consistent with Image 3.",
+      "promptLang": "cn",
+      "promptedSlotIndices": [],
+      "rhAspectRatio": "3:4",
+      "rhCount": 1,
+      "rhModelId": "",
+      "rhResolution": "1k",
+      "rhSeed": "",
+      "rhSeedMode": "random",
+      "selectedPrefixIds": [],
+      "selectedSuffixIds": [],
+      "slots": [
+        {
+          "image": "/static/images/img_905bd8bb5388.jpg",
+          "label": "发型",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_04856d82f686.jpg",
+          "label": "服装",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_c658e8a4b0d4.jpg",
+          "label": "人物面部与五官",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "/static/images/img_697fd16cb2f7.jpg",
+          "label": "背景",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        },
+        {
+          "image": "",
+          "label": "",
+          "prefixTemplate": "请参考"
+        }
+      ]
+    }
+  ],
+  "activeQueue": 1,
+  "queueMode": "multi",
+  "slots": []
+}

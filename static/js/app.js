@@ -6590,6 +6590,16 @@ if (autoBackupCheckbox) {
     });
 }
 
+// 备份路径持久化：输入框修改时保存到model_config
+const backupPathInput = document.getElementById('cfg-rh-download-path');
+if (backupPathInput) {
+    backupPathInput.addEventListener('change', async () => {
+        try {
+            await api('PUT', '/api/model-config', { rh_download_path: backupPathInput.value });
+        } catch(e) { console.error('保存备份路径失败:', e); }
+    });
+}
+
 // 改写标准按钮 → 打开系统提示词弹窗
 document.getElementById('btn-system-prompt-edit')?.addEventListener('click', async () => {
     try {
@@ -6729,8 +6739,8 @@ async function pollApiResult(apiKey, baseUrl) {
             displayApiResults(data.results || []);
             showToast('生成成功！', 'success');
 
-            // 自动下载到默认路径
-            autoDownloadResults(data.results || []);
+            // 自动备份到本地
+            autoBackupResults(data.results || []);
 
         } else if (data.status === 'FAILED') {
             clearTimeout(apiGenerateState.pollTimer);
@@ -6768,12 +6778,30 @@ function displayApiResults(results) {
     });
 }
 
-// ---------- 下载功能 ----------
+// ---------- 备份+下载功能 ----------
 const DEFAULT_DOWNLOAD_PATH = '~/Downloads/AI生图/';
+
+// 备份单张图片到本地（转JPG），返回本地URL
+async function backupImageToLocal(url, filename) {
+    try {
+        const resp = await api('POST', '/api/backup-result-image', { url, filename });
+        if (resp.ok && resp.local_url) {
+            return resp.local_url;
+        }
+        console.warn('备份失败:', resp.error);
+        return null;
+    } catch (e) {
+        console.warn('备份异常:', e);
+        return null;
+    }
+}
 
 async function downloadImage(url, filename) {
     try {
-        // 确保文件名扩展名为.jpg
+        // 先备份到本地，再触发浏览器下载
+        const localUrl = await backupImageToLocal(url, filename);
+        const downloadUrl = localUrl || url;
+
         const namePart = filename.replace(/\.\w+$/, '');
         const jpgFilename = namePart + '.jpg';
 
@@ -6781,11 +6809,10 @@ async function downloadImage(url, filename) {
         const resp = await fetch('/api/convert-download', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url, filename: jpgFilename })
+            body: JSON.stringify({ url: downloadUrl, filename: jpgFilename })
         });
         if (!resp.ok) {
-            // 后端转换失败，降级直接下载
-            const fallbackResp = await fetch(url);
+            const fallbackResp = await fetch(downloadUrl);
             const blob = await fallbackResp.blob();
             const blobUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -6808,27 +6835,32 @@ async function downloadImage(url, filename) {
         }
         showToast(`已下载: ${jpgFilename}`, 'success');
     } catch (e) {
-        // 降级：新窗口打开
         window.open(url, '_blank');
         showToast('下载失败，已在新窗口打开', 'info');
     }
 }
 
-async function autoDownloadResults(results) {
-    const downloadPath = document.getElementById('cfg-rh-download-path')?.value || DEFAULT_DOWNLOAD_PATH;
-    let count = 0;
-    for (const result of results) {
-        if (!result.url) continue;
-        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.jpg`;
-        await downloadImage(result.url, filename);
-        count++;
-        // 间隔下载避免浏览器拦截
-        if (count < results.length) {
-            await new Promise(r => setTimeout(r, 1000));
+// 自动备份结果图片到本地，替换results中的URL为本地路径
+async function autoBackupResults(results, qi) {
+    const isAutoBackup = document.getElementById('cfg-rh-auto-backup')?.checked;
+    if (!isAutoBackup) return;
+
+    let backupCount = 0;
+    for (let i = 0; i < results.length; i++) {
+        const r = results[i];
+        if (!r.url) continue;
+        if (r.url.startsWith('/static/')) continue;
+
+        const filename = r.filename || `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${i}.jpg`;
+        const localUrl = await backupImageToLocal(r.url, filename);
+        if (localUrl) {
+            r.url = localUrl;
+            r.localUrl = localUrl;
+            backupCount++;
         }
     }
-    if (count > 0) {
-        showToast(`${count}张图片已自动下载到浏览器默认下载目录`, 'success');
+    if (backupCount > 0) {
+        showToast(`${backupCount}张图片已自动备份到本地`, 'success');
     }
 }
 
@@ -6906,6 +6938,11 @@ document.getElementById('btn-open-download-folder')?.addEventListener('click', a
     } catch (e) {
         showToast('打开文件夹失败: ' + e.message, 'error');
     }
+});
+
+// 清除结果按钮
+document.getElementById('btn-clear-results')?.addEventListener('click', () => {
+    clearCurrentQueueResults();
 });
 
 // ========== 大图预览器（滚轮缩放+右键拖动+左右切换+勾选） ==========
@@ -8219,7 +8256,7 @@ function appendResultCard(item, index) {
     };
     const actionsDiv = document.createElement('div');
     actionsDiv.className = 'api-result-actions';
-    actionsDiv.innerHTML = '<button class="btn-icon download-single" title="下载">↓</button>';
+    actionsDiv.innerHTML = '<button class="btn-icon download-single" title="下载">↓</button><button class="btn-icon delete-single" title="删除" style="color:var(--danger);">×</button>';
     const checkDiv = document.createElement('div');
     checkDiv.style.cssText = 'position:absolute;top:4px;left:4px;';
     checkDiv.innerHTML = '<input type="checkbox" class="result-checkbox" style="width:14px;height:14px;cursor:pointer;" title="勾选下载">';
@@ -8242,7 +8279,51 @@ function appendResultCard(item, index) {
         e.stopPropagation();
         downloadImage(item.url, item.filename);
     });
+    card.querySelector('.delete-single').addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteResultItem(card, item);
+    });
     grid.appendChild(card);
+}
+
+// 删除单张结果
+function deleteResultItem(cardEl, item) {
+    const grid = document.getElementById('api-result-grid');
+    if (!grid) return;
+    // 从DOM移除
+    cardEl.remove();
+    // 从queueData中移除
+    if (queueMode === 'multi') {
+        const results = queueData[activeQueue]?.results || [];
+        const idx = results.findIndex(r => r.url === item.url);
+        if (idx >= 0) {
+            results.splice(idx, 1);
+            saveQueueData();
+        }
+    }
+    // 如果结果区为空，恢复占位
+    if (!grid.querySelector('.api-result-card')) {
+        grid.innerHTML = `<div id="api-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.2" style="opacity:0.4;margin-bottom:8px;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                <div>选择模型后点击「API生成」开始</div>
+            </div>`;
+    }
+    showToast('已删除', 'success');
+}
+
+// 清除当前队列所有结果
+function clearCurrentQueueResults() {
+    const grid = document.getElementById('api-result-grid');
+    if (!grid) return;
+    if (queueMode === 'multi') {
+        queueData[activeQueue].results = [];
+        saveQueueData();
+    }
+    grid.innerHTML = `<div id="api-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.2" style="opacity:0.4;margin-bottom:8px;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+            <div>选择模型后点击「API生成」开始</div>
+        </div>`;
+    showToast('已清除所有结果', 'success');
 }
 
 // ========================================================================
