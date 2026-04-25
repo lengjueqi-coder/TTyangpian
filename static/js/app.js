@@ -2528,7 +2528,7 @@ function saveCurrentQueueData(qi) {
     q.activePromptPresetIds = [...activePromptPresetIds];
     q.prevPromptCn = prevPromptCn;
     q.promptedSlotIndices = [...promptedSlotIndices];
-    // q.pinnedSlotIndices is global, not saved per-queue
+    q.pinnedSlotIndices = [...pinnedSlotIndices];
     // 保存语言/前缀/自动prompt状态
     q.promptLang = apiPromptLang;
     q.activePrefix = activePrefix;
@@ -2586,7 +2586,7 @@ function loadQueueData(qIndex) {
     activePromptPresetIds = new Set(q.activePromptPresetIds || []);
     prevPromptCn = q.prevPromptCn || '';
     promptedSlotIndices = new Set(q.promptedSlotIndices || []);
-    // pinnedSlotIndices is global, not restored per-queue
+    pinnedSlotIndices = new Set(q.pinnedSlotIndices || []);
     // 恢复语言/前缀/自动prompt
     apiPromptLang = q.promptLang || 'en';
     const langBtn = document.getElementById('btn-api-prompt-lang');
@@ -2693,7 +2693,7 @@ function switchQueueMode(mode) {
     });
 
     if (mode === 'multi') {
-        // 用当前slots初始化队列1，其他队列仅在首次（都为空时）复制队列1
+        // 用当前slots初始化队列1
         queueData[0].slots = JSON.parse(JSON.stringify(imageState.slots));
         queueData[0].promptCn = document.getElementById('img-prompt-cn')?.value || '';
         queueData[0].promptEn = document.getElementById('img-prompt-en')?.value || '';
@@ -2707,7 +2707,16 @@ function switchQueueMode(mode) {
         queueData[0].rhCount = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
         queueData[0].rhSeedMode = document.getElementById('cfg-rh-seed-mode-inline')?.value || 'random';
         queueData[0].rhSeed = document.getElementById('cfg-rh-seed-inline')?.value || '';
-        // 队列2-10：仅当它们没有独立数据时才复制队列1
+        // 保存前缀/后缀/预设状态到队列0
+        queueData[0].selectedPrefixIds = [...selectedPrefixIds];
+        queueData[0].selectedSuffixIds = [...selectedSuffixIds];
+        queueData[0].activePromptPresetIds = [...activePromptPresetIds];
+        queueData[0].prevPromptCn = prevPromptCn;
+        queueData[0].promptedSlotIndices = [...promptedSlotIndices];
+        queueData[0].promptLang = apiPromptLang;
+        queueData[0].activePrefix = activePrefix;
+        queueData[0].lastAutoPrompt = lastAutoPrompt;
+        // 队列2-10：仅当它们没有独立数据时才复制队列0的完整配置
         for (let q = 1; q < QUEUE_COUNT; q++) {
             const qd = queueData[q];
             const hasOwnData = qd.slots.some(s => s.image || s.label) || qd.promptCn?.trim() || qd.promptEn?.trim();
@@ -2715,6 +2724,24 @@ function switchQueueMode(mode) {
                 queueData[q].slots = JSON.parse(JSON.stringify(queueData[0].slots));
                 queueData[q].promptCn = queueData[0].promptCn;
                 queueData[q].promptEn = queueData[0].promptEn;
+                queueData[q].apiPlatform = queueData[0].apiPlatform;
+                queueData[q].rhModelId = queueData[0].rhModelId;
+                queueData[q].oaihkModelId = queueData[0].oaihkModelId;
+                queueData[q].rhAspectRatio = queueData[0].rhAspectRatio;
+                queueData[q].oaihkAspectRatio = queueData[0].oaihkAspectRatio;
+                queueData[q].rhResolution = queueData[0].rhResolution;
+                queueData[q].rhCount = queueData[0].rhCount;
+                queueData[q].rhSeedMode = queueData[0].rhSeedMode;
+                queueData[q].rhSeed = queueData[0].rhSeed;
+                queueData[q].selectedPrefixIds = [...queueData[0].selectedPrefixIds];
+                queueData[q].selectedSuffixIds = [...queueData[0].selectedSuffixIds];
+                queueData[q].activePromptPresetIds = [...queueData[0].activePromptPresetIds];
+                queueData[q].prevPromptCn = queueData[0].prevPromptCn;
+                queueData[q].promptedSlotIndices = [...queueData[0].promptedSlotIndices];
+                queueData[q].pinnedSlotIndices = [...queueData[0].pinnedSlotIndices];
+                queueData[q].promptLang = queueData[0].promptLang;
+                queueData[q].activePrefix = queueData[0].activePrefix;
+                queueData[q].lastAutoPrompt = queueData[0].lastAutoPrompt;
             }
         }
         saveQueueData();
@@ -6860,6 +6887,11 @@ async function autoBackupResults(results, qi) {
         }
     }
     if (backupCount > 0) {
+        // 备份完成后持久化到队列数据和服务端
+        if (qi !== undefined && qi !== null && queueData[qi]) {
+            queueData[qi].results = results;
+            saveQueueData();
+        }
         showToast(`${backupCount}张图片已自动备份到本地`, 'success');
     }
 }
