@@ -7411,7 +7411,7 @@ async function runSingleQueueGenerate() {
         logAction('api', '单队列生图完成', { queue: qi + 1, count: allResults.length });
         showToast(`队列${qi+1}生成完成！共${allResults.length}张`, 'success');
         if (document.getElementById('cfg-rh-auto-backup')?.checked) {
-            autoDownloadResults(allResults.map(r => ({ url: r.url, outputType: r.outputType })));
+            autoBackupResults(allResults, qi);
         }
     }
 
@@ -7591,7 +7591,7 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
         }
         // 自动备份
         if (document.getElementById('cfg-rh-auto-backup')?.checked) {
-            autoDownloadResults(allResults.map(r => ({ url: r.url, outputType: r.outputType })));
+            autoBackupResults(allResults, qi);
         }
     }
 });
@@ -8005,7 +8005,7 @@ async function generateViaOpenAIHK() {
             saveQueueData();
         }
         if (document.getElementById('cfg-rh-auto-backup')?.checked) {
-            autoDownloadResults(allResults.map(r => ({ url: r.url, outputType: r.outputType })));
+            autoBackupResults(allResults, qi);
         }
     }
 }
@@ -8249,7 +8249,7 @@ async function batchGenerateAll() {
         }
         saveQueueData();
         if (document.getElementById('cfg-rh-auto-backup')?.checked) {
-            autoDownloadResults(allResults.map(r => ({ url: r.url, outputType: r.outputType })));
+            autoBackupResults(allResults, qi);
         }
     }
 }
@@ -8812,7 +8812,7 @@ function compactAndRenumber() {
         q.slots = JSON.parse(JSON.stringify(imageState.slots));
         q.promptCn = imageState.promptCn;
         q.promptedSlotIndices = [...promptedSlotIndices];
-        // q.pinnedSlotIndices is global, not saved per-queue
+        q.pinnedSlotIndices = [...pinnedSlotIndices];
     }
 }
 
