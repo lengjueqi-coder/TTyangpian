@@ -19,6 +19,9 @@
   "api_platform": "oaihk",
   "oaihk_api_key": "",
   "oaihk_base_url": "",
+  "oaihk_image_timeout_sec": 240,
   "upload_short_edge": 1536,
-  "oaihk_model": "fal-ai/banana/v3.1/flash/2k"
+  "oaihk_model": "fal-ai/banana/v3.1/flash/2k",
+  "image_counter": 1,
+  "image_prefix": ""
 }

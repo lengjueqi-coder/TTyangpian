@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>人像 Prompt 生成器 PRO</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=30">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <title>样片工厂</title>
+    <link rel="stylesheet" href="/static/css/style.css?v={{ version }}">
 </head>
 <body>
     <!-- 初始加载指示器 -->
@@ -16,37 +17,46 @@
     <!-- 顶部栏 -->
     <header class="header-bar">
         <div class="header-left">
-            <h1 class="header-title">人像 Prompt 生成器 PRO</h1>
+            <h1 class="header-title">样片工厂</h1>
             <div id="mode-switch">
                 <button class="mode-btn active" data-mode="prompt">文生图</button>
                 <button class="mode-btn" data-mode="image">图生图</button>
+                <button class="mode-btn" data-mode="split">拆图</button>
             </div>
         </div>
         <div class="header-right">
-            <button class="btn btn-outline" id="btn-export" title="导出数据">
+            <button class="btn btn-outline" id="btn-export" title="导出数据" aria-label="导出数据">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                 导出
             </button>
-            <button class="btn btn-outline" id="btn-import" title="导入数据">
+            <button class="btn btn-outline" id="btn-import" title="导入数据" aria-label="导入数据">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                 导入
             </button>
-            <button class="btn btn-outline" id="btn-cleanup-images" title="清理未被引用的孤立图片">
+            <button class="btn btn-outline" id="btn-gallery" title="浏览本地备份图库" aria-label="浏览本地备份图库">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                图库
+            </button>
+            <button class="btn btn-outline" id="btn-cleanup-images" title="清理未被引用的孤立图片" aria-label="清理图片">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                清理图片
+                清理数据
             </button>
             <span id="usage-badge" class="usage-badge" title="今日生成统计" style="display:none;">今日: <span id="usage-badge-count">0</span>张</span>
-            <button class="btn btn-outline" id="btn-model-config" title="模型配置">
+            <button class="btn btn-outline" id="btn-model-config" title="模型配置" aria-label="模型配置">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                 模型配置
             </button>
-            <button class="btn btn-outline" id="btn-check-update" title="检查更新" style="position:relative;">
+            <button class="btn btn-outline" id="btn-check-update" title="检查更新" aria-label="检查更新" style="position:relative;">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
                 更新
                 <span id="update-dot" style="display:none;position:absolute;top:2px;right:2px;width:8px;height:8px;background:#ef4444;border-radius:50%;"></span>
             </button>
         </div>
     </header>
+    <div id="diag-status-bar" style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 10px 0;padding:4px 8px;border:1px solid var(--border-light);border-radius:6px;background:var(--card-bg);font-size:11px;color:var(--text-muted);">
+        <span id="diag-status-text">诊断中...</span>
+        <button class="btn btn-outline btn-compact" id="btn-diag-refresh" style="font-size:10px;padding:2px 6px;">刷新诊断</button>
+    </div>
 
     <!-- 主体内容：三栏布局 -->
     <main class="main-content">
@@ -205,7 +215,8 @@
                         <!-- 队列模式切换 -->
                         <div class="queue-mode-switch" style="display:flex;gap:2px;margin-left:8px;">
                             <button class="queue-mode-btn active" data-queue-mode="same" title="同一组图片/提示词，生成N张（抽卡）" style="padding:2px 6px;font-size:10px;border-radius:3px 0 0 3px;">同图抽卡</button>
-                            <button class="queue-mode-btn" data-queue-mode="multi" title="每轮用不同图片/提示词，批量出图" style="padding:2px 6px;font-size:10px;border-radius:0 3px 3px 0;">多图队列</button>
+                            <button class="queue-mode-btn" data-queue-mode="multi" title="每轮用不同图片/提示词，批量出图" style="padding:2px 6px;font-size:10px;">多图队列</button>
+                            <button class="queue-mode-btn" data-queue-mode="split" title="上传九宫格图片，按编号拆分批量生图" style="padding:2px 6px;font-size:10px;border-radius:0 3px 3px 0;">拆图</button>
                         </div>
                         <!-- 清除按钮 -->
                         <button class="btn btn-outline btn-compact" id="btn-clear-current-group" style="font-size:10px;padding:2px 6px;color:var(--danger);border-color:var(--danger);" title="清除当前组的图片素材（不删除本地文件）">清除本组</button>
@@ -232,7 +243,7 @@
             </div>
 
             <!-- Prompt 区域（可折叠） -->
-            <div class="img-workspace-section" style="padding:10px 14px;">
+            <div class="img-workspace-section" id="prompt-area-section" style="padding:10px 14px;">
                 <!-- 队列编号按钮行（多图队列模式时显示，在Prompt上方） -->
                 <div id="queue-prompt-bar" style="display:none;margin-bottom:4px;gap:3px;flex-wrap:wrap;"></div>
                 <!-- 中文 Prompt（默认展开） -->
@@ -242,6 +253,12 @@
                         <label>中文 Prompt</label>
                         <button class="btn btn-outline btn-sm" id="btn-system-prompt-edit" title="编辑大模型改写标准" style="margin-left:6px;padding:1px 5px;font-size:9px;">改写标准</button>
                         <button class="btn btn-outline btn-compact" id="btn-prompt-preset" title="提示词预设" style="font-size:9px;padding:1px 4px;margin-left:4px;">提示词预设</button>
+                        <select id="prompt-preset-group-filter" title="提示词预设分组" style="font-size:9px;padding:1px 4px;border:1px solid var(--border);border-radius:3px;max-width:92px;">
+                            <option value="__all">全部</option>
+                        </select>
+                        <button class="btn btn-outline btn-compact" id="btn-prompt-preset-group-add" title="新增提示词预设分组" style="font-size:9px;padding:1px 4px;">+</button>
+                        <button class="btn btn-outline btn-compact" id="btn-prompt-preset-group-edit" title="重命名当前分组" style="font-size:9px;padding:1px 4px;">改</button>
+                        <button class="btn btn-outline btn-compact" id="btn-prompt-preset-group-delete" title="删除当前分组，组内预设会变为未分组" style="font-size:9px;padding:1px 4px;color:var(--danger);">删</button>
                         <div id="prompt-preset-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;margin-left:2px;"></div>
                     </div>
                     <div class="prompt-collapsible-body expanded">
@@ -347,8 +364,13 @@
                         <option value="fal-ai/banana/v3.1/flash">nano2-3.1 1K 0.2</option>
                         <option value="fal-ai/banana/v3.1/flash/2k" selected>nano2-3.1 2K 0.3</option>
                         <option value="fal-ai/banana/v3.1/flash/4k">nano2-3.1 4K 0.48</option>
+                        <option value="gpt-image-2">GPT-img-2 1K 0.04</option>
+                        <option value="gpt-image-2/2k">GPT-img-2 2K 0.08</option>
+                        <option value="gpt-image-2/4k">GPT-img-2 4K 0.16</option>
                     </select>
                     <span id="oaihk-price-tag" style="display:none;font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">0.3</span>
+                    <button id="btn-set-default-model" class="btn btn-outline btn-compact" style="font-size:9px;padding:1px 5px;color:var(--text-muted);border-color:var(--border-light);" title="将当前平台+模型+分辨率+比例设为默认，切换队列时自动恢复">设为默认</button>
+                    <span id="default-model-badge" style="display:none;font-size:9px;color:var(--success);font-weight:500;white-space:nowrap;">★默认</span>
                     <div id="oaihk-aspect-ratio-group" style="display:none;align-items:center;gap:3px;">
                         <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">比例</span>
                         <select id="cfg-oaihk-aspect-ratio-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
@@ -380,17 +402,22 @@
                             <option value="random">随机</option>
                             <option value="fixed">固定</option>
                         </select>
-                        <input type="number" id="cfg-rh-seed-inline" placeholder="种子" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:60px;" disabled>
+                        <input type="number" id="cfg-rh-seed-inline" placeholder="种子" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:60px;" min="0" max="9999999999" disabled>
                     </div>
                     <div style="display:flex;align-items:center;gap:3px;">
                         <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">张数</span>
                         <input type="number" id="cfg-rh-count-inline" value="1" min="1" max="20" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:40px;">
                     </div>
                     <div style="display:flex;align-items:center;gap:3px;">
-                        <label style="font-size:10px;color:var(--text-muted);white-space:nowrap;cursor:pointer;" title="生成的图自动备份到指定目录（转JPG）">
-                            <input type="checkbox" id="cfg-rh-auto-backup" checked style="vertical-align:middle;"> 自动备份
+                        <label style="font-size:10px;color:var(--text-muted);white-space:nowrap;cursor:pointer;" title="生成的图自动下载到指定目录（转JPG）">
+                            <input type="checkbox" id="cfg-rh-auto-backup" checked style="vertical-align:middle;"> 自动下载
                         </label>
-                        <input type="text" id="cfg-rh-download-path" value="~/Downloads/AI生图/" style="font-size:9px;padding:1px 4px;border:1px solid var(--border);border-radius:3px;width:120px;color:var(--text-muted);" title="自动备份保存路径">
+                        <input type="text" id="cfg-rh-download-path" value="~/Downloads/AI生图/" style="font-size:9px;padding:1px 4px;border:1px solid var(--border);border-radius:3px;width:100px;color:var(--text-muted);" title="自动下载保存路径">
+                        <button class="btn btn-outline btn-compact" id="btn-select-folder" style="font-size:9px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;cursor:pointer;" title="选择本地文件夹">设置</button>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:3px;">
+                        <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">命名前缀</span>
+                        <input type="text" id="cfg-image-prefix" placeholder="留空自动" pattern="[\w\-]*" style="font-size:9px;padding:1px 4px;border:1px solid var(--border);border-radius:3px;width:80px;color:var(--text-muted);" title="自定义图片命名前缀，留空则使用平台-模型名（如 HK-3.1-2K）">
                     </div>
                     <button class="btn btn-outline btn-sm" id="btn-rh-settings" title="API Key等高级设置" style="padding:2px 6px;font-size:10px;margin-left:auto;">⚙设置</button>
                 </div>
@@ -428,16 +455,299 @@
         </section>
     </div>
 
+    <!-- 拆图模式（独立模块，与同图抽卡/多图队列完全隔离） -->
+    <div id="split-mode" class="main-content" style="display:none">
+        <!-- 左侧：素材库（复用image-mode的素材面板结构） -->
+        <section id="split-library-panel" class="config-panel" style="width:200px;min-width:80px;flex-direction:column;">
+            <div class="lib-tab-bar">
+                <button class="lib-tab-btn active" id="split-tab-lib" data-tab="library">素材库</button>
+            </div>
+            <div id="split-library-top" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;min-height:100px;">
+                <div class="config-header" style="display:flex;justify-content:space-between;align-items:center;">
+                    <button class="btn btn-outline btn-sm" id="btn-split-add-img-lib-category">+ 添加</button>
+                </div>
+                <div class="prop-search-box">
+                    <input type="text" id="split-img-lib-search" placeholder="搜索素材...">
+                </div>
+                <div class="prop-zoom-row" style="padding:2px 12px 4px;">
+                    <span class="prop-zoom-label">大</span>
+                    <input type="range" id="split-lib-zoom-slider" min="1" max="5" step="1" value="2">
+                    <span class="prop-zoom-label">小</span>
+                </div>
+                <div class="config-body" id="split-library-body" style="flex:1;overflow-y:auto;">
+                </div>
+            </div>
+        </section>
+
+        <!-- 拖拽分隔条 -->
+        <div class="resize-handle" id="resize-handle-split"></div>
+
+        <!-- 中间：拆图工作区 -->
+        <section id="split-workspace" class="result-panel" style="flex:1;min-width:60%;">
+            <!-- 拆图上传+配置区 -->
+            <div class="img-workspace-section">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <h2 style="margin:0;color:#7c3aed;">拆图</h2>
+                        <!-- 拆图队列编号按钮行 -->
+                        <div id="split-queue-number-bar" style="display:flex;gap:3px;flex-wrap:wrap;margin-left:8px;"></div>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                        <button class="btn btn-outline btn-compact" id="btn-split-clear-results" style="font-size:10px;padding:2px 6px;color:var(--danger);border-color:var(--danger);" title="清除当前队列所有生成结果">清除结果</button>
+                    </div>
+                </div>
+
+                <!-- 拆图上传面板 -->
+                <div id="split-upload-panel" style="margin-bottom:8px;">
+                    <div style="display:flex;gap:8px;align-items:flex-start;">
+                        <!-- 左：上传区+预览 -->
+                        <div style="min-width:160px;max-width:200px;">
+                            <div id="split-material-tabs" style="display:none;margin-bottom:6px;"></div>
+                            <div class="grid-split-upload" id="split-drop-zone" style="min-height:88px;flex-direction:column;gap:4px;">
+                                <span style="font-size:11px;text-align:center;line-height:1.35;">拖拽本地九宫格（可多张，最多 10 张）</span>
+                                <button type="button" id="btn-split-pick-local" class="btn btn-outline btn-compact" style="font-size:10px;padding:2px 8px;width:100%;">选择本地文件</button>
+                                <span style="font-size:10px;color:var(--text-muted);text-align:center;"><a href="#" id="split-open-gallery" style="color:var(--accent,#7c3aed);text-decoration:underline;">从图库选择一张</a></span>
+                                <span style="font-size:9px;color:var(--text-muted);text-align:center;">点击空白区域也可打开图库</span>
+                                <input type="file" id="split-file" accept="image/*" multiple hidden>
+                            </div>
+                            <div id="split-preview" style="display:none;margin-top:4px;">
+                                <div class="grid-image-wrapper" style="position:relative;">
+                                    <img id="split-img" alt="拆图预览" style="width:100%;border-radius:4px;">
+                                    <div class="grid-overlay" style="position:absolute;top:0;left:0;width:100%;height:100%;display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr);pointer-events:none;">
+                                        <span>1</span><span>2</span><span>3</span>
+                                        <span>4</span><span>5</span><span>6</span>
+                                        <span>7</span><span>8</span><span>9</span>
+                                    </div>
+                                    <button id="split-delete-preview" class="grid-split-delete-btn" title="删除图片" style="position:absolute;top:2px;right:2px;background:rgba(255,255,255,0.85);border:1px solid var(--border);border-radius:3px;cursor:pointer;font-size:12px;padding:0 4px;line-height:1;">×</button>
+                                </div>
+                            </div>
+                        </div>
+                        <!-- 右：编号选择+模板+模式 -->
+                        <div style="flex:1;display:flex;flex-direction:column;gap:6px;">
+                            <!-- 编号点选 -->
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">格子编号</span>
+                                <div class="grid-split-number-row" style="display:flex;gap:3px;">
+                                    <span class="split-num-btn" data-num="1">1</span>
+                                    <span class="split-num-btn" data-num="2">2</span>
+                                    <span class="split-num-btn" data-num="3">3</span>
+                                    <span class="split-num-btn" data-num="4">4</span>
+                                    <span class="split-num-btn" data-num="5">5</span>
+                                    <span class="split-num-btn" data-num="6">6</span>
+                                    <span class="split-num-btn" data-num="7">7</span>
+                                    <span class="split-num-btn" data-num="8">8</span>
+                                    <span class="split-num-btn" data-num="9">9</span>
+                                </div>
+                            </div>
+                            <!-- 提示词模板 -->
+                            <textarea id="split-prompt-template" class="grid-split-textarea"
+                                placeholder="提示词模板，用 {N} 代表编号&#10;如：为我生成图片第{N}张的单独图片 要保持画面不变..."
+                                rows="3"></textarea>
+                            <!-- 模板快捷按钮 -->
+                            <div id="split-template-btn-bar" style="display:flex;gap:3px;flex-wrap:wrap;margin-top:3px;"></div>
+                            <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:3px;">
+                                <button id="btn-split-template-add" class="btn btn-outline btn-compact" style="font-size:10px;padding:2px 8px;">+ 添加模板</button>
+                                <button id="btn-split-template-manage" class="btn btn-outline btn-compact" style="font-size:10px;padding:2px 8px;">管理模板</button>
+                            </div>
+                            <!-- 模式选择 + 确认按钮 -->
+                            <div style="display:flex;align-items:center;gap:8px;">
+                                <div class="grid-split-mode">
+                                    <label class="grid-split-mode-label"><input type="radio" name="split-mode" value="crop" checked> 裁剪模式</label>
+                                    <label class="grid-split-mode-label"><input type="radio" name="split-mode" value="nocrop"> 非裁剪模式</label>
+                                </div>
+                                <button id="btn-split-confirm" class="btn btn-primary btn-compact" style="font-size:12px;padding:4px 12px;background:#7c3aed;">拆分并填入队列</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 拆图工作区（拆分后显示，每个队列的图片+提示词） -->
+            <div id="split-workspace-area" class="img-workspace-section" style="padding:10px 14px;display:none;">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+                    <span style="font-weight:600;font-size:12px;color:#7c3aed;">拆图工作区</span>
+                    <div id="split-tab-bar" style="display:flex;gap:3px;flex-wrap:wrap;"></div>
+                </div>
+                <!-- 当前裁剪图预览 + 素材槽位 -->
+                <div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px;">
+                    <div id="split-img-container" style="position:relative;max-width:120px;">
+                        <img id="split-current-img" style="width:100%;border-radius:4px;cursor:pointer;" title="点击重新裁剪">
+                        <button id="btn-split-edit-crop" class="btn btn-outline btn-compact" style="position:absolute;top:2px;right:2px;font-size:9px;padding:1px 4px;background:rgba(255,255,255,0.85);border-radius:3px;z-index:3;" title="编辑裁剪">编辑</button>
+                    </div>
+                    <!-- 素材槽位（3个） -->
+                    <div style="display:flex;gap:4px;flex-direction:column;">
+                        <span style="font-size:9px;color:var(--text-muted);">参考素材</span>
+                        <div style="display:flex;gap:4px;">
+                            <div class="split-material-slot" data-slot="0" style="width:56px;height:56px;border:1.5px dashed var(--border);border-radius:4px;display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative;overflow:hidden;background:var(--card-bg);">
+                                <span style="font-size:16px;color:var(--text-muted);">+</span>
+                            </div>
+                            <div class="split-material-slot" data-slot="1" style="width:56px;height:56px;border:1.5px dashed var(--border);border-radius:4px;display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative;overflow:hidden;background:var(--card-bg);">
+                                <span style="font-size:16px;color:var(--text-muted);">+</span>
+                            </div>
+                            <div class="split-material-slot" data-slot="2" style="width:56px;height:56px;border:1.5px dashed var(--border);border-radius:4px;display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative;overflow:hidden;background:var(--card-bg);">
+                                <span style="font-size:16px;color:var(--text-muted);">+</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div style="flex:1;display:flex;flex-direction:column;gap:4px;">
+                        <!-- 前缀/后缀模板 -->
+                        <div style="margin-bottom:2px;">
+                            <div style="display:flex;gap:2px;align-items:center;flex-wrap:wrap;margin-bottom:2px;">
+                                <span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">前缀</span>
+                                <div id="split-prefix-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;"></div>
+                                <button class="btn btn-outline btn-compact" id="btn-split-add-prefix" title="添加前缀" style="font-size:10px;padding:2px 6px;">+</button>
+                                <button class="btn btn-outline btn-compact" id="btn-split-prefix-manage" style="font-size:9px;padding:1px 4px;color:var(--text-muted);" title="管理前缀">⚙</button>
+                            </div>
+                            <div style="display:flex;gap:2px;align-items:center;flex-wrap:wrap;">
+                                <span style="font-size:9px;color:var(--text-muted);white-space:nowrap;">后缀</span>
+                                <div id="split-suffix-btn-group" style="display:flex;gap:2px;flex-wrap:wrap;"></div>
+                                <button class="btn btn-outline btn-compact" id="btn-split-add-suffix" title="添加后缀" style="font-size:10px;padding:2px 6px;">+</button>
+                                <button class="btn btn-outline btn-compact" id="btn-split-suffix-manage" style="font-size:9px;padding:1px 4px;color:var(--text-muted);" title="管理后缀">⚙</button>
+                            </div>
+                        </div>
+                        <div id="split-prefix-preview" style="display:none;font-size:10px;color:#2563eb;background:#eff6ff;padding:2px 6px;border-radius:3px;word-break:break-all;"></div>
+                        <div style="display:flex;justify-content:flex-end;margin-bottom:4px;">
+                            <button type="button" class="btn btn-outline btn-compact" id="btn-split-sync-prompt-all" title="用当前框内文字覆盖本队列当前素材内所有格子编号的提示词" style="font-size:10px;padding:2px 8px;">同步到全部格子</button>
+                        </div>
+                        <textarea id="split-prompt-cn" rows="3" placeholder="中文提示词（{N}自动替换为编号）..." style="width:100%;padding:4px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px;background:var(--bg);color:var(--text);resize:vertical;"></textarea>
+                        <div id="split-suffix-preview" style="display:none;font-size:10px;color:#8b5cf6;background:#f5f3ff;padding:2px 6px;border-radius:3px;word-break:break-all;"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 操作按钮 -->
+            <div class="image-actions-compact" style="padding:0 14px 1px;">
+                <div class="action-group-left">
+                    <button class="btn btn-primary btn-compact" id="btn-split-generate" style="background:#7c3aed;">拆图生成</button>
+                    <button class="btn btn-primary btn-compact" id="btn-split-batch-generate" style="background:#7c3aed;">批量生成</button>
+                    <button class="btn btn-primary btn-compact" id="btn-split-batch-generate-all" style="display:none;background:#5b21b6;" title="对本队列全部素材中已就绪的格子并行生成（受并行上限限制）">全部素材生成</button>
+                    <button class="btn btn-outline btn-compact" id="btn-split-cancel" style="display:none;color:var(--danger);border-color:var(--danger);">取消</button>
+                </div>
+                <div class="action-group-right">
+                    <button class="btn btn-outline btn-compact" id="btn-split-download-all" style="font-size:10px;padding:2px 6px;">全部下载</button>
+                </div>
+            </div>
+
+            <!-- API 参数栏 -->
+            <div id="split-api-params-bar" class="api-params-bar" style="display:flex;align-items:center;gap:6px;padding:4px 8px;background:var(--card-bg);border:1px solid var(--border-light);border-radius:var(--radius-sm);margin:0 14px 4px;flex-wrap:wrap;">
+                <span style="font-size:10px;font-weight:500;color:var(--text-secondary);white-space:nowrap;">平台</span>
+                <select id="split-cfg-api-platform" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                    <option value="runninghub">通道一 RH</option>
+                    <option value="oaihk" selected>通道二 HK</option>
+                </select>
+                <span style="font-size:10px;font-weight:500;color:var(--text-secondary);white-space:nowrap;">模型</span>
+                <select id="split-cfg-rh-model" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;max-width:220px;">
+                    <optgroup label="V1 系列">
+                        <option value="rhart-image-v1/edit">V1-图生图-低价 0.05</option>
+                        <option value="rhart-image-v1-official/edit">V1-图生图-官方 0.2</option>
+                    </optgroup>
+                    <optgroup label="V2 系列">
+                        <option value="rhart-image-n-g31-flash/image-to-image">V2-图生图-低价 0.16</option>
+                        <option value="rhart-image-n-g31-flash-official/image-to-image">V2-图生图-官方 0.74</option>
+                    </optgroup>
+                    <optgroup label="PRO 系列">
+                        <option value="rhart-image-n-pro/edit">PRO-图生图-低价 0.4</option>
+                        <option value="rhart-image-n-pro-official/edit">PRO-图生图-官方 1</option>
+                    </optgroup>
+                </select>
+                <select id="split-cfg-oaihk-model" style="display:none;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;max-width:220px;">
+                    <option value="fal-ai/banana/v2">proK 0.48</option>
+                    <option value="fal-ai/banana/v2/2k">pro2K 0.48</option>
+                    <option value="fal-ai/banana/v2/4k">pro4K 0.48</option>
+                    <option value="fal-ai/banana/v3.1/flash">nano2-3.1 1K 0.2</option>
+                    <option value="fal-ai/banana/v3.1/flash/2k" selected>nano2-3.1 2K 0.3</option>
+                    <option value="fal-ai/banana/v3.1/flash/4k">nano2-3.1 4K 0.48</option>
+                    <option value="gpt-image-2">GPT-img-2 1K 0.04</option>
+                    <option value="gpt-image-2/2k">GPT-img-2 2K 0.08</option>
+                    <option value="gpt-image-2/4k">GPT-img-2 4K 0.16</option>
+                </select>
+                <span id="split-oaihk-price-tag" style="display:none;font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">0.3</span>
+                <span id="split-rh-price-tag" style="display:none;font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;"></span>
+                <button id="btn-split-set-default-model" class="btn btn-outline btn-compact" style="font-size:9px;padding:1px 5px;color:var(--text-muted);border-color:var(--border-light);" title="将当前平台+模型+分辨率+比例设为默认，切换队列时自动恢复">设为默认</button>
+                <span id="split-default-model-badge" style="display:none;font-size:9px;color:var(--success);font-weight:500;white-space:nowrap;">★默认</span>
+                <div id="split-oaihk-aspect-ratio-group" style="display:none;align-items:center;gap:3px;">
+                    <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">比例</span>
+                    <select id="split-cfg-oaihk-aspect-ratio" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                        <option value="3:4">3:4</option><option value="2:3">2:3</option><option value="1:1">1:1</option><option value="9:16">9:16</option><option value="4:3">4:3</option><option value="16:9">16:9</option>
+                    </select>
+                </div>
+                <div id="split-rh-resolution-group" style="display:flex;align-items:center;gap:3px;">
+                    <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">分辨率</span>
+                    <select id="split-cfg-rh-resolution" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                        <option value="1k">1K</option><option value="2k">2K</option><option value="4k">4K</option>
+                    </select>
+                </div>
+                <div style="display:flex;align-items:center;gap:3px;">
+                    <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">比例</span>
+                    <select id="split-cfg-rh-aspect-ratio" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;">
+                        <option value="3:4">3:4</option>
+                    </select>
+                </div>
+                <div style="display:flex;align-items:center;gap:3px;">
+                    <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">种子</span>
+                    <select id="split-cfg-rh-seed-mode" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:50px;">
+                        <option value="random">随机</option><option value="fixed">固定</option>
+                    </select>
+                    <input type="number" id="split-cfg-rh-seed" placeholder="种子" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:60px;" min="0" max="9999999999" disabled>
+                </div>
+                <div style="display:flex;align-items:center;gap:3px;">
+                    <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">张数</span>
+                    <input type="number" id="split-cfg-rh-count" value="1" min="1" max="20" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;width:40px;">
+                </div>
+                <div style="display:flex;align-items:center;gap:3px;">
+                    <label style="font-size:10px;color:var(--text-muted);white-space:nowrap;cursor:pointer;" title="生成的图自动下载到指定目录（转JPG）">
+                        <input type="checkbox" id="split-cfg-auto-backup" checked style="vertical-align:middle;"> 自动下载
+                    </label>
+                    <input type="text" id="split-cfg-download-path" value="~/Downloads/AI生图/" style="font-size:9px;padding:1px 4px;border:1px solid var(--border);border-radius:3px;width:100px;color:var(--text-muted);" title="自动下载保存路径">
+                    <button class="btn btn-outline btn-compact" id="btn-split-select-folder" style="font-size:9px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;cursor:pointer;" title="选择本地文件夹">设置</button>
+                </div>
+                <div style="display:flex;align-items:center;gap:3px;">
+                    <span style="font-size:10px;color:var(--text-muted);white-space:nowrap;">命名前缀</span>
+                    <input type="text" id="split-cfg-image-prefix" placeholder="留空自动" pattern="[\w\-]*" style="font-size:9px;padding:1px 4px;border:1px solid var(--border);border-radius:3px;width:80px;color:var(--text-muted);" title="自定义图片命名前缀">
+                </div>
+                <button class="btn btn-outline btn-sm" id="btn-split-settings" title="API Key等高级设置" style="padding:2px 6px;font-size:10px;margin-left:auto;">⚙设置</button>
+            </div>
+
+            <!-- 生成结果区 -->
+            <div id="split-result-section" style="flex:1;margin:0 14px 4px;overflow-y:auto;min-height:120px;">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;padding:0 2px;">
+                    <div style="display:flex;align-items:center;gap:4px;">
+                        <span style="font-size:10px;font-weight:500;color:var(--text-secondary);">生成结果</span>
+                    </div>
+                    <div style="display:flex;gap:4px;align-items:center;">
+                        <span style="font-size:9px;color:var(--text-muted);">预览大小</span>
+                        <input type="range" id="split-preview-size-slider" min="80" max="400" value="140" style="width:70px;height:12px;cursor:pointer;accent-color:#7c3aed;">
+                        <span id="split-failed-summary" style="display:none;font-size:10px;color:var(--danger);"></span>
+                        <button class="btn btn-outline btn-compact" id="btn-split-retry-failed" style="display:none;font-size:10px;padding:2px 6px;color:#7c3aed;border-color:#7c3aed;">重试失败</button>
+                        <button class="btn btn-outline btn-compact" id="btn-split-download-checked" style="font-size:10px;padding:2px 6px;">下载勾选</button>
+                        <button class="btn btn-outline btn-compact" id="btn-split-download-all-btn" style="font-size:10px;padding:2px 6px;">全部下载</button>
+                        <button class="btn btn-outline btn-compact" id="btn-split-open-folder" style="font-size:10px;padding:2px 6px;" title="打开保存文件夹">打开文件夹</button>
+                    </div>
+                </div>
+                <!-- 生成进度条 -->
+                <div id="split-progress-bar-wrap" style="display:none;height:6px;background:var(--border-light);border-radius:3px;margin-bottom:4px;overflow:hidden;">
+                    <div id="split-progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#9333ea);border-radius:3px;transition:width 0.4s ease;"></div>
+                </div>
+                <div id="split-progress-text" style="display:none;margin-bottom:4px;font-size:10px;color:var(--text-muted);text-align:right;"></div>
+                <div id="split-result-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:4px;">
+                    <div id="split-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;">
+                        <div>上传九宫格图片，选择编号后点击「拆分并填入队列」</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </div>
+
     <!-- 前缀/后缀模板管理弹窗 -->
     <div class="modal-overlay" id="modal-prompt-template" style="display:none;">
-        <div class="modal" style="width:520px;">
-            <div class="modal-header">
+        <div class="modal resizable-modal" style="width:620px;min-width:420px;max-width:92vw;min-height:300px;height:70vh;max-height:90vh;resize:both;overflow:hidden;display:flex;flex-direction:column;">
+            <div class="modal-header" style="flex-shrink:0;">
                 <h3 id="prompt-template-modal-title">管理前缀模板</h3>
                 <button class="modal-close" data-close="modal-prompt-template">&times;</button>
             </div>
-            <div class="modal-body" style="padding:12px;">
-                <div id="prompt-template-list" style="margin-bottom:8px;"></div>
-                <div style="display:flex;gap:4px;align-items:flex-start;">
+            <div class="modal-body" style="padding:12px;flex:1;overflow-y:auto;display:flex;flex-direction:column;">
+                <div id="prompt-template-list" style="margin-bottom:8px;flex:1;"></div>
+                <div style="display:flex;gap:4px;align-items:flex-start;flex-shrink:0;">
                     <input type="text" id="prompt-template-new-name" placeholder="模板名称" style="flex:1;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;">
                     <textarea id="prompt-template-new-text" placeholder="模板内容" rows="2" style="flex:2;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;resize:vertical;min-height:40px;"></textarea>
                     <button class="btn btn-primary btn-compact" id="btn-prompt-template-add" style="font-size:10px;padding:3px 8px;">添加</button>
@@ -454,10 +764,13 @@
                 <button class="modal-close" data-close="modal-prompt-preset">&times;</button>
             </div>
             <div class="modal-body" style="padding:12px;">
-                <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px;">勾选前10个将显示在标题栏按钮区，点击按钮可快速应用/取消预设</div>
+                <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px;">标题栏显示当前分组 + 未分组的前10个预设，点击按钮可快速应用/取消预设</div>
                 <div id="prompt-preset-list" style="margin-bottom:8px;"></div>
                 <div style="display:flex;gap:4px;align-items:flex-start;border-top:1px solid var(--border-light);padding-top:8px;">
                     <input type="text" id="prompt-preset-new-name" placeholder="预设名称" style="flex:1;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;">
+                    <select id="prompt-preset-new-group" title="预设分组" style="width:96px;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;">
+                        <option value="">未分组</option>
+                    </select>
                     <textarea id="prompt-preset-new-text" placeholder="预设提示词内容" rows="3" style="flex:2;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;resize:vertical;min-height:60px;"></textarea>
                     <button class="btn btn-primary btn-compact" id="btn-prompt-preset-add" style="font-size:10px;padding:3px 8px;">添加</button>
                 </div>
@@ -682,7 +995,7 @@
                 </div>
                 <div class="form-group">
                     <label>API Key</label>
-                    <input type="password" id="cfg-api-key" placeholder="输入 API Key">
+                    <input type="password" id="cfg-api-key" placeholder="输入 API Key" autocomplete="off">
                 </div>
                 <div class="form-group">
                     <label>接口地址</label>
@@ -705,7 +1018,7 @@
                 <div class="config-section-title" style="margin-top:16px;">RunningHub API 引擎</div>
                 <div class="form-group">
                     <label>API Key</label>
-                    <input type="password" id="cfg-rh-api-key" placeholder="输入 RunningHub API Key">
+                    <input type="password" id="cfg-rh-api-key" placeholder="输入 RunningHub API Key" autocomplete="off">
                 </div>
                 <div class="form-group">
                     <label>接口地址</label>
@@ -716,7 +1029,7 @@
                 <div class="config-section-title" style="margin-top:16px;">OpenAI-HK API 通道</div>
                 <div class="form-group">
                     <label>API Key</label>
-                    <input type="password" id="cfg-oaihk-api-key" placeholder="输入 OpenAI-HK API Key">
+                    <input type="password" id="cfg-oaihk-api-key" placeholder="输入 OpenAI-HK API Key" autocomplete="off">
                 </div>
                 <div class="form-group">
                     <label>接口地址</label>
@@ -789,7 +1102,7 @@
                                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#999" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                                 <p style="font-size:11px;">上传封面</p>
                             </div>
-                            <img id="upload-preview" src="" alt="" style="display:none; max-width:100%; border-radius:6px;">
+                            <img id="upload-preview" src="" alt="预设封面预览" style="display:none; max-width:100%; border-radius:6px;">
                         </div>
                     </div>
                     <div class="form-group" style="flex:1;">
@@ -800,7 +1113,7 @@
                                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#999" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                                 <p style="font-size:11px;">上传效果图</p>
                             </div>
-                            <img id="upload-preview-effect" src="" alt="" style="display:none; max-width:100%; border-radius:6px;">
+                            <img id="upload-preview-effect" src="" alt="预设效果图预览" style="display:none; max-width:100%; border-radius:6px;">
                         </div>
                     </div>
                 </div>
@@ -829,6 +1142,79 @@
         </div>
     </div>
 
+    <!-- 图库弹窗 -->
+    <div class="modal-overlay" id="modal-gallery" style="display:none;">
+        <div class="modal" style="width:90vw;height:85vh;max-width:1200px;max-height:900px;display:flex;flex-direction:column;">
+            <div class="modal-header" style="flex-shrink:0;">
+                <h3>图库</h3>
+                <button class="modal-close" data-close="modal-gallery">&times;</button>
+            </div>
+            <!-- 工具栏 -->
+            <div style="flex-shrink:0;padding:6px 12px;display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--border-light);flex-wrap:wrap;">
+                <span id="gallery-stats" style="font-size:11px;color:var(--text-muted);">加载中...</span>
+                <button class="btn btn-outline btn-compact" id="btn-gallery-refresh" style="font-size:10px;padding:2px 6px;">刷新</button>
+                <button class="btn btn-outline btn-compact gallery-range-btn" id="btn-gallery-range-1" style="font-size:10px;padding:2px 6px;">最近1天</button>
+                <button class="btn btn-outline btn-compact gallery-range-btn" id="btn-gallery-range-3" style="font-size:10px;padding:2px 6px;">最近3天</button>
+                <button class="btn btn-outline btn-compact gallery-range-btn" id="btn-gallery-range-7" style="font-size:10px;padding:2px 6px;">最近7天</button>
+                <button class="btn btn-outline btn-compact" id="btn-gallery-select-all" style="font-size:10px;padding:2px 6px;">全选</button>
+                <button class="btn btn-outline btn-compact" id="btn-gallery-select-none" style="font-size:10px;padding:2px 6px;">取消全选</button>
+                <button class="btn btn-outline btn-compact" id="btn-gallery-delete-selected" style="font-size:10px;padding:2px 6px;color:var(--danger);border-color:var(--danger);display:none;">删除选中</button>
+                <div style="display:flex;align-items:center;gap:3px;margin-left:auto;">
+                    <span style="font-size:10px;color:var(--text-muted);">缩放</span>
+                    <input type="range" id="gallery-zoom" min="60" max="200" value="100" style="width:60px;height:12px;cursor:pointer;accent-color:#2563eb;">
+                </div>
+            </div>
+            <!-- 图片网格 -->
+            <div id="gallery-body" style="flex:1;overflow-y:auto;padding:8px 12px;">
+                <div id="gallery-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:6px;">
+                    <p style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--text-muted);font-size:12px;">点击「刷新」加载图库</p>
+                </div>
+            </div>
+            <!-- 底部状态栏 -->
+            <div style="flex-shrink:0;padding:6px 12px;display:flex;align-items:center;gap:8px;border-top:1px solid var(--border-light);">
+                <span id="gallery-selected-count" style="font-size:11px;color:var(--text-secondary);">已选 0 张</span>
+                <button class="btn btn-outline btn-compact" id="btn-gallery-open-folder" style="font-size:10px;padding:2px 6px;">打开文件夹</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 清理数据弹窗 -->
+    <div class="modal-overlay" id="modal-cleanup" style="display:none;">
+        <div class="modal" style="width:560px;max-width:92vw;">
+            <div class="modal-header">
+                <h3>清理数据</h3>
+                <button class="modal-close" data-close="modal-cleanup">&times;</button>
+            </div>
+            <div class="modal-body" style="font-size:12px;color:var(--text-secondary);line-height:1.6;">
+                <p style="margin-top:0;color:var(--text-muted);">图片/缓存会移到 macOS 回收站，不永久删除；结果记录只清界面卡片，不删除图片、不清提示词和参考图。</p>
+                <div style="display:grid;gap:8px;">
+                    <div style="border:1px solid var(--border-light);border-radius:6px;padding:8px;">
+                        <strong>真实图片清理</strong>
+                        <p style="margin:4px 0;color:var(--text-muted);">请在「图库」里按日期、勾选或全选后移到回收站。</p>
+                        <button class="btn btn-outline btn-compact" id="btn-cleanup-open-gallery">打开图库</button>
+                    </div>
+                    <div style="border:1px solid var(--border-light);border-radius:6px;padding:8px;">
+                        <strong>内部缓存</strong>
+                        <div id="cleanup-dwpose-stats" style="font-size:11px;color:var(--text-muted);margin:4px 0;">统计中...</div>
+                        <button class="btn btn-outline btn-compact" id="btn-cleanup-orphans">孤立素材图移到回收站</button>
+                        <button class="btn btn-outline btn-compact" id="btn-cleanup-dwpose">DWPose缓存移到回收站</button>
+                    </div>
+                    <div style="border:1px solid var(--border-light);border-radius:6px;padding:8px;">
+                        <strong>只清界面结果记录</strong>
+                        <p style="margin:4px 0;color:var(--text-muted);">只清生成结果卡片和进度，不删除硬盘图片，也不清提示词/参考图。</p>
+                        <button class="btn btn-outline btn-compact" id="btn-cleanup-image-current-results">清当前生图队列结果</button>
+                        <button class="btn btn-outline btn-compact" id="btn-cleanup-image-all-results">清全部生图队列结果</button>
+                        <button class="btn btn-outline btn-compact" id="btn-cleanup-split-current-results">清当前拆图队列结果</button>
+                        <button class="btn btn-outline btn-compact" id="btn-cleanup-split-all-results">清全部拆图队列结果</button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-cleanup">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 大图预览器弹窗 -->
     <div class="modal-overlay" id="modal-image-viewer" style="display:none;">
         <div class="modal modal-image" style="width:90vw;height:90vh;max-width:1200px;max-height:900px;position:relative;display:flex;flex-direction:column;">
@@ -851,21 +1237,46 @@
         </div>
     </div>
 
-    <!-- 3:4 裁剪弹窗 -->
+    <!-- 3:4 / 4:3 自适应裁剪弹窗 -->
     <div class="modal-overlay" id="modal-crop" style="display:none;">
         <div class="modal" style="width:520px;">
             <div class="modal-header">
-                <h3>裁剪图片（3:4比例）</h3>
+                <h3>裁剪图片</h3>
                 <span id="crop-progress-indicator" style="display:none;font-size:12px;color:var(--accent);margin-left:8px;font-weight:500;"></span>
                 <button class="modal-close" data-close="modal-crop">&times;</button>
             </div>
             <div class="modal-body" style="text-align:center;">
                 <canvas id="crop-canvas" width="480" height="400" style="border:1px solid var(--border);cursor:move;max-width:100%;"></canvas>
-                <p style="font-size:11px;color:var(--text-muted);margin-top:6px;">拖动选框调整位置，拖角点或滚轮等比例缩放选框</p>
+                <p style="font-size:11px;color:var(--text-muted);margin-top:6px;">默认按原图更接近的 3:4 或 4:3 比例裁剪；拖动选框调整位置，拖角点或滚轮等比例缩放选框</p>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-outline" data-close="modal-crop">取消</button>
                 <button class="btn btn-primary" id="btn-crop-confirm">确认裁剪</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 拆图自由裁剪弹窗 -->
+    <div class="modal-overlay" id="modal-split-crop" style="display:none;">
+        <div class="modal split-crop-modal">
+            <div class="modal-header">
+                <h3>重新裁剪</h3>
+                <button class="modal-close" data-close="modal-split-crop">&times;</button>
+            </div>
+            <div class="modal-body split-crop-body">
+                <!-- 裁剪预设模式按钮 -->
+                <div id="split-crop-presets" style="display:flex;gap:6px;justify-content:center;margin-bottom:8px;flex-wrap:wrap;">
+                    <button class="split-crop-preset-btn" data-preset="4grid-portrait" title="四宫格竖图 3:4&#10;左键：应用&#10;右键：设为默认">四宫格竖图</button>
+                    <button class="split-crop-preset-btn" data-preset="4grid-landscape" title="四宫格横图 4:3&#10;左键：应用&#10;右键：设为默认">四宫格横图</button>
+                    <button class="split-crop-preset-btn" data-preset="9grid-portrait" title="九宫格竖图 3:4&#10;左键：应用&#10;右键：设为默认">九宫格竖图</button>
+                    <button class="split-crop-preset-btn" data-preset="9grid-landscape" title="九宫格横图 4:3&#10;左键：应用&#10;右键：设为默认">九宫格横图</button>
+                </div>
+                <canvas id="split-crop-canvas" width="960" height="720" style="border:1px solid var(--border);cursor:crosshair;"></canvas>
+                <p class="split-crop-help">滚轮缩放图片，空格/框外拖动画面；拖动裁剪框或四角调整区域，按住 C + 滚轮等比缩放裁剪框</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-split-crop">取消</button>
+                <button class="btn btn-primary" id="btn-split-crop-confirm">确认裁剪</button>
             </div>
         </div>
     </div>
@@ -957,6 +1368,6 @@
     <!-- 撤销指示器 -->
     <div id="undo-indicator" class="undo-indicator"></div>
 
-    <script src="/static/js/app.js?v=45"></script>
+    <script defer src="/static/js/app.js?v={{ version }}"></script>
 </body>
 </html>

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  人像 Prompt 生成器 PRO — macOS 桌面应用自动构建脚本
+#  样片工厂 — macOS 桌面应用自动构建脚本
 #  使用方法: chmod +x build_app.sh && ./build_app.sh
 # ============================================================
 set -euo pipefail
@@ -12,10 +12,10 @@ APP_NAME="AI人脸提示词"
 SPEC_FILE="AI人脸提示词.spec"
 DIST_DIR="dist"
 BUILD_DIR="build"
-DMG_NAME="人像Prompt生成器PRO_安装包"
+DMG_NAME="样片工厂_安装包"
 
 echo "=========================================="
-echo "  人像 Prompt 生成器 PRO — 桌面应用构建"
+echo "  样片工厂 — 桌面应用构建"
 echo "=========================================="
 
 # 1. 检查 Python3

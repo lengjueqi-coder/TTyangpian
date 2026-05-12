@@ -1,6 +1,12 @@
 // ========== 全局状态 ==========
 const SLOT_COUNT = 10;
 const QUEUE_COUNT = 10;
+/** 单条拆图队列内最多素材（九宫格张数） */
+const SPLIT_MAX_MATERIALS = 10;
+/** 单条拆图队列严格顺序提交：裁一张、带提示词发一张、处理完再下一张 */
+const SPLIT_GEN_CONCURRENCY = 1;
+/** 多条拆图队列不做人为等待上限；每个队列按自身顺序提交 */
+const SPLIT_GLOBAL_GEN_CONCURRENCY = Number.POSITIVE_INFINITY;
 const DEFAULT_PRESET_TAGS = ['肖像', '写真', '日系写真', '纯欲写真', '私房写真', '外景写真', '樱花写真', '新中式', '古风', '旗袍', '韩杂', '日杂', '杂志', '氛围感肖像', '胶片写真', '暗黑写真', '欧美肖像', '商业写真', '复古写真', '纪实写真'];
 
 const state = {
@@ -137,6 +143,36 @@ async function api(method, url, body, timeoutMs = 60000, cancelSignal, skipGloba
     }
 }
 
+/** OpenAI-HK GPT 同步生图：前端 fetch 超时与后端 model_config.json 的 oaihk_image_timeout_sec 对齐（默认 240s）并留余量 */
+function getOaihkGptClientTimeoutMs() {
+    const sec = parseInt(state.modelConfig?.oaihk_image_timeout_sec, 10);
+    const base = Number.isFinite(sec) && sec > 0 ? sec : 240;
+    return (base + 120) * 1000;
+}
+
+/** GPT 返回项 → 展示 URL：优先使用响应里的 base64（后端已处理则不再走 download-image，避免重复拉图） */
+async function displayUrlFromOaihkGptItem(item, signal) {
+    const b64 = item?.b64_json;
+    if (typeof b64 === 'string' && b64.length > 0) {
+        return `data:image/png;base64,${b64}`;
+    }
+    const url = item?.url;
+    if (!url) return '';
+    try {
+        const dlResp = await api('POST', '/api/download-image', { url }, getOaihkGptClientTimeoutMs(), signal);
+        if (dlResp.data?.data_uri) return dlResp.data.data_uri;
+    } catch (dlErr) {
+        console.warn('[HK-GPT] 成图代理下载失败:', dlErr);
+    }
+    return url;
+}
+
+/** HK 多任务并行时串行追加结果卡片，避免 allResults / index 竞态 */
+let _hkParallelUiTail = Promise.resolve();
+function enqueueHKParallelResultUi(fn) {
+    _hkParallelUiTail = _hkParallelUiTail.then(fn).catch(() => {});
+}
+
 // 上传图片辅助函数：封装fetch + 自动显示上采样警告
 async function uploadImage(formData) {
     const resp = await fetch('/api/upload-image', { method: 'POST', body: formData });
@@ -167,91 +203,361 @@ let apiPromptLang = localStorage.getItem('apiPromptLang') || 'en';
 
 // ========== 撤销系统（Ctrl+Z / Cmd+Z）==========
 const MAX_UNDO_STEPS = 10;
+const DEFAULT_DOWNLOAD_PATH_FALLBACK = '~/Downloads/AI生图/';
 let undoStack = [];
 let _undoEnabled = true; // 可临时禁用（恢复快照时）
+let _undoLastSnapshot = null;
+let _undoLastDigest = '';
+let _undoManualCheckpointPending = false;
+let _undoTextEditActiveEl = null;
+
+function deepClone(obj) {
+    try { return structuredClone(obj); } catch (e) { return JSON.parse(JSON.stringify(obj)); }
+}
+
+function cleanDownloadPath(path) {
+    return typeof path === 'string' ? path.trim() : '';
+}
+
+function getGlobalDownloadPath() {
+    return cleanDownloadPath(state.modelConfig?.rh_download_path) || DEFAULT_DOWNLOAD_PATH_FALLBACK;
+}
+
+function getEffectiveQueueDownloadPath(qi = activeQueue) {
+    const ownPath = cleanDownloadPath(queueData[qi]?.downloadPath);
+    return ownPath || getGlobalDownloadPath();
+}
+
+function getEffectiveSplitDownloadPath(qi = activeSplitQueue) {
+    const ownPath = cleanDownloadPath(splitQueueData[qi]?.downloadPath);
+    return ownPath || getGlobalDownloadPath();
+}
+
+function writeDownloadPathInputFromOwner(inputId, ownerPath) {
+    const el = document.getElementById(inputId);
+    if (!el) return;
+    const ownPath = cleanDownloadPath(ownerPath);
+    el.value = ownPath || getGlobalDownloadPath();
+    el.dataset.downloadPathInherited = ownPath ? '0' : '1';
+}
+
+function readDownloadPathInputForOwner(inputId) {
+    const el = document.getElementById(inputId);
+    if (!el) return '';
+    const value = cleanDownloadPath(el.value);
+    if (!value) return '';
+    if (el.dataset.downloadPathInherited === '1' && value === getGlobalDownloadPath()) {
+        return '';
+    }
+    return value;
+}
+
+function markDownloadPathInputAsOwn(inputId, path) {
+    const el = document.getElementById(inputId);
+    if (!el) return;
+    el.value = cleanDownloadPath(path);
+    el.dataset.downloadPathInherited = '0';
+}
+
+function undoJson(value, fallback) {
+    if (value === undefined) return fallback;
+    try { return deepClone(value); } catch (_) { return fallback; }
+}
+
+function undoSetToArray(value) {
+    try { return Array.from(value || []); } catch (_) { return []; }
+}
+
+function getUndoSelectedItemIds() {
+    const ids = [];
+    const selectedItems = state.selectedItems || {};
+    for (const value of Object.values(selectedItems)) {
+        if (Array.isArray(value)) ids.push(...value);
+        else if (value) ids.push(value);
+    }
+    return ids;
+}
+
+function captureUndoFormValues() {
+    const values = {};
+    document.querySelectorAll('input, textarea, select').forEach((el) => {
+        if (!el.id || el.type === 'file') return;
+        if (el.type === 'checkbox' || el.type === 'radio') values[el.id] = !!el.checked;
+        else values[el.id] = el.value;
+    });
+    return values;
+}
+
+function restoreUndoFormValues(values = {}) {
+    for (const [id, value] of Object.entries(values)) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (el.type === 'file') continue;
+        if (el.type === 'checkbox' || el.type === 'radio') el.checked = !!value;
+        else el.value = value == null ? '' : String(value);
+    }
+}
+
+function getQueueDataForUndo() {
+    const queues = undoJson(queueData, []);
+    const q = queues?.[activeQueue];
+    if (q && queueMode === 'multi') {
+        q.slots = undoJson(imageState.slots, []);
+        q.promptCn = document.getElementById('img-prompt-cn')?.value || '';
+        q.promptEn = document.getElementById('img-prompt-en')?.value || '';
+        q.selectedPrefixIds = undoSetToArray(selectedPrefixIds);
+        q.selectedSuffixIds = undoSetToArray(selectedSuffixIds);
+        q.activePromptPresetIds = undoSetToArray(activePromptPresetIds);
+        q.promptedSlotIndices = undoSetToArray(promptedSlotIndices);
+        q.pinnedSlotIndices = undoSetToArray(pinnedSlotIndices);
+        q.prevPromptCn = prevPromptCn || '';
+        q.lastAutoPrompt = lastAutoPrompt || '';
+        q.promptLang = apiPromptLang || 'en';
+        q.activePrefix = activePrefix || '请参考';
+    }
+    return queues;
+}
+
+function getSplitQueueDataForUndo() {
+    const queues = undoJson(splitQueueData, []);
+    const qd = queues?.[activeSplitQueue];
+    const promptEl = document.getElementById('split-prompt-cn');
+    const activeItem = qd?.workItems?.[qd.activeItemIndex || 0];
+    if (qd && promptEl) {
+        qd.promptCn = promptEl.value || '';
+        if (activeItem) activeItem.promptCn = promptEl.value || '';
+        const mat = qd.materials?.[qd.activeMaterialIndex || 0];
+        const matItem = mat?.workItems?.find(it => it?.number === activeItem?.number);
+        if (matItem) matItem.promptCn = promptEl.value || '';
+    }
+    return queues;
+}
+
+function getGlobalUndoSnapshot() {
+    return {
+        currentMode,
+        formValues: captureUndoFormValues(),
+        promptMode: {
+            preview: document.getElementById('prompt-preview')?.value || '',
+            resultText: document.getElementById('prompt-text')?.value || '',
+            resultVisible: document.getElementById('prompt-result')?.style.display || ''
+        },
+        stateData: {
+            categories: undoJson(state.categories, []),
+            prefixes: undoJson(state.prefixes, []),
+            suffixes: undoJson(state.suffixes, []),
+            props: undoJson(state.props, []),
+            presets: undoJson(state.presets, []),
+            presetTags: undoJson(state.presetTags, []),
+            categoryOrder: undoJson(state.categoryOrder, []),
+            propOrder: undoJson(state.propOrder, []),
+            selectedPrefixes: undoJson(state.selectedPrefixes, []),
+            selectedSuffixes: undoJson(state.selectedSuffixes, []),
+            selectedItems: undoJson(state.selectedItems, {}),
+            generatedPrompt: state.generatedPrompt || '',
+            generatedSource: state.generatedSource || ''
+        },
+        imageState: undoJson(imageState, {}),
+        queueData: getQueueDataForUndo(),
+        queueMode,
+        activeQueue,
+        splitQueueData: getSplitQueueDataForUndo(),
+        activeSplitQueue,
+        splitModeLoaded,
+        vars: {
+            promptedSlotIndices: undoSetToArray(promptedSlotIndices),
+            pinnedSlotIndices: undoSetToArray(pinnedSlotIndices),
+            selectedPrefixIds: undoSetToArray(selectedPrefixIds),
+            selectedSuffixIds: undoSetToArray(selectedSuffixIds),
+            activePromptPresetIds: undoSetToArray(activePromptPresetIds),
+            lastAutoPrompt: lastAutoPrompt || '',
+            prevPromptCn: prevPromptCn || '',
+            apiPromptLang: apiPromptLang || 'en',
+            activePrefix: activePrefix || '请参考',
+            promptTemplates: undoJson(promptTemplates, { prefixes: [], suffixes: [] }),
+            promptPresets: undoJson(promptPresets, []),
+            prefixTemplates: undoJson(prefixTemplates, [])
+        }
+    };
+}
+
+function getUndoDigest(snapshot) {
+    try { return JSON.stringify(snapshot); } catch (_) { return String(Date.now()); }
+}
+
+function setUndoBaseline(snapshot = getGlobalUndoSnapshot()) {
+    _undoLastSnapshot = undoJson(snapshot, null);
+    _undoLastDigest = _undoLastSnapshot ? getUndoDigest(_undoLastSnapshot) : '';
+}
 
 function pushUndoSnapshot() {
     if (!_undoEnabled) return;
-    const snapshot = {
-        slots: JSON.parse(JSON.stringify(imageState.slots)),
-        promptCn: document.getElementById('img-prompt-cn')?.value || '',
-        promptEn: document.getElementById('img-prompt-en')?.value || '',
-        promptedSlotIndices: [...promptedSlotIndices],
-        // pinnedSlotIndices is global, not in per-queue snapshot
-        lastAutoPrompt: lastAutoPrompt,
-        selectedItems: JSON.parse(JSON.stringify(state.selectedItems)),
-        selectedPrefixes: [...state.selectedPrefixes],
-        selectedSuffixes: [...state.selectedSuffixes],
-        generatedPrompt: state.generatedPrompt,
-        queueData: JSON.parse(JSON.stringify(queueData)),
-        activeQueue: activeQueue,
-        queueMode: queueMode,
-        library: JSON.parse(JSON.stringify(imageState.library)),
-        categories: JSON.parse(JSON.stringify(state.categories)),
-    };
+    const snapshot = getGlobalUndoSnapshot();
+    const digest = getUndoDigest(snapshot);
+    const lastStackDigest = undoStack.length ? getUndoDigest(undoStack[undoStack.length - 1]) : '';
+    if (digest === lastStackDigest) return;
     undoStack.push(snapshot);
     if (undoStack.length > MAX_UNDO_STEPS) undoStack.shift();
+    _undoManualCheckpointPending = true;
     updateUndoUI();
 }
 
-function undo() {
+function syncUndoBaselineAfterMutation() {
+    if (!_undoEnabled) return;
+    const current = getGlobalUndoSnapshot();
+    const currentDigest = getUndoDigest(current);
+    if (!_undoLastSnapshot) {
+        setUndoBaseline(current);
+        return;
+    }
+    if (_undoManualCheckpointPending) {
+        setUndoBaseline(current);
+        _undoManualCheckpointPending = false;
+        return;
+    }
+    if (currentDigest !== _undoLastDigest) {
+        const lastStackDigest = undoStack.length ? getUndoDigest(undoStack[undoStack.length - 1]) : '';
+        if (_undoLastDigest && _undoLastDigest !== lastStackDigest) {
+            undoStack.push(undoJson(_undoLastSnapshot, {}));
+            if (undoStack.length > MAX_UNDO_STEPS) undoStack.shift();
+        }
+        setUndoBaseline(current);
+        updateUndoUI();
+    }
+}
+
+function applyUndoModeVisibility(mode) {
+    currentMode = mode || 'prompt';
+    try { localStorage.setItem('app-mode', currentMode); } catch(e) {}
+    document.querySelectorAll('.mode-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.mode === currentMode);
+    });
+    const promptMode = document.querySelector('.main-content:not(#image-mode):not(#split-mode)');
+    const imageMode = document.getElementById('image-mode');
+    const splitModeEl = document.getElementById('split-mode');
+    if (promptMode) promptMode.style.display = currentMode === 'prompt' ? 'flex' : 'none';
+    if (imageMode) imageMode.style.display = currentMode === 'image' ? 'flex' : 'none';
+    if (splitModeEl) splitModeEl.style.display = currentMode === 'split' ? 'flex' : 'none';
+}
+
+function buildUndoPersistPayload(snapshot) {
+    const sd = snapshot.stateData || {};
+    return {
+        files: {
+            'categories.json': { categories: sd.categories || [] },
+            'prefixes.json': { prefixes: sd.prefixes || [] },
+            'suffixes.json': { suffixes: sd.suffixes || [] },
+            'props.json': { props: sd.props || [] },
+            'presets.json': { presets: sd.presets || [] },
+            'preset_tags.json': { tags: sd.presetTags || [] },
+            'category_order.json': { order: sd.categoryOrder || [] },
+            'prop_order.json': { order: sd.propOrder || [] },
+            'last_selection.json': {
+                selected_prefixes: sd.selectedPrefixes || [],
+                selected_suffixes: sd.selectedSuffixes || [],
+                selected_items: getUndoSelectedItemIds()
+            },
+            'queue_data.json': {
+                queues: snapshot.queueData || [],
+                activeQueue: snapshot.activeQueue || 0,
+                queueMode: snapshot.queueMode || 'same',
+                slots: snapshot.queueMode === 'same' ? (snapshot.imageState?.slots || []) : []
+            },
+            'split_queue_data.json': {
+                queues: snapshot.splitQueueData || [],
+                activeQueue: snapshot.activeSplitQueue || 0
+            },
+            'image_library.json': { categories: snapshot.imageState?.library || [] },
+            'image_presets.json': { presets: snapshot.imageState?.presets || [] },
+            'prompt_templates.json': snapshot.vars?.promptTemplates || { prefixes: [], suffixes: [], selectedPrefixIds: [], selectedSuffixIds: [] },
+            'prompt_presets.json': { presets: snapshot.vars?.promptPresets || [] },
+            'prefix_templates.json': { templates: snapshot.vars?.prefixTemplates || [] }
+        }
+    };
+}
+
+async function persistUndoSnapshot(snapshot) {
+    try {
+        await api('PUT', '/api/undo-state', buildUndoPersistPayload(snapshot), 60000, undefined, true);
+    } catch (e) {
+        console.error('持久化撤销状态失败:', e);
+        showToast('已恢复界面，但写回数据失败：' + e.message, 'warning');
+    }
+}
+
+async function undo() {
     if (undoStack.length === 0) return;
     const snapshot = undoStack.pop();
     _undoEnabled = false;
     try {
-        // 恢复图片模式状态
-        imageState.slots = snapshot.slots;
-        const promptCnEl = document.getElementById('img-prompt-cn');
-        const promptEnEl = document.getElementById('img-prompt-en');
-        if (promptCnEl) promptCnEl.value = snapshot.promptCn;
-        if (promptEnEl) promptEnEl.value = snapshot.promptEn;
-        imageState.promptCn = snapshot.promptCn;
-        imageState.promptEn = snapshot.promptEn;
-        promptedSlotIndices = new Set(snapshot.promptedSlotIndices);
-        // pinnedSlotIndices is global, not restored from snapshot
-        lastAutoPrompt = snapshot.lastAutoPrompt;
+        const sd = snapshot.stateData || {};
+        state.categories = undoJson(sd.categories, []);
+        state.prefixes = undoJson(sd.prefixes, []);
+        state.suffixes = undoJson(sd.suffixes, []);
+        state.props = undoJson(sd.props, []);
+        state.presets = undoJson(sd.presets, []);
+        state.presetTags = undoJson(sd.presetTags, [...DEFAULT_PRESET_TAGS]);
+        state.categoryOrder = undoJson(sd.categoryOrder, []);
+        state.propOrder = undoJson(sd.propOrder, []);
+        state.selectedItems = undoJson(sd.selectedItems, {});
+        state.selectedPrefixes = undoJson(sd.selectedPrefixes, []);
+        state.selectedSuffixes = undoJson(sd.selectedSuffixes, []);
+        state.generatedPrompt = sd.generatedPrompt || '';
+        state.generatedSource = sd.generatedSource || '';
 
-        // 恢复文字模式选择状态
-        state.selectedItems = snapshot.selectedItems;
-        state.selectedPrefixes = snapshot.selectedPrefixes;
-        state.selectedSuffixes = snapshot.selectedSuffixes;
-        state.generatedPrompt = snapshot.generatedPrompt;
+        Object.assign(imageState, undoJson(snapshot.imageState, {}));
+        queueData = undoJson(snapshot.queueData, []);
+        activeQueue = snapshot.activeQueue || 0;
+        queueMode = snapshot.queueMode || 'same';
+        splitQueueData = undoJson(snapshot.splitQueueData, []);
+        activeSplitQueue = snapshot.activeSplitQueue || 0;
+        splitModeLoaded = !!snapshot.splitModeLoaded;
 
-        // 恢复队列数据
-        queueData = snapshot.queueData;
-        activeQueue = snapshot.activeQueue;
-        queueMode = snapshot.queueMode;
+        const vars = snapshot.vars || {};
+        promptedSlotIndices = new Set(vars.promptedSlotIndices || []);
+        pinnedSlotIndices = new Set(vars.pinnedSlotIndices || []);
+        selectedPrefixIds = new Set(vars.selectedPrefixIds || []);
+        selectedSuffixIds = new Set(vars.selectedSuffixIds || []);
+        activePromptPresetIds = new Set(vars.activePromptPresetIds || []);
+        lastAutoPrompt = vars.lastAutoPrompt || '';
+        prevPromptCn = vars.prevPromptCn || '';
+        apiPromptLang = vars.apiPromptLang || 'en';
+        activePrefix = vars.activePrefix || '请参考';
+        promptTemplates = undoJson(vars.promptTemplates, { prefixes: [], suffixes: [] });
+        promptPresets = undoJson(vars.promptPresets, []);
+        prefixTemplates = undoJson(vars.prefixTemplates, prefixTemplates || []);
 
-        // 恢复素材库
-        imageState.library = snapshot.library;
-        state.categories = snapshot.categories;
-
-        // 刷新所有 UI
-        renderImageSlots();
-        renderImageLibrary();
+        initQueueData();
+        initSplitQueueData();
+        applyUndoModeVisibility(snapshot.currentMode);
+        renderAll();
+        if (queueMode === 'multi') loadQueueData(activeQueue);
+        else renderImageSlots();
+        if (imageState.loaded) renderImageMode();
         renderQueueNumberBars();
+        if (typeof normalizeSplitQueueWorkItems === 'function') normalizeSplitQueueWorkItems();
+        if (typeof renderSplitQueueNumberBar === 'function') renderSplitQueueNumberBar();
+        if (typeof renderSplitMaterialTabs === 'function') renderSplitMaterialTabs(activeSplitQueue);
+        if (typeof renderSplitWorkItemTabs === 'function') renderSplitWorkItemTabs(activeSplitQueue);
+        if (typeof loadSplitQueueToUI === 'function') loadSplitQueueToUI(activeSplitQueue);
+        if (typeof renderSplitQueueResults === 'function') renderSplitQueueResults(activeSplitQueue);
+        restoreUndoFormValues(snapshot.formValues);
+        const promptResult = document.getElementById('prompt-result');
+        if (promptResult) promptResult.style.display = snapshot.promptMode?.resultVisible || '';
+        updateGenerateButtons();
         updateGenerateBtnText();
-        // 恢复队列模式按钮状态
         document.querySelectorAll('.queue-mode-btn').forEach(btn => {
             btn.classList.toggle('active', btn.dataset.queueMode === queueMode);
         });
-        // 恢复队列数据到当前活动队列
-        if (queueMode === 'multi') {
-            loadQueueData(activeQueue);
-        }
-        // 刷新文字模式 UI
-        if (typeof renderCategoryList === 'function') renderCategoryList();
-        if (typeof renderPresets === 'function') renderPresets();
-        if (typeof updatePreview === 'function') updatePreview();
-        // 恢复批量生成按钮
         const batchBtn = document.getElementById('btn-api-batch-generate');
         if (batchBtn) batchBtn.style.display = queueMode === 'multi' ? 'inline-flex' : 'none';
 
         showToast(`已撤销（剩余${undoStack.length}步）`, 'info');
-        // 持久化撤销后的状态到服务器
-        saveQueueData();
+        setUndoBaseline(snapshot);
+        await persistUndoSnapshot(snapshot);
     } finally {
         _undoEnabled = true;
+        _undoManualCheckpointPending = false;
     }
     updateUndoUI();
 }
@@ -272,19 +578,35 @@ document.addEventListener('keydown', (e) => {
     }
 });
 
-// 提示词 textarea 手动编辑时保存撤销快照
-let _promptCnBeforeEdit = '';
-let _promptEnBeforeEdit = '';
-document.getElementById('img-prompt-cn')?.addEventListener('focus', () => { _promptCnBeforeEdit = document.getElementById('img-prompt-cn')?.value || ''; });
-document.getElementById('img-prompt-cn')?.addEventListener('blur', () => {
-    const cur = document.getElementById('img-prompt-cn')?.value || '';
-    if (cur !== _promptCnBeforeEdit) pushUndoSnapshot();
-});
-document.getElementById('img-prompt-en')?.addEventListener('focus', () => { _promptEnBeforeEdit = document.getElementById('img-prompt-en')?.value || ''; });
-document.getElementById('img-prompt-en')?.addEventListener('blur', () => {
-    const cur = document.getElementById('img-prompt-en')?.value || '';
-    if (cur !== _promptEnBeforeEdit) pushUndoSnapshot();
-});
+document.addEventListener('beforeinput', (e) => {
+    const el = e.target;
+    if (!_undoEnabled || !el || !el.matches?.('input:not([type="file"]), textarea')) return;
+    if (_undoTextEditActiveEl !== el) {
+        pushUndoSnapshot();
+        _undoTextEditActiveEl = el;
+    }
+}, true);
+
+document.addEventListener('focusout', () => {
+    _undoTextEditActiveEl = null;
+    syncUndoBaselineAfterMutation();
+}, true);
+
+document.addEventListener('change', (e) => {
+    const el = e.target;
+    if (!_undoEnabled || !el || !el.matches?.('select, input[type="checkbox"], input[type="radio"], input[type="range"]')) return;
+    pushUndoSnapshot();
+}, true);
+
+document.addEventListener('click', (e) => {
+    const target = e.target.closest?.('button, .context-menu-item, [role="menuitem"]');
+    if (!_undoEnabled || !target) return;
+    const text = `${target.id || ''} ${target.className || ''} ${target.title || ''} ${target.textContent || ''}`;
+    if (/复制|copy|关闭|cancel|刷新诊断|检查更新|图库|导出|导入/.test(text)) return;
+    if (/删除|清除|清空|重置|保存|添加|上传|应用|替换|生成|队列|拆图|preset|template|delete|clear|reset|save|add|upload|apply|generate|queue/i.test(text)) {
+        pushUndoSnapshot();
+    }
+}, true);
 
 // API提示词语言切换按钮
 document.getElementById('btn-api-prompt-lang')?.addEventListener('click', () => {
@@ -367,9 +689,14 @@ function showToast(msg, type = 'info') {
     }, duration);
 }
 
-function openModal(id) { document.getElementById(id).style.display = 'flex'; }
+function openModal(id) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'flex';
+}
 function closeModal(id) {
-    document.getElementById(id).style.display = 'none';
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.style.display = 'none';
     if (id === 'modal-crop') { cropQueue = []; cropQueueActive = false; updateCropProgress(); }
 }
 
@@ -420,8 +747,11 @@ async function loadAllData() {
                 for (let q = 0; q < queueData.length; q++) {
                     if (!queueData[q].slots) queueData[q].slots = [];
                     while (queueData[q].slots.length < SLOT_COUNT) {
-                        queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+                        queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
                     }
+                    if (!queueData[q].promptCn) queueData[q].promptCn = '';
+                    if (!queueData[q].promptEn) queueData[q].promptEn = '';
+                    if (!Array.isArray(queueData[q].results)) queueData[q].results = [];
                 }
             }
             if (queueDataResp.queueMode) queueMode = queueDataResp.queueMode;
@@ -441,7 +771,7 @@ async function loadAllData() {
                 const savedQM = localStorage.getItem('queue-mode');
                 if (savedQM) queueMode = savedQM;
                 const savedAQ = localStorage.getItem('active-queue');
-                if (savedAQ) activeQueue = parseInt(savedAQ) || 0;
+                if (savedAQ) activeQueue = parseInt(savedAQ, 10) || 0;
                 const savedSlots = localStorage.getItem('image-slots');
                 if (savedSlots) {
                     const parsed = JSON.parse(savedSlots);
@@ -459,7 +789,7 @@ async function loadAllData() {
         // 确保有10个队列
         while (queueData.length < QUEUE_COUNT) {
             queueData.push({
-                slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考' })),
+                slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' })),
                 promptCn: '',
                 promptEn: ''
             });
@@ -474,10 +804,20 @@ async function loadAllData() {
         // 恢复预设缩放设置
         try {
             const savedPresetZoom = localStorage.getItem('preset-zoom');
-            if (savedPresetZoom) state.presetZoom = parseInt(savedPresetZoom) || 4;
+            if (savedPresetZoom) state.presetZoom = parseInt(savedPresetZoom, 10) || 4;
         } catch(e) {}
 
         if (lastSel) restoreSelection(lastSel);
+
+        // 如果当前提示词为空，清除词库选中状态（避免UI高亮残留）
+        const currentPromptCn = queueMode === 'multi' ? queueData[activeQueue]?.promptCn : imageState.promptCn;
+        const currentPromptEn = queueMode === 'multi' ? queueData[activeQueue]?.promptEn : imageState.promptEn;
+        if (!currentPromptCn && !currentPromptEn) {
+            state.selectedPrefixes = [];
+            state.selectedSuffixes = [];
+            state.selectedItems = {};
+            saveSelection();
+        }
 
         renderAll();
 
@@ -810,7 +1150,7 @@ function renderPropPanel() {
         const rangeInput = zoomRow.querySelector('input[type="range"]');
         rangeInput.addEventListener('input', (e) => {
             e.stopPropagation();
-            const newCols = parseInt(e.target.value);
+            const newCols = parseInt(e.target.value, 10);
             state.propZoom[prop.id] = newCols;
             grid.style.gridTemplateColumns = `repeat(${newCols}, 1fr)`;
             // 保存到 localStorage
@@ -939,11 +1279,15 @@ $('#btn-add-preset-direct').addEventListener('click', () => {
     $('#preset-prompt-text').value = $('#prompt-preview').value || '';
 
     // 重置封面上传
-    $('#upload-preview').style.display = 'none';
-    $('#upload-placeholder').style.display = 'flex';
+    const uploadPreview = $('#upload-preview');
+    const uploadPlaceholder = $('#upload-placeholder');
+    if (uploadPreview) uploadPreview.style.display = 'none';
+    if (uploadPlaceholder) uploadPlaceholder.style.display = 'flex';
     // 重置效果图上传
-    $('#upload-preview-effect').style.display = 'none';
-    $('#upload-placeholder-effect').style.display = 'flex';
+    const uploadPreviewEffect = $('#upload-preview-effect');
+    const uploadPlaceholderEffect = $('#upload-placeholder-effect');
+    if (uploadPreviewEffect) uploadPreviewEffect.style.display = 'none';
+    if (uploadPlaceholderEffect) uploadPlaceholderEffect.style.display = 'flex';
 
     renderPresetTagList();
     openModal('modal-save-preset');
@@ -1504,6 +1848,7 @@ function getSelectedItemIds() {
 }
 
 async function saveSelection() {
+    syncUndoBaselineAfterMutation();
     try {
         await api('PUT', '/api/last-selection', {
             selected_prefixes: state.selectedPrefixes,
@@ -1523,11 +1868,15 @@ $('#btn-save-preset').addEventListener('click', () => {
     $('#preset-prompt-text').value = $('#prompt-preview').value || '';
 
     // 重置封面上传
-    $('#upload-preview').style.display = 'none';
-    $('#upload-placeholder').style.display = 'flex';
+    const uploadPreview2 = $('#upload-preview');
+    const uploadPlaceholder2 = $('#upload-placeholder');
+    if (uploadPreview2) uploadPreview2.style.display = 'none';
+    if (uploadPlaceholder2) uploadPlaceholder2.style.display = 'flex';
     // 重置效果图上传
-    $('#upload-preview-effect').style.display = 'none';
-    $('#upload-placeholder-effect').style.display = 'flex';
+    const uploadPreviewEffect2 = $('#upload-preview-effect');
+    const uploadPlaceholderEffect2 = $('#upload-placeholder-effect');
+    if (uploadPreviewEffect2) uploadPreviewEffect2.style.display = 'none';
+    if (uploadPlaceholderEffect2) uploadPlaceholderEffect2.style.display = 'flex';
 
     renderPresetTagList();
     openModal('modal-save-preset');
@@ -1931,23 +2280,25 @@ async function editPreset(preset) {
     $('#preset-prompt-text').value = preset.prompt_text || '';
 
     // 封面预览
+    const _upCover = $('#upload-preview');
+    const _upPlaceCover = $('#upload-placeholder');
     if (preset.cover_image) {
-        $('#upload-preview').src = preset.cover_image;
-        $('#upload-preview').style.display = 'block';
-        $('#upload-placeholder').style.display = 'none';
+        if (_upCover) { _upCover.src = preset.cover_image; _upCover.style.display = 'block'; }
+        if (_upPlaceCover) _upPlaceCover.style.display = 'none';
     } else {
-        $('#upload-preview').style.display = 'none';
-        $('#upload-placeholder').style.display = 'flex';
+        if (_upCover) _upCover.style.display = 'none';
+        if (_upPlaceCover) _upPlaceCover.style.display = 'flex';
     }
 
     // 效果图预览
+    const _upEffect = $('#upload-preview-effect');
+    const _upPlaceEffect = $('#upload-placeholder-effect');
     if (preset.effect_image) {
-        $('#upload-preview-effect').src = preset.effect_image;
-        $('#upload-preview-effect').style.display = 'block';
-        $('#upload-placeholder-effect').style.display = 'none';
+        if (_upEffect) { _upEffect.src = preset.effect_image; _upEffect.style.display = 'block'; }
+        if (_upPlaceEffect) _upPlaceEffect.style.display = 'none';
     } else {
-        $('#upload-preview-effect').style.display = 'none';
-        $('#upload-placeholder-effect').style.display = 'flex';
+        if (_upEffect) _upEffect.style.display = 'none';
+        if (_upPlaceEffect) _upPlaceEffect.style.display = 'flex';
     }
 
     renderPresetTagList();
@@ -1996,7 +2347,8 @@ function getPresetDesc(preset) {
 }
 
 // ========== 数据导出 ==========
-$('#btn-export').addEventListener('click', () => {
+const btnExport = $('#btn-export');
+if (btnExport) btnExport.addEventListener('click', () => {
     logAction('export', '导出数据', {});
     // 打开选择性导出弹窗
     openModal('modal-export');
@@ -2039,7 +2391,8 @@ document.getElementById('btn-confirm-export')?.addEventListener('click', async (
 });
 
 // ========== 数据导入 ==========
-$('#btn-import').addEventListener('click', () => {
+const btnImport = $('#btn-import');
+if (btnImport) btnImport.addEventListener('click', () => {
     logAction('export', '导入数据', {});
     openModal('modal-import');
 });
@@ -2100,22 +2453,372 @@ document.getElementById('btn-confirm-import')?.addEventListener('click', () => {
     }, { title: '确认导入', btnText: '导入' });
 });
 
-// ========== 清理未引用图片 ==========
-$('#btn-cleanup-images').addEventListener('click', () => {
-    showConfirm('确定要清理未被任何数据引用的孤立图片吗？此操作不可恢复。', async () => {
+// ========== 清理数据 ==========
+$('#btn-cleanup-images').addEventListener('click', async () => {
+    openModal('modal-cleanup');
+    await refreshCleanupStats();
+});
+
+async function refreshCleanupStats() {
+    const el = document.getElementById('cleanup-dwpose-stats');
+    if (!el) return;
+    el.textContent = '统计中...';
+    try {
+        const stats = await api('GET', '/api/dwpose-cache-stats');
+        const size = stats.size_kb > 1024 ? `${(stats.size_kb / 1024).toFixed(1)}MB` : `${Math.round(stats.size_kb)}KB`;
+        el.textContent = `DWPose缓存：${stats.count || 0} 个，${size}`;
+    } catch (e) {
+        el.textContent = 'DWPose缓存统计失败';
+    }
+}
+
+document.getElementById('btn-cleanup-orphans')?.addEventListener('click', () => {
+    showConfirm('将未被任何数据引用的内部图片移到回收站，不会永久删除。继续吗？', async () => {
         try {
             const result = await api('POST', '/api/cleanup-images');
-            if (result.success) {
-                if (result.deleted > 0) {
-                    showToast(`已清理${result.deleted}张孤立图片，释放${result.freed_kb}KB`, 'success');
-                } else {
-                    showToast('没有发现孤立图片', 'info');
-                }
+            if (result.success && result.deleted > 0) {
+                showToast(`已移到回收站 ${result.deleted} 张，释放约 ${result.freed_kb}KB`, 'success');
+            } else {
+                showToast('没有发现孤立图片', 'info');
             }
         } catch (e) {
             showToast('清理失败: ' + e.message, 'error');
         }
+    }, { title: '清理孤立图片', btnText: '移到回收站' });
+});
+
+document.getElementById('btn-cleanup-dwpose')?.addEventListener('click', () => {
+    showConfirm('将 DWPose 姿态缓存移到回收站，不会永久删除。继续吗？', async () => {
+        try {
+            const result = await api('POST', '/api/cleanup-dwpose-cache', { days: 'all' });
+            showToast(`已移到回收站 ${result.deleted || 0} 个缓存，释放约 ${Math.round(result.freed_kb || 0)}KB`, 'success');
+            await refreshCleanupStats();
+        } catch (e) {
+            showToast('清理失败: ' + e.message, 'error');
+        }
+    }, { title: '清理DWPose缓存', btnText: '移到回收站' });
+});
+
+async function cleanupQueueResults(kind, scope) {
+    const isSplit = kind === 'split';
+    const index = isSplit ? activeSplitQueue : activeQueue;
+    const label = `${isSplit ? '拆图' : '生图'}${scope === 'all' ? '全部队列' : `队列${index + 1}`}`;
+    showConfirm(`只清理${label}界面里的生成结果卡片和进度，不删除图片、不清提示词和参考图。继续吗？`, async () => {
+        try {
+            const result = await api('POST', '/api/cleanup-queue-results', { kind, scope, index });
+            if (isSplit) {
+                if (scope === 'all') splitQueueData.forEach(q => { if (q) { q.results = []; q.progressDone = 0; q.progressTotal = 0; q.failedItems = []; } });
+                else if (splitQueueData[index]) Object.assign(splitQueueData[index], { results: [], progressDone: 0, progressTotal: 0, failedItems: [] });
+                renderSplitQueueResults(activeSplitQueue);
+                renderSplitQueueNumberBar();
+                updateSplitFailedUI(activeSplitQueue);
+            } else {
+                if (scope === 'all') queueData.forEach(q => { if (q) { q.results = []; q.progressDone = 0; q.progressTotal = 0; } });
+                else if (queueData[index]) queueData[index].results = [];
+                renderQueueResults(activeQueue);
+                renderQueueNumberBars();
+            }
+            showToast(`已清理 ${result.cleared || 0} 条结果记录`, 'success');
+        } catch (e) {
+            showToast('清理失败: ' + e.message, 'error');
+        }
+    }, { title: '清理结果记录', btnText: '清理记录' });
+}
+
+document.getElementById('btn-cleanup-image-current-results')?.addEventListener('click', () => cleanupQueueResults('image', 'current'));
+document.getElementById('btn-cleanup-image-all-results')?.addEventListener('click', () => cleanupQueueResults('image', 'all'));
+document.getElementById('btn-cleanup-split-current-results')?.addEventListener('click', () => cleanupQueueResults('split', 'current'));
+document.getElementById('btn-cleanup-split-all-results')?.addEventListener('click', () => cleanupQueueResults('split', 'all'));
+document.getElementById('btn-cleanup-open-gallery')?.addEventListener('click', () => {
+    closeModal('modal-cleanup');
+    document.getElementById('btn-gallery')?.click();
+});
+
+// ========== 图库功能 ==========
+let galleryData = { groups: [], total_count: 0, total_size_kb: 0, base_path: '' };
+let gallerySelected = new Set(); // 选中的图片路径集合
+let galleryPickerContext = null; // { mode: 'split', recentDays: 3 }
+let galleryRecentDays = 0; // 0=全部
+
+function _processGalleryData(rawData, opts = {}) {
+    if (!rawData || !rawData.groups) return rawData;
+    const recentDays = opts.recentDays || 0;
+    const now = Date.now();
+    const cutoff = recentDays > 0 ? now - recentDays * 24 * 60 * 60 * 1000 : 0;
+
+    const allImages = [];
+    for (const group of rawData.groups) {
+        for (const img of (group.images || [])) {
+            if (recentDays > 0 && img.mtime && img.mtime * 1000 < cutoff) continue;
+            allImages.push(img);
+        }
+    }
+
+    // 按时间倒序（最新优先）
+    allImages.sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+
+    const grouped = {};
+    for (const img of allImages) {
+        const d = img.mtime ? new Date(img.mtime * 1000) : new Date();
+        const label = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        if (!grouped[label]) grouped[label] = [];
+        grouped[label].push(img);
+    }
+    const groups = Object.keys(grouped).sort((a, b) => b.localeCompare(a)).map(k => ({ label: k, images: grouped[k] }));
+
+    return {
+        ...rawData,
+        groups,
+        total_count: allImages.length,
+        total_size_kb: allImages.reduce((s, x) => s + (x.size_kb || 0), 0)
+    };
+}
+
+function renderGallery(data) {
+    galleryData = data;
+    gallerySelected.clear();
+    const grid = document.getElementById('gallery-grid');
+    if (!grid) return;
+
+    if (!data.groups || data.groups.length === 0) {
+        grid.innerHTML = '<p style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--text-muted);font-size:12px;">图库为空，生成图片后会自动出现在这里</p>';
+        document.getElementById('gallery-stats').textContent = '共 0 张';
+        updateGallerySelection();
+        return;
+    }
+
+    const sizeStr = formatSizeFromKb(data.total_size_kb);
+    const statsPrefix = galleryRecentDays > 0 ? `最近${galleryRecentDays}天` : '共';
+    document.getElementById('gallery-stats').textContent = galleryPickerContext?.mode === 'split'
+        ? `${statsPrefix} ${data.total_count} 张，${sizeStr}`
+        : `共 ${data.total_count} 张，${sizeStr}`;
+
+    let html = '';
+    for (const group of data.groups) {
+        // 日期分组标题
+        const safeGroupLabel = escHtml(group.label);
+        html += `<div style="grid-column:1/-1;display:flex;align-items:center;gap:6px;padding:8px 0 4px;border-bottom:1px solid var(--border-light);margin-top:4px;">
+            <span style="font-size:12px;font-weight:600;color:var(--text-secondary);">${safeGroupLabel}</span>
+            <span style="font-size:10px;color:var(--text-muted);">${group.images.length} 张</span>
+            <button class="btn btn-outline btn-compact gallery-folder-delete" data-folder="${safeGroupLabel}" style="font-size:9px;padding:1px 4px;color:var(--danger);border-color:var(--danger);margin-left:4px;">删除整组</button>
+        </div>`;
+
+        for (const img of group.images) {
+            const proxyUrl = `/api/gallery-image?path=${encodeURIComponent(img.path)}`;
+            const encodedPath = encodeURIComponent(img.path);
+            const safeName = escHtml(img.name);
+            html += `<div class="gallery-item" data-path="${encodedPath}" style="position:relative;aspect-ratio:3/4;border-radius:4px;overflow:hidden;cursor:pointer;background:var(--bg-secondary);border:1px solid var(--border-light);">
+                <img src="${proxyUrl}" loading="lazy" class="gallery-img" style="width:100%;height:100%;object-fit:cover;">
+                <input type="checkbox" class="gallery-checkbox" data-path="${encodedPath}" style="position:absolute;top:4px;left:4px;z-index:2;cursor:pointer;">
+                <span style="position:absolute;bottom:0;left:0;right:0;background:linear-gradient(transparent,rgba(0,0,0,0.6));color:#fff;font-size:9px;padding:2px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${safeName}</span>
+                <span style="position:absolute;top:4px;right:4px;font-size:8px;color:var(--text-muted);background:rgba(255,255,255,0.8);padding:0 2px;border-radius:2px;">${Math.round(img.size_kb)}KB</span>
+            </div>`;
+        }
+    }
+    grid.innerHTML = html;
+
+    // 图片加载失败处理（替代内联onerror，防止XSS）
+    grid.querySelectorAll('.gallery-img').forEach(imgEl => {
+        imgEl.addEventListener('error', function() {
+            this.style.display = 'none';
+            const fallback = document.createElement('span');
+            fallback.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:9px;color:var(--text-muted);';
+            fallback.textContent = '加载失败';
+            this.parentElement.appendChild(fallback);
+        });
     });
+
+    // 绑定事件
+    grid.querySelectorAll('.gallery-item').forEach(item => {
+        item.addEventListener('click', (e) => {
+            if (e.target.classList.contains('gallery-checkbox')) return;
+            const path = decodeURIComponent(item.dataset.path || '');
+            if (galleryPickerContext?.mode === 'split') {
+                selectGalleryImageForSplit(path);
+                return;
+            }
+            const proxyUrl = `/api/gallery-image?path=${encodeURIComponent(path)}`;
+            openImageViewer([{ url: proxyUrl, filename: path.split('/').pop() }]);
+        });
+    });
+
+    grid.querySelectorAll('.gallery-checkbox').forEach(cb => {
+        cb.addEventListener('change', () => {
+            const path = decodeURIComponent(cb.dataset.path || '');
+            if (!path) return;
+            if (cb.checked) gallerySelected.add(path);
+            else gallerySelected.delete(path);
+            updateGallerySelection();
+        });
+    });
+
+    grid.querySelectorAll('.gallery-folder-delete').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const folder = btn.dataset.folder;
+            showConfirm(`确定把「${folder}」整组图片移到回收站？`, async () => {
+                try {
+                    const group = (galleryData.groups || []).find(g => g.label === folder);
+                    const files = (group?.images || []).map(img => img.path);
+                    const result = files.length > 0
+                        ? await api('POST', '/api/gallery-delete', { files })
+                        : await api('POST', '/api/gallery-folder-delete', { folder });
+                    showToast(`已移到回收站 ${result.deleted} 张，释放 ${Math.round(result.freed_kb)}KB`, 'success');
+                    loadGallery();
+                } catch (err) {
+                    showToast('删除失败: ' + err.message, 'error');
+                }
+            }, { title: '移到回收站', btnText: '移到回收站' });
+        });
+    });
+
+    updateGallerySelection();
+}
+
+function formatSizeFromKb(kb) {
+    const sizeKb = Math.max(0, Number(kb) || 0);
+    if (sizeKb >= 1024 * 1024) return `${(sizeKb / 1024 / 1024).toFixed(1)}GB`;
+    if (sizeKb >= 1024) return `${(sizeKb / 1024).toFixed(1)}MB`;
+    return `${Math.round(sizeKb)}KB`;
+}
+
+function updateGallerySelection() {
+    const count = gallerySelected.size;
+    const countEl = document.getElementById('gallery-selected-count');
+    if (countEl) countEl.textContent = `已选 ${count} 张`;
+    const deleteBtn = document.getElementById('btn-gallery-delete-selected');
+    if (deleteBtn) deleteBtn.style.display = count > 0 ? 'inline-flex' : 'none';
+}
+
+async function loadGallery() {
+    const grid = document.getElementById('gallery-grid');
+    if (grid) grid.innerHTML = '<p style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--text-muted);font-size:12px;">加载中...</p>';
+    document.getElementById('gallery-stats').textContent = '加载中...';
+    try {
+        const qs = galleryRecentDays > 0 ? `?recent_days=${encodeURIComponent(galleryRecentDays)}` : '';
+        const data = await api('GET', `/api/gallery${qs}`);
+        const processed = _processGalleryData(data, { recentDays: galleryRecentDays });
+        renderGallery(processed);
+    } catch (e) {
+        if (grid) grid.innerHTML = '<p style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--danger);font-size:12px;">加载失败: ' + escHtml(e.message) + '</p>';
+    }
+}
+
+async function selectGalleryImageForSplit(path) {
+    try {
+        const result = await api('POST', '/api/gallery-import-image', { path });
+        if (!result.url) {
+            showToast('导入图片失败', 'error');
+            return;
+        }
+        splitImageUrl = result.url;
+        const qd = splitQueueData[activeSplitQueue];
+        if (qd) {
+            const name = result.name || getFileBaseName(path);
+            qd.progressTotal = 0;
+            qd.progressDone = 0;
+            qd.materials = [{
+                gridImageUrl: result.url,
+                sourceFilename: name,
+                selectedNums: [],
+                learnedGridLayout: null,
+                cropPreset: qd.cropPreset ?? null,
+                workItems: []
+            }];
+            qd.activeMaterialIndex = 0;
+            loadActiveSplitMaterialIntoQueue(qd, 0);
+            qd.gridImageUrl = result.url;
+            qd.workItems = [];
+            qd.activeItemIndex = 0;
+            qd.learnedGridLayout = null;
+            qd.sourceFilename = name;
+            saveSplitQueueData();
+        }
+        const imgEl = document.getElementById('split-img');
+        if (imgEl) imgEl.src = splitImageUrl;
+        const previewEl = document.getElementById('split-preview');
+        if (previewEl) previewEl.style.display = '';
+        const dropZoneEl = document.getElementById('split-drop-zone');
+        if (dropZoneEl) dropZoneEl.style.display = 'none';
+        galleryPickerContext = null;
+        closeModal('modal-gallery');
+        await maybeAutoSplitFromFilename(activeSplitQueue);
+        saveSplitQueueData();
+        renderSplitMaterialTabs(activeSplitQueue);
+        renderSplitWorkItemTabs(activeSplitQueue);
+        loadSplitQueueToUI(activeSplitQueue);
+        updateSplitGenerateBtnState();
+        renderSplitQueueNumberBar();
+        showToast(`已加载图库图片: ${result.name || '已选择图片'}`, 'success');
+    } catch (e) {
+        showToast('导入图库图片失败: ' + e.message, 'error');
+    }
+}
+
+// 图库按钮
+document.getElementById('btn-gallery')?.addEventListener('click', () => {
+    galleryPickerContext = null;
+    galleryRecentDays = 0;
+    openModal('modal-gallery');
+    loadGallery();
+});
+
+document.getElementById('btn-gallery-range-1')?.addEventListener('click', () => { galleryRecentDays = 1; loadGallery(); });
+document.getElementById('btn-gallery-range-3')?.addEventListener('click', () => { galleryRecentDays = 3; loadGallery(); });
+document.getElementById('btn-gallery-range-7')?.addEventListener('click', () => { galleryRecentDays = 7; loadGallery(); });
+
+// 刷新
+document.getElementById('btn-gallery-refresh')?.addEventListener('click', () => loadGallery());
+
+// 全选
+document.getElementById('btn-gallery-select-all')?.addEventListener('click', () => {
+    document.querySelectorAll('.gallery-checkbox').forEach(cb => {
+        cb.checked = true;
+        const path = decodeURIComponent(cb.dataset.path || '');
+        if (path) gallerySelected.add(path);
+    });
+    updateGallerySelection();
+});
+
+// 取消全选
+document.getElementById('btn-gallery-select-none')?.addEventListener('click', () => {
+    document.querySelectorAll('.gallery-checkbox').forEach(cb => { cb.checked = false; });
+    gallerySelected.clear();
+    updateGallerySelection();
+});
+
+// 删除选中
+document.getElementById('btn-gallery-delete-selected')?.addEventListener('click', () => {
+    const files = [...gallerySelected];
+    if (files.length === 0) return;
+    showConfirm(`确定把选中的 ${files.length} 张图片移到回收站？`, async () => {
+        try {
+            const result = await api('POST', '/api/gallery-delete', { files });
+            let msg = `已移到回收站 ${result.deleted} 张，释放 ${Math.round(result.freed_kb)}KB`;
+            if (result.errors && result.errors.length > 0) msg += `，${result.errors.length} 个失败`;
+            showToast(msg, result.deleted > 0 ? 'success' : 'error');
+            loadGallery();
+        } catch (e) {
+            showToast('删除失败: ' + e.message, 'error');
+        }
+    }, { title: '移到回收站', btnText: '移到回收站' });
+});
+
+// 缩放滑块
+document.getElementById('gallery-zoom')?.addEventListener('input', (e) => {
+    const size = parseInt(e.target.value, 10) || 100;
+    const grid = document.getElementById('gallery-grid');
+    if (grid) grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${size}px, 1fr))`;
+});
+
+// 打开文件夹
+document.getElementById('btn-gallery-open-folder')?.addEventListener('click', async () => {
+    try {
+        const path = galleryData.base_path || document.getElementById('cfg-rh-download-path')?.value || '~/Downloads/AI生图/';
+        await api('POST', '/api/open-download-folder', { path });
+    } catch (e) {
+        showToast('打开失败: ' + e.message, 'error');
+    }
 });
 
 // ========== 模型配置 ==========
@@ -2138,7 +2841,12 @@ $('#btn-model-config').addEventListener('click', async () => {
         if (config.rh_aspect_ratio) $('#cfg-rh-aspect-ratio').value = config.rh_aspect_ratio;
         if (config.rh_seed_mode) $('#cfg-rh-seed-mode').value = config.rh_seed_mode;
         if (config.rh_seed) { $('#cfg-rh-seed').value = config.rh_seed; $('#cfg-rh-seed').disabled = config.rh_seed_mode === 'random'; }
-        $('#cfg-rh-download-path').value = config.rh_download_path || '~/Downloads/AI生图/';
+        $('#cfg-rh-download-path').value = getGlobalDownloadPath();
+        $('#cfg-rh-download-path').dataset.downloadPathInherited = '1';
+
+        // 图片命名前缀
+        const prefixInput = document.getElementById('cfg-image-prefix');
+        if (prefixInput) prefixInput.value = config.image_prefix || '';
 
         // OpenAI-HK 配置
         $('#cfg-oaihk-api-key').value = config.oaihk_api_key || '';
@@ -2150,7 +2858,7 @@ $('#btn-model-config').addEventListener('click', async () => {
         if (seInput) seInput.value = uploadShortEdge;
         // 高亮对应预设按钮
         document.querySelectorAll('#cfg-upload-preset-group .upload-preset-btn').forEach(btn => {
-            btn.classList.toggle('active', parseInt(btn.dataset.value) === uploadShortEdge);
+            btn.classList.toggle('active', parseInt(btn.dataset.value, 10) === uploadShortEdge);
         });
 
         // 平台选择
@@ -2179,7 +2887,7 @@ $('#btn-model-config').addEventListener('click', async () => {
 
 $('#btn-save-config').addEventListener('click', async () => {
     const config = {
-        provider: $('#cfg-provider').value, api_key: $('#cfg-api-key').value, base_url: $('#cfg-base-url').value, model_name: $('#cfg-model-name').value, timeout_ms: parseInt($('#cfg-timeout').value) || 30000, retry_count: parseInt($('#cfg-retry').value) || 1,
+        provider: $('#cfg-provider').value, api_key: $('#cfg-api-key').value, base_url: $('#cfg-base-url').value, model_name: $('#cfg-model-name').value, timeout_ms: parseInt($('#cfg-timeout').value, 10) || 30000, retry_count: parseInt($('#cfg-retry').value, 10) || 1,
         // 平台选择
         api_platform: $('#cfg-api-platform')?.value || 'runninghub',
         // RunningHub
@@ -2190,16 +2898,20 @@ $('#btn-save-config').addEventListener('click', async () => {
         rh_aspect_ratio: $('#cfg-rh-aspect-ratio').value,
         rh_seed_mode: $('#cfg-rh-seed-mode').value,
         rh_seed: $('#cfg-rh-seed').value,
-        rh_download_path: $('#cfg-rh-download-path').value,
+        rh_download_path: queueMode === 'multi'
+            ? getGlobalDownloadPath()
+            : (cleanDownloadPath($('#cfg-rh-download-path').value) || DEFAULT_DOWNLOAD_PATH_FALLBACK),
         // OpenAI-HK
         oaihk_api_key: $('#cfg-oaihk-api-key').value,
         oaihk_base_url: $('#cfg-oaihk-base-url').value,
         // 上传压缩设置
-        upload_short_edge: parseInt($('#cfg-upload-short-edge')?.value) || 1536,
+        upload_short_edge: parseInt($('#cfg-upload-short-edge')?.value, 10) || 1536,
         // 系统提示词
         system_prompt_prompt: $('#cfg-system-prompt-prompt').value,
         system_prompt_bilingual: $('#cfg-system-prompt-bilingual').value,
-        system_prompt_translate: $('#cfg-system-prompt-translate').value
+        system_prompt_translate: $('#cfg-system-prompt-translate').value,
+        // 图片命名前缀
+        image_prefix: document.getElementById('cfg-image-prefix')?.value?.trim() || ''
     };
     try {
         await api('PUT', '/api/model-config', config);
@@ -2234,7 +2946,7 @@ $('#btn-test-connection').addEventListener('click', async () => {
     btn.disabled = true;
     btn.textContent = '测试中...';
     try {
-        const config = { provider: $('#cfg-provider').value, api_key: $('#cfg-api-key').value, base_url: $('#cfg-base-url').value, model_name: $('#cfg-model-name').value, timeout_ms: parseInt($('#cfg-timeout').value) || 30000 };
+        const config = { provider: $('#cfg-provider').value, api_key: $('#cfg-api-key').value, base_url: $('#cfg-base-url').value, model_name: $('#cfg-model-name').value, timeout_ms: parseInt($('#cfg-timeout').value, 10) || 30000 };
         const result = await api('POST', '/api/test-connection', config);
         showToast(result.success ? result.message : result.message, result.success ? 'success' : 'error');
     } catch (e) { showToast(e.message, 'error'); }
@@ -2338,7 +3050,7 @@ $('#preset-collapse-arrow').addEventListener('click', () => {
 
 // ========== 预设缩放滑杆 ==========
 $('#preset-zoom-slider').addEventListener('input', (e) => {
-    state.presetZoom = parseInt(e.target.value);
+    state.presetZoom = parseInt(e.target.value, 10);
     const grid = $('#preset-grid');
     grid.style.gridTemplateColumns = `repeat(${state.presetZoom}, 1fr)`;
     try { localStorage.setItem('preset-zoom', state.presetZoom); } catch(err) {}
@@ -2358,6 +3070,7 @@ function removeAppLoading() {
 setTimeout(removeAppLoading, 10000);
 
 loadAllData().then(() => {
+    setUndoBaseline();
     removeAppLoading();
 }).catch(e => {
     removeAppLoading();
@@ -2381,8 +3094,8 @@ const imageState = {
     imgPresetFilterTag: '',     // 预设列表筛选标签
     imgPresetZoom: 3,           // 预设缩放列数
     slots: [
-        { image: '', label: '', prefixTemplate: '请参考' },
-        { image: '', label: '', prefixTemplate: '请参考' }
+        { image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' },
+        { image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' }
     ],
     promptCn: '',
     promptEn: '',
@@ -2395,6 +3108,7 @@ const imageState = {
     libZoom: 2,  // 素材库缩放列数
     activeLibTab: 'library'  // 'library' or 'preset'
 };
+let splitModeLoaded = false; // 拆图模块是否已完成一次数据加载
 
 // ---------- 多图队列系统 ----------
 // QUEUE_COUNT 已在文件顶部声明
@@ -2403,12 +3117,13 @@ let activeQueue = 0;     // 当前活动的队列编号 (0-9)
 
 // 每个队列独立的数据：{ slots: [...], promptCn: '', promptEn: '', results: [...], apiPlatform, rhModelId, ... }
 let queueData = [];
+let _saveQueueTimer = null; // saveQueueData 防抖定时器
 function initQueueData() {
     // 队列数据现在从服务端加载（loadAllData 中处理）
     // 这里仅确保有10个队列
     while (queueData.length < QUEUE_COUNT) {
         queueData.push({
-            slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考' })),
+            slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' })),
             promptCn: '',
             promptEn: '',
             results: [],
@@ -2416,11 +3131,14 @@ function initQueueData() {
             rhModelId: '',
             oaihkModelId: 'fal-ai/banana/v3.1/flash/2k',
             rhAspectRatio: '3:4',
-            oaihkAspectRatio: '1:1',
+            oaihkAspectRatio: '3:4',
             rhResolution: '1k',
             rhCount: 1,
             rhSeedMode: 'random',
-            rhSeed: ''
+            rhSeed: '',
+            downloadPath: '',
+            imagePrefix: '',
+            autoBackup: true
         });
     }
     // 兼容旧数据：确保每个队列都有新字段
@@ -2430,16 +3148,1607 @@ function initQueueData() {
         if (!queueData[q].rhModelId) queueData[q].rhModelId = '';
         if (!queueData[q].oaihkModelId) queueData[q].oaihkModelId = 'fal-ai/banana/v3.1/flash/2k';
         if (!queueData[q].rhAspectRatio) queueData[q].rhAspectRatio = '3:4';
-        if (!queueData[q].oaihkAspectRatio) queueData[q].oaihkAspectRatio = '1:1';
+        if (!queueData[q].oaihkAspectRatio) queueData[q].oaihkAspectRatio = '3:4';
         if (!queueData[q].rhResolution) queueData[q].rhResolution = '1k';
         if (queueData[q].rhCount === undefined) queueData[q].rhCount = 1;
         if (!queueData[q].rhSeedMode) queueData[q].rhSeedMode = 'random';
         if (queueData[q].rhSeed === undefined) queueData[q].rhSeed = '';
+        if (queueData[q].downloadPath === undefined) queueData[q].downloadPath = '';
+        if (queueData[q].imagePrefix === undefined) queueData[q].imagePrefix = '';
+        if (queueData[q].autoBackup === undefined) queueData[q].autoBackup = true;
+        // 兼容旧数据：确保每个槽位有 DW 字段
+        if (queueData[q].slots) {
+            for (let s = 0; s < queueData[q].slots.length; s++) {
+                if (queueData[q].slots[s].dwEnabled === undefined) queueData[q].slots[s].dwEnabled = false;
+                if (queueData[q].slots[s].dwOriginalImage === undefined) queueData[q].slots[s].dwOriginalImage = '';
+            }
+        }
     }
 }
 
-let _saveQueueTimer = null;
+// ---------- 拆图队列系统（独立模块） ----------
+let activeSplitQueue = 0;
+let splitQueueData = [];
+function initSplitQueueData() {
+    while (splitQueueData.length < QUEUE_COUNT) {
+        splitQueueData.push({
+            gridImageUrl: '',
+            imageUrl: '',           // 九宫格原图URL
+            croppedImageUrl: '',    // 裁剪后的图URL（裁剪模式）
+            promptCn: '',           // 提示词
+            number: 0,              // 编号
+            selectedNums: [],       // 该队列独立的编号选中状态
+            workItems: [],
+            activeItemIndex: 0,
+            selectedPrefixIds: [],
+            selectedSuffixIds: [],
+            results: [],
+            apiPlatform: 'oaihk',
+            rhModelId: '',
+            oaihkModelId: 'fal-ai/banana/v3.1/flash/2k',
+            rhAspectRatio: '3:4',
+            oaihkAspectRatio: '3:4',
+            rhResolution: '1k',
+            rhCount: 1,
+            rhSeedMode: 'random',
+            rhSeed: '',
+            downloadPath: '',
+            imagePrefix: '',
+            autoBackup: true,
+            cropPreset: null,
+            sourceFilename: '',
+            learnedGridLayout: null,
+            /** 用户手动改过比例后为 true；裁剪框变更后清零并重新自动匹配横竖比例 */
+            splitAspectRatioManualOverride: false,
+            materials: [],
+            activeMaterialIndex: 0
+        });
+    }
+    // 兼容旧数据
+    for (let q = 0; q < splitQueueData.length; q++) {
+        if (splitQueueData[q].gridImageUrl === undefined) splitQueueData[q].gridImageUrl = '';
+        if (!Array.isArray(splitQueueData[q].selectedNums)) splitQueueData[q].selectedNums = [];
+        if (!splitQueueData[q].results) splitQueueData[q].results = [];
+        if (!Array.isArray(splitQueueData[q].workItems)) splitQueueData[q].workItems = [];
+        if (splitQueueData[q].activeItemIndex === undefined) splitQueueData[q].activeItemIndex = 0;
+        if (!splitQueueData[q].apiPlatform) splitQueueData[q].apiPlatform = 'oaihk';
+        if (!splitQueueData[q].oaihkModelId) splitQueueData[q].oaihkModelId = 'fal-ai/banana/v3.1/flash/2k';
+        if (!splitQueueData[q].oaihkAspectRatio) splitQueueData[q].oaihkAspectRatio = '3:4';
+        if (splitQueueData[q].downloadPath === undefined) splitQueueData[q].downloadPath = '';
+        if (splitQueueData[q].imagePrefix === undefined) splitQueueData[q].imagePrefix = '';
+        if (splitQueueData[q].autoBackup === undefined) splitQueueData[q].autoBackup = true;
+        if (splitQueueData[q].cropPreset === undefined) splitQueueData[q].cropPreset = null;
+        if (splitQueueData[q].sourceFilename === undefined) splitQueueData[q].sourceFilename = '';
+        if (splitQueueData[q].learnedGridLayout === undefined) splitQueueData[q].learnedGridLayout = null;
+        if (splitQueueData[q].splitAspectRatioManualOverride === undefined) splitQueueData[q].splitAspectRatioManualOverride = false;
+        if (!Array.isArray(splitQueueData[q].materials)) splitQueueData[q].materials = [];
+        if (splitQueueData[q].activeMaterialIndex === undefined) splitQueueData[q].activeMaterialIndex = 0;
+        if (!Array.isArray(splitQueueData[q].failedItems)) splitQueueData[q].failedItems = [];
+        if (splitQueueData[q].workItems.length === 0 && (splitQueueData[q].imageUrl || splitQueueData[q].croppedImageUrl)) {
+            splitQueueData[q].workItems.push({
+                imageUrl: splitQueueData[q].imageUrl || '',
+                gridImageUrl: splitQueueData[q].gridImageUrl || splitQueueData[q].imageUrl || '',
+                croppedImageUrl: splitQueueData[q].croppedImageUrl || '',
+                cropRect: splitQueueData[q].cropRect || null,
+                cropPreset: splitQueueData[q].cropPreset || null,
+                promptCn: splitQueueData[q].promptCn || '',
+                number: splitQueueData[q].number || (q + 1),
+                selectedPrefixIds: dedupeTemplateIds(splitQueueData[q].selectedPrefixIds || []),
+                selectedSuffixIds: dedupeTemplateIds(splitQueueData[q].selectedSuffixIds || [])
+            });
+        }
+    }
+    normalizeSplitQueueWorkItems();
+}
+
+function normalizeSplitQueueWorkItems() {
+    let changed = false;
+    for (let q = 0; q < splitQueueData.length; q++) {
+        const qd = splitQueueData[q];
+        if (!qd || !Array.isArray(qd.workItems)) continue;
+        const queueGridUrl = qd.gridImageUrl || qd.imageUrl || '';
+        qd.workItems.forEach(item => {
+            if (!item || typeof item !== 'object') return;
+            if (item.gridImageUrl === undefined) {
+                item.gridImageUrl = '';
+                changed = true;
+            }
+            if (item.cropRect && !item.gridImageUrl) {
+                const fallbackGridUrl = queueGridUrl || item.imageUrl || '';
+                if (fallbackGridUrl) {
+                    item.gridImageUrl = fallbackGridUrl;
+                    changed = true;
+                }
+            }
+            if (!qd.gridImageUrl && item.gridImageUrl) {
+                qd.gridImageUrl = item.gridImageUrl;
+                changed = true;
+            }
+            if (item.cropPreset === undefined) {
+                item.cropPreset = qd.cropPreset || null;
+                changed = true;
+            }
+            const dp = dedupeTemplateIds(item.selectedPrefixIds);
+            const ds = dedupeTemplateIds(item.selectedSuffixIds);
+            if ((item.selectedPrefixIds || []).length !== dp.length) {
+                item.selectedPrefixIds = dp;
+                changed = true;
+            }
+            if ((item.selectedSuffixIds || []).length !== ds.length) {
+                item.selectedSuffixIds = ds;
+                changed = true;
+            }
+        });
+        const qDp = dedupeTemplateIds(qd.selectedPrefixIds);
+        const qDs = dedupeTemplateIds(qd.selectedSuffixIds);
+        if ((qd.selectedPrefixIds || []).length !== qDp.length) {
+            qd.selectedPrefixIds = qDp;
+            changed = true;
+        }
+        if ((qd.selectedSuffixIds || []).length !== qDs.length) {
+            qd.selectedSuffixIds = qDs;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+function normalizeSplitQueueMaterials(qd) {
+    if (!qd || typeof qd !== 'object') return;
+    if (!Array.isArray(qd.materials)) qd.materials = [];
+    if (typeof qd.activeMaterialIndex !== 'number' || qd.activeMaterialIndex < 0) qd.activeMaterialIndex = 0;
+    if (qd.materials.length === 0) {
+        qd.materials.push({
+            gridImageUrl: qd.gridImageUrl || '',
+            sourceFilename: qd.sourceFilename || '',
+            selectedNums: Array.isArray(qd.selectedNums) ? [...qd.selectedNums] : [],
+            learnedGridLayout: qd.learnedGridLayout ?? null,
+            cropPreset: qd.cropPreset ?? null,
+            workItems: deepClone(qd.workItems || [])
+        });
+        qd.activeMaterialIndex = 0;
+    } else {
+        qd.activeMaterialIndex = Math.min(qd.activeMaterialIndex, qd.materials.length - 1);
+        qd.materials.forEach(m => {
+            if (!m || typeof m !== 'object') return;
+            if (!Array.isArray(m.workItems)) m.workItems = [];
+            if (!Array.isArray(m.selectedNums)) m.selectedNums = [];
+            if (m.gridImageUrl === undefined) m.gridImageUrl = '';
+            if (m.sourceFilename === undefined) m.sourceFilename = '';
+            if (m.learnedGridLayout === undefined) m.learnedGridLayout = null;
+            if (m.cropPreset === undefined) m.cropPreset = null;
+        });
+    }
+}
+
+function persistActiveSplitMaterial(qd) {
+    normalizeSplitQueueMaterials(qd);
+    const idx = Math.max(0, Math.min(qd.activeMaterialIndex || 0, qd.materials.length - 1));
+    qd.activeMaterialIndex = idx;
+    const m = qd.materials[idx];
+    if (!m) return;
+    m.gridImageUrl = qd.gridImageUrl || '';
+    m.sourceFilename = qd.sourceFilename || '';
+    m.selectedNums = Array.isArray(qd.selectedNums) ? [...qd.selectedNums] : [];
+    m.learnedGridLayout = qd.learnedGridLayout ?? null;
+    m.cropPreset = qd.cropPreset ?? null;
+    m.workItems = deepClone(qd.workItems || []);
+}
+
+function loadActiveSplitMaterialIntoQueue(qd, idx) {
+    normalizeSplitQueueMaterials(qd);
+    idx = Math.max(0, Math.min(idx, qd.materials.length - 1));
+    qd.activeMaterialIndex = idx;
+    const m = qd.materials[idx];
+    if (!m) return;
+    qd.gridImageUrl = m.gridImageUrl || '';
+    qd.sourceFilename = m.sourceFilename || '';
+    qd.selectedNums = Array.isArray(m.selectedNums) ? [...m.selectedNums] : [];
+    qd.learnedGridLayout = m.learnedGridLayout ?? null;
+    qd.cropPreset = m.cropPreset ?? null;
+    qd.workItems = deepClone(m.workItems || []);
+    if (typeof qd.activeItemIndex !== 'number') qd.activeItemIndex = 0;
+    if (qd.workItems.length === 0) qd.activeItemIndex = 0;
+    else qd.activeItemIndex = Math.min(qd.activeItemIndex, qd.workItems.length - 1);
+}
+
+function renderSplitMaterialTabs(qi) {
+    const wrap = document.getElementById('split-material-tabs');
+    if (!wrap) return;
+    const qd = splitQueueData[qi];
+    if (!qd) return;
+    normalizeSplitQueueMaterials(qd);
+    wrap.innerHTML = '';
+    if (qd.materials.length <= 1) {
+        wrap.style.display = 'none';
+        return;
+    }
+    wrap.style.display = 'flex';
+    wrap.style.alignItems = 'center';
+    wrap.style.flexWrap = 'wrap';
+    wrap.style.gap = '4px';
+    const hint = document.createElement('span');
+    hint.style.cssText = 'font-size:10px;color:var(--text-muted);margin-right:4px;white-space:nowrap;';
+    hint.textContent = '素材';
+    wrap.appendChild(hint);
+    qd.materials.forEach((_, mi) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `split-num-btn ${mi === qd.activeMaterialIndex ? 'active' : ''}`;
+        btn.textContent = String(mi + 1);
+        btn.title = `切换到素材 ${mi + 1}`;
+        btn.addEventListener('click', () => {
+            if (qi !== activeSplitQueue) switchToSplitQueue(qi);
+            const qd2 = splitQueueData[qi];
+            if (!qd2 || qd2.activeMaterialIndex === mi) return;
+            persistActiveSplitMaterial(qd2);
+            loadActiveSplitMaterialIntoQueue(qd2, mi);
+            splitImageUrl = qd2.gridImageUrl || '';
+            splitGridImageUrl = splitImageUrl;
+            renderSplitMaterialTabs(qi);
+            loadSplitQueueToUI(qi);
+            saveSplitQueueData();
+        });
+        wrap.appendChild(btn);
+    });
+}
+
+let splitGenerateStates = Array.from({length: 10}, () => ({
+    running: false,
+    cancelled: false,
+    abortController: null,
+    progressPercent: 0,
+    progressText: '',
+    /** 当前生成任务在结果区的占位卡总数（与批次迭代次数一致，用于切队列后恢复骨架屏） */
+    batchVisualTotal: 0,
+    batchVisualFilled: 0
+}));
+// 拆图生成允许多队列并发进入，但外部 API 请求统一串行 FIFO
+let splitApiDispatchChain = Promise.resolve();
+let splitApiDispatchSeq = 0;
+const SPLIT_QUEUE_LOCAL_KEY = 'splitQueueDataLocal_v2';
+
+function saveSplitQueueLocalFallback() {
+    try {
+        localStorage.setItem(SPLIT_QUEUE_LOCAL_KEY, JSON.stringify({
+            queues: splitQueueData,
+            activeQueue: activeSplitQueue,
+            ts: Date.now()
+        }));
+    } catch (e) {
+        // ignore
+    }
+}
+
+function loadSplitQueueLocalFallback() {
+    try {
+        const raw = localStorage.getItem(SPLIT_QUEUE_LOCAL_KEY);
+        if (!raw) return false;
+        const data = JSON.parse(raw);
+        if (!data || !Array.isArray(data.queues)) return false;
+        for (let i = 0; i < QUEUE_COUNT; i++) {
+            if (data.queues[i]) {
+                splitQueueData[i] = { ...splitQueueData[i], ...data.queues[i] };
+            }
+        }
+        if (typeof data.activeQueue === 'number' && data.activeQueue >= 0 && data.activeQueue < QUEUE_COUNT) {
+            activeSplitQueue = data.activeQueue;
+        }
+        if (normalizeSplitQueueWorkItems()) saveSplitQueueLocalFallback();
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// 拆图上传/编号选择状态
+let splitImageUrl = '';
+let splitMode = 'crop'; // 'crop' | 'nocrop'
+let splitGridImageUrl = ''; // 原始九宫格URL
+
+let _saveSplitQueueTimer = null;
+function saveSplitQueueData() {
+    syncUndoBaselineAfterMutation();
+    // 无论后端是否可用，先落本地，保证刷新不丢
+    saveSplitQueueLocalFallback();
+    if (_saveSplitQueueTimer) clearTimeout(_saveSplitQueueTimer);
+    _saveSplitQueueTimer = setTimeout(() => {
+        api('PUT', '/api/split-queue-data', {
+            queues: splitQueueData,
+            activeQueue: activeSplitQueue
+        }, 60000, undefined, true).catch(e => {
+            console.error('保存拆图队列数据失败:', e);
+            if ((e?.message || '').includes('404')) {
+                showToast('拆图后端接口不可用，已改为本地临时保存（请重启软件后端）', 'warning');
+            }
+        });
+    }, 300);
+}
+async function saveSplitQueueDataNow() {
+    syncUndoBaselineAfterMutation();
+    saveSplitQueueLocalFallback();
+    if (_saveSplitQueueTimer) { clearTimeout(_saveSplitQueueTimer); _saveSplitQueueTimer = null; }
+    await api('PUT', '/api/split-queue-data', {
+        queues: splitQueueData,
+        activeQueue: activeSplitQueue
+    }, 60000, undefined, true).catch(e => {
+        console.error('立即保存拆图队列失败:', e);
+        if ((e?.message || '').includes('404')) {
+            showToast('拆图后端接口不可用，已改为本地临时保存（请重启软件后端）', 'warning');
+        }
+    });
+}
+
+function isAnySplitQueueGenerating() {
+    return splitGenerateStates.some(s => s.running);
+}
+
+function getSplitQueueProgressStat(qi) {
+    const qd = splitQueueData[qi] || {};
+    const total = Math.max(0, parseInt(qd.progressTotal ?? ((qd.workItems || []).filter(it => it?.croppedImageUrl || it?.imageUrl).length), 10) || 0);
+    const doneRaw = parseInt(qd.progressDone ?? Math.min((qd.results || []).length, total), 10) || 0;
+    const done = Math.max(0, Math.min(doneRaw, total));
+    return { total, done };
+}
+
+/** 当前拆图队列批量生成全部结束时的提示音（Web Audio，无需音频文件；浏览器静音或无权限时静默失败） */
+function playSplitQueueCompleteChime() {
+    try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        const ctx = new AC();
+        const p = ctx.resume?.();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+        const now = ctx.currentTime;
+        const ding = (freq, start) => {
+            const o = ctx.createOscillator();
+            const g = ctx.createGain();
+            o.type = 'sine';
+            o.frequency.value = freq;
+            o.connect(g);
+            g.connect(ctx.destination);
+            g.gain.setValueAtTime(0, start);
+            g.gain.linearRampToValueAtTime(0.1, start + 0.03);
+            g.gain.linearRampToValueAtTime(0, start + 0.18);
+            o.start(start);
+            o.stop(start + 0.2);
+        };
+        ding(784, now);
+        ding(988, now + 0.14);
+    } catch (_) { /* ignore */ }
+}
+
+/** 限制异步并行数量（结果数组与 items 下标一致）。onEach(i, entry) 在每个任务 settle 后立刻调用，便于刷新进度 UI */
+async function mapWithConcurrency(items, limit, mapper, onEach) {
+    const arr = Array.isArray(items) ? items : [];
+    const results = new Array(arr.length);
+    let nextIndex = 0;
+    async function worker() {
+        while (true) {
+            const i = nextIndex++;
+            if (i >= arr.length) break;
+            try {
+                const value = await mapper(arr[i], i);
+                results[i] = { status: 'fulfilled', value };
+                if (typeof onEach === 'function') {
+                    try {
+                        onEach(i, results[i]);
+                    } catch (_) { /* ignore */ }
+                }
+            } catch (reason) {
+                results[i] = { status: 'rejected', reason };
+                if (typeof onEach === 'function') {
+                    try {
+                        onEach(i, results[i]);
+                    } catch (_) { /* ignore */ }
+                }
+            }
+        }
+    }
+    const n = Math.min(Math.max(1, limit || 1), Math.max(1, arr.length));
+    await Promise.all(Array.from({ length: n }, () => worker()));
+    return results;
+}
+
+let splitGlobalActiveJobs = 0;
+const splitGlobalJobQueue = [];
+
+function createSplitAbortError() {
+    try {
+        return new DOMException('Aborted', 'AbortError');
+    } catch (_) {
+        const err = new Error('Aborted');
+        err.name = 'AbortError';
+        return err;
+    }
+}
+
+function removeSplitGlobalQueuedJob(entry) {
+    const idx = splitGlobalJobQueue.indexOf(entry);
+    if (idx >= 0) splitGlobalJobQueue.splice(idx, 1);
+}
+
+function pumpSplitGlobalJobQueue() {
+    while (splitGlobalActiveJobs < SPLIT_GLOBAL_GEN_CONCURRENCY && splitGlobalJobQueue.length > 0) {
+        const entry = splitGlobalJobQueue.shift();
+        if (!entry || entry.cancelled) continue;
+        entry.start();
+    }
+}
+
+function runWithSplitGlobalConcurrency(taskFn, signal) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            if (signal?.removeEventListener) signal.removeEventListener('abort', onAbort);
+            fn(value);
+        };
+        const entry = {
+            cancelled: false,
+            start: () => {
+                if (entry.cancelled || settled) return;
+                if (signal?.aborted) {
+                    finish(reject, createSplitAbortError());
+                    return;
+                }
+                splitGlobalActiveJobs++;
+                Promise.resolve()
+                    .then(taskFn)
+                    .then(value => finish(resolve, value), reason => finish(reject, reason))
+                    .finally(() => {
+                        splitGlobalActiveJobs = Math.max(0, splitGlobalActiveJobs - 1);
+                        pumpSplitGlobalJobQueue();
+                    });
+            }
+        };
+        const onAbort = () => {
+            entry.cancelled = true;
+            removeSplitGlobalQueuedJob(entry);
+            finish(reject, createSplitAbortError());
+        };
+        if (signal?.aborted) {
+            onAbort();
+            return;
+        }
+        if (signal?.addEventListener) signal.addEventListener('abort', onAbort, { once: true });
+        splitGlobalJobQueue.push(entry);
+        pumpSplitGlobalJobQueue();
+    });
+}
+
+function renderSplitNumSelectionForQueue(qi = activeSplitQueue) {
+    const selected = Array.isArray(splitQueueData[qi]?.selectedNums) ? splitQueueData[qi].selectedNums : [];
+    document.querySelectorAll('.grid-split-number-row .split-num-btn').forEach(btn => {
+        const num = parseInt(btn.dataset.num, 10);
+        if (!Number.isFinite(num)) return;
+        btn.classList.toggle('active', selected.includes(num));
+    });
+}
+
+function syncSplitProgressUI() {
+    const progressWrap = document.getElementById('split-progress-bar-wrap');
+    const progressBar = document.getElementById('split-progress-bar');
+    const progressText = document.getElementById('split-progress-text');
+    const cancelBtn = document.getElementById('btn-split-cancel');
+    if (!progressWrap || !progressBar || !progressText || !cancelBtn) return;
+
+    const activeState = splitGenerateStates[activeSplitQueue];
+    if (activeState?.running) {
+        progressWrap.style.display = '';
+        progressText.style.display = '';
+        progressBar.style.width = `${Math.max(0, Math.min(100, activeState.progressPercent || 0))}%`;
+        progressText.textContent = activeState.progressText || `队列${activeSplitQueue + 1}生成中...`;
+        cancelBtn.style.display = '';
+        return;
+    }
+
+    const runningIdx = splitGenerateStates.findIndex(s => s.running);
+    if (runningIdx >= 0) {
+        // 非当前队列在生成时，不占用当前队列的进度/按钮显示
+        progressWrap.style.display = 'none';
+        progressText.style.display = 'none';
+        cancelBtn.style.display = 'none';
+        return;
+    }
+
+    progressWrap.style.display = 'none';
+    progressText.style.display = 'none';
+    cancelBtn.style.display = 'none';
+}
+
+async function loadSplitModeData() {
+    if (splitModeLoaded) return;
+    initSplitQueueData();
+    try {
+        const resp = await api('GET', '/api/split-queue-data', null, 30000);
+        if (resp && resp.queues && resp.queues.length > 0) {
+            for (let i = 0; i < QUEUE_COUNT; i++) {
+                if (resp.queues[i]) {
+                    splitQueueData[i] = { ...splitQueueData[i], ...resp.queues[i] };
+                    if (!splitQueueData[i].results) splitQueueData[i].results = [];
+                }
+            }
+            if (typeof resp.activeQueue === 'number' && resp.activeQueue >= 0 && resp.activeQueue < QUEUE_COUNT) {
+                activeSplitQueue = resp.activeQueue;
+            }
+            if (normalizeSplitQueueWorkItems()) saveSplitQueueData();
+        }
+    } catch(e) {
+        console.error('加载拆图队列数据失败:', e);
+        const restored = loadSplitQueueLocalFallback();
+        if (restored) {
+            showToast('拆图数据已从本地恢复（后端接口异常）', 'warning');
+        } else if ((e?.message || '').includes('404')) {
+            showToast('当前后端不支持拆图队列接口，请重启到最新版本', 'error');
+        }
+    }
+    splitModeLoaded = true;
+    loadSplitTemplate(getCurrentSplitMode());
+    await renderSplitLibrary();
+    renderSplitQueueNumberBar();
+    switchToSplitQueue(activeSplitQueue);
+}
+
+function saveCurrentSplitQueueData() {
+    const qd = splitQueueData[activeSplitQueue];
+    if (!qd) return;
+    const activeItem = getActiveSplitWorkItem(activeSplitQueue);
+    const promptEl = document.getElementById('split-prompt-cn');
+    if (promptEl && activeItem) activeItem.promptCn = promptEl.value;
+    // 读取API配置
+    readSplitApiConfigToQueue(activeSplitQueue);
+    syncActiveSplitItemToQueue(activeSplitQueue);
+    persistActiveSplitMaterial(qd);
+    saveSplitQueueData();
+}
+
+/** 将当前提示词框内容写入本拆图队列全部编号的 workItem（verbatim） */
+function syncSplitPromptToAllWorkItems() {
+    const qi = activeSplitQueue;
+    const qd = splitQueueData[qi];
+    if (!qd || !Array.isArray(qd.workItems) || qd.workItems.length === 0) {
+        showToast('当前队列没有拆图工作项', 'warning');
+        return;
+    }
+    const promptEl = document.getElementById('split-prompt-cn');
+    const text = promptEl ? promptEl.value : '';
+    qd.workItems.forEach(item => {
+        if (item) item.promptCn = text;
+    });
+    qd.promptCn = text;
+    syncActiveSplitItemToQueue(qi);
+    persistActiveSplitMaterial(qd);
+    saveSplitQueueData();
+    normalizeSplitQueueMaterials(qd);
+    const matHint = qd.materials.length > 1 ? `（当前素材 ${qd.activeMaterialIndex + 1}）` : '';
+    showToast(`已同步到本队列当前素材${matHint}全部 ${qd.workItems.length} 个格子编号`, 'success');
+}
+
+function readSplitApiConfigToQueue(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd) return;
+    const platformEl = document.getElementById('split-cfg-api-platform');
+    if (platformEl) qd.apiPlatform = platformEl.value;
+    const rhModelEl = document.getElementById('split-cfg-rh-model');
+    if (rhModelEl) qd.rhModelId = rhModelEl.value;
+    const oaihkModelEl = document.getElementById('split-cfg-oaihk-model');
+    if (oaihkModelEl) qd.oaihkModelId = oaihkModelEl.value;
+    const rhArEl = document.getElementById('split-cfg-rh-aspect-ratio');
+    if (rhArEl) qd.rhAspectRatio = rhArEl.value;
+    const oaihkArEl = document.getElementById('split-cfg-oaihk-aspect-ratio');
+    if (oaihkArEl) qd.oaihkAspectRatio = oaihkArEl.value;
+    const rhResEl = document.getElementById('split-cfg-rh-resolution');
+    if (rhResEl) qd.rhResolution = rhResEl.value;
+    const rhCountEl = document.getElementById('split-cfg-rh-count');
+    if (rhCountEl) qd.rhCount = parseInt(rhCountEl.value, 10) || 1;
+    const rhSeedModeEl = document.getElementById('split-cfg-rh-seed-mode');
+    if (rhSeedModeEl) qd.rhSeedMode = rhSeedModeEl.value;
+    const rhSeedEl = document.getElementById('split-cfg-rh-seed');
+    if (rhSeedEl) qd.rhSeed = rhSeedEl.value;
+    const dlPathEl = document.getElementById('split-cfg-download-path');
+    if (dlPathEl) qd.downloadPath = readDownloadPathInputForOwner('split-cfg-download-path');
+    const prefixEl = document.getElementById('split-cfg-image-prefix');
+    if (prefixEl) qd.imagePrefix = prefixEl.value;
+    const autoBackupEl = document.getElementById('split-cfg-auto-backup');
+    if (autoBackupEl) qd.autoBackup = autoBackupEl.checked;
+}
+
+/** 按当前 RH 模型重建拆图比例下拉，并校正 qd.rhAspectRatio */
+function syncSplitRhAspectRatioSelectForQueue(qd) {
+    const aspectSelect = document.getElementById('split-cfg-rh-aspect-ratio');
+    if (!aspectSelect || !qd) return;
+    const modelId = qd.rhModelId || document.getElementById('split-cfg-rh-model')?.value || '';
+    const model = RH_MODELS[modelId];
+    const ratios = model?.aspectRatios;
+    if (!ratios?.length) return;
+    aspectSelect.innerHTML = '';
+    for (const ratio of ratios) {
+        const opt = document.createElement('option');
+        opt.value = ratio;
+        opt.textContent = ratio === 'auto' ? '自适应' : ratio;
+        aspectSelect.appendChild(opt);
+    }
+    let val = qd.rhAspectRatio;
+    if (!ratios.includes(val)) {
+        val = ratios.includes('3:4') ? '3:4' : ratios.includes('4:3') ? '4:3' : ratios[0];
+        qd.rhAspectRatio = val;
+    }
+    aspectSelect.value = val;
+}
+
+function pickAspectRatioFromAllowedList(allowed, pref) {
+    if (!allowed?.length) return pref;
+    if (allowed.includes(pref)) return pref;
+    const alt = pref === '4:3' ? '3:4' : '4:3';
+    if (allowed.includes(alt)) return alt;
+    if (pref === '4:3') {
+        for (const x of ['16:9', '3:2', '21:9']) if (allowed.includes(x)) return x;
+    }
+    if (pref === '3:4') {
+        for (const x of ['9:16', '2:3', '4:5']) if (allowed.includes(x)) return x;
+    }
+    return allowed.includes('auto') ? 'auto' : allowed[0];
+}
+
+/** 裁剪框相对宽高 → 期望出图比例：横裁 4:3，竖裁 3:4，近似正方默认 3:4 */
+function inferSplitOutputAspectFromCropRect(rect) {
+    if (!rect || typeof rect.w !== 'number' || typeof rect.h !== 'number') return null;
+    const { w, h } = rect;
+    if (w <= 0 || h <= 0) return null;
+    const tol = 0.02;
+    if (Math.abs(w - h) <= tol) return '3:4';
+    return w > h ? '4:3' : '3:4';
+}
+
+function applyPreferredAspectToSplitQueue(qd, pref, qi) {
+    if (!qd || !pref) return;
+    const platform = qd.apiPlatform || 'oaihk';
+    if (platform === 'runninghub') {
+        const model = RH_MODELS[qd.rhModelId];
+        if (!model?.aspectRatios?.length) return;
+        const picked = pickAspectRatioFromAllowedList(model.aspectRatios, pref);
+        qd.rhAspectRatio = picked;
+        if (qi === activeSplitQueue) {
+            const sel = document.getElementById('split-cfg-rh-aspect-ratio');
+            if (sel && [...sel.options].some(o => o.value === picked)) sel.value = picked;
+        }
+    } else {
+        const model = OAIHK_MODELS[qd.oaihkModelId];
+        const allowed = ['3:4', '2:3', '1:1', '9:16', '4:3', '16:9'];
+        const picked = pickAspectRatioFromAllowedList(allowed, pref);
+        qd.oaihkAspectRatio = picked;
+        if (qi === activeSplitQueue && !model?.isGptImage) {
+            const sel = document.getElementById('split-cfg-oaihk-aspect-ratio');
+            if (sel && [...sel.options].some(o => o.value === picked)) sel.value = picked;
+        }
+    }
+}
+
+/** 根据当前激活编号的裁剪框自动设置 RH/HK 出图比例（未手动锁定时） */
+function applySplitAutoAspectRatioFromCrop(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd || qd.splitAspectRatioManualOverride) return;
+    const item = getActiveSplitWorkItem(qi);
+    const pref = inferSplitOutputAspectFromCropRect(item?.cropRect);
+    if (!pref) return;
+    applyPreferredAspectToSplitQueue(qd, pref, qi);
+}
+
+function writeSplitApiConfigFromQueue(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd) return;
+    const setVal = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
+    setVal('split-cfg-api-platform', qd.apiPlatform || 'oaihk');
+    setVal('split-cfg-rh-model', qd.rhModelId || '');
+    setVal('split-cfg-oaihk-model', qd.oaihkModelId || 'fal-ai/banana/v3.1/flash/2k');
+    syncSplitRhAspectRatioSelectForQueue(qd);
+    setVal('split-cfg-oaihk-aspect-ratio', qd.oaihkAspectRatio || '3:4');
+    setVal('split-cfg-rh-resolution', qd.rhResolution || '1k');
+    setVal('split-cfg-rh-count', qd.rhCount || 1);
+    setVal('split-cfg-rh-seed-mode', qd.rhSeedMode || 'random');
+    setVal('split-cfg-rh-seed', qd.rhSeed || '');
+    writeDownloadPathInputFromOwner('split-cfg-download-path', qd.downloadPath);
+    setVal('split-cfg-image-prefix', qd.imagePrefix || '');
+    const autoEl = document.getElementById('split-cfg-auto-backup');
+    if (autoEl) autoEl.checked = qd.autoBackup !== false;
+    // 触发平台切换
+    updateSplitApiPlatformUI();
+}
+
+function updateSplitApiPlatformUI() {
+    const platform = document.getElementById('split-cfg-api-platform')?.value || 'oaihk';
+    const rhModelGroup = document.getElementById('split-cfg-rh-model');
+    const oaihkModelGroup = document.getElementById('split-cfg-oaihk-model');
+    const oaihkArGroup = document.getElementById('split-oaihk-aspect-ratio-group');
+    const rhResGroup = document.getElementById('split-rh-resolution-group');
+    if (rhModelGroup) rhModelGroup.style.display = platform === 'runninghub' ? '' : 'none';
+    if (oaihkModelGroup) oaihkModelGroup.style.display = platform === 'oaihk' ? '' : 'none';
+    if (oaihkArGroup) {
+        if (platform === 'oaihk') {
+            const hkModel = OAIHK_MODELS[oaihkModelGroup?.value];
+            oaihkArGroup.style.display = hkModel?.isGptImage ? 'none' : 'flex';
+        } else {
+            oaihkArGroup.style.display = 'none';
+        }
+    }
+    if (rhResGroup) rhResGroup.style.display = platform === 'runninghub' ? 'flex' : 'none';
+    const seedInput = document.getElementById('split-cfg-rh-seed');
+    const seedMode = document.getElementById('split-cfg-rh-seed-mode')?.value;
+    if (seedInput) seedInput.disabled = seedMode !== 'fixed';
+    // 更新价格标签
+    const oaihkPriceTag = document.getElementById('split-oaihk-price-tag');
+    const rhPriceTag = document.getElementById('split-rh-price-tag');
+    if (platform === 'oaihk') {
+        const model = OAIHK_MODELS[oaihkModelGroup?.value];
+        if (oaihkPriceTag) { oaihkPriceTag.textContent = model?.price || ''; oaihkPriceTag.style.display = ''; }
+        if (rhPriceTag) rhPriceTag.style.display = 'none';
+    } else {
+        const rhModel = RH_MODELS?.[rhModelGroup?.value];
+        if (rhPriceTag) { rhPriceTag.textContent = rhModel?.price || ''; rhPriceTag.style.display = rhModel?.price ? '' : 'none'; }
+        if (oaihkPriceTag) oaihkPriceTag.style.display = 'none';
+    }
+    updateSplitDefaultModelBadge();
+}
+
+function renderSplitQueueNumberBar() {
+    const bar = document.getElementById('split-queue-number-bar');
+    if (!bar) return;
+    bar.innerHTML = '';
+    for (let i = 0; i < QUEUE_COUNT; i++) {
+        const btn = document.createElement('button');
+        btn.className = 'queue-num-btn' + (i === activeSplitQueue ? ' active' : '');
+        btn.textContent = i + 1;
+        btn.dataset.queue = i;
+        // 显示队列状态指示器
+        const qd = splitQueueData[i];
+        normalizeSplitQueueMaterials(qd);
+        const anyMatGrid = (qd.materials || []).some(m => m?.gridImageUrl);
+        const anyMatWork = (qd.materials || []).some(m => (m?.workItems || []).length > 0);
+        const hasSplitData = anyMatWork || anyMatGrid || (qd.workItems || []).length > 0 || qd.gridImageUrl;
+        if (qd && hasSplitData) {
+            btn.style.background = 'var(--accent-light, #ede9fe)';
+            btn.style.borderColor = 'var(--accent, #7c3aed)';
+        }
+        if (splitGenerateStates[i]?.running) {
+            btn.style.background = '#fef3c7';
+            btn.style.borderColor = '#f59e0b';
+            btn.classList.add('generating');
+        }
+        const { total, done } = getSplitQueueProgressStat(i);
+        if (total > 0) {
+            const dot = document.createElement('span');
+            dot.className = 'queue-result-dot';
+            dot.textContent = `${total}-${done}`;
+            btn.appendChild(dot);
+        }
+        btn.addEventListener('click', () => switchToSplitQueue(i));
+        bar.appendChild(btn);
+    }
+}
+
+function switchToSplitQueue(targetQueue) {
+    if (targetQueue < 0 || targetQueue >= QUEUE_COUNT) return;
+    // 保存当前队列数据
+    saveCurrentSplitQueueData();
+    activeSplitQueue = targetQueue;
+    const qd = splitQueueData[targetQueue];
+    if (qd) {
+        normalizeSplitQueueMaterials(qd);
+        loadActiveSplitMaterialIntoQueue(qd, qd.activeMaterialIndex);
+        splitImageUrl = getEffectiveSplitGridPreviewUrl(targetQueue);
+        splitGridImageUrl = splitImageUrl;
+    }
+    // 恢复拆图默认模型配置
+    applySplitDefaultModelConfig();
+    // 加载目标队列数据到UI
+    loadSplitQueueToUI(targetQueue);
+    renderSplitMaterialTabs(targetQueue);
+    renderSplitQueueNumberBar();
+    saveSplitQueueData();
+    syncSplitProgressUI();
+}
+
+function loadSplitQueueToUI(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd) return;
+    ensureSplitQueueWorkItems(qi);
+    // 写入API配置
+    writeSplitApiConfigFromQueue(qi);
+    const activeItem = getActiveSplitWorkItem(qi);
+    if (activeItem && !activeItem.promptCn && qd.lastSplitPromptTemplate) {
+        const n = activeItem.number || (qd.activeItemIndex + 1);
+        activeItem.promptCn = qd.lastSplitPromptTemplate.replace(/\{N\}/g, String(n)).trim();
+    }
+    const promptEl = document.getElementById('split-prompt-cn');
+    if (promptEl) promptEl.value = activeItem?.promptCn || '';
+    // 显示/隐藏工作区
+    const workspaceArea = document.getElementById('split-workspace-area');
+    const uploadPanel = document.getElementById('split-upload-panel');
+    if (activeItem && (activeItem.imageUrl || activeItem.croppedImageUrl || activeItem.gridImageUrl)) {
+        // 队列有图片数据，显示工作区
+        if (workspaceArea) workspaceArea.style.display = 'block';
+        const currentImg = document.getElementById('split-current-img');
+        if (currentImg) {
+            // 裁剪模式：显示原图+裁剪框预览；非裁剪模式：显示原图或裁剪图
+            const displayUrl = activeItem.gridImageUrl || activeItem.imageUrl || activeItem.croppedImageUrl;
+            currentImg.src = displayUrl;
+            currentImg.style.display = 'block';
+            // 显示/隐藏裁剪框预览叠加层
+            updateSplitCropOverlay(activeItem);
+        }
+        // 渲染素材槽位
+        _renderAllSplitMaterialSlots();
+        // 渲染前缀/后缀
+        renderSplitPrefixSuffix(activeItem);
+    } else {
+        if (workspaceArea) workspaceArea.style.display = 'none';
+    }
+    applySplitSourcePreview(qi);
+    renderSplitNumSelectionForQueue(qi);
+    renderSplitWorkItemTabs(qi);
+    // 渲染结果
+    renderSplitQueueResults(qi);
+    restoreSplitQueueGeneratingPlaceholders(qi);
+    applySplitAutoAspectRatioFromCrop(qi);
+    renderSplitMaterialTabs(qi);
+    // 更新生成按钮状态
+    updateSplitGenerateBtnState();
+    syncSplitProgressUI();
+}
+
+// ========== 拆图裁剪框预览叠加层 ==========
+function updateSplitCropOverlay(activeItem) {
+    const container = document.getElementById('split-img-container');
+    if (!container) return;
+    // 移除旧叠加层
+    const oldOverlay = container.querySelector('.split-crop-overlay');
+    if (oldOverlay) oldOverlay.remove();
+
+    // 非裁剪模式或没有裁剪框数据时不显示叠加层
+    if (!activeItem || !activeItem.cropRect) return;
+
+    const rect = activeItem.cropRect; // {x, y, w, h} 比例坐标 0-1
+    const overlay = document.createElement('div');
+    overlay.className = 'split-crop-overlay';
+    overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;pointer-events:none;z-index:2;';
+
+    // 半透明遮罩（裁剪框外部区域变暗）
+    const mask = document.createElement('div');
+    mask.className = 'split-crop-mask';
+    mask.style.cssText = `position:absolute;top:0;left:0;width:100%;height:100%;
+        box-shadow:inset 0 0 0 9999px rgba(0,0,0,0.45);
+        clip-path:polygon(0% 0%,0% 100%,${(rect.x*100).toFixed(2)}% 100%,${(rect.x*100).toFixed(2)}% ${(rect.y*100).toFixed(2)}%,${((rect.x+rect.w)*100).toFixed(2)}% ${(rect.y*100).toFixed(2)}%,${((rect.x+rect.w)*100).toFixed(2)}% ${((rect.y+rect.h)*100).toFixed(2)}%,${(rect.x*100).toFixed(2)}% ${((rect.y+rect.h)*100).toFixed(2)}%,${(rect.x*100).toFixed(2)}% 100%,100% 100%,100% 0%);`;
+
+    // 裁剪框边框
+    const border = document.createElement('div');
+    border.className = 'split-crop-border';
+    border.style.cssText = `position:absolute;left:${(rect.x*100).toFixed(2)}%;top:${(rect.y*100).toFixed(2)}%;width:${(rect.w*100).toFixed(2)}%;height:${(rect.h*100).toFixed(2)}%;border:2px solid #00d4ff;box-shadow:0 0 8px rgba(0,212,255,0.5);pointer-events:auto;cursor:move;`;
+
+    // 编号标签
+    const label = document.createElement('div');
+    label.className = 'split-crop-label';
+    label.textContent = `#${activeItem.number || ''}`;
+    label.style.cssText = 'position:absolute;top:-22px;left:0;background:#00d4ff;color:#000;font-size:11px;font-weight:700;padding:1px 6px;border-radius:3px 3px 0 0;white-space:nowrap;line-height:1.4;';
+    border.appendChild(label);
+
+    // 拖动裁剪框
+    _makeSplitCropBorderDraggable(border, activeItem, mask);
+
+    overlay.appendChild(mask);
+    overlay.appendChild(border);
+    container.appendChild(overlay);
+}
+
+function _makeSplitCropBorderDraggable(borderEl, activeItem, maskEl) {
+    let isDragging = false;
+    let startX, startY, startRectX, startRectY;
+    const onDown = (e) => {
+        e.preventDefault();
+        isDragging = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        startRectX = activeItem.cropRect.x;
+        startRectY = activeItem.cropRect.y;
+    };
+    const onMove = (e) => {
+        if (!isDragging) return;
+        const parentRect = borderEl.parentElement.getBoundingClientRect();
+        const dx = (e.clientX - startX) / parentRect.width;
+        const dy = (e.clientY - startY) / parentRect.height;
+        let newX = startRectX + dx;
+        let newY = startRectY + dy;
+        const w = activeItem.cropRect.w;
+        const h = activeItem.cropRect.h;
+        newX = Math.max(0, Math.min(1 - w, newX));
+        newY = Math.max(0, Math.min(1 - h, newY));
+        activeItem.cropRect.x = newX;
+        activeItem.cropRect.y = newY;
+        borderEl.style.left = (newX * 100).toFixed(2) + '%';
+        borderEl.style.top = (newY * 100).toFixed(2) + '%';
+        _updateSplitCropMaskClip(maskEl, activeItem.cropRect);
+    };
+    const onUp = () => {
+        if (!isDragging) return;
+        isDragging = false;
+        const qdDrag = splitQueueData[activeSplitQueue];
+        if (qdDrag && activeItem?.cropRect) {
+            qdDrag.splitAspectRatioManualOverride = false;
+            applySplitAutoAspectRatioFromCrop(activeSplitQueue);
+        }
+        saveSplitQueueData();
+    };
+    borderEl.addEventListener('mousedown', onDown);
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    // 触摸支持
+    borderEl.addEventListener('touchstart', (e) => { onDown(e.touches[0]); }, { passive: false });
+    document.addEventListener('touchmove', (e) => { if (isDragging) onMove(e.touches[0]); }, { passive: false });
+    document.addEventListener('touchend', onUp);
+}
+
+function _updateSplitCropMaskClip(maskEl, rect) {
+    if (!maskEl) return;
+    maskEl.style.clipPath = `polygon(0% 0%,0% 100%,${(rect.x*100).toFixed(2)}% 100%,${(rect.x*100).toFixed(2)}% ${(rect.y*100).toFixed(2)}%,${((rect.x+rect.w)*100).toFixed(2)}% ${(rect.y*100).toFixed(2)}%,${((rect.x+rect.w)*100).toFixed(2)}% ${((rect.y+rect.h)*100).toFixed(2)}%,${(rect.x*100).toFixed(2)}% ${((rect.y+rect.h)*100).toFixed(2)}%,${(rect.x*100).toFixed(2)}% 100%,100% 100%,100% 0%)`;
+}
+
+/** 前缀/后缀模板 ID 去重（保序），避免按钮区与数据重复 */
+function dedupeTemplateIds(ids) {
+    if (!Array.isArray(ids)) return [];
+    const seen = new Set();
+    const out = [];
+    for (const id of ids) {
+        if (id === undefined || id === null || id === '') continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push(id);
+    }
+    return out;
+}
+
+/**
+ * 拼接实际发送的提示词：点击前缀/后缀时已写入 textarea，此处若再拼接会重复。
+ * 仅当正文首尾尚未包含已选模板全文时自动补上（兼容旧数据或未通过按钮编辑的情况）。
+ */
+function mergePromptBodyWithSelectedTemplates(body, prefixIds, suffixIds) {
+    const pIds = dedupeTemplateIds(prefixIds);
+    const sIds = dedupeTemplateIds(suffixIds);
+    const prefixTexts = pIds.map(id => promptTemplates?.prefixes?.find(t => t.id === id)?.text).filter(Boolean);
+    const suffixTexts = sIds.map(id => promptTemplates?.suffixes?.find(t => t.id === id)?.text).filter(Boolean);
+    const preJoin = prefixTexts.join(' ').trim();
+    const sufJoin = suffixTexts.join(' ').trim();
+    let out = (body || '').trim();
+    const norm = (s) => s.replace(/\s+/g, ' ').trim();
+    if (preJoin) {
+        const nb = norm(out);
+        const np = norm(preJoin);
+        if (!nb.startsWith(np)) out = `${preJoin} ${out}`.trim();
+    }
+    if (sufJoin) {
+        const no = norm(out);
+        const ns = norm(sufJoin);
+        if (!no.endsWith(ns)) out = `${out} ${sufJoin}`.trim();
+    }
+    return out;
+}
+
+function renderSplitPrefixSuffix(item) {
+    const prefixGroup = document.getElementById('split-prefix-btn-group');
+    const suffixGroup = document.getElementById('split-suffix-btn-group');
+    const visiblePrefixes = _getVisibleItems('prefix');
+    const visibleSuffixes = _getVisibleItems('suffix');
+    if (prefixGroup) {
+        prefixGroup.innerHTML = '';
+        if (typeof promptTemplates !== 'undefined' && promptTemplates.prefixes) {
+            visiblePrefixes.forEach((t) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'template-btn ' + (dedupeTemplateIds(item.selectedPrefixIds || []).includes(t.id) ? 'selected' : '');
+                btn.textContent = t.name;
+                btn.dataset.id = t.id;
+                btn.title = t.text || t.name || '';
+                btn.addEventListener('click', () => toggleSplitTemplate(item, 'prefix', t.id, btn));
+                prefixGroup.appendChild(btn);
+            });
+        }
+    }
+    if (suffixGroup) {
+        suffixGroup.innerHTML = '';
+        if (typeof promptTemplates !== 'undefined' && promptTemplates.suffixes) {
+            visibleSuffixes.forEach((t) => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'template-btn ' + (dedupeTemplateIds(item.selectedSuffixIds || []).includes(t.id) ? 'selected' : '');
+                btn.textContent = t.name;
+                btn.dataset.id = t.id;
+                btn.title = t.text || t.name || '';
+                btn.addEventListener('click', () => toggleSplitTemplate(item, 'suffix', t.id, btn));
+                suffixGroup.appendChild(btn);
+            });
+        }
+    }
+    updateSplitPrefixSuffixPreview(item);
+}
+
+function toggleSplitTemplate(item, type, templateId, btnEl) {
+    const key = type === 'prefix' ? 'selectedPrefixIds' : 'selectedSuffixIds';
+    if (!item[key]) item[key] = [];
+    const templateList = type === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
+    const tpl = (templateList || []).find(t => t.id === templateId);
+    if (!tpl || !tpl.text) return;
+    const textarea = document.getElementById('split-prompt-cn');
+    const i = item[key].indexOf(templateId);
+    if (i >= 0) {
+        item[key] = item[key].filter(id => id !== templateId);
+        btnEl.classList.remove('selected');
+        if (textarea) {
+            let val = textarea.value || '';
+            if (type === 'prefix') {
+                const trimmed = val.trimStart();
+                if (trimmed.startsWith(tpl.text)) val = trimmed.slice(tpl.text.length).trimStart();
+                else {
+                    const idx = val.indexOf(tpl.text);
+                    if (idx >= 0) val = (val.slice(0, idx) + val.slice(idx + tpl.text.length)).replace(/\s{2,}/g, ' ').trim();
+                }
+            } else {
+                const trimmed = val.trimEnd();
+                if (trimmed.endsWith(tpl.text)) val = trimmed.slice(0, -tpl.text.length).trimEnd();
+                else {
+                    const idx = val.lastIndexOf(tpl.text);
+                    if (idx >= 0) val = (val.slice(0, idx) + val.slice(idx + tpl.text.length)).replace(/\s{2,}/g, ' ').trim();
+                }
+            }
+            textarea.value = val;
+            item.promptCn = val;
+        }
+    } else {
+        item[key].push(templateId);
+        btnEl.classList.add('selected');
+        if (textarea) {
+            if (type === 'prefix') textarea.value = `${tpl.text} ${textarea.value || ''}`.trim();
+            else textarea.value = `${textarea.value || ''} ${tpl.text}`.trim();
+            item.promptCn = textarea.value;
+        }
+    }
+    item[key] = dedupeTemplateIds(item[key]);
+    syncActiveSplitItemToQueue(activeSplitQueue);
+    updateSplitPrefixSuffixPreview(item);
+    saveSplitQueueData();
+}
+
+function updateSplitPrefixSuffixPreview(item) {
+    const prefixPreview = document.getElementById('split-prefix-preview');
+    const suffixPreview = document.getElementById('split-suffix-preview');
+    if (prefixPreview) {
+        const names = dedupeTemplateIds(item.selectedPrefixIds || []).map(id => promptTemplates?.prefixes?.find(t => t.id === id)?.name).filter(Boolean);
+        if (names.length > 0) {
+            prefixPreview.textContent = `已选前缀：${names.join('、')}（正文见下方输入框）`;
+            prefixPreview.style.display = 'block';
+        } else {
+            prefixPreview.style.display = 'none';
+        }
+    }
+    if (suffixPreview) {
+        const names = dedupeTemplateIds(item.selectedSuffixIds || []).map(id => promptTemplates?.suffixes?.find(t => t.id === id)?.name).filter(Boolean);
+        if (names.length > 0) {
+            suffixPreview.textContent = `已选后缀：${names.join('、')}（正文见下方输入框）`;
+            suffixPreview.style.display = 'block';
+        } else {
+            suffixPreview.style.display = 'none';
+        }
+    }
+}
+
+function buildSplitFullPrompt(item) {
+    return mergePromptBodyWithSelectedTemplates(item.promptCn, item.selectedPrefixIds, item.selectedSuffixIds);
+}
+
+function getSplitCropSourceUrl(item, qd) {
+    return item?.gridImageUrl || qd?.gridImageUrl || item?.imageUrl || '';
+}
+
+function validateSplitWorkItemsForGenerate(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd || !Array.isArray(qd.workItems) || qd.workItems.length === 0) {
+        return { ok: false, message: '该队列没有拆图数据', missingIndex: -1 };
+    }
+    for (let i = 0; i < qd.workItems.length; i++) {
+        const item = qd.workItems[i];
+        const sourceUrl = item?.croppedImageUrl || item?.imageUrl || (item?.cropRect && getSplitCropSourceUrl(item, qd) ? 'preview' : '');
+        if (!sourceUrl) {
+            return { ok: false, message: `格子编号 ${item?.number || (i + 1)} 缺少图片，请重新拆分`, missingIndex: i };
+        }
+        const fullPrompt = buildSplitFullPrompt(item).trim();
+        if (!fullPrompt) {
+            return { ok: false, message: `格子编号 ${item?.number || (i + 1)} 未设置提示词，请先填写`, missingIndex: i };
+        }
+    }
+    return { ok: true, message: '', missingIndex: -1 };
+}
+
+function createSplitResultCardElement(qi, item, idx, results) {
+    const card = document.createElement('div');
+    card.className = 'api-result-card';
+    card.dataset.index = String(idx);
+    card.style.position = 'relative';
+    const qdCard = splitQueueData[qi];
+    const showMatLabel = qdCard && (qdCard.materials || []).length > 1 && Number.isFinite(item?._materialIndex);
+    const imgEl = document.createElement('img');
+    imgEl.alt = '拆图结果';
+    imgEl.loading = 'lazy';
+    imgEl.src = item.url;
+    imgEl.style.cssText = 'width:100%;aspect-ratio:3/4;object-fit:cover;display:block;cursor:pointer;';
+    imgEl.addEventListener('click', () => {
+        const images = (results || []).map((r, i) => ({
+            url: r.url || '',
+            checked: !!r.checked,
+            filename: r.filename || `拆图结果_${i + 1}.jpg`
+        }));
+        openImageViewer(images, idx);
+    });
+    imgEl.onerror = () => {
+        imgEl.style.display = 'none';
+        const fallback = document.createElement('div');
+        fallback.style.cssText = 'width:100%;aspect-ratio:3/4;display:flex;align-items:center;justify-content:center;background:var(--border-light);color:var(--text-muted);font-size:10px;';
+        fallback.textContent = '加载失败';
+        card.insertBefore(fallback, card.firstChild);
+    };
+    const actionsDiv = document.createElement('div');
+    actionsDiv.className = 'api-result-actions';
+    const downloadBtn = document.createElement('button');
+    downloadBtn.className = 'btn-icon';
+    downloadBtn.title = '下载';
+    downloadBtn.textContent = '↓';
+    downloadBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        downloadSplitResultImage(item.url, qi, idx);
+    });
+    const regenBtn = document.createElement('button');
+    regenBtn.className = 'btn-icon';
+    regenBtn.title = '再次生成';
+    regenBtn.style.cssText = 'color:#7c3aed;font-size:10px;';
+    regenBtn.textContent = '再生';
+    regenBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await regenerateSplitResult(qi, idx);
+    });
+    actionsDiv.appendChild(downloadBtn);
+    actionsDiv.appendChild(regenBtn);
+    const checkDiv = document.createElement('div');
+    checkDiv.style.cssText = 'position:absolute;top:4px;left:4px;';
+    checkDiv.innerHTML = '<input type="checkbox" class="split-result-checkbox" style="width:14px;height:14px;cursor:pointer;" title="勾选下载">';
+    const cb = checkDiv.querySelector('.split-result-checkbox');
+    if (cb) cb.checked = !!item.checked;
+    if (cb) {
+        cb.addEventListener('change', () => {
+            item.checked = cb.checked;
+            saveSplitQueueData();
+        });
+    }
+    card.appendChild(imgEl);
+    if (showMatLabel) {
+        const lab = document.createElement('div');
+        lab.style.cssText = 'position:absolute;top:22px;left:4px;font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(124,58,237,0.92);color:#fff;font-weight:600;pointer-events:none;z-index:2;';
+        lab.textContent = `素材 ${item._materialIndex + 1}`;
+        card.style.position = 'relative';
+        card.appendChild(lab);
+    }
+    card.appendChild(actionsDiv);
+    card.appendChild(checkDiv);
+    return card;
+}
+
+function appendSplitResultPendingSlots(grid, count) {
+    if (!grid || count < 1) return;
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < count; i++) {
+        const card = document.createElement('div');
+        card.className = 'split-result-pending-card api-result-pending-card';
+        card.dataset.slotIndex = String(i);
+        card.innerHTML = `<div class="split-result-pending-inner api-result-pending-inner">
+            <div class="split-result-pending-shimmer api-result-pending-shimmer"></div>
+            <div class="split-result-pending-status api-result-pending-status"><span class="loading" style="display:inline-block;"></span> 等待返图…</div>
+            <div class="split-result-pending-num api-result-pending-num">${i + 1} / ${count}</div>
+        </div>`;
+        frag.appendChild(card);
+    }
+    grid.appendChild(frag);
+}
+
+function fillNextSplitPendingCard(grid, element) {
+    if (!grid || !element) return;
+    const pending = grid.querySelector('.split-result-pending-card');
+    if (pending) pending.replaceWith(element);
+    else grid.appendChild(element);
+}
+
+function fillSplitPendingSlotAt(grid, slotIndex, element) {
+    if (!grid || !element) return;
+    const ph = grid.querySelector(`.split-result-pending-card[data-slot-index="${slotIndex}"]`);
+    if (ph) ph.replaceWith(element);
+    else fillNextSplitPendingCard(grid, element);
+}
+
+function clearRemainingSplitResultPendingSlots(grid) {
+    const g = grid || document.getElementById('split-result-grid');
+    if (!g) return;
+    g.querySelectorAll('.split-result-pending-card').forEach(el => el.remove());
+}
+
+function splitPendingStubCard(kind, detail) {
+    const card = document.createElement('div');
+    card.className = 'api-result-card split-result-pending-card--failed api-result-pending-card--failed';
+    card.style.cssText = 'display:flex;align-items:center;justify-content:center;padding:12px;aspect-ratio:3/4;border:1px solid var(--border);border-radius:var(--radius-sm);';
+    const inner = document.createElement('div');
+    inner.style.cssText = 'text-align:center;font-size:10px;color:var(--text-muted);line-height:1.4;';
+    inner.textContent = kind === 'skip' ? '已跳过' : (detail || '未返图');
+    card.appendChild(inner);
+    return card;
+}
+
+function clearSplitFailures(qi) {
+    const qd = splitQueueData[qi];
+    if (qd) qd.failedItems = [];
+    updateSplitFailedUI(qi);
+}
+
+function recordSplitFailure(qi, failure) {
+    const qd = splitQueueData[qi];
+    if (!qd) return;
+    if (!Array.isArray(qd.failedItems)) qd.failedItems = [];
+    const item = {
+        materialIndex: Number.isFinite(failure.materialIndex) ? failure.materialIndex : (qd.activeMaterialIndex || 0),
+        itemIndex: Number.isFinite(failure.itemIndex) ? failure.itemIndex : 0,
+        gridNum: failure.gridNum || '',
+        reason: failure.reason || '未返图',
+        ts: Date.now()
+    };
+    const key = `${item.materialIndex}:${item.itemIndex}`;
+    qd.failedItems = qd.failedItems.filter(x => `${x.materialIndex}:${x.itemIndex}` !== key);
+    qd.failedItems.push(item);
+    updateSplitFailedUI(qi);
+}
+
+function removeSplitFailure(qi, materialIndex, itemIndex) {
+    const qd = splitQueueData[qi];
+    if (!qd || !Array.isArray(qd.failedItems)) return;
+    qd.failedItems = qd.failedItems.filter(x => !(x.materialIndex === materialIndex && x.itemIndex === itemIndex));
+    updateSplitFailedUI(qi);
+}
+
+function inferMissingSplitFailures(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd || (qd.failedItems || []).length > 0) return;
+    if (!qd.progressTotal || !qd.progressDone || qd.progressDone >= qd.progressTotal) return;
+    const resultKeys = new Set((qd.results || []).map(r => `${Number.isFinite(r?._materialIndex) ? r._materialIndex : -1}:${r?._regenImageUrl || ''}`));
+    const inferred = [];
+    (qd.materials || []).forEach((mat, mi) => {
+        (mat.workItems || []).forEach((item, wi) => {
+            const source = item.croppedImageUrl || item.imageUrl || '';
+            if (!source) return;
+            if (!resultKeys.has(`${mi}:${source}`)) {
+                inferred.push({ materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '未返图', ts: Date.now() });
+            }
+        });
+    });
+    if (inferred.length > 0) qd.failedItems = inferred.slice(0, Math.max(0, qd.progressTotal - qd.progressDone));
+}
+
+function updateSplitFailedUI(qi = activeSplitQueue) {
+    const qd = splitQueueData[qi];
+    inferMissingSplitFailures(qi);
+    const count = Array.isArray(qd?.failedItems) ? qd.failedItems.length : 0;
+    const summary = document.getElementById('split-failed-summary');
+    const btn = document.getElementById('btn-split-retry-failed');
+    if (summary) {
+        summary.style.display = count > 0 ? '' : 'none';
+        summary.textContent = count > 0 ? `失败 ${count} 张` : '';
+    }
+    if (btn) {
+        btn.style.display = count > 0 ? 'inline-flex' : 'none';
+        btn.disabled = !!splitGenerateStates[qi]?.running;
+    }
+}
+
+function renderSplitQueueResults(qi) {
+    const grid = document.getElementById('split-result-grid');
+    if (!grid) return;
+    const qd = splitQueueData[qi];
+    const results = qd?.results || [];
+    grid.innerHTML = '';
+    updateSplitFailedUI(qi);
+    if (results.length === 0) {
+        grid.innerHTML = '<div id="split-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;"><div>上传九宫格图片，选择编号后点击「拆分并填入队列」</div></div>';
+        return;
+    }
+    results.forEach((item, idx) => {
+        grid.appendChild(createSplitResultCardElement(qi, item, idx, results));
+    });
+}
+
+/** 当前队列仍在生成时，在已有结果后补上剩余占位卡（切换回该队列时调用） */
+function restoreSplitQueueGeneratingPlaceholders(qi) {
+    const qs = splitGenerateStates[qi];
+    const grid = document.getElementById('split-result-grid');
+    if (!grid || qi !== activeSplitQueue || !qs?.running) return;
+    const total = Math.max(0, qs.batchVisualTotal || 0);
+    const filled = Math.max(0, qs.batchVisualFilled || 0);
+    const remaining = Math.max(0, total - filled);
+    if (remaining > 0) appendSplitResultPendingSlots(grid, remaining);
+}
+
+function updateSplitGenerateBtnState() {
+    const singleBtn = document.getElementById('btn-split-generate');
+    const batchBtn = document.getElementById('btn-split-batch-generate');
+    const batchAllBtn = document.getElementById('btn-split-batch-generate-all');
+    const cancelBtn = document.getElementById('btn-split-cancel');
+    const activeState = splitGenerateStates[activeSplitQueue];
+    const qd = splitQueueData[activeSplitQueue];
+    if (qd) normalizeSplitQueueMaterials(qd);
+    const activeQueueHasData = (qd?.workItems || []).length > 0;
+    const multiMaterial =
+        !!qd && Array.isArray(qd.materials) && qd.materials.length > 1 &&
+        qd.materials.some(m => (m?.workItems || []).length > 0);
+    const thisQueueGenerating = !!activeState?.running;
+    if (singleBtn) {
+        // 有工作项时始终显示；加载文案仅在本队列生成时出现（其它队列批量生成不影响当前队列按钮）
+        singleBtn.style.display = activeQueueHasData ? '' : 'none';
+        singleBtn.disabled = thisQueueGenerating;
+        singleBtn.innerHTML = thisQueueGenerating ? '<span class="loading"></span> 生成中...' : '拆图生成';
+    }
+    if (batchBtn) {
+        batchBtn.style.display = activeQueueHasData ? '' : 'none';
+        batchBtn.disabled = thisQueueGenerating;
+        batchBtn.innerHTML = thisQueueGenerating ? '<span class="loading"></span> 批量生成中...' : '批量生成';
+    }
+    if (batchAllBtn) {
+        batchAllBtn.style.display = multiMaterial ? '' : 'none';
+        batchAllBtn.disabled = thisQueueGenerating;
+        batchAllBtn.textContent = thisQueueGenerating ? '全部素材生成中…' : '全部素材生成';
+    }
+    if (cancelBtn) cancelBtn.style.display = thisQueueGenerating ? '' : 'none';
+}
+
+async function downloadSplitResultImage(url, qi, idx) {
+    const resp = await downloadImageAsJpg(url, splitQueueData[qi]?.imagePrefix || 'split', getEffectiveSplitDownloadPath(qi));
+    if (resp.ok) {
+        showToast('下载成功', 'success');
+    } else {
+        const err = resp.error || '未知错误';
+        if (String(err).includes('pro.filesystem.site')) {
+            showToast(`下载失败: ${err}（请重启后端使白名单生效）`, 'error');
+        } else {
+            showToast(`下载失败: ${err}`, 'error');
+        }
+    }
+}
+
+async function regenerateSplitResult(qi, idx) {
+    const qd = splitQueueData[qi];
+    const item = qd?.results?.[idx];
+    if (!qd || !item) return;
+    const platform = qd.apiPlatform || 'oaihk';
+    if (platform === 'oaihk' && !OAIHK_MODELS[qd.oaihkModelId]) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
+    if (platform !== 'oaihk' && !RH_MODELS[qd.rhModelId]) { showToast('请选择模型', 'error'); return; }
+
+    const prompt = (item._regenPrompt || item.prompt || '').trim();
+    const source = item._regenImageUrl || '';
+    if (!prompt || !source) {
+        showToast('缺少再次生成所需的原始提示词或参考图', 'error');
+        return;
+    }
+
+    const qs = splitGenerateStates[qi];
+    if (qs?.running) {
+        showToast(`拆图队列${qi + 1}正在生成中，请稍后`, 'warning');
+        return;
+    }
+    qs.running = true;
+    qs.cancelled = false;
+    qs.abortController = new AbortController();
+    qs.progressPercent = 0;
+    qs.progressText = '';
+    const signal = qs.abortController.signal;
+    updateSplitGenerateBtnState();
+
+    try {
+        const imageUrls = platform !== 'oaihk' && source.startsWith('/') ? [window.location.origin + source] : [source];
+        const task = { prompt, imageUrls, queueLabel: `再生${idx + 1}` };
+        const newResults = await generateSingleTaskForSplit(qi, task, platform, qd, signal);
+        if (newResults.length === 0) {
+            showToast('再次生成未返回结果', 'warning');
+            return;
+        }
+        for (const r of newResults) {
+            r._regenPrompt = prompt;
+            r._regenImageUrl = source;
+        }
+        if (qd.autoBackup !== false) await autoBackupSplitResults(newResults, qi);
+        qd.results.splice(idx, 1, ...newResults);
+        saveSplitQueueData();
+        if (qi === activeSplitQueue) renderSplitQueueResults(qi);
+        showToast('再次生成完成', 'success');
+    } catch (e) {
+        if (!qs.cancelled) showToast('再次生成失败: ' + e.message, 'error');
+    } finally {
+        qs.running = false;
+        qs.cancelled = false;
+        qs.abortController = null;
+        updateSplitGenerateBtnState();
+        renderSplitQueueNumberBar();
+    }
+}
+
+async function loadSplitResultToQueue(imageUrl) {
+    if (!imageUrl) return;
+    const targetQueue = findAvailableSplitQueue();
+    if (targetQueue < 0) {
+        showToast('没有可用拆图队列（都在运行或已占用），请先清理一个队列', 'warning');
+        return;
+    }
+    const qd = splitQueueData[targetQueue];
+    qd.gridImageUrl = imageUrl;
+    qd.workItems = [];
+    qd.activeItemIndex = 0;
+    qd.learnedGridLayout = null;
+    try {
+        const tail = imageUrl.split('/').pop() || '';
+        qd.sourceFilename = decodeURIComponent(tail.replace(/\+/g, ' '));
+    } catch (_) {
+        qd.sourceFilename = getFileBaseName(imageUrl);
+    }
+    qd.imageUrl = '';
+    qd.croppedImageUrl = '';
+    qd.promptCn = '';
+    qd.number = 0;
+    qd.selectedNums = [];
+    qd.selectedPrefixIds = [];
+    qd.selectedSuffixIds = [];
+    qd.progressTotal = 0;
+    qd.progressDone = 0;
+    splitImageUrl = imageUrl;
+    splitGridImageUrl = imageUrl;
+    saveSplitQueueData();
+    switchMode('split');
+    switchToSplitQueue(targetQueue);
+    document.getElementById('split-img').src = imageUrl;
+    await maybeAutoSplitFromFilename(targetQueue);
+    saveSplitQueueData();
+    if (!(splitQueueData[targetQueue]?.workItems || []).length) {
+        showToast(`已发送到拆图队列${targetQueue + 1}，请选择编号后点击「拆分并填入队列」`, 'success');
+    }
+}
+
+function findAvailableSplitQueue() {
+    for (let i = 0; i < QUEUE_COUNT; i++) {
+        const qd = splitQueueData[i];
+        const hasData = !!(qd?.gridImageUrl) || (qd?.workItems || []).length > 0 || (qd?.results || []).length > 0;
+        if (!splitGenerateStates[i]?.running && !hasData) return i;
+    }
+    return -1;
+}
+
+function ensureSplitQueueWorkItems(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd) return;
+    if (!Array.isArray(qd.workItems)) qd.workItems = [];
+    if (typeof qd.activeItemIndex !== 'number' || qd.activeItemIndex < 0) qd.activeItemIndex = 0;
+    if (qd.activeItemIndex >= qd.workItems.length && qd.workItems.length > 0) qd.activeItemIndex = 0;
+}
+
+function getActiveSplitWorkItem(qi) {
+    const qd = splitQueueData[qi];
+    ensureSplitQueueWorkItems(qi);
+    if (!qd || qd.workItems.length === 0) return null;
+    return qd.workItems[qd.activeItemIndex] || qd.workItems[0] || null;
+}
+
+function syncActiveSplitItemToQueue(qi) {
+    const qd = splitQueueData[qi];
+    const item = getActiveSplitWorkItem(qi);
+    if (!qd) return;
+    if (!item) {
+        qd.imageUrl = '';
+        qd.croppedImageUrl = '';
+        qd.promptCn = '';
+        qd.number = 0;
+        qd.selectedPrefixIds = [];
+        qd.selectedSuffixIds = [];
+        return;
+    }
+    qd.imageUrl = item.imageUrl || '';
+    qd.croppedImageUrl = item.croppedImageUrl || '';
+    qd.gridImageUrl = item.gridImageUrl || qd.gridImageUrl || item.imageUrl || '';
+    qd.cropRect = item.cropRect || null;
+    qd.cropPreset = item.cropPreset || qd.cropPreset || null;
+    qd.promptCn = item.promptCn || '';
+    qd.number = item.number || 0;
+    item.selectedPrefixIds = dedupeTemplateIds(item.selectedPrefixIds);
+    item.selectedSuffixIds = dedupeTemplateIds(item.selectedSuffixIds);
+    qd.selectedPrefixIds = [...item.selectedPrefixIds];
+    qd.selectedSuffixIds = [...item.selectedSuffixIds];
+}
+
+function renderSplitWorkItemTabs(qi) {
+    const tabBar = document.getElementById('split-tab-bar');
+    const qd = splitQueueData[qi];
+    if (!tabBar || !qd) return;
+    tabBar.innerHTML = '';
+    const items = qd.workItems || [];
+    if (items.length === 0) {
+        tabBar.innerHTML = '<span style="font-size:10px;color:var(--text-muted);">暂无拆图工作项</span>';
+        return;
+    }
+    items.forEach((item, idx) => {
+        const btn = document.createElement('button');
+        btn.className = `split-num-btn ${idx === qd.activeItemIndex ? 'active' : ''}`;
+        btn.type = 'button';
+        btn.textContent = `${item.number || (idx + 1)}`;
+        btn.title = `切换到格子编号 ${item.number || (idx + 1)}`;
+        btn.addEventListener('click', () => {
+            saveCurrentSplitQueueData();
+            qd.activeItemIndex = idx;
+            syncActiveSplitItemToQueue(qi);
+            loadSplitQueueToUI(qi);
+            saveSplitQueueData();
+        });
+        tabBar.appendChild(btn);
+    });
+}
+
+/** 与工作区「当前格子」同一套图源优先级，避免队列仅有 workItem.gridImageUrl 时九宫格预览仍盯 qd.gridImageUrl */
+function getEffectiveSplitGridPreviewUrl(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd) return '';
+    ensureSplitQueueWorkItems(qi);
+    const it = getActiveSplitWorkItem(qi);
+    if (it) {
+        return (
+            (it.gridImageUrl || it.imageUrl || it.croppedImageUrl || qd.gridImageUrl || '')
+                .trim()
+        );
+    }
+    return (qd.gridImageUrl || '').trim();
+}
+
+function applySplitSourcePreview(qi) {
+    const source = getEffectiveSplitGridPreviewUrl(qi);
+    splitImageUrl = source;
+    splitGridImageUrl = source;
+    const previewEl = document.getElementById('split-preview');
+    const dropZoneEl = document.getElementById('split-drop-zone');
+    const imgEl = document.getElementById('split-img');
+    if (!previewEl || !dropZoneEl || !imgEl) return;
+
+    const previewKey = `${qi}|${source}`;
+    if (!source) {
+        imgEl.dataset.splitPreviewKey = previewKey;
+        imgEl.removeAttribute('src');
+        previewEl.style.display = 'none';
+        dropZoneEl.style.display = '';
+        return;
+    }
+
+    previewEl.style.display = '';
+    dropZoneEl.style.display = 'none';
+
+    if (imgEl.dataset.splitPreviewKey === previewKey) return;
+
+    imgEl.dataset.splitPreviewKey = previewKey;
+    imgEl.alt = `拆图队列 ${qi + 1} 九宫格`;
+
+    imgEl.src = '';
+    imgEl.removeAttribute('src');
+    requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+            if (imgEl.dataset.splitPreviewKey !== previewKey) return;
+            imgEl.src = source;
+        });
+    });
+}
 function saveQueueData() {
+    syncUndoBaselineAfterMutation();
     // 保存全局 pinnedSlotIndices
     try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
     // 防抖：300ms 内的多次调用只执行一次
@@ -2455,6 +4764,7 @@ function saveQueueData() {
 }
 // 立即保存队列数据（无防抖），返回 Promise
 async function saveQueueDataNow() {
+    syncUndoBaselineAfterMutation();
     if (_saveQueueTimer) { clearTimeout(_saveQueueTimer); _saveQueueTimer = null; }
     try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
     await api('PUT', '/api/queue-data', {
@@ -2470,7 +4780,7 @@ function copyQueue1ToAll() {
     pushUndoSnapshot();
     const q1 = queueData[0];
     for (let q = 1; q < QUEUE_COUNT; q++) {
-        queueData[q].slots = JSON.parse(JSON.stringify(q1.slots));
+        queueData[q].slots = deepClone(q1.slots);
         queueData[q].promptCn = q1.promptCn;
         queueData[q].promptEn = q1.promptEn;
     }
@@ -2488,8 +4798,11 @@ async function switchToQueue(qIndex) {
     saveQueueData();
     // 加载目标队列数据
     loadQueueData(qIndex);
+    // 切换队列时应用默认模型设置
+    applyDefaultModelConfig();
     renderQueueNumberBars();
     updateGenerateBtnText();
+    // 切换队列时无需重置拆图面板（拆图已是独立模块）
     // 切换队列时更新进度条和取消按钮
     const qs = queueGenerateStates[activeQueue];
     const cancelBtn = document.getElementById('btn-api-cancel');
@@ -2509,7 +4822,7 @@ function saveCurrentQueueData(qi) {
     const idx = (qi !== undefined && qi !== null) ? qi : activeQueue;
     const q = queueData[idx];
     if (!q) return; // 防御性检查
-    q.slots = JSON.parse(JSON.stringify(imageState.slots));
+    q.slots = deepClone(imageState.slots);
     q.promptCn = document.getElementById('img-prompt-cn')?.value || '';
     q.promptEn = document.getElementById('img-prompt-en')?.value || '';
     // 保存 API 配置
@@ -2517,14 +4830,18 @@ function saveCurrentQueueData(qi) {
     q.rhModelId = document.getElementById('cfg-rh-model-inline')?.value || '';
     q.oaihkModelId = document.getElementById('cfg-oaihk-model-inline')?.value || '';
     q.rhAspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value || '3:4';
-    q.oaihkAspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '1:1';
+    q.oaihkAspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
     q.rhResolution = document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
-    q.rhCount = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
+    q.rhCount = parseInt(document.getElementById('cfg-rh-count-inline')?.value, 10) || 1;
     q.rhSeedMode = document.getElementById('cfg-rh-seed-mode-inline')?.value || 'random';
     q.rhSeed = document.getElementById('cfg-rh-seed-inline')?.value || '';
+    // 保存每个队列独立的下载设置
+    q.downloadPath = readDownloadPathInputForOwner('cfg-rh-download-path');
+    q.imagePrefix = document.getElementById('cfg-image-prefix')?.value?.trim() || '';
+    q.autoBackup = document.getElementById('cfg-rh-auto-backup')?.checked ?? true;
     // 保存前缀/后缀/预设状态
-    q.selectedPrefixIds = [...selectedPrefixIds];
-    q.selectedSuffixIds = [...selectedSuffixIds];
+    q.selectedPrefixIds = dedupeTemplateIds([...selectedPrefixIds]);
+    q.selectedSuffixIds = dedupeTemplateIds([...selectedSuffixIds]);
     q.activePromptPresetIds = [...activePromptPresetIds];
     q.prevPromptCn = prevPromptCn;
     q.promptedSlotIndices = [...promptedSlotIndices];
@@ -2554,13 +4871,19 @@ function restoreApiConfigToDOM(q) {
     setSelectValue('cfg-rh-model-inline', q.rhModelId || '');
     setSelectValue('cfg-oaihk-model-inline', q.oaihkModelId || 'fal-ai/banana/v3.1/flash/2k');
     setSelectValue('cfg-rh-aspect-ratio-inline', q.rhAspectRatio || '3:4');
-    setSelectValue('cfg-oaihk-aspect-ratio-inline', q.oaihkAspectRatio || '1:1');
+    setSelectValue('cfg-oaihk-aspect-ratio-inline', q.oaihkAspectRatio || '3:4');
     setSelectValue('cfg-rh-resolution-inline', q.rhResolution || '1k');
     const countEl = document.getElementById('cfg-rh-count-inline');
     if (countEl) countEl.value = q.rhCount || 1;
     setSelectValue('cfg-rh-seed-mode-inline', q.rhSeedMode || 'random');
     const seedEl = document.getElementById('cfg-rh-seed-inline');
     if (seedEl) { seedEl.value = q.rhSeed || ''; seedEl.disabled = (q.rhSeedMode || 'random') !== 'fixed'; }
+    // 恢复每个队列独立的下载设置
+    writeDownloadPathInputFromOwner('cfg-rh-download-path', q.downloadPath);
+    const imagePrefixEl = document.getElementById('cfg-image-prefix');
+    if (imagePrefixEl) imagePrefixEl.value = q.imagePrefix || '';
+    const autoBackupEl = document.getElementById('cfg-rh-auto-backup');
+    if (autoBackupEl) autoBackupEl.checked = q.autoBackup !== undefined ? q.autoBackup : true;
     // 触发平台切换，显示/隐藏对应配置区
     togglePlatformUI(platform);
     // 触发模型参数适配
@@ -2571,18 +4894,25 @@ function restoreApiConfigToDOM(q) {
 function loadQueueData(qIndex) {
     const q = queueData[qIndex];
     if (!q) return; // 防御性检查
-    imageState.slots = JSON.parse(JSON.stringify(q.slots));
+    imageState.slots = deepClone(q.slots);
+    // 兼容旧数据：确保每个槽位有 DW 字段
+    for (let s = 0; s < imageState.slots.length; s++) {
+        if (imageState.slots[s].dwEnabled === undefined) imageState.slots[s].dwEnabled = false;
+        if (imageState.slots[s].dwOriginalImage === undefined) imageState.slots[s].dwOriginalImage = '';
+    }
     // 确保有10个槽位
     while (imageState.slots.length < SLOT_COUNT) {
-        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
     }
     const promptCn = document.getElementById('img-prompt-cn');
     const promptEn = document.getElementById('img-prompt-en');
     if (promptCn) promptCn.value = q.promptCn || '';
     if (promptEn) promptEn.value = q.promptEn || '';
-    // 恢复前缀/后缀/预设状态
-    selectedPrefixIds = new Set(q.selectedPrefixIds || []);
-    selectedSuffixIds = new Set(q.selectedSuffixIds || []);
+    // 恢复前缀/后缀/预设状态（持久化里可能有重复 id，与按钮区重复渲染一并修正）
+    q.selectedPrefixIds = dedupeTemplateIds(q.selectedPrefixIds || []);
+    q.selectedSuffixIds = dedupeTemplateIds(q.selectedSuffixIds || []);
+    selectedPrefixIds = new Set(q.selectedPrefixIds);
+    selectedSuffixIds = new Set(q.selectedSuffixIds);
     activePromptPresetIds = new Set(q.activePromptPresetIds || []);
     prevPromptCn = q.prevPromptCn || '';
     promptedSlotIndices = new Set(q.promptedSlotIndices || []);
@@ -2658,7 +4988,8 @@ function renderQueueNumberBars() {
 
     const html = Array.from({length: QUEUE_COUNT}, (_, i) => {
         const isActive = i === activeQueue;
-        const hasData = queueData[i].slots.some(s => s.image || s.label) || queueData[i].promptCn;
+        const qd = queueData[i];
+        const hasData = (qd?.slots || []).some(s => s.image || s.label) || (qd?.promptCn || '');
         const isGenerating = queueGenerateStates[i]?.running;
         const stateClass = isGenerating ? ' generating' : '';
         const stateIcon = isGenerating ? ' <span class="queue-gen-indicator"></span>' : '';
@@ -2670,10 +5001,10 @@ function renderQueueNumberBars() {
 
     // 绑定点击事件
     bar1.querySelectorAll('.queue-num-btn').forEach(btn => {
-        btn.addEventListener('click', () => switchToQueue(parseInt(btn.dataset.queue)));
+        btn.addEventListener('click', () => switchToQueue(parseInt(btn.dataset.queue, 10)));
     });
     bar2.querySelectorAll('.queue-num-btn').forEach(btn => {
-        btn.addEventListener('click', () => switchToQueue(parseInt(btn.dataset.queue)));
+        btn.addEventListener('click', () => switchToQueue(parseInt(btn.dataset.queue, 10)));
     });
 }
 
@@ -2683,6 +5014,23 @@ function switchQueueMode(mode) {
     // 先保存当前队列数据（必须在修改 queueMode 之前）
     if (queueMode === 'multi' && mode !== 'multi') {
         saveCurrentQueueData();
+    }
+    // 切换队列模式前，取消正在进行的图生图生成（避免孤立轮询循环）
+    if (apiGenerateState.running) {
+        apiGenerateState.cancelled = true;
+        apiGenerateState.abortController?.abort();
+        apiGenerateState.running = false;
+        apiGenerateState.abortController = null;
+    }
+    // 取消当前队列的生成
+    if (queueMode === 'multi') {
+        const qs = queueGenerateStates[activeQueue];
+        if (qs?.running) {
+            qs.cancelled = true;
+            qs.abortController?.abort();
+            qs.running = false;
+            qs.abortController = null;
+        }
     }
 
     queueMode = mode;
@@ -2694,7 +5042,7 @@ function switchQueueMode(mode) {
 
     if (mode === 'multi') {
         // 用当前slots初始化队列1
-        queueData[0].slots = JSON.parse(JSON.stringify(imageState.slots));
+        queueData[0].slots = deepClone(imageState.slots);
         queueData[0].promptCn = document.getElementById('img-prompt-cn')?.value || '';
         queueData[0].promptEn = document.getElementById('img-prompt-en')?.value || '';
         // 保存当前 API 配置到队列0
@@ -2702,11 +5050,15 @@ function switchQueueMode(mode) {
         queueData[0].rhModelId = document.getElementById('cfg-rh-model-inline')?.value || '';
         queueData[0].oaihkModelId = document.getElementById('cfg-oaihk-model-inline')?.value || '';
         queueData[0].rhAspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value || '3:4';
-        queueData[0].oaihkAspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '1:1';
+        queueData[0].oaihkAspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
         queueData[0].rhResolution = document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
-        queueData[0].rhCount = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
+        queueData[0].rhCount = parseInt(document.getElementById('cfg-rh-count-inline')?.value, 10) || 1;
         queueData[0].rhSeedMode = document.getElementById('cfg-rh-seed-mode-inline')?.value || 'random';
         queueData[0].rhSeed = document.getElementById('cfg-rh-seed-inline')?.value || '';
+        // 保存当前下载设置到队列0
+        queueData[0].downloadPath = readDownloadPathInputForOwner('cfg-rh-download-path');
+        queueData[0].imagePrefix = document.getElementById('cfg-image-prefix')?.value?.trim() || '';
+        queueData[0].autoBackup = document.getElementById('cfg-rh-auto-backup')?.checked ?? true;
         // 保存前缀/后缀/预设状态到队列0
         queueData[0].selectedPrefixIds = [...selectedPrefixIds];
         queueData[0].selectedSuffixIds = [...selectedSuffixIds];
@@ -2721,7 +5073,7 @@ function switchQueueMode(mode) {
             const qd = queueData[q];
             const hasOwnData = qd.slots.some(s => s.image || s.label) || qd.promptCn?.trim() || qd.promptEn?.trim();
             if (!hasOwnData) {
-                queueData[q].slots = JSON.parse(JSON.stringify(queueData[0].slots));
+                queueData[q].slots = deepClone(queueData[0].slots);
                 queueData[q].promptCn = queueData[0].promptCn;
                 queueData[q].promptEn = queueData[0].promptEn;
                 queueData[q].apiPlatform = queueData[0].apiPlatform;
@@ -2733,6 +5085,9 @@ function switchQueueMode(mode) {
                 queueData[q].rhCount = queueData[0].rhCount;
                 queueData[q].rhSeedMode = queueData[0].rhSeedMode;
                 queueData[q].rhSeed = queueData[0].rhSeed;
+                queueData[q].downloadPath = '';
+                queueData[q].imagePrefix = queueData[0].imagePrefix;
+                queueData[q].autoBackup = queueData[0].autoBackup;
                 queueData[q].selectedPrefixIds = [...queueData[0].selectedPrefixIds];
                 queueData[q].selectedSuffixIds = [...queueData[0].selectedSuffixIds];
                 queueData[q].activePromptPresetIds = [...queueData[0].activePromptPresetIds];
@@ -2788,12 +5143,19 @@ document.getElementById('btn-clear-current-group')?.addEventListener('click', ()
     const promptEnEl = document.getElementById('img-prompt-en');
     if (promptCnEl) promptCnEl.value = '';
     if (promptEnEl) promptEnEl.value = '';
+    // 清除词库选中状态（前缀、后缀、条目），避免残留选中干扰下次生成
+    state.selectedPrefixes = [];
+    state.selectedSuffixes = [];
+    state.selectedItems = {};
     if (queueMode === 'multi') {
-        queueData[activeQueue].slots = JSON.parse(JSON.stringify(imageState.slots));
+        queueData[activeQueue].slots = deepClone(imageState.slots);
         queueData[activeQueue].promptCn = '';
         queueData[activeQueue].promptEn = '';
     }
     saveQueueData();
+    saveSelection();
+    renderCategoryList();
+    updatePreview();
     renderImageSlots();
     showToast('已清除当前组图片素材和提示词', 'success');
 });
@@ -2817,9 +5179,9 @@ document.getElementById('btn-clear-all-groups')?.addEventListener('click', () =>
         queueData[q].promptEn = '';
     }
     // 同步当前显示
-    imageState.slots = JSON.parse(JSON.stringify(queueData[activeQueue].slots));
+    imageState.slots = deepClone(queueData[activeQueue].slots);
     while (imageState.slots.length < SLOT_COUNT) {
-        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
     }
     imageState.promptCn = '';
     imageState.promptEn = '';
@@ -2843,7 +5205,10 @@ function switchMode(mode) {
     if (currentMode === 'image' && queueMode === 'multi') {
         saveCurrentQueueData();
     }
-
+    // 切换模式前保存拆图数据
+    if (currentMode === 'split') {
+        saveCurrentSplitQueueData();
+    }
     // 切换前保存当前模式的提示词文本，避免切换后丢失
     const savedPrompts = {
         promptZh: $('#prompt-preview')?.value || '',
@@ -2857,16 +5222,25 @@ function switchMode(mode) {
         btn.classList.toggle('active', btn.dataset.mode === mode);
     });
 
-    const promptMode = document.querySelector('.main-content:not(#image-mode)');
+    const promptMode = document.querySelector('.main-content:not(#image-mode):not(#split-mode)');
     const imageMode = document.getElementById('image-mode');
+    const splitMode = document.getElementById('split-mode');
 
     if (mode === 'image') {
         if (promptMode) promptMode.style.display = 'none';
         if (imageMode) imageMode.style.display = 'flex';
+        if (splitMode) splitMode.style.display = 'none';
         if (!imageState.loaded) loadImageModeData();
+    } else if (mode === 'split') {
+        if (promptMode) promptMode.style.display = 'none';
+        if (imageMode) imageMode.style.display = 'none';
+        if (splitMode) splitMode.style.display = 'flex';
+        if (!splitModeLoaded) loadSplitModeData();
+        else renderSplitLibrary();
     } else {
         if (promptMode) promptMode.style.display = 'flex';
         if (imageMode) imageMode.style.display = 'none';
+        if (splitMode) splitMode.style.display = 'none';
     }
 
     // 切换后恢复提示词文本
@@ -2886,6 +5260,8 @@ document.querySelectorAll('.mode-btn').forEach(btn => {
 // 恢复上次模式
 if (currentMode === 'image') {
     switchMode('image');
+} else if (currentMode === 'split') {
+    switchMode('split');
 }
 
 // ---------- 数据加载 ----------
@@ -2911,16 +5287,49 @@ function renderImageMode() {
     renderImagePresets();
 }
 
-// ---------- 素材库渲染（子分类结构） ----------
-async function renderImageLibrary() {
-    const container = document.getElementById('image-library-body');
+// ---------- 素材库渲染（子分类结构，图生图 / 拆图共用 DOM 逻辑） ----------
+const LIB_MATERIAL_DRAG_MIME = 'application/x-ai-lib-material+json';
+
+function parseLibMaterialDragPayload(dataTransfer) {
+    if (!dataTransfer) return null;
+    try {
+        let raw = dataTransfer.getData(LIB_MATERIAL_DRAG_MIME);
+        if (!raw) raw = dataTransfer.getData('text/plain');
+        if (!raw) return null;
+        const o = JSON.parse(raw);
+        if (o && typeof o.url === 'string' && o.url) return { url: o.url, name: o.name || '' };
+    } catch (_) { /* ignore */ }
+    return null;
+}
+
+function bindLibraryPanelBlankDropTarget(container) {
+    if (!container || container._aiLibBlankDropBound) return;
+    container._aiLibBlankDropBound = true;
+    container.addEventListener('dragover', (e) => { e.preventDefault(); container.style.outline = '2px dashed var(--accent)'; container.style.outlineOffset = '-4px'; });
+    container.addEventListener('dragleave', () => { container.style.outline = ''; container.style.outlineOffset = ''; });
+    container.addEventListener('drop', (e) => {
+        e.preventDefault(); container.style.outline = ''; container.style.outlineOffset = '';
+        const targetCat = imageState.library.find(c => c.id === imageState.expandedLibCategory) || imageState.library[0];
+        if (!targetCat) return;
+        const subs = targetCat.subcategories || [];
+        const targetSub = subs.find(s => s.name === '默认' || s._isDefault) || subs[0];
+        if (targetSub) handleLibDrop(e, targetCat, targetSub);
+    });
+}
+
+async function renderLibraryPanel(opts = {}) {
+    const containerId = opts.containerId || 'image-library-body';
+    const context = opts.context || 'image';
+    const keyword = opts.keyword !== undefined ? opts.keyword : imageState.libSearchKeyword.trim().toLowerCase();
+    const scheduleRerender = () => { void (context === 'split' ? renderSplitLibrary() : renderImageLibrary()); };
+
+    const container = document.getElementById(containerId);
     if (!container) return;
     container.innerHTML = '';
 
-    const keyword = imageState.libSearchKeyword.trim().toLowerCase();
-
     if (imageState.library.length === 0) {
         container.innerHTML = '<p class="empty-hint">点击上方按钮添加素材分类</p>';
+        bindLibraryPanelBlankDropTarget(container);
         return;
     }
 
@@ -2933,7 +5342,7 @@ async function renderImageLibrary() {
         if (keyword) {
             for (const sub of subcategories) {
                 for (const item of (sub.items || [])) {
-                    if (item.name.toLowerCase().includes(keyword)) {
+                    if ((item.name || '').toLowerCase().includes(keyword)) {
                         searchItems.push({ item, sub, cat });
                     }
                 }
@@ -2962,7 +5371,7 @@ async function renderImageLibrary() {
             if (e.target.closest('.edit-lib-cat')) { e.stopPropagation(); editImageLibCategory(cat); return; }
             if (e.target.closest('.delete-lib-cat')) { e.stopPropagation(); deleteImageLibCategory(cat); return; }
             imageState.expandedLibCategory = imageState.expandedLibCategory === cat.id ? null : cat.id;
-            renderImageLibrary();
+            scheduleRerender();
         });
 
         const body = document.createElement('div');
@@ -2974,7 +5383,7 @@ async function renderImageLibrary() {
             grid.className = 'prop-items-grid';
             grid.style.gridTemplateColumns = `repeat(${imageState.libZoom}, 1fr)`;
             for (const { item, sub } of searchItems) {
-                grid.appendChild(createLibItemCard(cat, sub, item));
+                grid.appendChild(createLibItemCard(cat, sub, item, context));
             }
             body.appendChild(grid);
             catEl.appendChild(header);
@@ -2995,7 +5404,7 @@ async function renderImageLibrary() {
             grid.style.gridTemplateColumns = `repeat(${imageState.libZoom}, 1fr)`;
 
             for (const item of ((defaultSub && defaultSub.items) || [])) {
-                grid.appendChild(createLibItemCard(cat, defaultSub, item));
+                grid.appendChild(createLibItemCard(cat, defaultSub, item, context));
             }
 
             // 添加素材按钮
@@ -3047,7 +5456,7 @@ async function renderImageLibrary() {
                 if (e.target.closest('.edit-lib-sub')) { e.stopPropagation(); editLibSubcategory(cat, sub); return; }
                 if (e.target.closest('.delete-lib-sub')) { e.stopPropagation(); deleteLibSubcategory(cat, sub); return; }
                 imageState.expandedLibSubcategory = imageState.expandedLibSubcategory === sub.id ? null : sub.id;
-                renderImageLibrary();
+                scheduleRerender();
             });
 
             const subBody = document.createElement('div');
@@ -3058,7 +5467,7 @@ async function renderImageLibrary() {
             grid.style.gridTemplateColumns = `repeat(${imageState.libZoom}, 1fr)`;
 
             for (const item of (sub.items || [])) {
-                grid.appendChild(createLibItemCard(cat, sub, item));
+                grid.appendChild(createLibItemCard(cat, sub, item, context));
             }
 
             // 添加素材按钮（支持点击和拖拽）
@@ -3110,52 +5519,75 @@ async function renderImageLibrary() {
         container.appendChild(catEl);
     }
 
-    // 素材库面板级别拖拽兜底：拖到面板空白区域添加到当前展开分类
-    container.addEventListener('dragover', (e) => { e.preventDefault(); container.style.outline = '2px dashed var(--accent)'; container.style.outlineOffset = '-4px'; });
-    container.addEventListener('dragleave', () => { container.style.outline = ''; container.style.outlineOffset = ''; });
-    container.addEventListener('drop', (e) => {
-        e.preventDefault(); container.style.outline = ''; container.style.outlineOffset = '';
-        // 找到当前展开的分类，或第一个分类
-        const targetCat = imageState.library.find(c => c.id === imageState.expandedLibCategory) || imageState.library[0];
-        if (!targetCat) return;
-        const subs = targetCat.subcategories || [];
-        const targetSub = subs.find(s => s.name === '默认' || s._isDefault) || subs[0];
-        if (targetSub) handleLibDrop(e, targetCat, targetSub);
-    });
+    bindLibraryPanelBlankDropTarget(container);
 }
 
-// 创建素材卡片（子分类版本）
-function createLibItemCard(cat, sub, item) {
+async function renderImageLibrary() {
+    await renderLibraryPanel({
+        containerId: 'image-library-body',
+        keyword: imageState.libSearchKeyword.trim().toLowerCase(),
+        context: 'image'
+    });
+    await maybeRenderSplitLibrarySidebar();
+}
+
+async function maybeRenderSplitLibrarySidebar() {
+    const sm = document.getElementById('split-mode');
+    if (!sm || sm.style.display !== 'flex') return;
+    await renderSplitLibrary();
+}
+
+// 创建素材卡片（子分类版本）；context: image | split — split 下点击/拖拽填入拆图参考素材槽
+function createLibItemCard(cat, sub, item, context = 'image') {
     const card = document.createElement('div');
     card.className = 'prop-item-card';
-    card.title = `点击将"${item.name}"填入当前图片槽`;
+    card.title = context === 'split'
+        ? `拖拽到右侧「参考素材」槽，或点击填入首个空槽`
+        : `点击将"${item.name}"填入当前图片槽；可拖到图片槽`;
 
     const imgHtml = item.image
-        ? `<img src="${escHtml(item.image)}" alt="${escHtml(item.name)}" class="prop-item-img">`
+        ? `<img src="${escHtml(item.image)}" alt="${escHtml(item.name)}" class="prop-item-img" draggable="false">`
         : `<div class="prop-item-no-img">📷</div>`;
 
     // 操作按钮：上传/重新上传图片、删除图片、编辑名称、删除素材
     const hasImage = !!item.image;
     const uploadTitle = hasImage ? '重新上传' : '上传图片';
-    const deleteImgBtn = hasImage ? `<button class="btn-icon danger delete-lib-img" title="删除图片">🗑</button>` : '';
+    const deleteImgBtn = hasImage ? `<button type="button" draggable="false" class="btn-icon danger delete-lib-img" title="删除图片">🗑</button>` : '';
 
     card.innerHTML = `
         ${imgHtml}
         <div class="prop-item-name">${escHtml(item.name)}</div>
         <div class="prop-item-actions">
-            <button class="btn-icon upload-lib-img" title="${uploadTitle}">🖼</button>
+            <button type="button" draggable="false" class="btn-icon upload-lib-img" title="${uploadTitle}">🖼</button>
             ${deleteImgBtn}
-            <button class="btn-icon edit-lib-item" title="编辑名称">✎</button>
-            <button class="btn-icon danger delete-lib-item" title="删除素材">×</button>
+            <button type="button" draggable="false" class="btn-icon edit-lib-item" title="编辑名称">✎</button>
+            <button type="button" draggable="false" class="btn-icon danger delete-lib-item" title="删除素材">×</button>
         </div>
     `;
+
+    if (item.image) {
+        card.draggable = true;
+        card.addEventListener('dragstart', (e) => {
+            const payload = JSON.stringify({ url: item.image, name: item.name || '' });
+            try {
+                e.dataTransfer.setData(LIB_MATERIAL_DRAG_MIME, payload);
+                e.dataTransfer.setData('text/plain', payload);
+            } catch (_) {
+                e.dataTransfer.setData('text/plain', payload);
+            }
+            e.dataTransfer.effectAllowed = 'copy';
+        });
+    } else {
+        card.draggable = false;
+    }
 
     card.addEventListener('click', (e) => {
         if (e.target.closest('.upload-lib-img')) { e.stopPropagation(); uploadLibSubImage(cat, sub, item); return; }
         if (e.target.closest('.delete-lib-img')) { e.stopPropagation(); deleteLibItemImage(cat, sub, item); return; }
         if (e.target.closest('.edit-lib-item')) { e.stopPropagation(); editLibSubItem(cat, sub, item); return; }
         if (e.target.closest('.delete-lib-item')) { e.stopPropagation(); deleteLibSubItem(cat, sub, item); return; }
-        fillSlotFromMaterial(item, cat.name);
+        if (context === 'split') fillSplitMaterialFromLibrary(item, cat.name);
+        else fillSlotFromMaterial(item, cat.name);
     });
 
     const imgEl = card.querySelector('.prop-item-img');
@@ -3196,13 +5628,27 @@ document.querySelectorAll('.lib-tab-btn').forEach(btn => {
 
 // ---------- 素材库缩放滑杆 ----------
 const libZoomSlider = document.getElementById('lib-zoom-slider');
+const splitLibZoomSlider = document.getElementById('split-lib-zoom-slider');
 if (libZoomSlider) {
     const savedLibZoom = localStorage.getItem('lib-zoom');
-    if (savedLibZoom) { imageState.libZoom = parseInt(savedLibZoom) || 2; libZoomSlider.value = imageState.libZoom; }
+    if (savedLibZoom) { imageState.libZoom = parseInt(savedLibZoom, 10) || 2; libZoomSlider.value = imageState.libZoom; }
+    if (splitLibZoomSlider) splitLibZoomSlider.value = String(imageState.libZoom);
     libZoomSlider.addEventListener('input', (e) => {
-        imageState.libZoom = parseInt(e.target.value);
+        imageState.libZoom = parseInt(e.target.value, 10);
         try { localStorage.setItem('lib-zoom', imageState.libZoom); } catch(err) {}
+        if (splitLibZoomSlider) splitLibZoomSlider.value = String(imageState.libZoom);
         renderImageLibrary();
+    });
+}
+if (splitLibZoomSlider && !splitLibZoomSlider._bound) {
+    splitLibZoomSlider._bound = true;
+    splitLibZoomSlider.value = String(imageState.libZoom || 2);
+    splitLibZoomSlider.addEventListener('input', (e) => {
+        imageState.libZoom = parseInt(e.target.value, 10);
+        try { localStorage.setItem('lib-zoom', imageState.libZoom); } catch(err) {}
+        if (libZoomSlider) libZoomSlider.value = String(imageState.libZoom);
+        void renderSplitLibrary();
+        void renderImageLibrary();
     });
 }
 
@@ -3210,9 +5656,9 @@ if (libZoomSlider) {
 const imgPresetZoomSlider = document.getElementById('img-preset-zoom-slider');
 if (imgPresetZoomSlider) {
     const savedZoom = localStorage.getItem('img-preset-zoom');
-    if (savedZoom) { imageState.imgPresetZoom = parseInt(savedZoom) || 3; imgPresetZoomSlider.value = imageState.imgPresetZoom; }
+    if (savedZoom) { imageState.imgPresetZoom = parseInt(savedZoom, 10) || 3; imgPresetZoomSlider.value = imageState.imgPresetZoom; }
     imgPresetZoomSlider.addEventListener('input', (e) => {
-        imageState.imgPresetZoom = parseInt(e.target.value);
+        imageState.imgPresetZoom = parseInt(e.target.value, 10);
         try { localStorage.setItem('img-preset-zoom', imageState.imgPresetZoom); } catch(err) {}
         renderImagePresets();
     });
@@ -3223,12 +5669,53 @@ function fillSlotFromMaterial(item, categoryName) {
     const idx = imageState.activeSlotIndex;
     if (idx >= 0 && idx < imageState.slots.length) {
         if (item.image) imageState.slots[idx].image = item.image;
+        // 更换图片时重置 DW 状态
+        imageState.slots[idx].dwEnabled = false;
+        imageState.slots[idx].dwOriginalImage = '';
         // 语义标签自动设为分类名（如"五官"、"发型"）
         imageState.slots[idx].label = categoryName || item.name;
         renderImageSlots();
         updateLocalPrompt();
         showToast(`已填入 Image ${idx + 1}，语义：${categoryName || item.name}`, 'success');
     }
+}
+
+/** 拆图参考素材槽：从素材库点击填入首个空槽 */
+function fillSplitMaterialFromLibrary(item, categoryName) {
+    if (!item?.image) {
+        showToast('该素材没有图片地址', 'warning');
+        return;
+    }
+    const workItem = getActiveSplitWorkItem(activeSplitQueue);
+    if (!workItem) {
+        showToast('请先完成九宫格拆分并选中编号', 'warning');
+        return;
+    }
+    if (!workItem.materials) workItem.materials = [null, null, null];
+    const idx = workItem.materials.findIndex(m => !m);
+    if (idx < 0) {
+        showToast('三个参考素材槽已满，请点击槽内图片清空后再试', 'warning');
+        return;
+    }
+    workItem.materials[idx] = item.image;
+    _renderSplitMaterialSlot(idx);
+    saveSplitQueueData();
+    showToast(`已填入参考素材 ${idx + 1}${categoryName ? `（${categoryName}）` : ''}`, 'success');
+}
+
+function applyLibraryPayloadToSplitMaterialSlot(slotIdx, payload) {
+    if (!payload?.url || slotIdx < 0 || slotIdx > 2) return false;
+    const workItem = getActiveSplitWorkItem(activeSplitQueue);
+    if (!workItem) {
+        showToast('请先完成九宫格拆分并选中编号', 'warning');
+        return false;
+    }
+    if (!workItem.materials) workItem.materials = [null, null, null];
+    workItem.materials[slotIdx] = payload.url;
+    _renderSplitMaterialSlot(slotIdx);
+    saveSplitQueueData();
+    showToast(`参考素材槽 ${slotIdx + 1} 已更新`, 'success');
+    return true;
 }
 
 // 素材库分类 CRUD
@@ -3659,7 +6146,26 @@ try { initQueueData(); } catch(e) { console.error('initQueueData error:', e); qu
 
 // 队列模式按钮绑定
 document.querySelectorAll('.queue-mode-btn').forEach(btn => {
-    btn.addEventListener('click', () => switchQueueMode(btn.dataset.queueMode));
+    btn.addEventListener('click', () => {
+        const newMode = btn.dataset.queueMode;
+        console.log('[queue-mode-btn] click, newMode:', newMode, 'currentMode:', currentMode, 'queueMode:', queueMode);
+        try {
+            if (newMode === 'split') {
+                // 拆图模式：切换到独立模块
+                switchMode('split');
+                // 同时更新queueMode按钮的active状态
+                document.querySelectorAll('.queue-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.queueMode === 'split'));
+                return;
+            }
+            // 如果当前是拆图模式页面，先切回图生图
+            if (currentMode === 'split') {
+                switchMode('image');
+            }
+            switchQueueMode(newMode);
+        } catch(e) {
+            console.error('[queue-mode-btn] ERROR:', e);
+        }
+    });
 });
 
 // 恢复队列模式UI
@@ -3682,7 +6188,7 @@ updateGenerateBtnText();
 // 初始化10个槽位
 if (imageState.slots.length < SLOT_COUNT) {
     while (imageState.slots.length < SLOT_COUNT) {
-        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
     }
 }
 
@@ -3690,7 +6196,7 @@ if (imageState.slots.length < SLOT_COUNT) {
 function saveSlotsToStorage() {
     // 多图队列模式时同步保存到队列数据
     if (queueMode === 'multi' && queueData[activeQueue]) {
-        queueData[activeQueue].slots = JSON.parse(JSON.stringify(imageState.slots));
+        queueData[activeQueue].slots = deepClone(imageState.slots);
     }
     saveQueueData();
 }
@@ -3700,7 +6206,7 @@ function renderImageSlots() {
     if (!container) return;
     container.innerHTML = '';
 
-    const zoomValue = parseInt(document.getElementById('slot-zoom-slider')?.value || 70);
+    const zoomValue = parseInt(document.getElementById('slot-zoom-slider')?.value || '70', 10);
     const imgSize = zoomValue;
 
     for (let i = 0; i < SLOT_COUNT; i++) {
@@ -3719,8 +6225,11 @@ function renderImageSlots() {
         const semantic = slot.label || '';
 
         const pinBtn = (queueMode === 'multi' && slot.image) ? `<button class="slot-pin-btn ${pinnedSlotIndices.has(i) ? 'pinned' : ''}" title="${pinnedSlotIndices.has(i) ? '取消全列队' : '应用全列队'}">${pinnedSlotIndices.has(i) ? '📌' : '📍'}</button>` : '';
+        const dwBtn = slot.image
+            ? `<button class="slot-dw-btn ${slot.dwEnabled ? 'active' : ''}" title="DWPose 姿态提取">${slot._dwLoading ? '<span class="dw-spinner"></span>' : 'DW'}</button>`
+            : '';
         slotEl.innerHTML = `
-            <div class="slot-compact-image-area">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}</div>
+            <div class="slot-compact-image-area ${slot.dwEnabled ? 'dw-active' : ''}">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}${dwBtn}</div>
             <div class="slot-compact-label">
                 <span class="slot-prefix" title="点击编辑前缀">${escHtml(prefix)}</span><span class="slot-auto-text">图${i+1}${semantic ? '的' + escHtml(semantic) : ''}</span>
             </div>
@@ -3732,6 +6241,15 @@ function renderImageSlots() {
             pinEl.addEventListener('click', (e) => {
                 e.stopPropagation();
                 togglePinSlotToAllQueues(i);
+            });
+        }
+
+        // DWPose 姿态提取按钮
+        const dwEl = slotEl.querySelector('.slot-dw-btn');
+        if (dwEl) {
+            dwEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                toggleDW(i);
             });
         }
 
@@ -3795,6 +6313,19 @@ function renderImageSlots() {
         slotEl.addEventListener('drop', async (e) => {
             e.preventDefault(); e.stopPropagation();
             slotEl.classList.remove('drag-over');
+            const libPayload = parseLibMaterialDragPayload(e.dataTransfer);
+            if (libPayload?.url) {
+                imageState.activeSlotIndex = i;
+                imageState.slots[i].image = libPayload.url;
+                imageState.slots[i].dwEnabled = false;
+                imageState.slots[i].dwOriginalImage = '';
+                imageState.slots[i].label = libPayload.name || '素材库';
+                renderImageSlots();
+                updateLocalPrompt();
+                showToast(`已从素材库拖拽填入 Image ${i + 1}`, 'success');
+                logAction('slot', '素材库拖拽到槽', { slotIndex: i });
+                return;
+            }
             const imageFiles = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
             if (!imageFiles.length) return;
             if (imageFiles.length === 1) {
@@ -3809,6 +6340,8 @@ function renderImageSlots() {
                             // 弹出分配素材弹窗
                             const assignResult = await showAssignMaterial(url, imageFiles[0].name);
                             imageState.slots[i].image = url;
+                            imageState.slots[i].dwEnabled = false;
+                            imageState.slots[i].dwOriginalImage = '';
                             if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
                                 imageState.slots[i].label = assignResult.labels.join('、');
                             }
@@ -3836,6 +6369,8 @@ function renderImageSlots() {
                             const assignResult = await showAssignMaterial(url, imageFiles[idx].name);
                             if (targetSlot < SLOT_COUNT) {
                                 imageState.slots[targetSlot].image = url;
+                                imageState.slots[targetSlot].dwEnabled = false;
+                                imageState.slots[targetSlot].dwOriginalImage = '';
                                 if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
                                     imageState.slots[targetSlot].label = assignResult.labels.join('、');
                                 }
@@ -3859,7 +6394,7 @@ function renderImageSlots() {
             const choice = confirm('确定清除该图片槽？\n\n取消 = 选择本地上传图片');
             if (choice) {
                 pushUndoSnapshot();
-                imageState.slots[i] = { image: '', label: '', prefixTemplate: '请参考' };
+                imageState.slots[i] = { image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' };
                 compactAndRenumber();
                 renderImageSlots();
                 updateLocalPrompt();
@@ -3895,7 +6430,7 @@ function togglePinSlotToAllQueues(slotIndex) {
     // 确保queueData有QUEUE_COUNT个队列
     while (queueData.length < QUEUE_COUNT) {
         queueData.push({
-            slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考' })),
+            slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' })),
             promptCn: '', promptEn: '', results: []
         });
     }
@@ -3907,12 +6442,12 @@ function togglePinSlotToAllQueues(slotIndex) {
             if (q === activeQueue) continue;
             if (!queueData[q].slots) queueData[q].slots = [];
             while (queueData[q].slots.length <= slotIndex) {
-                queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+                queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
             }
             if (originals[q]) {
-                queueData[q].slots[slotIndex] = JSON.parse(JSON.stringify(originals[q]));
+                queueData[q].slots[slotIndex] = deepClone(originals[q]);
             } else {
-                queueData[q].slots[slotIndex] = { image: '', label: '', prefixTemplate: '请参考' };
+                queueData[q].slots[slotIndex] = { image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' };
             }
         }
         delete pinnedSlotOriginals[slotIndex];
@@ -3923,16 +6458,16 @@ function togglePinSlotToAllQueues(slotIndex) {
         showToast(`已取消图${slotIndex + 1}的全列队应用`, 'info');
     } else {
         // 应用：先保存其他列队的原始数据，再复制
-        const slotCopy = JSON.parse(JSON.stringify(currentSlot));
+        const slotCopy = deepClone(currentSlot);
         pinnedSlotOriginals[slotIndex] = {};
         for (let q = 0; q < QUEUE_COUNT; q++) {
             if (q === activeQueue) continue;
             if (!queueData[q].slots) queueData[q].slots = [];
             while (queueData[q].slots.length <= slotIndex) {
-                queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+                queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
             }
             // 保存原始数据
-            pinnedSlotOriginals[slotIndex][q] = JSON.parse(JSON.stringify(queueData[q].slots[slotIndex]));
+            pinnedSlotOriginals[slotIndex][q] = deepClone(queueData[q].slots[slotIndex]);
             queueData[q].slots[slotIndex] = slotCopy;
         }
         pinnedSlotIndices.add(slotIndex);
@@ -3941,6 +6476,47 @@ function togglePinSlotToAllQueues(slotIndex) {
         renderImageSlots();
         showToast(`已将图${slotIndex + 1}应用到所有列队`, 'success');
     }
+}
+
+// DWPose 姿态提取开关
+async function toggleDW(slotIndex) {
+    const slot = imageState.slots[slotIndex];
+    if (!slot.image) return;
+
+    if (slot.dwEnabled) {
+        // 关闭：恢复原图
+        if (slot.dwOriginalImage) {
+            slot.image = slot.dwOriginalImage;
+            slot.dwOriginalImage = '';
+        }
+        slot.dwEnabled = false;
+        renderImageSlots();
+        if (queueMode === 'multi') saveCurrentQueueData();
+        return;
+    }
+
+    // 开启：调用 DWPose 处理
+    const originalImage = slot.image;
+    slot._dwLoading = true;
+    renderImageSlots();
+
+    try {
+        const result = await api('POST', '/api/dwpose-process', { imageUrl: originalImage });
+        if (result.error) {
+            showToast('DWPose 处理失败: ' + result.error, 'error');
+            slot._dwLoading = false;
+            renderImageSlots();
+            return;
+        }
+        slot.dwOriginalImage = originalImage;
+        slot.image = result.poseImageUrl;
+        slot.dwEnabled = true;
+    } catch (e) {
+        showToast('DWPose 处理失败: ' + e.message, 'error');
+    }
+    slot._dwLoading = false;
+    renderImageSlots();
+    if (queueMode === 'multi') saveCurrentQueueData();
 }
 
 function updateLocalPrompt() {
@@ -4137,6 +6713,21 @@ document.getElementById('btn-add-prefix')?.addEventListener('click', async () =>
     showToast(`已添加"${newPrefix.trim()}"`, 'success');
 });
 
+// 批量前缀栏的"+"按钮（图片槽区域）
+document.getElementById('btn-add-prefix-old')?.addEventListener('click', async () => {
+    const newPrefix = await showPrompt('添加自定义前缀模板', '', '例如：将背景替换成');
+    if (!newPrefix || !newPrefix.trim()) return;
+    if (prefixTemplates.includes(newPrefix.trim())) {
+        showToast('该前缀已存在', 'error');
+        return;
+    }
+    prefixTemplates.push(newPrefix.trim());
+    await savePrefixTemplates();
+    activePrefix = newPrefix.trim();
+    renderPrefixBatchBar();
+    showToast(`已添加"${newPrefix.trim()}"`, 'success');
+});
+
 // 上传图片到槽位（本地上传）
 function uploadSlotImage(slotIndex) {
     const input = document.createElement('input');
@@ -4157,6 +6748,8 @@ function uploadSlotImage(slotIndex) {
                         const url = await uploadImage(formData);
                         const assignResult = await showAssignMaterial(url, files[0].name);
                         imageState.slots[slotIndex].image = url;
+                        imageState.slots[slotIndex].dwEnabled = false;
+                        imageState.slots[slotIndex].dwOriginalImage = '';
                         if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
                             imageState.slots[slotIndex].label = assignResult.labels.join('、');
                         }
@@ -4183,6 +6776,8 @@ function uploadSlotImage(slotIndex) {
                         const assignResult = await showAssignMaterial(url, files[idx].name);
                         if (targetSlot < SLOT_COUNT) {
                             imageState.slots[targetSlot].image = url;
+                            imageState.slots[targetSlot].dwEnabled = false;
+                            imageState.slots[targetSlot].dwOriginalImage = '';
                             if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
                                 imageState.slots[targetSlot].label = assignResult.labels.join('、');
                             }
@@ -4597,7 +7192,7 @@ function getDisplayedTemplateIds(type) {
     return null; // null表示未设置，用默认前10个
 }
 function setDisplayedTemplateIds(type, ids) {
-    localStorage.setItem(`displayed_${type}_ids`, JSON.stringify(ids.slice(0, 10)));
+    localStorage.setItem(`displayed_${type}_ids`, JSON.stringify(dedupeTemplateIds(ids || []).slice(0, 10)));
 }
 
 async function loadPromptTemplates() {
@@ -4607,12 +7202,12 @@ async function loadPromptTemplates() {
             promptTemplates.prefixes = data.prefixes || [];
             promptTemplates.suffixes = data.suffixes || [];
             if (selectedPrefixIds.size === 0 && selectedSuffixIds.size === 0) {
-                selectedPrefixIds = new Set(data.selectedPrefixIds || []);
-                selectedSuffixIds = new Set(data.selectedSuffixIds || []);
+                selectedPrefixIds = new Set(dedupeTemplateIds(data.selectedPrefixIds || []));
+                selectedSuffixIds = new Set(dedupeTemplateIds(data.selectedSuffixIds || []));
             }
             if (queueData[0] && (!queueData[0].selectedPrefixIds || queueData[0].selectedPrefixIds.length === 0)) {
-                queueData[0].selectedPrefixIds = [...selectedPrefixIds];
-                queueData[0].selectedSuffixIds = [...selectedSuffixIds];
+                queueData[0].selectedPrefixIds = dedupeTemplateIds([...selectedPrefixIds]);
+                queueData[0].selectedSuffixIds = dedupeTemplateIds([...selectedSuffixIds]);
             }
         } else {
             try {
@@ -4641,8 +7236,8 @@ async function savePromptTemplates() {
     const data = {
         prefixes: promptTemplates.prefixes,
         suffixes: promptTemplates.suffixes,
-        selectedPrefixIds: [...selectedPrefixIds],
-        selectedSuffixIds: [...selectedSuffixIds]
+        selectedPrefixIds: dedupeTemplateIds([...selectedPrefixIds]),
+        selectedSuffixIds: dedupeTemplateIds([...selectedSuffixIds])
     };
     try { localStorage.setItem('promptTemplates', JSON.stringify(data)); } catch {}
     try { await api('PUT', '/api/prompt-templates', data); } catch {}
@@ -4651,12 +7246,28 @@ async function savePromptTemplates() {
 function _getVisibleItems(type) {
     const items = type === 'prefix' ? promptTemplates.prefixes : promptTemplates.suffixes;
     const displayed = getDisplayedTemplateIds(type);
-    if (displayed) {
-        // 按用户勾选顺序显示
-        return displayed.map(id => items.find(t => t.id === id)).filter(Boolean);
+    if (displayed && displayed.length) {
+        const seen = new Set();
+        const ordered = [];
+        for (const id of dedupeTemplateIds(displayed)) {
+            const t = items.find(x => x.id === id);
+            if (t && !seen.has(id)) {
+                seen.add(id);
+                ordered.push(t);
+            }
+        }
+        return ordered;
     }
-    // 默认：前10个
-    return items.slice(0, 10);
+    // 默认：前10个（按 id 去重，避免数据异常时同一按钮出现两次）
+    const seen = new Set();
+    const out = [];
+    for (const t of items.slice(0, 10)) {
+        if (t?.id && !seen.has(t.id)) {
+            seen.add(t.id);
+            out.push(t);
+        }
+    }
+    return out;
 }
 
 function renderTemplateButtons() {
@@ -4790,23 +7401,29 @@ function updateTemplatePreviews() {
     const prefixPreview = document.getElementById('prefix-preview');
     const suffixPreview = document.getElementById('suffix-preview');
     if (prefixPreview) {
-        const texts = [...selectedPrefixIds].map(id => promptTemplates.prefixes.find(p => p.id === id)?.text).filter(Boolean);
-        if (texts.length > 0) {
-            prefixPreview.textContent = texts.join(' ');
+        const names = [...selectedPrefixIds].map(id => promptTemplates.prefixes.find(p => p.id === id)?.name).filter(Boolean);
+        if (names.length > 0) {
+            prefixPreview.textContent = `已选前缀：${names.join('、')}（正文见下方输入框）`;
             prefixPreview.style.display = 'block';
         } else {
             prefixPreview.style.display = 'none';
         }
     }
     if (suffixPreview) {
-        const texts = [...selectedSuffixIds].map(id => promptTemplates.suffixes.find(p => p.id === id)?.text).filter(Boolean);
-        if (texts.length > 0) {
-            suffixPreview.textContent = texts.join(' ');
+        const names = [...selectedSuffixIds].map(id => promptTemplates.suffixes.find(p => p.id === id)?.name).filter(Boolean);
+        if (names.length > 0) {
+            suffixPreview.textContent = `已选后缀：${names.join('、')}（正文见下方输入框）`;
             suffixPreview.style.display = 'block';
         } else {
             suffixPreview.style.display = 'none';
         }
     }
+}
+
+function refreshSplitTemplateUI() {
+    const item = getActiveSplitWorkItem(activeSplitQueue);
+    if (!item) return;
+    renderSplitPrefixSuffix(item);
 }
 
 function getFullPromptCn() {
@@ -4896,6 +7513,7 @@ function renderTemplateList() {
                 renderTemplateList();
                 renderTemplateButtons();
                 updateTemplatePreviews();
+                refreshSplitTemplateUI();
             }
         });
     });
@@ -4940,6 +7558,28 @@ document.getElementById('btn-add-suffix')?.addEventListener('click', () => {
     renderTemplateList();
     openModal('modal-prompt-template');
 });
+document.getElementById('btn-split-prefix-manage')?.addEventListener('click', () => openTemplateManager('prefix'));
+document.getElementById('btn-split-suffix-manage')?.addEventListener('click', () => openTemplateManager('suffix'));
+document.getElementById('btn-split-add-prefix')?.addEventListener('click', () => {
+    templateEditType = 'prefix';
+    editingTemplateId = null;
+    document.getElementById('prompt-template-new-name').value = '';
+    document.getElementById('prompt-template-new-text').value = '';
+    const title = document.getElementById('prompt-template-modal-title');
+    if (title) title.textContent = '添加前缀模板';
+    renderTemplateList();
+    openModal('modal-prompt-template');
+});
+document.getElementById('btn-split-add-suffix')?.addEventListener('click', () => {
+    templateEditType = 'suffix';
+    editingTemplateId = null;
+    document.getElementById('prompt-template-new-name').value = '';
+    document.getElementById('prompt-template-new-text').value = '';
+    const title = document.getElementById('prompt-template-modal-title');
+    if (title) title.textContent = '添加后缀模板';
+    renderTemplateList();
+    openModal('modal-prompt-template');
+});
 
 document.getElementById('btn-prompt-template-add')?.addEventListener('click', () => {
     const name = document.getElementById('prompt-template-new-name')?.value.trim();
@@ -4964,6 +7604,7 @@ document.getElementById('btn-prompt-template-add')?.addEventListener('click', ()
     renderTemplateList();
     renderTemplateButtons();
     updateTemplatePreviews();
+    refreshSplitTemplateUI();
     document.getElementById('prompt-template-new-name').value = '';
     document.getElementById('prompt-template-new-text').value = '';
     showToast(editingTemplateId ? '已更新' : '模板已添加', 'success');
@@ -4971,41 +7612,92 @@ document.getElementById('btn-prompt-template-add')?.addEventListener('click', ()
 
 // ========== 提示词预设系统 ==========
 let promptPresets = [];
+let promptPresetGroups = [];
 let activePromptPresetIds = new Set();
 let prevPromptCn = '';
+let editingPromptPresetId = null;
+const PROMPT_PRESET_ALL_GROUP = '__all';
 
 async function loadPromptPresets() {
     try {
         const data = await api('GET', '/api/prompt-presets');
-        promptPresets = data.presets || [];
+        promptPresets = (data.presets || []).map(p => ({ ...p, groupId: p.groupId || '' }));
+        promptPresetGroups = data.groups || [];
     } catch {
         promptPresets = [];
+        promptPresetGroups = [];
     }
+    normalizeActivePromptPresetGroup();
 }
 
 async function savePromptPresets() {
     try {
-        await api('PUT', '/api/prompt-presets', { presets: promptPresets });
+        await api('PUT', '/api/prompt-presets', { presets: promptPresets, groups: promptPresetGroups });
     } catch {}
 }
 
-function getPinnedPresetIds() {
+function getActivePromptPresetGroupId() {
     try {
-        const saved = localStorage.getItem('pinnedPresetIds');
-        if (saved) return JSON.parse(saved);
+        return localStorage.getItem('activePromptPresetGroupId') || PROMPT_PRESET_ALL_GROUP;
     } catch {}
-    return [];
+    return PROMPT_PRESET_ALL_GROUP;
 }
-function setPinnedPresetIds(ids) {
-    localStorage.setItem('pinnedPresetIds', JSON.stringify(ids.slice(0, 10)));
+
+function setActivePromptPresetGroupId(groupId) {
+    const val = groupId || '';
+    try { localStorage.setItem('activePromptPresetGroupId', val); } catch {}
+}
+
+function normalizeActivePromptPresetGroup() {
+    const active = getActivePromptPresetGroupId();
+    if (active === PROMPT_PRESET_ALL_GROUP || active === '') return;
+    if (!promptPresetGroups.some(g => g.id === active)) setActivePromptPresetGroupId(PROMPT_PRESET_ALL_GROUP);
+}
+
+function getPromptPresetGroupName(groupId) {
+    if (!groupId) return '未分组';
+    return promptPresetGroups.find(g => g.id === groupId)?.name || '未分组';
+}
+
+function getPromptPresetsForActiveGroup() {
+    const activeGroupId = getActivePromptPresetGroupId();
+    if (activeGroupId === PROMPT_PRESET_ALL_GROUP) return promptPresets;
+    return promptPresets.filter(p => !p.groupId || p.groupId === activeGroupId);
+}
+
+function renderPromptPresetGroupControls() {
+    const select = document.getElementById('prompt-preset-group-filter');
+    if (select) {
+        const active = getActivePromptPresetGroupId();
+        select.innerHTML = `<option value="${PROMPT_PRESET_ALL_GROUP}">全部</option><option value="">未分组</option>` +
+            promptPresetGroups.map(g => `<option value="${escHtml(g.id)}">${escHtml(g.name)}</option>`).join('');
+        select.value = (active === '' || active === PROMPT_PRESET_ALL_GROUP || promptPresetGroups.some(g => g.id === active))
+            ? active
+            : PROMPT_PRESET_ALL_GROUP;
+    }
+
+    const newGroupSelect = document.getElementById('prompt-preset-new-group');
+    if (newGroupSelect) {
+        const current = newGroupSelect.value || '';
+        newGroupSelect.innerHTML = '<option value="">未分组</option>' +
+            promptPresetGroups.map(g => `<option value="${escHtml(g.id)}">${escHtml(g.name)}</option>`).join('');
+        if (current && promptPresetGroups.some(g => g.id === current)) newGroupSelect.value = current;
+    }
+
+    const active = getActivePromptPresetGroupId();
+    const canEdit = active && active !== PROMPT_PRESET_ALL_GROUP;
+    const editBtn = document.getElementById('btn-prompt-preset-group-edit');
+    const delBtn = document.getElementById('btn-prompt-preset-group-delete');
+    if (editBtn) editBtn.disabled = !canEdit;
+    if (delBtn) delBtn.disabled = !canEdit;
 }
 
 function renderPromptPresetButtons() {
     const group = document.getElementById('prompt-preset-btn-group');
     if (!group) return;
-    const pinnedIds = getPinnedPresetIds();
-    const pinned = promptPresets.filter(p => pinnedIds.includes(p.id));
-    group.innerHTML = pinned.map(p => {
+    renderPromptPresetGroupControls();
+    const visible = getPromptPresetsForActiveGroup().slice(0, 10);
+    group.innerHTML = visible.map(p => {
         const isActive = activePromptPresetIds.has(p.id);
         return `<button class="template-btn ${isActive ? 'selected' : ''}" data-preset-id="${p.id}" title="${escHtml(p.text)}">${escHtml(p.name)}</button>`;
     }).join('');
@@ -5052,41 +7744,25 @@ function renderPromptPresetButtons() {
 function renderPromptPresetList() {
     const list = document.getElementById('prompt-preset-list');
     if (!list) return;
-    const pinnedIds = getPinnedPresetIds();
+    renderPromptPresetGroupControls();
     if (promptPresets.length === 0) {
         list.innerHTML = '<div style="color:var(--text-muted);font-size:11px;padding:8px 0;">暂无预设，请在下方添加</div>';
         return;
     }
     list.innerHTML = promptPresets.map((p, idx) => {
-        const isPinned = pinnedIds.includes(p.id);
         return `
         <div style="display:flex;align-items:center;gap:4px;padding:4px 0;border-bottom:1px solid var(--border-light);">
-            <label style="display:flex;align-items:center;gap:2px;font-size:10px;cursor:pointer;white-space:nowrap;" title="勾选后显示在按钮区">
-                <input type="checkbox" class="preset-pin-cb" data-id="${p.id}" ${isPinned ? 'checked' : ''} style="width:12px;height:12px;"> 📌
-            </label>
             <span style="font-size:11px;font-weight:500;min-width:50px;">${escHtml(p.name)}</span>
+            <span style="font-size:9px;color:var(--text-muted);border:1px solid var(--border-light);border-radius:3px;padding:1px 4px;white-space:nowrap;">${escHtml(getPromptPresetGroupName(p.groupId || ''))}</span>
             <span style="font-size:10px;color:var(--text-muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escHtml(p.text)}">${escHtml(p.text)}</span>
             <button class="btn btn-outline btn-compact preset-edit-btn" data-idx="${idx}" style="font-size:9px;padding:1px 4px;">编辑</button>
             <button class="btn btn-outline btn-compact preset-del-btn" data-idx="${idx}" style="font-size:9px;padding:1px 4px;color:var(--danger);">删除</button>
         </div>`;
     }).join('');
 
-    list.querySelectorAll('.preset-pin-cb').forEach(cb => {
-        cb.addEventListener('change', () => {
-            let ids = getPinnedPresetIds();
-            if (cb.checked) {
-                if (ids.length >= 10) { showToast('最多显示10个', 'error'); cb.checked = false; return; }
-                if (!ids.includes(cb.dataset.id)) ids.push(cb.dataset.id);
-            } else {
-                ids = ids.filter(id => id !== cb.dataset.id);
-            }
-            setPinnedPresetIds(ids);
-            renderPromptPresetButtons();
-        });
-    });
     list.querySelectorAll('.preset-del-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            const idx = parseInt(btn.dataset.idx);
+            const idx = parseInt(btn.dataset.idx, 10);
             const preset = promptPresets[idx];
             if (preset) {
                 if (activePromptPresetIds.has(preset.id)) activePromptPresetIds.delete(preset.id);
@@ -5100,15 +7776,16 @@ function renderPromptPresetList() {
     });
     list.querySelectorAll('.preset-edit-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            const idx = parseInt(btn.dataset.idx);
+            const idx = parseInt(btn.dataset.idx, 10);
             const preset = promptPresets[idx];
             if (preset) {
                 document.getElementById('prompt-preset-new-name').value = preset.name;
                 document.getElementById('prompt-preset-new-text').value = preset.text;
-                promptPresets.splice(idx, 1);
-                savePromptPresets();
-                renderPromptPresetList();
-                renderPromptPresetButtons();
+                const groupSelect = document.getElementById('prompt-preset-new-group');
+                if (groupSelect) groupSelect.value = preset.groupId || '';
+                editingPromptPresetId = preset.id;
+                const addBtn = document.getElementById('btn-prompt-preset-add');
+                if (addBtn) addBtn.textContent = '保存';
             }
         });
     });
@@ -5116,6 +7793,57 @@ function renderPromptPresetList() {
 
 loadPromptPresets().then(() => {
     renderPromptPresetButtons();
+});
+
+document.getElementById('prompt-preset-group-filter')?.addEventListener('change', (e) => {
+    setActivePromptPresetGroupId(e.target.value);
+    renderPromptPresetButtons();
+    renderPromptPresetList();
+});
+
+document.getElementById('btn-prompt-preset-group-add')?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const name = await showPrompt('新增提示词预设分组', '', '分组名称');
+    if (!name || !name.trim()) return;
+    const group = { id: 'ppg_' + Date.now(), name: name.trim() };
+    promptPresetGroups.push(group);
+    setActivePromptPresetGroupId(group.id);
+    await savePromptPresets();
+    renderPromptPresetButtons();
+    renderPromptPresetList();
+    showToast('分组已添加', 'success');
+});
+
+document.getElementById('btn-prompt-preset-group-edit')?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const active = getActivePromptPresetGroupId();
+    const group = promptPresetGroups.find(g => g.id === active);
+    if (!group) return;
+    const name = await showPrompt('重命名提示词预设分组', group.name, '分组名称');
+    if (!name || !name.trim()) return;
+    group.name = name.trim();
+    await savePromptPresets();
+    renderPromptPresetButtons();
+    renderPromptPresetList();
+    showToast('分组已更新', 'success');
+});
+
+document.getElementById('btn-prompt-preset-group-delete')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const active = getActivePromptPresetGroupId();
+    const group = promptPresetGroups.find(g => g.id === active);
+    if (!group) return;
+    showConfirm(`删除分组"${group.name}"？组内预设会保留并变为未分组。`, async () => {
+        promptPresetGroups = promptPresetGroups.filter(g => g.id !== active);
+        for (const preset of promptPresets) {
+            if (preset.groupId === active) preset.groupId = '';
+        }
+        setActivePromptPresetGroupId(PROMPT_PRESET_ALL_GROUP);
+        await savePromptPresets();
+        renderPromptPresetButtons();
+        renderPromptPresetList();
+        showToast('分组已删除，预设已转为未分组', 'success');
+    });
 });
 
 document.getElementById('btn-prompt-preset')?.addEventListener('click', (e) => {
@@ -5127,14 +7855,29 @@ document.getElementById('btn-prompt-preset')?.addEventListener('click', (e) => {
 document.getElementById('btn-prompt-preset-add')?.addEventListener('click', () => {
     const name = document.getElementById('prompt-preset-new-name')?.value.trim();
     const text = document.getElementById('prompt-preset-new-text')?.value.trim();
+    const groupId = document.getElementById('prompt-preset-new-group')?.value || '';
     if (!name || !text) { showToast('请填写预设名称和内容', 'error'); return; }
-    promptPresets.push({ id: 'pp_' + Date.now(), name, text });
+    if (editingPromptPresetId) {
+        const preset = promptPresets.find(p => p.id === editingPromptPresetId);
+        if (preset) {
+            preset.name = name;
+            preset.text = text;
+            preset.groupId = groupId;
+        }
+        editingPromptPresetId = null;
+        const addBtn = document.getElementById('btn-prompt-preset-add');
+        if (addBtn) addBtn.textContent = '添加';
+    } else {
+        promptPresets.push({ id: 'pp_' + Date.now(), name, text, groupId });
+    }
     savePromptPresets();
     renderPromptPresetList();
     renderPromptPresetButtons();
     document.getElementById('prompt-preset-new-name').value = '';
     document.getElementById('prompt-preset-new-text').value = '';
-    showToast('预设已添加', 'success');
+    const groupSelect = document.getElementById('prompt-preset-new-group');
+    if (groupSelect) groupSelect.value = '';
+    showToast(editingPromptPresetId ? '预设已更新' : '预设已保存', 'success');
 });
 
 // 弹窗关闭
@@ -5689,9 +8432,11 @@ function renderImgPresetTagList() {
 }
 
 // 预设搜索
+let _imgPresetSearchTimer = null;
 document.getElementById('img-preset-search-input')?.addEventListener('input', (e) => {
     imageState.presetSearchKeyword = e.target.value;
-    renderImagePresets();
+    clearTimeout(_imgPresetSearchTimer);
+    _imgPresetSearchTimer = setTimeout(() => renderImagePresets(), 200);
 });
 
 // 图生图预设排序
@@ -5870,11 +8615,11 @@ function applyImagePreset(preset) {
             prefixTemplate: img.prefixTemplate || '请参考'
         }));
     } else {
-        imageState.slots = [{ image: '', label: '', prefixTemplate: '请参考' }, { image: '', label: '', prefixTemplate: '请参考' }];
+        imageState.slots = [{ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' }, { image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' }];
     }
     // 确保有10个槽位
     while (imageState.slots.length < SLOT_COUNT) {
-        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
     }
     imageState.activeSlotIndex = 0;
     renderImageSlots();
@@ -5909,7 +8654,7 @@ async function cloneImagePreset(preset) {
             prompt_cn: preset.prompt_cn || '',
             prompt_en: preset.prompt_en || '',
             prompt_lang: preset.prompt_lang || 'en',
-            images: JSON.parse(JSON.stringify(preset.images || [])),
+            images: deepClone(preset.images || []),
             platform: preset.platform || '',
             model: preset.model || '',
             aspect_ratio: preset.aspect_ratio || '3:4',
@@ -5960,10 +8705,35 @@ function deleteImagePreset(preset) {
             localStorage.setItem('image-lib-panel-width', panel1.style.width);
         });
     }
+
+    // 拆图模式 resize handle
+    const splitHandle = document.getElementById('resize-handle-split');
+    const splitPanel1 = document.getElementById('split-library-panel');
+    const splitModeEl = document.getElementById('split-mode');
+    if (splitHandle && splitPanel1 && splitModeEl) {
+        const savedSplitLibWidth = localStorage.getItem('split-lib-panel-width');
+        if (savedSplitLibWidth) splitPanel1.style.width = savedSplitLibWidth;
+        let isSplitResizing = false;
+        splitHandle.addEventListener('mousedown', (e) => { isSplitResizing = true; splitHandle.classList.add('active'); document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none'; e.preventDefault(); });
+        document.addEventListener('mousemove', (e) => {
+            if (!isSplitResizing) return;
+            const rect = splitModeEl.getBoundingClientRect();
+            let newWidth = Math.max(80, Math.min(rect.width - 400, e.clientX - rect.left));
+            splitPanel1.style.width = newWidth + 'px';
+        });
+        document.addEventListener('mouseup', () => {
+            if (!isSplitResizing) return;
+            isSplitResizing = false;
+            splitHandle.classList.remove('active');
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+            localStorage.setItem('split-lib-panel-width', splitPanel1.style.width);
+        });
+    }
 })();
 
-// ---------- 3:4 裁剪 + 压缩工具 ----------
-let cropState = null; // { img, imgWidth, imgHeight, cropX, cropY, cropW, cropH, callback }
+// ---------- 3:4 / 4:3 自适应裁剪 + 压缩工具 ----------
+let cropState = null; // { img, imgWidth, imgHeight, cropX, cropY, cropW, cropH, targetRatio, ratioLabel, callback }
 
 // ---------- 批量裁剪队列 ----------
 let cropQueue = []; // [{ file, slotIndex, callback }]
@@ -6025,6 +8795,17 @@ function startBatchCrop(files, slotIndex, onEachCropped) {
     }
 }
 
+function getClosestUploadCropRatio(width, height) {
+    const ratio = width / height;
+    const portrait = 3 / 4;
+    const landscape = 4 / 3;
+    const portraitDiff = Math.abs(ratio - portrait);
+    const landscapeDiff = Math.abs(ratio - landscape);
+    return landscapeDiff < portraitDiff
+        ? { ratio: landscape, label: '4:3' }
+        : { ratio: portrait, label: '3:4' };
+}
+
 function showCropModal(imgSrc, callback) {
     // imgSrc: data URL or object URL of the image
     // callback: function(croppedBlob) called when user confirms crop
@@ -6032,15 +8813,10 @@ function showCropModal(imgSrc, callback) {
     const ctx = canvas.getContext('2d');
     const img = new Image();
     img.onload = () => {
-        // 判断原图是否已是3:4比例（容差0.02）
-        const origRatio = img.width / img.height;
-        const targetRatio = 3 / 4;
-        const isAlready34 = Math.abs(origRatio - targetRatio) / targetRatio < 0.02;
-
-        if (isAlready34) {
-            // 原图已是3:4，仍显示裁剪框让用户确认（但选区默认覆盖全图）
-            // 不再静默跳过，确保用户每次上传都能看到裁剪+命名+分类的完整流程
-        }
+        const pickedRatio = getClosestUploadCropRatio(img.width, img.height);
+        const targetRatio = pickedRatio.ratio;
+        const title = document.querySelector('#modal-crop .modal-header h3');
+        if (title) title.textContent = `裁剪图片（${pickedRatio.label}比例）`;
 
         // Fit image to display canvas
         const maxW = 480, maxH = 400;
@@ -6050,16 +8826,16 @@ function showCropModal(imgSrc, callback) {
         canvas.width = Math.round(drawW);
         canvas.height = Math.round(drawH);
 
-        // 动态计算最大3:4选区（在显示坐标系内）
+        // 动态计算最大 3:4 / 4:3 选区（在显示坐标系内）
         let cropW, cropH;
-        if (drawW / drawH > 3 / 4) {
-            // 图片偏宽：高度撑满，宽度按3:4
+        if (drawW / drawH > targetRatio) {
+            // 图片偏宽：高度撑满，宽度按目标比例
             cropH = drawH;
-            cropW = cropH * 3 / 4;
+            cropW = cropH * targetRatio;
         } else {
-            // 图片偏窄：宽度撑满，高度按3:4
+            // 图片偏窄：宽度撑满，高度按目标比例
             cropW = drawW;
-            cropH = cropW * 4 / 3;
+            cropH = cropW / targetRatio;
         }
         const cropX = (drawW - cropW) / 2;
         const cropY = (drawH - cropH) / 2;
@@ -6067,6 +8843,8 @@ function showCropModal(imgSrc, callback) {
         cropState = {
             img, drawW, drawH,
             cropX, cropY, cropW, cropH,
+            targetRatio,
+            ratioLabel: pickedRatio.label,
             callback,
             dragging: false, resizing: false, resizeCorner: -1,
             dragStartX: 0, dragStartY: 0, origCropX: 0, origCropY: 0,
@@ -6082,7 +8860,7 @@ function showCropModal(imgSrc, callback) {
 
 function drawCropCanvas() {
     if (!cropState) return;
-    const { img, drawW, drawH, cropX, cropY, cropW, cropH } = cropState;
+    const { img, drawW, drawH, cropX, cropY, cropW, cropH, ratioLabel } = cropState;
     const canvas = document.getElementById('crop-canvas');
     const ctx = canvas.getContext('2d');
 
@@ -6117,7 +8895,7 @@ function drawCropCanvas() {
     const realH = Math.round(cropH * scaleY);
     ctx.fillStyle = 'rgba(0,0,0,0.6)';
     ctx.font = '11px sans-serif';
-    const sizeText = `${realW} × ${realH}`;
+    const sizeText = `${realW} × ${realH} · ${ratioLabel || '3:4'}`;
     const textW = ctx.measureText(sizeText).width;
     const textX = cropX + (cropW - textW) / 2;
     const textY = cropY + cropH - 8;
@@ -6191,7 +8969,7 @@ function drawCropCanvas() {
         const mx = (e.clientX - rect.left) * scaleX;
         const my = (e.clientY - rect.top) * scaleY;
 
-        // 角点拖拽缩放（保持3:4比例）
+        // 角点拖拽缩放（保持当前目标比例）
         if (cropState.resizing) {
             const dx = mx - cropState.dragStartX;
             // 根据拖拽方向和角点位置决定缩放
@@ -6202,15 +8980,16 @@ function drawCropCanvas() {
             const widthDelta = isLeft ? -dx : dx;
 
             let newW = cropState.origCropW + widthDelta;
-            let newH = newW * 4 / 3;
+            const targetRatio = cropState.targetRatio || 3 / 4;
+            let newH = newW / targetRatio;
 
             // 最小尺寸限制
             newW = Math.max(30, newW);
-            newH = newW * 4 / 3;
+            newH = newW / targetRatio;
 
             // 不能超出画布
-            if (newW > cropState.drawW) { newW = cropState.drawW; newH = newW * 4 / 3; }
-            if (newH > cropState.drawH) { newH = cropState.drawH; newW = newH * 3 / 4; }
+            if (newW > cropState.drawW) { newW = cropState.drawW; newH = newW / targetRatio; }
+            if (newH > cropState.drawH) { newH = cropState.drawH; newW = newH * targetRatio; }
 
             // 保持裁剪框中心位置不变
             const centerX = cropState.origCropX + cropState.origCropW / 2;
@@ -6250,18 +9029,19 @@ function drawCropCanvas() {
         }
     });
 
-    // Scroll to resize crop box (保持3:4比例)
+    // Scroll to resize crop box (保持当前目标比例)
     canvas.addEventListener('wheel', (e) => {
         if (!cropState) return;
         e.preventDefault();
         const delta = e.deltaY > 0 ? -10 : 10;
+        const targetRatio = cropState.targetRatio || 3 / 4;
         let newW = cropState.cropW + delta;
-        let newH = newW * 4 / 3;
+        let newH = newW / targetRatio;
 
         // Clamp
         newW = Math.max(30, Math.min(cropState.drawW, newW));
-        newH = newW * 4 / 3;
-        if (newH > cropState.drawH) { newH = cropState.drawH; newW = newH * 3 / 4; }
+        newH = newW / targetRatio;
+        if (newH > cropState.drawH) { newH = cropState.drawH; newW = newH * targetRatio; }
 
         // Keep centered
         const cx = cropState.cropX + cropState.cropW / 2;
@@ -6372,37 +9152,37 @@ if (seedModeSelect && seedInput) {
 // ---------- RunningHub 模型配置系统（内联版） ----------
 const RH_MODELS = {
     'rhart-image-v1/edit': {
-        name: 'V1-图生图-低价渠道版', price: '0.05', type: 'image-to-image',
+        name: 'V1-图生图-低价渠道版', shortName: 'V1', price: '0.05', type: 'image-to-image',
         maxImages: 5, maxImageMB: 10, hasResolution: false,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: true
     },
     'rhart-image-v1-official/edit': {
-        name: 'V1-图生图-官方稳定版', price: '0.2', type: 'image-to-image',
+        name: 'V1-图生图-官方稳定版', shortName: 'V1-official', price: '0.2', type: 'image-to-image',
         maxImages: 5, maxImageMB: 10, hasResolution: false,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: true
     },
     'rhart-image-n-g31-flash/image-to-image': {
-        name: 'V2-图生图-低价渠道版', price: '0.16', type: 'image-to-image',
+        name: 'V2-图生图-低价渠道版', shortName: 'V2', price: '0.16', type: 'image-to-image',
         maxImages: 10, maxImageMB: 30, hasResolution: true,
         aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
     },
     'rhart-image-n-g31-flash-official/image-to-image': {
-        name: 'V2-图生图-官方稳定版', price: '0.74', type: 'image-to-image',
+        name: 'V2-图生图-官方稳定版', shortName: 'V2-official', price: '0.74', type: 'image-to-image',
         maxImages: 14, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
     },
     'rhart-image-n-pro/edit': {
-        name: 'PRO-图生图-低价渠道版', price: '0.4', type: 'image-to-image',
+        name: 'PRO-图生图-低价渠道版', shortName: 'PRO', price: '0.4', type: 'image-to-image',
         maxImages: 10, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
     },
     'rhart-image-n-pro-official/edit': {
-        name: 'PRO-图生图-官方稳定版', price: '1', type: 'image-to-image',
+        name: 'PRO-图生图-官方稳定版', shortName: 'PRO-official', price: '1', type: 'image-to-image',
         maxImages: 10, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
@@ -6412,48 +9192,153 @@ const RH_MODELS = {
 // OpenAI-HK 模型配置
 const OAIHK_MODELS = {
     'fal-ai/banana/v2': {
-        name: 'proK', price: '0.48',
+        name: 'proK', shortName: 'proK', price: '0.48',
         endpoint: 'fal-ai/banana/v2',
         modelId: 'fal-ai/banana/v2',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 1024
     },
     'fal-ai/banana/v2/2k': {
-        name: 'pro2K', price: '0.48',
+        name: 'pro2K', shortName: 'pro2K', price: '0.48',
         endpoint: 'fal-ai/banana/v2/2k',
         modelId: 'fal-ai/banana/v2/2k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 1536
     },
     'fal-ai/banana/v2/4k': {
-        name: 'pro4K', price: '0.48',
+        name: 'pro4K', shortName: 'pro4K', price: '0.48',
         endpoint: 'fal-ai/banana/v2/4k',
         modelId: 'fal-ai/banana/v2/4k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 2048
     },
     'fal-ai/banana/v3.1/flash': {
-        name: 'nano2-3.1 1K', price: '0.2',
+        name: 'nano2-3.1 1K', shortName: '3.1-1K', price: '0.2',
         endpoint: 'fal-ai/banana/v3.1/flash',
         modelId: 'fal-ai/banana/v3.1/flash',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 1024
     },
     'fal-ai/banana/v3.1/flash/2k': {
-        name: 'nano2-3.1 2K', price: '0.3',
+        name: 'nano2-3.1 2K', shortName: '3.1-2K', price: '0.3',
         endpoint: 'fal-ai/banana/v3.1/flash/2k',
         modelId: 'fal-ai/banana/v3.1/flash/2k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 1536
     },
     'fal-ai/banana/v3.1/flash/4k': {
-        name: 'nano2-3.1 4K', price: '0.48',
+        name: 'nano2-3.1 4K', shortName: '3.1-4K', price: '0.48',
         endpoint: 'fal-ai/banana/v3.1/flash/4k',
         modelId: 'fal-ai/banana/v3.1/flash/4k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
         shortEdge: 2048
+    },
+    'gpt-image-2': {
+        name: 'GPT-img-2 1K', shortName: 'GPT2-1K', price: '0.04',
+        endpoint: 'gpt-image-2',
+        modelId: 'gpt-image-2',
+        pollEndpoint: null,
+        shortEdge: 1024,
+        sizes: { '3:4': '1024x1536', '2:3': '1024x1536', '1:1': '1024x1024', '9:16': '1024x1820', '4:3': '1536x1024', '16:9': '1820x1024' },
+        isGptImage: true
+    },
+    'gpt-image-2/2k': {
+        name: 'GPT-img-2 2K', shortName: 'GPT2-2K', price: '0.08',
+        endpoint: 'gpt-image-2',
+        modelId: 'gpt-image-2',
+        pollEndpoint: null,
+        shortEdge: 1536,
+        sizes: { '3:4': '1536x2048', '2:3': '1536x2048', '1:1': '1536x1536', '9:16': '1536x2730', '4:3': '2048x1536', '16:9': '2730x1536' },
+        isGptImage: true
+    },
+    'gpt-image-2/4k': {
+        name: 'GPT-img-2 4K', shortName: 'GPT2-4K', price: '0.16',
+        endpoint: 'gpt-image-2',
+        modelId: 'gpt-image-2',
+        pollEndpoint: null,
+        shortEdge: 2048,
+        sizes: { '3:4': '2160x2880', '2:3': '2160x3240', '1:1': '2160x2160', '9:16': '2160x3840', '4:3': '2880x2160', '16:9': '3840x2160' },
+        isGptImage: true
     }
 };
+
+function parseAspectRatio(ratio) {
+    if (!ratio || typeof ratio !== 'string' || !ratio.includes(':')) return null;
+    const [wStr, hStr] = ratio.split(':');
+    const w = parseFloat(wStr);
+    const h = parseFloat(hStr);
+    if (!isFinite(w) || !isFinite(h) || w <= 0 || h <= 0) return null;
+    return { w, h };
+}
+
+function getOaihkImageSize(model, aspectRatio = '3:4') {
+    const ratio = aspectRatio || '3:4';
+    // 1) 优先使用模型给出的官方size映射
+    if (model?.sizes?.[ratio]) return model.sizes[ratio];
+    if (model?.size) return model.size;
+
+    // 2) 未命中映射时，用 shortEdge + 比例动态计算，避免回退到 1K
+    const shortEdge = Math.max(512, parseInt(model?.shortEdge || 1024, 10));
+    const parsed = parseAspectRatio(ratio);
+    if (!parsed) return `${shortEdge}x${shortEdge}`;
+    let width;
+    let height;
+    if (parsed.w >= parsed.h) {
+        height = shortEdge;
+        width = Math.round((shortEdge * parsed.w) / parsed.h);
+    } else {
+        width = shortEdge;
+        height = Math.round((shortEdge * parsed.h) / parsed.w);
+    }
+    // 常见图像API对8的倍数更稳定
+    width = Math.max(512, Math.round(width / 8) * 8);
+    height = Math.max(512, Math.round(height / 8) * 8);
+    return `${width}x${height}`;
+}
+
+function getOaihkGptQuality(model) {
+    return (model?.shortEdge || 1024) >= 1536 ? 'high' : 'low';
+}
+
+function announceOaihkSubmit(source, payload) {
+    const model = payload?.model || '';
+    const size = payload?.size || '';
+    const quality = payload?.quality || '';
+    const endpoint = payload?.endpoint || '';
+    logAction('api', 'OAIHK提交参数', { source, model, size, quality, endpoint });
+    // 关键参数直接提示到界面，避免“选了4K但实际提交不是4K”无法感知
+    const parts = [`模型:${model}`];
+    if (size) parts.push(`尺寸:${size}`);
+    if (quality) parts.push(`质量:${quality}`);
+    if (endpoint) parts.push(`端点:${endpoint}`);
+    showToast(`本次提交 -> ${parts.join(' | ')}`, 'info');
+}
+
+// ---------- 图片命名系统 ----------
+function getDefaultImagePrefix() {
+    const platform = document.getElementById('cfg-api-platform')?.value || 'oaihk';
+    const platformShort = platform === 'oaihk' ? 'HK' : 'RH';
+    let modelShort = '';
+    if (platform === 'oaihk') {
+        const modelId = document.getElementById('cfg-oaihk-model-inline')?.value;
+        const model = OAIHK_MODELS[modelId];
+        modelShort = model?.shortName || 'unknown';
+    } else {
+        const modelId = document.getElementById('cfg-rh-model-inline')?.value;
+        const model = RH_MODELS[modelId];
+        modelShort = model?.shortName || 'unknown';
+    }
+    return `${platformShort}-${modelShort}`;
+}
+
+function getEffectiveImagePrefix() {
+    const customPrefix = document.getElementById('cfg-image-prefix')?.value?.trim();
+    return customPrefix || getDefaultImagePrefix();
+}
+
+function formatImageNumber(num, digits = 3) {
+    return String(num).padStart(digits, '0');
+}
 
 // 平台切换：显示/隐藏对应控件
 function togglePlatformUI(platform) {
@@ -6491,7 +9376,169 @@ function updateOaihkModelParamsInline() {
     if (!modelSelect) return;
     const model = OAIHK_MODELS[modelSelect.value];
     if (model && priceTag) priceTag.textContent = model.price;
+    // GPT-Image 模型隐藏比例选择器（比例已内嵌在模型 sizes 映射中）
+    const hkAspectRatioGroup = document.getElementById('oaihk-aspect-ratio-group');
+    if (hkAspectRatioGroup) {
+        hkAspectRatioGroup.style.display = model?.isGptImage ? 'none' : 'flex';
+    }
+    updateDefaultModelBadge();
 }
+
+// ========== 默认模型 ==========
+const DEFAULT_MODEL_KEY = 'defaultModelConfig';
+
+function getDefaultModelConfig() {
+    try {
+        return JSON.parse(localStorage.getItem(DEFAULT_MODEL_KEY));
+    } catch { return null; }
+}
+
+function setDefaultModelConfig() {
+    const platform = document.getElementById('cfg-api-platform')?.value || 'oaihk';
+    const config = {
+        platform,
+        rhModelId: document.getElementById('cfg-rh-model-inline')?.value || '',
+        oaihkModelId: document.getElementById('cfg-oaihk-model-inline')?.value || '',
+        rhResolution: document.getElementById('cfg-rh-resolution-inline')?.value || '1k',
+        rhAspectRatio: document.getElementById('cfg-rh-aspect-ratio-inline')?.value || '3:4',
+        oaihkAspectRatio: document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4'
+    };
+    localStorage.setItem(DEFAULT_MODEL_KEY, JSON.stringify(config));
+    updateDefaultModelBadge();
+    showToast('已设为默认模型', 'success');
+}
+
+function applyDefaultModelConfig() {
+    const config = getDefaultModelConfig();
+    if (!config) return false;
+    // 设置平台
+    const platformSelect = document.getElementById('cfg-api-platform');
+    if (platformSelect) platformSelect.value = config.platform;
+    togglePlatformUI(config.platform);
+    // 设置模型
+    if (config.platform === 'runninghub') {
+        setSelectValue('cfg-rh-model-inline', config.rhModelId);
+        setSelectValue('cfg-rh-resolution-inline', config.rhResolution);
+        setSelectValue('cfg-rh-aspect-ratio-inline', config.rhAspectRatio);
+        updateRhModelParamsInline();
+    } else {
+        setSelectValue('cfg-oaihk-model-inline', config.oaihkModelId);
+        setSelectValue('cfg-oaihk-aspect-ratio-inline', config.oaihkAspectRatio);
+        updateOaihkModelParamsInline();
+    }
+    return true;
+}
+
+function updateDefaultModelBadge() {
+    const badge = document.getElementById('default-model-badge');
+    if (!badge) return;
+    const config = getDefaultModelConfig();
+    if (!config) { badge.style.display = 'none'; return; }
+    const platform = document.getElementById('cfg-api-platform')?.value || 'oaihk';
+    let isMatch = false;
+    if (platform === 'runninghub') {
+        isMatch = document.getElementById('cfg-rh-model-inline')?.value === config.rhModelId
+            && document.getElementById('cfg-rh-resolution-inline')?.value === config.rhResolution
+            && document.getElementById('cfg-rh-aspect-ratio-inline')?.value === config.rhAspectRatio;
+    } else {
+        isMatch = document.getElementById('cfg-oaihk-model-inline')?.value === config.oaihkModelId
+            && document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value === config.oaihkAspectRatio;
+    }
+    badge.style.display = isMatch ? '' : 'none';
+}
+
+document.getElementById('btn-set-default-model')?.addEventListener('click', setDefaultModelConfig);
+
+// ========== 拆图模式默认模型 ==========
+const SPLIT_DEFAULT_MODEL_KEY = 'splitDefaultModelConfig';
+
+function getSplitDefaultModelConfig() {
+    try {
+        return JSON.parse(localStorage.getItem(SPLIT_DEFAULT_MODEL_KEY));
+    } catch { return null; }
+}
+
+function setSplitDefaultModelConfig() {
+    const platform = document.getElementById('split-cfg-api-platform')?.value || 'oaihk';
+    const config = {
+        platform,
+        rhModelId: document.getElementById('split-cfg-rh-model')?.value || '',
+        oaihkModelId: document.getElementById('split-cfg-oaihk-model')?.value || '',
+        rhResolution: document.getElementById('split-cfg-rh-resolution')?.value || '1k',
+        rhAspectRatio: document.getElementById('split-cfg-rh-aspect-ratio')?.value || '3:4',
+        oaihkAspectRatio: document.getElementById('split-cfg-oaihk-aspect-ratio')?.value || '3:4'
+    };
+    localStorage.setItem(SPLIT_DEFAULT_MODEL_KEY, JSON.stringify(config));
+    updateSplitDefaultModelBadge();
+    showToast('已设为拆图默认模型', 'success');
+}
+
+function applySplitDefaultModelConfig() {
+    const config = getSplitDefaultModelConfig();
+    if (!config) return false;
+    const platformSelect = document.getElementById('split-cfg-api-platform');
+    if (platformSelect) platformSelect.value = config.platform;
+    updateSplitApiPlatformUI();
+    if (config.platform === 'runninghub') {
+        setSelectValue('split-cfg-rh-model', config.rhModelId);
+        setSelectValue('split-cfg-rh-resolution', config.rhResolution);
+        setSelectValue('split-cfg-rh-aspect-ratio', config.rhAspectRatio);
+    } else {
+        setSelectValue('split-cfg-oaihk-model', config.oaihkModelId);
+        setSelectValue('split-cfg-oaihk-aspect-ratio', config.oaihkAspectRatio);
+    }
+    updateSplitApiPlatformUI();
+    return true;
+}
+
+function updateSplitDefaultModelBadge() {
+    const badge = document.getElementById('split-default-model-badge');
+    if (!badge) return;
+    const config = getSplitDefaultModelConfig();
+    if (!config) { badge.style.display = 'none'; return; }
+    const platform = document.getElementById('split-cfg-api-platform')?.value || 'oaihk';
+    let isMatch = false;
+    if (platform === 'runninghub') {
+        isMatch = document.getElementById('split-cfg-rh-model')?.value === config.rhModelId
+            && document.getElementById('split-cfg-rh-resolution')?.value === config.rhResolution
+            && document.getElementById('split-cfg-rh-aspect-ratio')?.value === config.rhAspectRatio;
+    } else {
+        isMatch = document.getElementById('split-cfg-oaihk-model')?.value === config.oaihkModelId
+            && document.getElementById('split-cfg-oaihk-aspect-ratio')?.value === config.oaihkAspectRatio;
+    }
+    badge.style.display = isMatch ? '' : 'none';
+}
+
+document.getElementById('btn-split-set-default-model')?.addEventListener('click', setSplitDefaultModelConfig);
+document.getElementById('btn-split-settings')?.addEventListener('click', () => {
+    document.getElementById('btn-model-config')?.click();
+});
+document.getElementById('split-cfg-oaihk-model')?.addEventListener('change', () => {
+    readSplitApiConfigToQueue(activeSplitQueue);
+    applySplitAutoAspectRatioFromCrop(activeSplitQueue);
+    updateSplitApiPlatformUI();
+    saveSplitQueueData();
+});
+document.getElementById('split-cfg-rh-model')?.addEventListener('change', () => {
+    readSplitApiConfigToQueue(activeSplitQueue);
+    const qdRh = splitQueueData[activeSplitQueue];
+    syncSplitRhAspectRatioSelectForQueue(qdRh);
+    applySplitAutoAspectRatioFromCrop(activeSplitQueue);
+    updateSplitApiPlatformUI();
+    saveSplitQueueData();
+});
+document.getElementById('split-cfg-rh-aspect-ratio')?.addEventListener('change', () => {
+    const qdM = splitQueueData[activeSplitQueue];
+    if (qdM) qdM.splitAspectRatioManualOverride = true;
+    readSplitApiConfigToQueue(activeSplitQueue);
+    saveSplitQueueData();
+});
+document.getElementById('split-cfg-oaihk-aspect-ratio')?.addEventListener('change', () => {
+    const qdM = splitQueueData[activeSplitQueue];
+    if (qdM) qdM.splitAspectRatioManualOverride = true;
+    readSplitApiConfigToQueue(activeSplitQueue);
+    saveSplitQueueData();
+});
 
 document.getElementById('cfg-oaihk-model-inline')?.addEventListener('change', () => {
     updateOaihkModelParamsInline();
@@ -6614,16 +9661,79 @@ if (autoBackupCheckbox) {
     } catch(e) {}
     autoBackupCheckbox.addEventListener('change', () => {
         try { localStorage.setItem('rh-auto-backup', autoBackupCheckbox.checked); } catch(e) {}
+        // 多图队列模式下，同步保存到当前队列
+        if (queueMode === 'multi' && queueData[activeQueue]) {
+            queueData[activeQueue].autoBackup = autoBackupCheckbox.checked;
+            saveQueueData();
+        }
     });
 }
 
-// 备份路径持久化：输入框修改时保存到model_config
+// 备份路径持久化：输入框修改时保存到model_config和当前队列
 const backupPathInput = document.getElementById('cfg-rh-download-path');
 if (backupPathInput) {
     backupPathInput.addEventListener('change', async () => {
         try {
-            await api('PUT', '/api/model-config', { rh_download_path: backupPathInput.value });
+            if (queueMode === 'multi' && queueData[activeQueue]) {
+                backupPathInput.dataset.downloadPathInherited = '0';
+                queueData[activeQueue].downloadPath = cleanDownloadPath(backupPathInput.value);
+                saveQueueData();
+            } else {
+                const path = cleanDownloadPath(backupPathInput.value) || DEFAULT_DOWNLOAD_PATH_FALLBACK;
+                backupPathInput.value = path;
+                backupPathInput.dataset.downloadPathInherited = '1';
+                state.modelConfig.rh_download_path = path;
+                await api('PUT', '/api/model-config', { rh_download_path: path });
+            }
         } catch(e) { console.error('保存备份路径失败:', e); }
+    });
+}
+
+// 文件夹选择器按钮：调用后端 AppleScript choose folder 对话框
+document.getElementById('btn-select-folder')?.addEventListener('click', async () => {
+    try {
+        showToast('请在弹出的文件夹选择窗口中选择...', 'info');
+        // 传入当前队列的下载路径作为初始目录
+        const currentPath = document.getElementById('cfg-rh-download-path')?.value || '';
+        const resp = await api('POST', '/api/select-folder', { initial_dir: currentPath });
+        if (resp.ok && resp.path) {
+            if (queueMode === 'multi' && queueData[activeQueue]) {
+                markDownloadPathInputAsOwn('cfg-rh-download-path', resp.path);
+                queueData[activeQueue].downloadPath = resp.path;
+                saveQueueData();
+                showToast(`队列${activeQueue + 1}保存路径已设置: ${resp.path}`, 'success');
+            } else {
+                const el = document.getElementById('cfg-rh-download-path');
+                if (el) {
+                    el.value = resp.path;
+                    el.dataset.downloadPathInherited = '1';
+                }
+                state.modelConfig.rh_download_path = resp.path;
+                await api('PUT', '/api/model-config', { rh_download_path: resp.path });
+                showToast(`默认保存路径已设置: ${resp.path}`, 'success');
+            }
+        } else if (resp.ok === false && !resp.path) {
+            showToast('已取消选择', 'info');
+        } else {
+            showToast(resp.error || '选择文件夹失败', 'error');
+        }
+    } catch (e) {
+        showToast('选择文件夹失败: ' + e.message, 'error');
+    }
+});
+
+// 自定义命名前缀持久化
+const imagePrefixInput = document.getElementById('cfg-image-prefix');
+if (imagePrefixInput) {
+    imagePrefixInput.addEventListener('change', async () => {
+        try {
+            await api('PUT', '/api/model-config', { image_prefix: imagePrefixInput.value.trim() });
+            // 多图队列模式下，同步保存到当前队列
+            if (queueMode === 'multi' && queueData[activeQueue]) {
+                queueData[activeQueue].imagePrefix = imagePrefixInput.value.trim();
+                saveQueueData();
+            }
+        } catch(e) { console.error('保存自定义前缀失败:', e); }
     });
 }
 
@@ -6767,7 +9877,7 @@ async function pollApiResult(apiKey, baseUrl) {
             showToast('生成成功！', 'success');
 
             // 自动备份到本地
-            autoBackupResults(data.results || []);
+            await autoBackupResults(data.results || []);
 
         } else if (data.status === 'FAILED') {
             clearTimeout(apiGenerateState.pollTimer);
@@ -6798,35 +9908,125 @@ function displayApiResults(results) {
     section.style.display = 'block';
     grid.innerHTML = '';
 
+    const newItems = [];
     results.forEach((result, index) => {
         if (!result.url) return;
         const item = { url: result.url, checked: false, filename: `AI生图_${index+1}.${result.outputType || 'png'}`, outputType: result.outputType || 'png' };
+        newItems.push(item);
         appendResultCard(item, index);
     });
+
+    if (newItems.length > 0 && queueMode === 'multi') {
+        queueData[activeQueue].results = (queueData[activeQueue].results || []).concat(newItems);
+        saveQueueData();
+    }
 }
 
 // ---------- 备份+下载功能 ----------
 const DEFAULT_DOWNLOAD_PATH = '~/Downloads/AI生图/';
 
 // 备份单张图片到本地（转JPG），返回本地URL
-async function backupImageToLocal(url, filename) {
+async function backupImageToLocal(url, filename, downloadPath) {
+    const detail = await backupImageToLocalDetailed(url, filename, downloadPath);
+    return detail.ok ? detail.localUrl : null;
+}
+
+async function backupImageToLocalDetailed(url, filename, downloadPath) {
     try {
-        const resp = await api('POST', '/api/backup-result-image', { url, filename });
+        const payload = { url, filename };
+        if (downloadPath) payload.download_path = downloadPath;
+        const resp = await api('POST', '/api/backup-result-image', payload);
         if (resp.ok && resp.local_url) {
-            return resp.local_url;
+            return { ok: true, localUrl: resp.local_url, error: null };
         }
         console.warn('备份失败:', resp.error);
-        return null;
+        return { ok: false, localUrl: null, error: resp.error || '未知错误' };
     } catch (e) {
         console.warn('备份异常:', e);
-        return null;
+        return { ok: false, localUrl: null, error: e?.message || '请求异常' };
     }
 }
 
-async function downloadImage(url, filename) {
+function isGalleryProxyUrl(url) {
+    return typeof url === 'string' && url.startsWith('/api/gallery-image?path=');
+}
+
+async function ensurePreviewUsesGallery(item, { downloadPath = '', imagePrefix = 'img', save = null, rerender = null } = {}) {
+    if (!item || !item.url) return false;
+    if (isGalleryProxyUrl(item.url)) return true;
+    if (item._ensuringGallery) return false;
+    item._ensuringGallery = true;
+    try {
+        const ts = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const prefix = (imagePrefix || 'img').trim() || 'img';
+        const fallbackName = `${prefix}_${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.jpg`;
+        const filename = item.filename || fallbackName;
+        const detail = await backupImageToLocalDetailed(item.url, filename, downloadPath);
+        if (detail.ok && detail.localUrl) {
+            item.url = detail.localUrl;
+            item.localUrl = detail.localUrl;
+            updateDiagEnsureStatus(true, '预览图已自动入图库');
+            if (typeof save === 'function') save();
+            if (typeof rerender === 'function') rerender();
+            return true;
+        }
+        item._galleryError = detail.error || '入图库失败';
+        updateDiagEnsureStatus(false, item._galleryError);
+        return false;
+    } finally {
+        item._ensuringGallery = false;
+    }
+}
+
+const diagState = {
+    galleryApiOk: null,
+    splitApiOk: null,
+    lastEnsureOk: null,
+    lastEnsureMsg: '',
+    lastEnsureAt: 0
+};
+
+function updateDiagEnsureStatus(ok, msg) {
+    diagState.lastEnsureOk = !!ok;
+    diagState.lastEnsureMsg = msg || '';
+    diagState.lastEnsureAt = Date.now();
+    renderDiagStatusBar();
+}
+
+function renderDiagStatusBar() {
+    const el = document.getElementById('diag-status-text');
+    if (!el) return;
+    const apiGallery = diagState.galleryApiOk === null ? '⌛' : (diagState.galleryApiOk ? '✅' : '❌');
+    const apiSplit = diagState.splitApiOk === null ? '⌛' : (diagState.splitApiOk ? '✅' : '❌');
+    let ensurePart = '入库状态: 暂无';
+    if (diagState.lastEnsureOk !== null) {
+        const t = diagState.lastEnsureAt ? new Date(diagState.lastEnsureAt).toLocaleTimeString() : '';
+        ensurePart = `入库状态: ${diagState.lastEnsureOk ? '✅成功' : '❌失败'}${diagState.lastEnsureMsg ? `（${diagState.lastEnsureMsg}）` : ''}${t ? ` @${t}` : ''}`;
+    }
+    el.textContent = `后端接口 /api/gallery ${apiGallery} | /api/split-queue-data ${apiSplit} | ${ensurePart}`;
+}
+
+async function runDiagHealthCheck() {
+    try {
+        await api('GET', '/api/gallery', null, 12000);
+        diagState.galleryApiOk = true;
+    } catch (e) {
+        diagState.galleryApiOk = false;
+    }
+    try {
+        await api('GET', '/api/split-queue-data', null, 12000);
+        diagState.splitApiOk = true;
+    } catch (e) {
+        diagState.splitApiOk = false;
+    }
+    renderDiagStatusBar();
+}
+
+async function downloadImage(url, filename, downloadPath) {
     try {
         // 先备份到本地，再触发浏览器下载
-        const localUrl = await backupImageToLocal(url, filename);
+        const localUrl = await backupImageToLocal(url, filename, downloadPath);
         const downloadUrl = localUrl || url;
 
         const namePart = filename.replace(/\.\w+$/, '');
@@ -6869,30 +10069,49 @@ async function downloadImage(url, filename) {
 
 // 自动备份结果图片到本地，替换results中的URL为本地路径
 async function autoBackupResults(results, qi) {
-    const isAutoBackup = document.getElementById('cfg-rh-auto-backup')?.checked;
-    if (!isAutoBackup) return;
+    const imagesToBackup = results.filter(r => r.url && !r.url.startsWith('/static/') && !r.url.startsWith('/api/gallery-image'));
+    if (imagesToBackup.length === 0) return;
 
+    // 获取当前队列的下载路径
+    const currentQi = (qi !== undefined && qi !== null) ? qi : activeQueue;
+    const queueDownloadPath = queueMode === 'multi'
+        ? getEffectiveQueueDownloadPath(currentQi)
+        : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
+
+    let counterStart = 1;
+    try {
+        const counterResp = await api('POST', '/api/next-image-counter', { count: imagesToBackup.length });
+        counterStart = counterResp.start;
+    } catch (e) {
+        console.error('获取图片计数器失败:', e);
+    }
+
+    const prefix = getEffectiveImagePrefix();
     let backupCount = 0;
+    let counterIdx = 0;
     for (let i = 0; i < results.length; i++) {
         const r = results[i];
         if (!r.url) continue;
-        if (r.url.startsWith('/static/')) continue;
+        if (r.url.startsWith('/static/') || r.url.startsWith('/api/gallery-image')) continue;
 
-        const filename = r.filename || `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${i}.jpg`;
-        const localUrl = await backupImageToLocal(r.url, filename);
+        const num = formatImageNumber(counterStart + counterIdx);
+        const filename = `${prefix}-${num}.jpg`;
+        counterIdx++;
+
+        const localUrl = await backupImageToLocal(r.url, filename, queueDownloadPath);
         if (localUrl) {
             r.url = localUrl;
             r.localUrl = localUrl;
+            r.filename = filename;
             backupCount++;
         }
     }
     if (backupCount > 0) {
-        // 备份完成后持久化到队列数据和服务端
         if (qi !== undefined && qi !== null && queueData[qi]) {
-            queueData[qi].results = results;
             saveQueueData();
+            if (activeQueue === qi) renderQueueResults(qi);
         }
-        showToast(`${backupCount}张图片已自动备份到本地`, 'success');
+        showToast(`${backupCount}张图片已统一入图库`, 'success');
     }
 }
 
@@ -6902,11 +10121,22 @@ document.getElementById('btn-download-all')?.addEventListener('click', async () 
     const cards = grid.querySelectorAll('.api-result-card img');
     if (cards.length === 0) { showToast('没有可下载的图片', 'error'); return; }
 
+    let counterStart = 1;
+    try {
+        const counterResp = await api('POST', '/api/next-image-counter', { count: cards.length });
+        counterStart = counterResp.start;
+    } catch (e) { console.error('获取图片计数器失败:', e); }
+
+    const prefix = getEffectiveImagePrefix();
+    const currentDownloadPath = queueMode === 'multi'
+        ? getEffectiveQueueDownloadPath(activeQueue)
+        : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
     let count = 0;
     for (const img of cards) {
         const url = img.src;
-        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.jpg`;
-        await downloadImage(url, filename);
+        const num = formatImageNumber(counterStart + count);
+        const filename = `${prefix}-${num}.jpg`;
+        await downloadImage(url, filename, currentDownloadPath);
         count++;
         if (count < cards.length) await new Promise(r => setTimeout(r, 1000));
     }
@@ -6915,7 +10145,7 @@ document.getElementById('btn-download-all')?.addEventListener('click', async () 
 
 // 预览图大小滑块
 document.getElementById('preview-size-slider')?.addEventListener('input', (e) => {
-    const size = parseInt(e.target.value) || 140;
+    const size = parseInt(e.target.value, 10) || 140;
     const grid = document.getElementById('api-result-grid');
     if (grid) {
         grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${size}px, 1fr))`;
@@ -6934,13 +10164,23 @@ document.getElementById('btn-download-checked')?.addEventListener('click', async
     });
     if (checkedCards.length === 0) { showToast('没有勾选的图片，请先在预览器中勾选或直接勾选结果卡片', 'error'); return; }
 
+    let counterStart = 1;
+    try {
+        const counterResp = await api('POST', '/api/next-image-counter', { count: checkedCards.length });
+        counterStart = counterResp.start;
+    } catch (e) { console.error('获取图片计数器失败:', e); }
+
+    const prefix = getEffectiveImagePrefix();
+    const currentDownloadPath = queueMode === 'multi'
+        ? getEffectiveQueueDownloadPath(activeQueue)
+        : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
     let count = 0;
     for (const card of checkedCards) {
         const img = card.querySelector('img');
         if (!img) continue;
-        const url = img.src;
-        const filename = `AI生图_${new Date().toISOString().replace(/[:.]/g, '-')}_${count}.jpg`;
-        await downloadImage(url, filename);
+        const num = formatImageNumber(counterStart + count);
+        const filename = `${prefix}-${num}.jpg`;
+        await downloadImage(img.src, filename, currentDownloadPath);
         count++;
         if (count < checkedCards.length) await new Promise(r => setTimeout(r, 1000));
     }
@@ -6951,7 +10191,20 @@ document.getElementById('btn-download-to-folder')?.addEventListener('click', asy
     // 浏览器无法选择文件夹，提示用户设置下载路径
     const path = await showPrompt('指定下载文件夹路径', document.getElementById('cfg-rh-download-path')?.value || DEFAULT_DOWNLOAD_PATH, '路径');
     if (path && path.trim()) {
-        document.getElementById('cfg-rh-download-path').value = path.trim();
+        const cleanPath = path.trim();
+        const el = document.getElementById('cfg-rh-download-path');
+        if (queueMode === 'multi' && queueData[activeQueue]) {
+            markDownloadPathInputAsOwn('cfg-rh-download-path', cleanPath);
+            queueData[activeQueue].downloadPath = cleanPath;
+            saveQueueData();
+        } else {
+            if (el) {
+                el.value = cleanPath;
+                el.dataset.downloadPathInherited = '1';
+            }
+            state.modelConfig.rh_download_path = cleanPath;
+            api('PUT', '/api/model-config', { rh_download_path: cleanPath }).catch(e => console.error('保存下载路径失败:', e));
+        }
         showToast('下载路径已更新，后续图片将下载到浏览器默认目录\n如需更改浏览器下载目录，请在浏览器设置中修改', 'info');
         // 触发全部下载
         document.getElementById('btn-download-all')?.click();
@@ -6959,7 +10212,9 @@ document.getElementById('btn-download-to-folder')?.addEventListener('click', asy
 });
 
 document.getElementById('btn-open-download-folder')?.addEventListener('click', async () => {
-    const downloadPath = document.getElementById('cfg-rh-download-path')?.value || DEFAULT_DOWNLOAD_PATH;
+    const downloadPath = queueMode === 'multi'
+        ? getEffectiveQueueDownloadPath(activeQueue)
+        : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
     try {
         const resp = await api('POST', '/api/open-download-folder', { path: downloadPath });
         if (resp.ok) {
@@ -7005,6 +10260,15 @@ function openImageViewer(images, startIndex = 0) {
     openModal('modal-image-viewer');
 }
 
+function closeImageViewer() {
+    viewerState.dragging = false;
+    viewerState.img = null;
+    const canvas = document.getElementById('viewer-canvas');
+    const ctx = canvas?.getContext('2d');
+    if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    closeModal('modal-image-viewer');
+}
+
 // 渲染底部缩略图栏
 function renderViewerThumbnails() {
     const bar = document.getElementById('viewer-thumbnails');
@@ -7020,7 +10284,7 @@ function renderViewerThumbnails() {
         el.style.cssText = `height:56px;aspect-ratio:3/4;object-fit:cover;border-radius:3px;cursor:pointer;border:2px solid ${i === viewerState.currentIndex ? '#2563eb' : 'transparent'};opacity:${i === viewerState.currentIndex ? '1' : '0.6'};flex-shrink:0;`;
         el.addEventListener('click', (e) => {
             e.stopPropagation();
-            const idx = parseInt(el.dataset.index);
+            const idx = parseInt(el.dataset.index, 10);
             if (idx !== viewerState.currentIndex) {
                 viewerState.currentIndex = idx;
                 loadViewerImage();
@@ -7124,7 +10388,7 @@ function drawViewerCanvas() {
             const dx = Math.abs(e.clientX - mouseDownPos.x);
             const dy = Math.abs(e.clientY - mouseDownPos.y);
             if (dx < 5 && dy < 5) {
-                closeModal('modal-image-viewer');
+                closeImageViewer();
             }
         }
         mouseDownPos = null;
@@ -7229,6 +10493,133 @@ if (apiGenBtn && apiGenBtn.parentNode) {
 }
 
 // 多图列队模式：单队列独立生成（异步，不阻塞其他队列）
+// 单任务生图核心逻辑（不含UI操作），供 runSingleQueueGenerate 和拆图批量生图复用
+// task: { prompt, imageUrls, queueLabel }
+// 返回结果数组 [{ url, checked, filename, outputType }, ...]
+async function generateSingleTask(qi, task, platform, qd, signal, uiRoundIndex) {
+    const qs = queueGenerateStates[qi];
+    const results = [];
+
+    try {
+        if (platform === 'oaihk') {
+            const modelId = qd.oaihkModelId;
+            const model = OAIHK_MODELS[modelId];
+            const aspectRatio = qd.oaihkAspectRatio || '3:4';
+            const shortEdge = model.shortEdge || 1536;
+
+            // 预处理图片
+            const publicUrls = [];
+            for (const url of task.imageUrls) {
+                if (qs.cancelled) break;
+                publicUrls.push(await uploadToTmpfiles(url, aspectRatio, shortEdge));
+            }
+            if (qs.cancelled) return results;
+
+            if (model.isGptImage) {
+                announceOaihkSubmit('多图队列-单队列-GPT', {
+                    model: model.modelId || 'gpt-image-2',
+                    size: getOaihkImageSize(model, aspectRatio),
+                    quality: getOaihkGptQuality(model)
+                });
+                const gptTm = getOaihkGptClientTimeoutMs();
+                const gptResp = await api('POST', '/api/oaihk-gpt-image', {
+                    action: publicUrls.length > 0 ? 'edits' : 'generations',
+                    model: model.modelId || 'gpt-image-2',
+                    prompt: task.prompt,
+                    size: getOaihkImageSize(model, aspectRatio),
+                    quality: getOaihkGptQuality(model),
+                    n: 1,
+                    image_base64_list: publicUrls
+                }, gptTm, signal);
+                publicUrls.length = 0;
+                if (qs.cancelled) return results;
+
+                if (gptResp.data && Array.isArray(gptResp.data)) {
+                    for (const item of gptResp.data) {
+                        const displayUrl = await displayUrlFromOaihkGptItem(item, signal);
+                        if (!displayUrl) continue;
+                        if (!item.b64_json && item.url && displayUrl === item.url) {
+                            showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL`, 'warning');
+                        }
+                        results.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${results.length + 1}.jpg`, outputType: 'png' });
+                    }
+                } else if (gptResp.error) {
+                    let friendlyMsg = typeof gptResp.error === 'object' ? gptResp.error.message : gptResp.error;
+                    showToast(`${task.queueLabel}生成失败: ${friendlyMsg}`, 'error');
+                }
+            } else {
+                const hkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 600000);
+                const payload = { prompt: task.prompt, image_urls: publicUrls, num_images: 1, aspect_ratio: aspectRatio };
+                if (model.modelId) payload.model = model.modelId;
+
+                const submitData = await api('POST', '/api/oaihk-proxy', {
+                    action: 'submit', api_key: '', base_url: '', endpoint: model.endpoint, model_id: modelId, params: payload
+                }, hkTm, signal);
+
+                if (!submitData.request_id) {
+                    showToast(`${task.queueLabel}提交失败: ${submitData.error || '未返回request_id'}`, 'error');
+                    return results;
+                }
+
+                const result = await pollOAIHK('', '', model.pollEndpoint, submitData.request_id, qi, signal, uiRoundIndex);
+                if (qs.cancelled) return results;
+
+                if (result && result.images) {
+                    for (const img of result.images) {
+                        if (img.url) {
+                            let displayUrl = img.url;
+                            try {
+                                const dlResp = await api('POST', '/api/download-image', { url: img.url }, hkTm, signal);
+                                if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                            } catch (dlErr) {
+                                console.warn('[多图队列-OAIHK] 图片下载失败:', dlErr);
+                                showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL`, 'warning');
+                            }
+                            results.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${results.length + 1}.jpg`, outputType: 'png' });
+                        }
+                    }
+                }
+            }
+        } else {
+            // RH通道
+            const modelId = qd.rhModelId;
+            const model = RH_MODELS[modelId];
+            const rhApiKey = document.getElementById('cfg-rh-api-key')?.value || state.modelConfig.rh_api_key || '';
+            const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
+
+            const payload = { prompt: task.prompt };
+            if (model.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
+            if (model.hasResolution) payload.resolution = qd.rhResolution || '1k';
+            const aspectRatio = qd.rhAspectRatio;
+            if (aspectRatio) payload.aspectRatio = aspectRatio;
+
+            const data = await api('POST', '/api/rh-proxy', {
+                action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
+            }, undefined, signal);
+
+            if (data.status === 'FAILED') {
+                showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
+                return results;
+            }
+
+                const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, Date.now(), qi, signal, uiRoundIndex);
+            if (qs.cancelled) return results;
+
+            if (result && result.results) {
+                for (const r of result.results) {
+                    if (r.url) {
+                        results.push({ url: r.url, checked: false, filename: `AI生图_${task.queueLabel}_${results.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' });
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        if (!qs.cancelled) showToast(`${task.queueLabel}生成失败: ${e.message}`, 'error');
+    }
+
+    return results;
+}
+
 async function runSingleQueueGenerate() {
     pushUndoSnapshot();
     const qi = activeQueue; // 立即捕获当前队列索引，防止异步期间被切换
@@ -7297,100 +10688,32 @@ async function runSingleQueueGenerate() {
     const allResults = [];
     if (activeQueue === qi) {
         const resultGrid = document.getElementById('api-result-grid');
-        if (resultGrid) {
-            resultGrid.innerHTML = `<div id="api-generating-placeholder-queue${qi}" style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--text-muted);font-size:12px;"><span class="loading" style="display:inline-block;"></span> 队列${qi+1}正在生成...</div>`;
-        }
+        if (resultGrid) renderApiResultPendingSlots(resultGrid, tasks.length);
     }
 
-    // 执行每个任务
+    const prevResultLen = (queueData[qi].results || []).length;
+
+    const buckets = Array.from({ length: tasks.length }, () => []);
+    await Promise.allSettled(tasks.map((task, round) => (async () => {
+        if (qs.cancelled) return;
+        buckets[round] = await generateSingleTask(qi, task, platform, qd, queueSignal, round);
+        if (activeQueue === qi) {
+            btn.innerHTML = `<span class="loading"></span> 队列${qi + 1}（并行 ${tasks.length} 张）`;
+            setApiProgress(Math.min(92, Math.round(((round + 1) / tasks.length) * 40)));
+        }
+    })()));
+
     for (let round = 0; round < tasks.length; round++) {
         if (qs.cancelled) break;
-        const task = tasks[round];
-        if (activeQueue === qi) {
-            btn.innerHTML = `<span class="loading"></span> 队列${qi+1} ${round+1}/${tasks.length}`;
-        }
-
-        try {
-            if (platform === 'oaihk') {
-                const modelId = qd.oaihkModelId;
-                const model = OAIHK_MODELS[modelId];
-                const aspectRatio = qd.oaihkAspectRatio || '3:4';
-                const shortEdge = model.shortEdge || 1536;
-
-                // 预处理图片
-                const publicUrls = [];
-                for (const url of task.imageUrls) {
-                    if (qs.cancelled) break;
-                    publicUrls.push(await uploadToTmpfiles(url, aspectRatio, shortEdge));
-                }
-                if (qs.cancelled) break;
-
-                const payload = { prompt: task.prompt, image_urls: publicUrls, num_images: 1, aspect_ratio: aspectRatio };
-                if (model.modelId) payload.model = model.modelId;
-
-                const submitData = await api('POST', '/api/oaihk-proxy', {
-                    action: 'submit', api_key: '', base_url: '', endpoint: model.endpoint, model_id: modelId, params: payload
-                }, 120000, queueSignal);
-
-                if (!submitData.request_id) {
-                    showToast(`${task.queueLabel}提交失败: ${submitData.error || '未返回request_id'}`, 'error');
-                    continue;
-                }
-
-                if (activeQueue === qi) setApiProgress(25);
-                const result = await pollOAIHK('', '', model.pollEndpoint, submitData.request_id, qi, queueSignal);
-                if (activeQueue === qi && result) setApiProgress(100);
-                if (qs.cancelled) break;
-
-                if (result && result.images) {
-                    for (const img of result.images) {
-                        if (img.url) {
-                            let displayUrl = img.url;
-                            try {
-                                const dlResp = await api('POST', '/api/download-image', { url: img.url }, undefined, queueSignal);
-                                if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
-                            } catch (dlErr) {}
-                            allResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${allResults.length+1}.jpg`, outputType: 'png' });
-                        }
-                    }
-                }
-            } else {
-                // RH通道
-                const modelId = qd.rhModelId;
-                const model = RH_MODELS[modelId];
-                const rhApiKey = document.getElementById('cfg-rh-api-key')?.value || state.modelConfig.rh_api_key || '';
-                const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
-
-                const payload = { prompt: task.prompt };
-                if (model.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
-                if (model.hasResolution) payload.resolution = qd.rhResolution || '1k';
-                const aspectRatio = qd.rhAspectRatio;
-                if (aspectRatio) payload.aspectRatio = aspectRatio;
-
-                const data = await api('POST', '/api/rh-proxy', {
-                    action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
-                }, undefined, queueSignal);
-
-                if (data.status === 'FAILED') {
-                    showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
-                    continue;
-                }
-
-                if (activeQueue === qi) setApiProgress(10);
-                const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, Date.now(), qi, queueSignal);
-                if (activeQueue === qi && result) setApiProgress(100);
-                if (qs.cancelled) break;
-
-                if (result && result.results) {
-                    for (const r of result.results) {
-                        if (r.url) {
-                            allResults.push({ url: r.url, checked: false, filename: `AI生图_${task.queueLabel}_${allResults.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' });
-                        }
-                    }
-                }
+        const taskResults = buckets[round] || [];
+        let imgIdx = 0;
+        for (const tr of taskResults) {
+            allResults.push(tr);
+            if (activeQueue === qi) {
+                const idx = prevResultLen + allResults.length - 1;
+                appendResultCard(tr, idx, imgIdx === 0 ? { slotIndex: round } : {});
             }
-        } catch (e) {
-            if (!qs.cancelled) showToast(`${task.queueLabel}生成失败: ${e.message}`, 'error');
+            imgIdx++;
         }
     }
 
@@ -7400,9 +10723,9 @@ async function runSingleQueueGenerate() {
     qs.abortController = null;
     apiGenerateState.running = isAnyQueueGenerating();
 
-    // 存储结果到队列
+    // 存储结果到队列（追加模式：新生成的图片排在已有结果后面）
     if (allResults.length > 0) {
-        queueData[qi].results = allResults;
+        queueData[qi].results = (queueData[qi].results || []).concat(allResults);
         saveQueueData();
         // 如果当前显示的是这个队列，渲染结果
         if (activeQueue === qi) {
@@ -7410,9 +10733,7 @@ async function runSingleQueueGenerate() {
         }
         logAction('api', '单队列生图完成', { queue: qi + 1, count: allResults.length });
         showToast(`队列${qi+1}生成完成！共${allResults.length}张`, 'success');
-        if (document.getElementById('cfg-rh-auto-backup')?.checked) {
-            autoBackupResults(allResults, qi);
-        }
+        await autoBackupResults(allResults, queueMode === 'multi' ? qi : undefined);
     }
 
     // 更新UI
@@ -7426,9 +10747,10 @@ async function runSingleQueueGenerate() {
         cancelBtn.style.display = 'none';
         hideApiProgress();
     }
-    // 移除该队列的占位符
-    const qPlaceholder = document.getElementById(`api-generating-placeholder-queue${qi}`);
-    if (qPlaceholder) qPlaceholder.remove();
+    clearRemainingApiResultPendingSlots(document.getElementById('api-result-grid'));
+    if (activeQueue === qi && allResults.length === 0) {
+        restoreApiResultEmptyPlaceholderIfNeeded();
+    }
     // 刷新队列按钮状态（移除生成指示器）
     renderQueueNumberBars();
 }
@@ -7461,7 +10783,7 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
     if (!model) { showToast('请选择模型', 'error'); return; }
 
     const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
-    const count = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
+    const count = parseInt(document.getElementById('cfg-rh-count-inline')?.value, 10) || 1;
 
     // 构建生成任务列表
     const tasks = []; // [{ prompt, imageUrls }]
@@ -7510,12 +10832,10 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
     cancelBtn.style.display = 'inline-flex';
     hideApiRegenerateBtn();
 
-    // 清空结果区并显示生成中占位
+    // 清空结果区并显示本轮张数占位卡片
     const allResults = [];
     const resultGrid = document.getElementById('api-result-grid');
-    if (resultGrid) {
-        resultGrid.innerHTML = '<div id="api-generating-placeholder" style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--text-muted);font-size:12px;"><span class="loading" style="display:inline-block;"></span> 正在提交生成任务...</div>';
-    }
+    if (resultGrid) renderApiResultPendingSlots(resultGrid, tasks.length);
     setApiProgress(5);
 
     const rhStartTime = Date.now();
@@ -7545,30 +10865,36 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
 
             if (data.status === 'FAILED') {
                 showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
+                markApiResultPendingSlotFailed(resultGrid, round, '提交失败');
                 continue;
             }
 
             // 提交成功，开始轮询
             setApiProgress(10);
-            const ph = document.getElementById('api-generating-placeholder');
-            if (ph) ph.innerHTML = '<span class="loading" style="display:inline-block;"></span> 正在绘制中... (已提交，等待处理)';
+            setApiResultPendingSlotStatus(resultGrid, round, '<span class="loading" style="display:inline-block;"></span> 已提交，等待绘制…');
 
             // 轮询等待结果
-            const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, rhStartTime);
+            const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, rhStartTime, undefined, undefined, round);
             if (apiGenerateState.cancelled) break;
+            let rhImgIdx = 0;
             if (result && result.results) {
                 setApiProgress(100);
                 for (const r of result.results) {
                     if (r.url) {
                         const item = { url: r.url, checked: false, filename: `AI生图_${allResults.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' };
                         allResults.push(item);
-                        appendResultCard(item, allResults.length - 1);
+                        appendResultCard(item, allResults.length - 1, rhImgIdx === 0 ? { slotIndex: round } : {});
+                        rhImgIdx++;
                     }
                 }
+            }
+            if (rhImgIdx === 0 && !apiGenerateState.cancelled) {
+                markApiResultPendingSlotFailed(resultGrid, round, '未返图');
             }
         } catch (e) {
             if (apiGenerateState.cancelled) break;
             showToast(`${task.queueLabel}生成失败: ${e.message}`, 'error');
+            markApiResultPendingSlotFailed(resultGrid, round, e.message.length > 120 ? `${e.message.slice(0, 118)}…` : e.message);
         }
     }
 
@@ -7581,23 +10907,25 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
     showApiRegenerateBtn();
     hideApiProgress();
 
+    clearRemainingApiResultPendingSlots(resultGrid);
     if (allResults.length > 0) {
         logAction('api', 'RH生图完成', { count: allResults.length });
         showToast(`生成完成！共${allResults.length}张`, 'success');
-        // 多图列队模式下，将结果存到当前队列
+        // 多图列队模式下，将结果追加到当前队列
         if (queueMode === 'multi') {
-            queueData[activeQueue].results = allResults;
+            queueData[activeQueue].results = (queueData[activeQueue].results || []).concat(allResults);
             saveQueueData();
+            renderQueueResults(activeQueue);
         }
-        // 自动备份
-        if (document.getElementById('cfg-rh-auto-backup')?.checked) {
-            autoBackupResults(allResults, qi);
-        }
+        // 统一入图库
+        await autoBackupResults(allResults, queueMode === 'multi' ? activeQueue : undefined);
+    } else {
+        restoreApiResultEmptyPlaceholderIfNeeded();
     }
 });
 
 // 轮询直到完成
-async function pollUntilDone(apiKey, baseUrl, taskId, startTime = Date.now(), qi, signal) {
+async function pollUntilDone(apiKey, baseUrl, taskId, startTime = Date.now(), qi, signal, statusSlotIndex) {
     const maxPolls = 120; // 最多轮询120次（6分钟）
     const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
     for (let i = 0; i < maxPolls; i++) {
@@ -7606,8 +10934,16 @@ async function pollUntilDone(apiKey, baseUrl, taskId, startTime = Date.now(), qi
         if (isCancelled()) return null;
         // 更新进度和状态文本
         const elapsed = Math.round((Date.now() - startTime) / 1000);
-        const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
-        if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中... (${elapsed}秒，第${i+1}次查询)`;
+        if (statusSlotIndex !== undefined && statusSlotIndex !== null) {
+            const apiGrid = document.getElementById('api-result-grid');
+            if (apiGrid?.querySelector(`.api-result-pending-card[data-slot-index="${statusSlotIndex}"]`)) {
+                setApiResultPendingSlotStatus(apiGrid, statusSlotIndex,
+                    `<span class="loading" style="display:inline-block;"></span> 正在绘制中… (${elapsed}秒，第${i + 1}次查询)`);
+            }
+        } else {
+            const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
+            if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中... (${elapsed}秒，第${i+1}次查询)`;
+        }
         if (activeQueue === qi) setApiProgress(10 + 80 * ((i + 1) / maxPolls));
         try {
             const data = await api('POST', '/api/rh-proxy', {
@@ -7635,7 +10971,12 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
     logAction('api', '取消生成', {});
 
     if (queueMode === 'multi') {
-        // 多图列队模式：取消所有正在生成的队列
+        // 批量生成取消
+        if (apiGenerateState.running) {
+            apiGenerateState.cancelled = true;
+            apiGenerateState.abortController?.abort();
+        }
+        // 取消所有正在生成的队列
         for (let qi = 0; qi < QUEUE_COUNT; qi++) {
             const qs = queueGenerateStates[qi];
             if (qs.running) {
@@ -7645,22 +10986,22 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
                 }
             }
         }
-        apiGenerateState.running = isAnyQueueGenerating();
-        // 更新当前队列的 UI
+        // 更新UI
         const btn = document.getElementById('btn-api-generate');
         if (btn) { btn.disabled = false; updateGenerateBtnText(); }
-        // 如果没有其他队列在生成，隐藏取消按钮
         const cancelBtn = document.getElementById('btn-api-cancel');
-        if (cancelBtn && !isAnyQueueGenerating()) {
-            cancelBtn.style.display = 'none';
-        }
+        if (cancelBtn) cancelBtn.style.display = 'none';
         // 移除所有队列的生成中占位
         for (let qi2 = 0; qi2 < QUEUE_COUNT; qi2++) {
             const placeholder = document.getElementById(`api-generating-placeholder-queue${qi2}`);
             if (placeholder) placeholder.remove();
         }
+        const batchPlaceholder = document.getElementById('api-generating-placeholder');
+        if (batchPlaceholder) batchPlaceholder.remove();
+        clearRemainingApiResultPendingSlots(document.getElementById('api-result-grid'));
         hideApiProgress();
         renderQueueNumberBars();
+        if (queueMode === 'multi') renderQueueResults(activeQueue);
         showToast('已取消所有正在生成的队列', 'info');
     } else {
         // 同图抽卡模式：取消全局状态
@@ -7686,6 +11027,7 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
         // 移除生成中占位
         const placeholder = document.getElementById('api-generating-placeholder');
         if (placeholder) placeholder.remove();
+        clearRemainingApiResultPendingSlots(document.getElementById('api-result-grid'));
         // 如果结果区为空，恢复空白占位
         const resultGrid = document.getElementById('api-result-grid');
         if (resultGrid && !resultGrid.querySelector('.api-result-card')) {
@@ -7744,12 +11086,12 @@ async function uploadToTmpfiles(localUrl, aspectRatio = '3:4', shortEdge = 0) {
 
     logAction('api', '图片预处理开始', { url: localUrl, aspectRatio, shortEdge });
 
-    // 通过后端处理：按比例裁剪 → 按模型短边缩放 → base64
+    // 通过后端处理：按比例裁剪 → 按模型短边缩放 → base64（大图多队列并行时适当拉长超时）
     const resp = await api('POST', '/api/preprocess-to-base64', {
         local_url: localUrl,
         aspect_ratio: aspectRatio,
         short_edge: shortEdge
-    });
+    }, 180000);
 
     if (!resp.data?.data_uri) {
         const errMsg = resp.error || '图片预处理失败';
@@ -7762,7 +11104,7 @@ async function uploadToTmpfiles(localUrl, aspectRatio = '3:4', shortEdge = 0) {
 }
 
 // OpenAI-HK 轮询直到完成
-async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId, qi, signal) {
+async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId, qi, signal, statusSlotIndex) {
     const maxPolls = 120; // 最多轮询120次（6分钟）
     const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
     let queueCount = 0;
@@ -7772,6 +11114,9 @@ async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId, qi, signal) {
         if (isCancelled()) return null;
         const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
         const elapsed = Math.round((i + 1) * 3);
+        const pendingStatusEl = statusSlotIndex !== undefined && statusSlotIndex !== null
+            ? document.getElementById('api-result-grid')?.querySelector(`.api-result-pending-card[data-slot-index="${statusSlotIndex}"] .api-result-pending-status`)
+            : null;
         if (activeQueue === qi) setApiProgress(40 + Math.min(55, 30 * Math.log10(i + 1)));
         try {
             const data = await api('POST', '/api/oaihk-proxy', {
@@ -7788,9 +11133,18 @@ async function pollOAIHK(apiKey, baseUrl, pollEndpoint, requestId, qi, signal) {
             }
             if (data.status === 'IN_QUEUE') {
                 queueCount++;
-                if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 排队等待中...（已等${elapsed}秒，第${i+1}次查询）${queueCount > 10 ? '<br><span style="font-size:10px;color:#e67e22;">排队较久，API服务器可能繁忙，请耐心等待或取消重试</span>' : ''}`;
+                const extra = queueCount > 10 ? '<br><span style="font-size:10px;color:#e67e22;">排队较久，API服务器可能繁忙，请耐心等待或取消重试</span>' : '';
+                if (pendingStatusEl) {
+                    pendingStatusEl.innerHTML = `<span class="loading" style="display:inline-block;"></span> 排队等待中...（已等${elapsed}秒，第${i+1}次查询）${extra}`;
+                } else if (ph) {
+                    ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 排队等待中...（已等${elapsed}秒，第${i+1}次查询）${extra}`;
+                }
             } else {
-                if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（${elapsed}秒，第${i+1}次查询）`;
+                if (pendingStatusEl) {
+                    pendingStatusEl.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（${elapsed}秒，第${i+1}次查询）`;
+                } else if (ph) {
+                    ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（${elapsed}秒，第${i+1}次查询）`;
+                }
             }
         } catch (e) {
             if (isCancelled()) return null;
@@ -7812,7 +11166,7 @@ async function generateViaOpenAIHK() {
     const model = OAIHK_MODELS[modelId];
     if (!model) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
 
-    const count = parseInt(document.getElementById('cfg-rh-count-inline')?.value) || 1;
+    const count = parseInt(document.getElementById('cfg-rh-count-inline')?.value, 10) || 1;
 
     // 构建任务列表（复用 queueMode 逻辑）
     const tasks = []; // [{ prompt, imageUrls }]
@@ -7862,125 +11216,179 @@ async function generateViaOpenAIHK() {
 
     const allResults = [];
     const resultGrid = document.getElementById('api-result-grid');
-    if (resultGrid) {
-        resultGrid.innerHTML = '<div id="api-generating-placeholder" style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--text-muted);font-size:12px;"><span class="loading" style="display:inline-block;"></span> 正在压缩图片...</div>';
-    }
+    if (resultGrid) renderApiResultPendingSlots(resultGrid, tasks.length);
 
-    for (let round = 0; round < tasks.length; round++) {
-        if (apiGenerateState.cancelled) {
-            showToast(`已取消，已完成${round}张`, 'info');
-            break;
-        }
-        const task = tasks[round];
-        btn.innerHTML = `<span class="loading"></span> ${round+1}/${tasks.length}`;
+    const aspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
+    const shortEdge = model.shortEdge || 1536;
+    const gptTimeoutMs = getOaihkGptClientTimeoutMs();
+    const hkSubmitTimeoutMs = Math.min(Math.max(gptTimeoutMs, 120000), 600000);
+    _hkParallelUiTail = Promise.resolve();
+    let hkParallelFinished = 0;
 
+    const pushHKRoundResultsToUi = (round, produced) => {
+        enqueueHKParallelResultUi(async () => {
+            let imgIx = 0;
+            for (const result of produced) {
+                allResults.push(result);
+                appendResultCard(result, allResults.length - 1, imgIx === 0 ? { slotIndex: round } : {});
+                imgIx++;
+            }
+        });
+    };
+
+    await Promise.allSettled(tasks.map((task, round) => (async () => {
+        const produced = [];
         try {
-            // 步骤 A：将本地图片预处理为 base64
+            if (apiGenerateState.cancelled) return;
+
             setApiProgress(5);
-            const aspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
-            const shortEdge = model.shortEdge || 1536;
             const publicUrls = [];
             for (let j = 0; j < task.imageUrls.length; j++) {
-                if (apiGenerateState.cancelled) break;
-                setApiProgress(5 + (15 * (j + 1) / task.imageUrls.length)); // 5% → 20%
-                const ph = document.getElementById('api-generating-placeholder');
-                if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在压缩图片... (${j+1}/${task.imageUrls.length})`;
+                if (apiGenerateState.cancelled) return;
+                setApiResultPendingSlotStatus(resultGrid, round, `<span class="loading" style="display:inline-block;"></span> 压缩图片 (${j + 1}/${task.imageUrls.length})`);
                 const publicUrl = await uploadToTmpfiles(task.imageUrls[j], aspectRatio, shortEdge);
                 publicUrls.push(publicUrl);
             }
-            if (apiGenerateState.cancelled) break;
+            if (apiGenerateState.cancelled) return;
 
-            // 步骤 B：发起异步生图任务
             setApiProgress(25);
-            const placeholder = document.getElementById('api-generating-placeholder');
-            if (placeholder) placeholder.innerHTML = '<span class="loading" style="display:inline-block;"></span> 正在加密传输（Base64）...';
 
-            const payload = {
-                prompt: task.prompt,
-                image_urls: publicUrls,
-                num_images: 1,
-                aspect_ratio: aspectRatio
-            };
-            // 在payload中指定具体模型版本（如 fal-ai/banana/v3.1/flash）
-            if (model.modelId) {
-                payload.model = model.modelId;
-            }
+            if (model.isGptImage) {
+                setApiResultPendingSlotStatus(resultGrid, round, '<span class="loading" style="display:inline-block;"></span> GPT生图中…');
 
-            logAction('api', 'HK提交生图', { model: modelId, aspectRatio, images: publicUrls.length, promptLen: task.prompt.length });
+                logAction('api', 'GPT-img提交生图', { model: modelId, images: publicUrls.length, promptLen: task.prompt.length });
+                announceOaihkSubmit('图生图-GPT', {
+                    model: model.modelId || 'gpt-image-2',
+                    size: getOaihkImageSize(model, aspectRatio),
+                    quality: getOaihkGptQuality(model)
+                });
 
-            const submitData = await api('POST', '/api/oaihk-proxy', {
-                action: 'submit',
-                api_key: oaihkApiKey,
-                base_url: oaihkBaseUrl,
-                endpoint: model.endpoint,
-                model_id: modelId,
-                params: payload
-            }, 120000); // Base64数据量大，超时设为120秒
+                const gptResp = await api('POST', '/api/oaihk-gpt-image', {
+                    action: publicUrls.length > 0 ? 'edits' : 'generations',
+                    model: model.modelId || 'gpt-image-2',
+                    prompt: task.prompt,
+                    size: getOaihkImageSize(model, aspectRatio),
+                    quality: getOaihkGptQuality(model),
+                    n: 1,
+                    image_base64_list: publicUrls
+                }, gptTimeoutMs, apiGenerateState.abortController?.signal);
 
-            // 提交后立即释放 base64 字符串内存
-            publicUrls.length = 0;
+                publicUrls.length = 0;
 
-            const requestId = submitData.request_id;
-            if (!requestId) {
-                const errMsg = submitData.error || '未返回request_id';
-                // 针对不同错误类型给出友好提示
-                let friendlyMsg = errMsg;
-                if (errMsg.includes('已禁用') || errMsg.includes('428')) {
-                    friendlyMsg = '模型已被禁用(428)，请稍后重试或联系OpenAI-HK客服';
-                } else if (errMsg.includes('无可用渠道') || errMsg.includes('503')) {
-                    friendlyMsg = 'API渠道暂不可用(503)，请稍后重试或检查API Key/余额';
-                }
-                showToast(`${task.queueLabel}提交失败: ${friendlyMsg}`, 'error');
-                // 清除生成中占位符
-                const failPlaceholder = document.getElementById('api-generating-placeholder');
-                if (failPlaceholder) failPlaceholder.remove();
-                continue;
-            }
+                if (apiGenerateState.cancelled) return;
 
-            // 步骤 C：轮询获取结果
-            setApiProgress(35);
-            const pollPlaceholder = document.getElementById('api-generating-placeholder');
-            if (pollPlaceholder) pollPlaceholder.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在等待云端响应（任务ID: ${requestId.slice(0,8)}...）<br><span style="font-size:10px;">每3秒刷新一次状态</span>`;
-
-            const result = await pollOAIHK(oaihkApiKey, oaihkBaseUrl, model.pollEndpoint, requestId);
-            if (apiGenerateState.cancelled) break;
-
-            // 步骤 D：渲染结果（通过代理下载，避免v3.fal.media被墙）
-            setApiProgress(100);
-            if (result && result.images) {
-                for (const img of result.images) {
-                    if (img.url) {
-                        let displayUrl = img.url;
-                        // 通过后端代理下载结果图片，避免国内无法访问v3.fal.media
-                        try {
-                            const dlResp = await api('POST', '/api/download-image', { url: img.url });
-                            if (dlResp.data?.data_uri) {
-                                displayUrl = dlResp.data.data_uri;
-                            }
-                        } catch (dlErr) {
-                            console.warn('代理下载失败，使用原始URL:', dlErr);
-                        }
-                        const item = { url: displayUrl, checked: false, filename: `AI生图_HK_${allResults.length+1}.jpg`, outputType: 'png' };
-                        allResults.push(item);
-                        appendResultCard(item, allResults.length - 1);
+                if (gptResp.data && Array.isArray(gptResp.data)) {
+                    let gptImgIdx = 0;
+                    for (const item of gptResp.data) {
+                        const displayUrl = await displayUrlFromOaihkGptItem(item, apiGenerateState.abortController?.signal);
+                        if (!displayUrl) continue;
+                        produced.push({
+                            url: displayUrl,
+                            checked: false,
+                            filename: `AI生图_HK_${round + 1}_${gptImgIdx + 1}.jpg`,
+                            outputType: 'png'
+                        });
+                        gptImgIdx++;
                     }
+                    pushHKRoundResultsToUi(round, produced);
+                } else if (gptResp.error) {
+                    let friendlyMsg = gptResp.error;
+                    if (typeof gptResp.error === 'object' && gptResp.error.message) friendlyMsg = gptResp.error.message;
+                    showToast(`${task.queueLabel}生成失败: ${friendlyMsg}`, 'error');
+                    markApiResultPendingSlotFailed(resultGrid, round, typeof friendlyMsg === 'string' && friendlyMsg.length > 120 ? `${friendlyMsg.slice(0, 118)}…` : String(friendlyMsg || '失败'));
+                }
+            } else {
+                setApiResultPendingSlotStatus(resultGrid, round, '<span class="loading" style="display:inline-block;"></span> 加密传输（Base64）…');
+
+                const payload = {
+                    prompt: task.prompt,
+                    image_urls: publicUrls,
+                    num_images: 1,
+                    aspect_ratio: aspectRatio
+                };
+                if (model.modelId) {
+                    payload.model = model.modelId;
+                }
+
+                logAction('api', 'HK提交生图', { model: modelId, aspectRatio, images: publicUrls.length, promptLen: task.prompt.length });
+
+                const submitData = await api('POST', '/api/oaihk-proxy', {
+                    action: 'submit',
+                    api_key: oaihkApiKey,
+                    base_url: oaihkBaseUrl,
+                    endpoint: model.endpoint,
+                    model_id: modelId,
+                    params: payload
+                }, hkSubmitTimeoutMs, apiGenerateState.abortController?.signal);
+
+                publicUrls.length = 0;
+
+                const requestId = submitData.request_id;
+                if (!requestId) {
+                    const errMsg = submitData.error || '未返回request_id';
+                    let friendlyMsg = errMsg;
+                    if (errMsg.includes('已禁用') || errMsg.includes('428')) {
+                        friendlyMsg = '模型已被禁用(428)，请稍后重试或联系OpenAI-HK客服';
+                    } else if (errMsg.includes('无可用渠道') || errMsg.includes('503')) {
+                        friendlyMsg = 'API渠道暂不可用(503)，请稍后重试或检查API Key/余额';
+                    }
+                    showToast(`${task.queueLabel}提交失败: ${friendlyMsg}`, 'error');
+                    markApiResultPendingSlotFailed(resultGrid, round, friendlyMsg.length > 120 ? `${friendlyMsg.slice(0, 118)}…` : friendlyMsg);
+                    return;
+                }
+
+                setApiResultPendingSlotStatus(resultGrid, round, `<span class="loading" style="display:inline-block;"></span> 等待云端（任务 ${requestId.slice(0, 8)}…）<br><span style="font-size:10px;">约每 3 秒查询</span>`);
+
+                const result = await pollOAIHK(oaihkApiKey, oaihkBaseUrl, model.pollEndpoint, requestId, undefined, apiGenerateState.abortController?.signal, round);
+                if (apiGenerateState.cancelled) return;
+
+                if (result && result.images) {
+                    let bnImgIdx = 0;
+                    for (const img of result.images) {
+                        if (img.url) {
+                            let displayUrl = img.url;
+                            try {
+                                const dlResp = await api('POST', '/api/download-image', { url: img.url }, hkSubmitTimeoutMs, apiGenerateState.abortController?.signal);
+                                if (dlResp.data?.data_uri) {
+                                    displayUrl = dlResp.data.data_uri;
+                                }
+                            } catch (dlErr) {
+                                console.warn('代理下载失败，使用原始URL:', dlErr);
+                            }
+                            produced.push({
+                                url: displayUrl,
+                                checked: false,
+                                filename: `AI生图_HK_${round + 1}_${bnImgIdx + 1}.jpg`,
+                                outputType: 'png'
+                            });
+                            bnImgIdx++;
+                        }
+                    }
+                    pushHKRoundResultsToUi(round, produced);
                 }
             }
         } catch (e) {
-            if (apiGenerateState.cancelled) break;
-            logAction('error', 'HK生图失败', { error: e.message });
-            // 针对不同错误类型给出友好提示
-            let friendlyMsg = e.message;
-            if (e.message.includes('已禁用') || e.message.includes('428')) {
-                friendlyMsg = '模型已被禁用(428)，请稍后重试或联系OpenAI-HK客服';
-            } else if (e.message.includes('无可用渠道') || e.message.includes('503')) {
-                friendlyMsg = 'API渠道暂不可用(503)，请稍后重试或检查API Key/余额';
+            if (!apiGenerateState.cancelled) {
+                logAction('error', 'HK生图失败', { error: e.message });
+                let friendlyMsg = e.message;
+                if (e.message.includes('已禁用') || e.message.includes('428')) {
+                    friendlyMsg = '模型已被禁用(428)，请稍后重试或联系OpenAI-HK客服';
+                } else if (e.message.includes('无可用渠道') || e.message.includes('503')) {
+                    friendlyMsg = 'API渠道暂不可用(503)，请稍后重试或检查API Key/余额';
+                }
+                showToast(`${task.queueLabel}生成失败: ${friendlyMsg}`, 'error');
+                markApiResultPendingSlotFailed(resultGrid, round, friendlyMsg.length > 120 ? `${friendlyMsg.slice(0, 118)}…` : friendlyMsg);
             }
-            showToast(`${task.queueLabel}生成失败: ${friendlyMsg}`, 'error');
-            // 清除生成中占位符
-            const errPlaceholder = document.getElementById('api-generating-placeholder');
-            if (errPlaceholder) errPlaceholder.remove();
+        } finally {
+            hkParallelFinished++;
+            btn.innerHTML = `<span class="loading"></span> ${hkParallelFinished}/${tasks.length}`;
+            setApiProgress(Math.min(95, Math.round((hkParallelFinished / tasks.length) * 100)));
         }
+    })()));
+
+    await _hkParallelUiTail;
+    if (apiGenerateState.cancelled) {
+        showToast(`已取消（本轮已结束任务 ${hkParallelFinished}/${tasks.length}）`, 'info');
     }
 
     // 无论成功/失败/取消，都重置UI状态
@@ -7992,31 +11400,26 @@ async function generateViaOpenAIHK() {
     cancelBtn.style.display = 'none';
     showApiRegenerateBtn();
     hideApiProgress();
-    // 清除可能残留的占位符
-    const leftoverPlaceholder = document.getElementById('api-generating-placeholder');
-    if (leftoverPlaceholder) leftoverPlaceholder.remove();
+    clearRemainingApiResultPendingSlots(resultGrid);
 
     if (allResults.length > 0) {
         logAction('api', 'HK生图完成', { count: allResults.length });
         showToast(`生成完成！共${allResults.length}张`, 'success');
-        // 多图列队模式下，将结果存到当前队列
+        // 多图列队模式下，将结果追加到当前队列
         if (queueMode === 'multi') {
-            queueData[activeQueue].results = allResults;
+            queueData[activeQueue].results = (queueData[activeQueue].results || []).concat(allResults);
             saveQueueData();
+            renderQueueResults(activeQueue);
         }
-        if (document.getElementById('cfg-rh-auto-backup')?.checked) {
-            autoBackupResults(allResults, qi);
-        }
+        await autoBackupResults(allResults, undefined);
+    } else {
+        restoreApiResultEmptyPlaceholderIfNeeded();
     }
 }
 
 // ========== 批量并行生成（多图列队模式） ==========
 async function batchGenerateAll() {
     pushUndoSnapshot();
-    if (apiGenerateState.running) {
-        showToast('正在生成中，请等待', 'error');
-        return;
-    }
 
     logAction('api', '批量生图开始', { queueMode });
 
@@ -8024,10 +11427,12 @@ async function batchGenerateAll() {
     saveCurrentQueueData();
     const baseTasks = [];
 
-    // 收集有效队列
+    // 收集有效队列（跳过正在生成的队列，包括拆图生成中的）
     for (let q = 0; q < QUEUE_COUNT; q++) {
         const qd = queueData[q];
         if (!qd) continue;
+        // 跳过正在生成的队列（拆图或单队列生成中）
+        if (queueGenerateStates[q]?.running) continue;
         const platform = qd.apiPlatform || 'runninghub';
         const count = qd.rhCount || 1;
         let prompt;
@@ -8043,7 +11448,7 @@ async function batchGenerateAll() {
         if (platform === 'oaihk') {
             const modelId = qd.oaihkModelId;
             const model = OAIHK_MODELS[modelId];
-            if (!model) continue; // 跳过无效模型
+            if (!model) continue;
         } else {
             const modelId = qd.rhModelId;
             const model = RH_MODELS[modelId];
@@ -8054,7 +11459,6 @@ async function batchGenerateAll() {
             if (s.image.startsWith('/')) return window.location.origin + s.image;
             return s.image;
         });
-        // 每个队列生成 count 张
         for (let i = 0; i < count; i++) {
             baseTasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${q+1} 第${i+1}张` : `队列${q+1}`, queueIndex: q, platform, rhModelId: qd.rhModelId, oaihkModelId: qd.oaihkModelId, rhAspectRatio: qd.rhAspectRatio, oaihkAspectRatio: qd.oaihkAspectRatio, rhResolution: qd.rhResolution });
         }
@@ -8067,14 +11471,23 @@ async function batchGenerateAll() {
 
     const tasks = baseTasks;
 
-    // 设置UI状态
+    // 为每个涉及的队列设置生成状态
+    const involvedQueues = [...new Set(tasks.map(t => t.queueIndex))];
+    for (const q of involvedQueues) {
+        const qs = queueGenerateStates[q];
+        qs.running = true;
+        qs.cancelled = false;
+        qs.abortController = new AbortController();
+    }
+
+    // 批量生成使用独立的取消控制器
+    const batchAbortController = new AbortController();
     apiGenerateState.running = true;
     apiGenerateState.cancelled = false;
-    apiGenerateState.abortController = new AbortController();
-    const btn = document.getElementById('btn-api-generate');
+    apiGenerateState.abortController = batchAbortController;
+
     const batchBtn = document.getElementById('btn-api-batch-generate');
     const cancelBtn = document.getElementById('btn-api-cancel');
-    btn.disabled = true;
     batchBtn.disabled = true;
     batchBtn.innerHTML = '<span class="loading"></span> 0/' + tasks.length;
     cancelBtn.style.display = 'inline-flex';
@@ -8084,77 +11497,106 @@ async function batchGenerateAll() {
     let completedCount = 0;
     const totalTasks = tasks.length;
 
-    // 清空结果区
+    // 清空结果区并按任务组数铺占位卡片
     const resultGrid = document.getElementById('api-result-grid');
-    if (resultGrid) {
-        resultGrid.innerHTML = '<div id="api-generating-placeholder" style="grid-column:1/-1;text-align:center;padding:40px 0;color:var(--text-muted);font-size:12px;"><span class="loading" style="display:inline-block;"></span> 批量生成中... 0/' + totalTasks + ' 组完成</div>';
-    }
+    if (resultGrid) renderApiResultPendingSlots(resultGrid, totalTasks);
     setApiProgress(5);
+    renderQueueNumberBars();
 
     // 单任务执行函数
     async function executeOneTask(task) {
         const localResults = [];
+        const qi = task.queueIndex;
+        const qs = queueGenerateStates[qi];
         try {
-            const taskPlatform = task.platform || platform;
+            const taskPlatform = task.platform || 'runninghub';
             if (taskPlatform === 'oaihk') {
                 const modelId = task.oaihkModelId || document.getElementById('cfg-oaihk-model-inline')?.value;
                 const model = OAIHK_MODELS[modelId];
                 const aspectRatio = task.oaihkAspectRatio || document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
                 const shortEdge = model.shortEdge || 1536;
 
-                // 预处理图片
                 const publicUrls = [];
                 for (let j = 0; j < task.imageUrls.length; j++) {
-                    if (apiGenerateState.cancelled) return localResults;
+                    if (apiGenerateState.cancelled || qs.cancelled) return localResults;
                     const publicUrl = await uploadToTmpfiles(task.imageUrls[j], aspectRatio, shortEdge);
                     publicUrls.push(publicUrl);
                 }
-                if (apiGenerateState.cancelled) return localResults;
+                if (apiGenerateState.cancelled || qs.cancelled) return localResults;
 
-                // 提交
-                const payload = {
-                    prompt: task.prompt,
-                    image_urls: publicUrls,
-                    num_images: 1,
-                    aspect_ratio: aspectRatio
-                };
-                if (model.modelId) payload.model = model.modelId;
+                const hkBatchTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 600000);
+                if (model.isGptImage) {
+                    announceOaihkSubmit('多图队列-批量-GPT', {
+                        model: model.modelId || 'gpt-image-2',
+                        size: getOaihkImageSize(model, aspectRatio),
+                        quality: getOaihkGptQuality(model)
+                    });
+                    const gptResp = await api('POST', '/api/oaihk-gpt-image', {
+                        action: publicUrls.length > 0 ? 'edits' : 'generations',
+                        model: model.modelId || 'gpt-image-2',
+                        prompt: task.prompt,
+                        size: getOaihkImageSize(model, aspectRatio),
+                        quality: getOaihkGptQuality(model),
+                        n: 1,
+                        image_base64_list: publicUrls
+                    }, hkBatchTm);
+                    publicUrls.length = 0;
 
-                const submitData = await api('POST', '/api/oaihk-proxy', {
-                    action: 'submit',
-                    api_key: '',
-                    base_url: '',
-                    endpoint: model.endpoint,
-                    model_id: task.oaihkModelId || modelId,
-                    params: payload
-                }, 120000);
+                    if (gptResp.data && Array.isArray(gptResp.data)) {
+                        for (const item of gptResp.data) {
+                            const displayUrl = await displayUrlFromOaihkGptItem(item, undefined);
+                            if (!displayUrl) continue;
+                            if (!item.b64_json && item.url && displayUrl === item.url) {
+                                showToast('图片下载到本地失败，已使用外网URL', 'warning');
+                            }
+                            localResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${localResults.length + 1}.jpg`, outputType: 'png', queueIndex: task.queueIndex });
+                        }
+                    }
+                } else {
+                    const payload = {
+                        prompt: task.prompt,
+                        image_urls: publicUrls,
+                        num_images: 1,
+                        aspect_ratio: aspectRatio
+                    };
+                    if (model.modelId) payload.model = model.modelId;
 
-                const requestId = submitData.request_id;
-                if (!requestId) {
-                    const errMsg = submitData.error || '未返回request_id';
-                    showToast(`${task.queueLabel}提交失败: ${errMsg}`, 'error');
-                    return localResults;
-                }
+                    const submitData = await api('POST', '/api/oaihk-proxy', {
+                        action: 'submit',
+                        api_key: '',
+                        base_url: '',
+                        endpoint: model.endpoint,
+                        model_id: task.oaihkModelId || modelId,
+                        params: payload
+                    }, hkBatchTm);
 
-                // 轮询
-                const result = await pollOAIHK('', '', model.pollEndpoint, requestId);
-                if (apiGenerateState.cancelled) return localResults;
+                    const requestId = submitData.request_id;
+                    if (!requestId) {
+                        const errMsg = submitData.error || '未返回request_id';
+                        showToast(`${task.queueLabel}提交失败: ${errMsg}`, 'error');
+                        return localResults;
+                    }
 
-                // 下载结果
-                if (result && result.images) {
-                    for (const img of result.images) {
-                        if (img.url) {
-                            let displayUrl = img.url;
-                            try {
-                                const dlResp = await api('POST', '/api/download-image', { url: img.url });
-                                if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
-                            } catch (dlErr) { console.warn('代理下载失败:', dlErr); }
-                            localResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${localResults.length+1}.jpg`, outputType: 'png', queueIndex: task.queueIndex });
+                    const result = await pollOAIHK('', '', model.pollEndpoint, requestId, undefined, undefined, undefined);
+                    if (apiGenerateState.cancelled || qs.cancelled) return localResults;
+
+                    if (result && result.images) {
+                        for (const img of result.images) {
+                            if (img.url) {
+                                let displayUrl = img.url;
+                                try {
+                                    const dlResp = await api('POST', '/api/download-image', { url: img.url }, hkBatchTm);
+                                    if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                                } catch (dlErr) {
+                                    console.warn('[批量生图-OAIHK] 图片下载失败:', dlErr);
+                                    showToast('图片下载到本地失败，已使用外网URL', 'warning');
+                                }
+                                localResults.push({ url: displayUrl, checked: false, filename: `AI生图_HK_${task.queueLabel}_${localResults.length + 1}.jpg`, outputType: 'png', queueIndex: task.queueIndex });
+                            }
                         }
                     }
                 }
             } else {
-                // RH通道
                 const modelId = task.rhModelId || document.getElementById('cfg-rh-model-inline')?.value;
                 const model = RH_MODELS[modelId];
 
@@ -8177,8 +11619,8 @@ async function batchGenerateAll() {
                     return localResults;
                 }
 
-                const result = await pollUntilDone('', '', data.taskId, Date.now());
-                if (apiGenerateState.cancelled) return localResults;
+                const result = await pollUntilDone('', '', data.taskId, Date.now(), undefined, undefined, undefined);
+                if (apiGenerateState.cancelled || qs.cancelled) return localResults;
 
                 if (result && result.results) {
                     for (const r of result.results) {
@@ -8196,61 +11638,76 @@ async function batchGenerateAll() {
         return localResults;
     }
 
-    // 分批并行提交：每批2组，避免大量图片同时上传导致内存/网络/API过载
-    const BATCH_CONCURRENCY = 2;
-    for (let batchStart = 0; batchStart < tasks.length; batchStart += BATCH_CONCURRENCY) {
-        if (apiGenerateState.cancelled) break;
-        const batchEnd = Math.min(batchStart + BATCH_CONCURRENCY, tasks.length);
-        const batchTasks = tasks.slice(batchStart, batchEnd);
-        const batchLabel = `提交第${batchStart+1}-${batchEnd}组（共${totalTasks}组）`;
-        const ph = document.getElementById('api-generating-placeholder');
-        if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> ${batchLabel}... ${completedCount}/${totalTasks} 组已完成`;
-
-        const batchPromises = batchTasks.map(task =>
-            executeOneTask(task).then(results => {
-                completedCount++;
+    // 全部任务同时提交，由上游 API 各自排队；完成顺序不影响占位填补（fillNextPending）
+    const batchPromises = tasks.map(task =>
+        executeOneTask(task).then(results => {
+            completedCount++;
+            const gridEl = document.getElementById('api-result-grid');
+            if (results.length === 0) {
+                const ph = gridEl?.querySelector('.api-result-pending-card');
+                if (ph) {
+                    ph.classList.add('api-result-pending-card--failed');
+                    ph.replaceChildren();
+                    const inner = document.createElement('div');
+                    inner.className = 'api-result-pending-inner';
+                    const st = document.createElement('div');
+                    st.className = 'api-result-pending-status';
+                    st.style.fontSize = '10px';
+                    st.textContent = '未返图';
+                    inner.appendChild(st);
+                    ph.appendChild(inner);
+                }
+            } else {
                 for (const item of results) {
                     allResults.push(item);
-                    appendResultCard(item, allResults.length - 1);
+                    appendResultCard(item, allResults.length - 1, { fillNextPending: true });
                 }
-                batchBtn.innerHTML = `<span class="loading"></span> ${completedCount}/${totalTasks}`;
-                const ph2 = document.getElementById('api-generating-placeholder');
-                if (ph2) ph2.innerHTML = `<span class="loading" style="display:inline-block;"></span> 批量生成中... ${completedCount}/${totalTasks} 组完成`;
-                setApiProgress(Math.round((completedCount / totalTasks) * 100));
-                return results;
-            })
-        );
+            }
+            batchBtn.innerHTML = `<span class="loading"></span> ${completedCount}/${totalTasks}`;
+            setApiProgress(Math.round((completedCount / totalTasks) * 100));
+            return results;
+        })
+    );
+    await Promise.allSettled(batchPromises);
 
-        await Promise.allSettled(batchPromises);
+    // 重置涉及的队列生成状态
+    for (const q of involvedQueues) {
+        const qs = queueGenerateStates[q];
+        qs.running = false;
+        qs.cancelled = false;
+        qs.abortController = null;
     }
 
     // 重置UI
     apiGenerateState.running = false;
     apiGenerateState.cancelled = false;
     apiGenerateState.abortController = null;
-    btn.disabled = false;
     batchBtn.disabled = false;
     batchBtn.textContent = '批量生成';
-    cancelBtn.style.display = 'none';
+    if (!isAnyQueueGenerating()) {
+        cancelBtn.style.display = 'none';
+        hideApiProgress();
+    }
     showApiRegenerateBtn();
-    hideApiProgress();
-    const leftoverPlaceholder = document.getElementById('api-generating-placeholder');
-    if (leftoverPlaceholder) leftoverPlaceholder.remove();
+    clearRemainingApiResultPendingSlots(resultGrid);
+    renderQueueNumberBars();
 
     if (allResults.length > 0) {
+        const platform = involvedQueues.length > 0 ? (queueData[involvedQueues[0]]?.apiPlatform || 'runninghub') : 'runninghub';
         logAction('api', platform === 'oaihk' ? 'HK批量生图完成' : 'RH批量生图完成', { count: allResults.length, tasks: totalTasks });
         showToast(`批量生成完成！共${allResults.length}张（${completedCount}组）`, 'success');
-        // 按队列存储结果
+        // 按队列追加结果
         for (let q = 0; q < QUEUE_COUNT; q++) {
             const qResults = allResults.filter(r => r.queueIndex === q);
             if (qResults.length > 0) {
-                queueData[q].results = qResults;
+                queueData[q].results = (queueData[q].results || []).concat(qResults);
             }
         }
         saveQueueData();
-        if (document.getElementById('cfg-rh-auto-backup')?.checked) {
-            autoBackupResults(allResults, qi);
-        }
+        renderQueueResults(activeQueue);
+        await autoBackupResults(allResults, activeQueue);
+    } else {
+        restoreApiResultEmptyPlaceholderIfNeeded();
     }
 }
 
@@ -8263,22 +11720,77 @@ document.getElementById('btn-api-batch-generate')?.addEventListener('click', () 
     batchGenerateAll();
 });
 
-// 追加单张结果卡片
-function appendResultCard(item, index) {
-    const grid = document.getElementById('api-result-grid');
-    if (!grid) return;
-    // 移除占位提示
-    const placeholder = grid.querySelector('#api-result-placeholder') || grid.querySelector('[style*="grid-column"]');
-    if (placeholder) placeholder.remove();
+// API 结果区：本轮生成占位卡片（与真实卡片同网格）
+function renderApiResultPendingSlots(grid, count) {
+    if (!grid || count < 1) return;
+    clearRemainingApiResultPendingSlots(grid);
+    grid.querySelector('#api-result-placeholder')?.remove();
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < count; i++) {
+        const card = document.createElement('div');
+        card.className = 'api-result-pending-card';
+        card.dataset.slotIndex = String(i);
+        card.innerHTML = `<div class="api-result-pending-inner">
+            <div class="api-result-pending-shimmer"></div>
+            <div class="api-result-pending-status"><span class="loading" style="display:inline-block;"></span> 等待返图…</div>
+            <div class="api-result-pending-num">${i + 1} / ${count}</div>
+        </div>`;
+        frag.appendChild(card);
+    }
+    grid.appendChild(frag);
+}
 
+function clearRemainingApiResultPendingSlots(grid) {
+    const g = grid || document.getElementById('api-result-grid');
+    if (!g) return;
+    g.querySelectorAll('.api-result-pending-card').forEach(el => el.remove());
+}
+
+function setApiResultPendingSlotStatus(gridRef, slotIndex, html) {
+    const grid = typeof gridRef === 'string' ? document.getElementById(gridRef) : gridRef;
+    const el = grid?.querySelector(`.api-result-pending-card[data-slot-index="${slotIndex}"] .api-result-pending-status`);
+    if (el) el.innerHTML = html;
+}
+
+function removeApiResultPendingSlotAt(gridRef, slotIndex) {
+    const grid = typeof gridRef === 'string' ? document.getElementById(gridRef) : gridRef;
+    grid?.querySelector(`.api-result-pending-card[data-slot-index="${slotIndex}"]`)?.remove();
+}
+
+function markApiResultPendingSlotFailed(gridRef, slotIndex, message) {
+    const grid = typeof gridRef === 'string' ? document.getElementById(gridRef) : gridRef;
+    const ph = grid?.querySelector(`.api-result-pending-card[data-slot-index="${slotIndex}"]`);
+    if (!ph) return;
+    ph.classList.add('api-result-pending-card--failed');
+    ph.replaceChildren();
+    const inner = document.createElement('div');
+    inner.className = 'api-result-pending-inner';
+    const st = document.createElement('div');
+    st.className = 'api-result-pending-status';
+    st.style.color = 'var(--error-text)';
+    st.style.fontSize = '10px';
+    st.textContent = message || '失败';
+    inner.appendChild(st);
+    ph.appendChild(inner);
+}
+
+function restoreApiResultEmptyPlaceholderIfNeeded() {
+    const grid = document.getElementById('api-result-grid');
+    if (!grid || grid.querySelector('.api-result-card')) return;
+    grid.innerHTML = `<div id="api-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.2" style="opacity:0.4;margin-bottom:8px;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                <div>选择模型后点击「API生成」开始</div>
+            </div>`;
+}
+
+function buildApiResultCardElement(item, index) {
     const card = document.createElement('div');
     card.className = 'api-result-card';
-    card.dataset.index = index;
+    card.dataset.index = String(index);
     const imgEl = document.createElement('img');
     imgEl.alt = '生成结果';
     imgEl.style.cssText = 'width:100%;aspect-ratio:3/4;object-fit:cover;display:block;cursor:pointer;';
     imgEl.src = item.url;
-    // 图片加载失败时显示占位
     imgEl.onerror = () => {
         imgEl.style.display = 'none';
         const fallback = document.createElement('div');
@@ -8295,26 +11807,55 @@ function appendResultCard(item, index) {
     card.appendChild(imgEl);
     card.appendChild(actionsDiv);
     card.appendChild(checkDiv);
-    // 点击图片 → 大图预览
     imgEl.addEventListener('click', () => {
-        // 收集所有结果
-        const allCards = grid.querySelectorAll('.api-result-card');
+        const gridEl = document.getElementById('api-result-grid');
+        if (!gridEl) return;
+        const allCards = gridEl.querySelectorAll('.api-result-card');
         const images = [];
         allCards.forEach(c => {
             const img = c.querySelector('img');
             const cb = c.querySelector('.result-checkbox');
-            images.push({ url: img?.src || '', checked: cb?.checked || false, filename: `AI生图_${images.length+1}.jpg` });
+            images.push({ url: img?.src || '', checked: cb?.checked || false, filename: `AI生图_${images.length + 1}.jpg` });
         });
         openImageViewer(images, index);
     });
     card.querySelector('.download-single').addEventListener('click', (e) => {
         e.stopPropagation();
-        downloadImage(item.url, item.filename);
+        const currentDownloadPath = queueMode === 'multi'
+            ? getEffectiveQueueDownloadPath(activeQueue)
+            : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
+        downloadImage(item.url, item.filename, currentDownloadPath);
     });
     card.querySelector('.delete-single').addEventListener('click', (e) => {
         e.stopPropagation();
         deleteResultItem(card, item);
     });
+    return card;
+}
+
+// 追加单张结果卡片（可选：按槽位替换占位，或并行模式下填补下一个占位）
+function appendResultCard(item, index, options = {}) {
+    const grid = document.getElementById('api-result-grid');
+    if (!grid) return;
+    const placeholder = grid.querySelector('#api-result-placeholder');
+    if (placeholder) placeholder.remove();
+
+    const card = buildApiResultCardElement(item, index);
+    const si = options.slotIndex;
+    if (si !== undefined && si !== null) {
+        const ph = grid.querySelector(`.api-result-pending-card[data-slot-index="${si}"]`);
+        if (ph) {
+            ph.replaceWith(card);
+            return;
+        }
+    }
+    if (options.fillNextPending) {
+        const ph = grid.querySelector('.api-result-pending-card');
+        if (ph) {
+            ph.replaceWith(card);
+            return;
+        }
+    }
     grid.appendChild(card);
 }
 
@@ -8349,13 +11890,33 @@ function clearCurrentQueueResults() {
     if (!grid) return;
     if (queueMode === 'multi') {
         queueData[activeQueue].results = [];
+        // 清除结果时，将当前队列模型恢复为默认配置
+        const q = queueData[activeQueue];
+        const config = getDefaultModelConfig();
+        if (config) {
+            q.apiPlatform = config.platform || 'oaihk';
+            q.rhModelId = config.rhModelId || q.rhModelId || '';
+            q.oaihkModelId = config.oaihkModelId || q.oaihkModelId || 'fal-ai/banana/v3.1/flash/2k';
+            q.rhResolution = config.rhResolution || q.rhResolution || '1k';
+            q.rhAspectRatio = config.rhAspectRatio || q.rhAspectRatio || '3:4';
+            q.oaihkAspectRatio = config.oaihkAspectRatio || q.oaihkAspectRatio || '3:4';
+        } else {
+            q.apiPlatform = 'oaihk';
+            q.oaihkModelId = 'fal-ai/banana/v3.1/flash/2k';
+            q.oaihkAspectRatio = '3:4';
+            q.rhResolution = q.rhResolution || '1k';
+            q.rhAspectRatio = '3:4';
+        }
+        // 同步恢复到当前UI
+        restoreApiConfigToDOM(q);
         saveQueueData();
     }
     grid.innerHTML = `<div id="api-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;">
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.2" style="opacity:0.4;margin-bottom:8px;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
             <div>选择模型后点击「API生成」开始</div>
         </div>`;
-    showToast('已清除所有结果', 'success');
+    updateDefaultModelBadge();
+    showToast('已清除所有结果，当前队列模型已恢复默认', 'success');
 }
 
 // ========================================================================
@@ -8414,7 +11975,7 @@ logAction = function logActionWithUsage(action, msg, detail) {
 const SHORTCUT_ACTIONS = {
     'generate-prompt': { label: '生成提示词', trigger: () => document.getElementById('btn-img-generate')?.click() },
     'generate-image': { label: 'API生图', trigger: () => document.getElementById('btn-api-generate')?.click() },
-    'save-preset': { label: '保存预设', trigger: () => document.getElementById('btn-save-image-preset')?.click() },
+    'save-preset': { label: '保存预设', trigger: () => document.getElementById('btn-img-save-preset')?.click() },
     'export-data': { label: '导出数据', trigger: () => document.getElementById('btn-export')?.click() }
 };
 
@@ -8431,17 +11992,11 @@ function formatShortcutKey(combo) {
 
 function shortcutComboFromEvent(e) {
     const parts = [];
-    if (e.ctrlKey) parts.push('Control');
-    if (e.metaKey) parts.push('Meta');
-    if (e.shiftKey) parts.push('Shift');
-    if (e.altKey) parts.push('Alt');
-    const key = e.key;
-    if (!['Control', 'Meta', 'Shift', 'Alt'].includes(key)) {
-        parts.push(key.length === 1 ? key.toUpperCase() : key);
-    }
-    if (parts.length === 0 || (parts.length === 1 && ['Control', 'Meta', 'Shift', 'Alt'].includes(parts[0]))) {
-        return null;
-    }
+    if (e.ctrlKey || e.metaKey) parts.push('mod');
+    if (e.altKey) parts.push('alt');
+    if (e.shiftKey) parts.push('shift');
+    const key = typeof e.key === 'string' ? e.key : '';
+    if (key && !['Control','Meta','Alt','Shift'].includes(key)) parts.push(key.toLowerCase());
     return parts.join('+');
 }
 
@@ -8543,11 +12098,11 @@ renderImageSlots = function renderImageSlotsDynamic() {
     if (!container) return;
     container.innerHTML = '';
 
-    const zoomValue = parseInt(document.getElementById('slot-zoom-slider')?.value || 70);
+    const zoomValue = parseInt(document.getElementById('slot-zoom-slider')?.value || '70', 10);
     const imgSize = zoomValue;
 
     while (imageState.slots.length < SLOT_COUNT) {
-        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
     }
 
     // Find last occupied slot
@@ -8574,8 +12129,11 @@ renderImageSlots = function renderImageSlotsDynamic() {
         const semantic = slot.label || '';
 
         const pinBtn = (queueMode === 'multi' && slot.image) ? `<button class="slot-pin-btn ${pinnedSlotIndices.has(i) ? 'pinned' : ''}" title="${pinnedSlotIndices.has(i) ? '取消全列队' : '应用全列队'}">${pinnedSlotIndices.has(i) ? '📌' : '📍'}</button>` : '';
+        const dwBtn = slot.image
+            ? `<button class="slot-dw-btn ${slot.dwEnabled ? 'active' : ''}" title="DWPose 姿态提取">${slot._dwLoading ? '<span class="dw-spinner"></span>' : 'DW'}</button>`
+            : '';
         slotEl.innerHTML = `
-            <div class="slot-compact-image-area">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}</div>
+            <div class="slot-compact-image-area ${slot.dwEnabled ? 'dw-active' : ''}">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}${dwBtn}</div>
             <div class="slot-compact-label">
                 <span class="slot-prefix" title="点击编辑前缀">${escHtml(prefix)}</span><span class="slot-auto-text">图${i+1}${semantic ? '的' + escHtml(semantic) : ''}</span>
             </div>
@@ -8587,6 +12145,15 @@ renderImageSlots = function renderImageSlotsDynamic() {
             pinEl.addEventListener('click', (e) => {
                 e.stopPropagation();
                 togglePinSlotToAllQueues(i);
+            });
+        }
+
+        // DWPose 姿态提取按钮
+        const dwEl = slotEl.querySelector('.slot-dw-btn');
+        if (dwEl) {
+            dwEl.addEventListener('click', (e) => {
+                e.stopPropagation();
+                toggleDW(i);
             });
         }
 
@@ -8648,6 +12215,19 @@ renderImageSlots = function renderImageSlotsDynamic() {
         slotEl.addEventListener('drop', async (e) => {
             e.preventDefault(); e.stopPropagation();
             slotEl.classList.remove('drag-over');
+            const libPayload2 = parseLibMaterialDragPayload(e.dataTransfer);
+            if (libPayload2?.url) {
+                imageState.activeSlotIndex = i;
+                imageState.slots[i].image = libPayload2.url;
+                imageState.slots[i].dwEnabled = false;
+                imageState.slots[i].dwOriginalImage = '';
+                imageState.slots[i].label = libPayload2.name || '素材库';
+                renderImageSlots();
+                updateLocalPrompt();
+                showToast(`已从素材库拖拽填入 Image ${i + 1}`, 'success');
+                logAction('slot', '素材库拖拽到槽', { slotIndex: i });
+                return;
+            }
             const imageFiles = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
             if (!imageFiles.length) return;
             if (imageFiles.length === 1) {
@@ -8662,6 +12242,8 @@ renderImageSlots = function renderImageSlotsDynamic() {
                             // 弹出分配素材弹窗（命名+分类）
                             const assignResult = await showAssignMaterial(url, imageFiles[0].name);
                             imageState.slots[i].image = url;
+                            imageState.slots[i].dwEnabled = false;
+                            imageState.slots[i].dwOriginalImage = '';
                             if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
                                 imageState.slots[i].label = assignResult.labels.join('、');
                             }
@@ -8689,6 +12271,8 @@ renderImageSlots = function renderImageSlotsDynamic() {
                             const assignResult = await showAssignMaterial(url, imageFiles[idx].name);
                             if (targetSlot < SLOT_COUNT) {
                                 imageState.slots[targetSlot].image = url;
+                                imageState.slots[targetSlot].dwEnabled = false;
+                                imageState.slots[targetSlot].dwOriginalImage = '';
                                 if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
                                     imageState.slots[targetSlot].label = assignResult.labels.join('、');
                                 }
@@ -8711,7 +12295,7 @@ renderImageSlots = function renderImageSlotsDynamic() {
             const choice = confirm('确定清除该图片槽？\n\n取消 = 选择本地上传图片');
             if (choice) {
                 pushUndoSnapshot();
-                imageState.slots[i] = { image: '', label: '', prefixTemplate: '请参考' };
+                imageState.slots[i] = { image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' };
                 compactAndRenumber();
                 renderImageSlots();
                 updateLocalPrompt();
@@ -8745,7 +12329,7 @@ function compactSlots() {
         imageState.slots.pop();
     }
     if (imageState.slots.length === 0) {
-        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考' });
+        imageState.slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
     }
 }
 
@@ -8767,7 +12351,7 @@ function compactAndRenumber() {
     }
     // 补齐到 SLOT_COUNT
     while (newSlots.length < SLOT_COUNT) {
-        newSlots.push({ image: '', label: '', prefixTemplate: '请参考' });
+        newSlots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
     }
     imageState.slots = newSlots;
 
@@ -8809,7 +12393,7 @@ function compactAndRenumber() {
     // 同步到当前队列数据
     const q = queueData[activeQueue];
     if (q) {
-        q.slots = JSON.parse(JSON.stringify(imageState.slots));
+        q.slots = deepClone(imageState.slots);
         q.promptCn = imageState.promptCn;
         q.promptedSlotIndices = [...promptedSlotIndices];
         q.pinnedSlotIndices = [...pinnedSlotIndices];
@@ -8970,7 +12554,7 @@ pollUntilDone = async function pollUntilDoneBackoff(apiKey, baseUrl, taskId, sta
 
 // Replace pollOAIHK with exponential backoff version
 const _origPollOAIHK = pollOAIHK;
-pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, requestId, qi, signal) {
+pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, requestId, qi, signal, statusSlotIndex) {
     const maxPolls = 120;
     const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
     let queueCount = 0;
@@ -8981,6 +12565,9 @@ pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, reque
         if (isCancelled()) return null;
         const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
         const elapsed = Math.round((i + 1) * 3);
+        const pendingStatusEl = statusSlotIndex !== undefined && statusSlotIndex !== null
+            ? document.getElementById('api-result-grid')?.querySelector(`.api-result-pending-card[data-slot-index="${statusSlotIndex}"] .api-result-pending-status`)
+            : null;
         try {
             const data = await api('POST', '/api/oaihk-proxy', {
                 action: 'poll',
@@ -8997,9 +12584,18 @@ pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, reque
             // 跟踪排队状态
             if (data.status === 'IN_QUEUE') {
                 queueCount++;
-                if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 排队等待中...（已等${elapsed}秒，第${i+1}次查询）${queueCount > 10 ? '<br><span style="font-size:10px;color:#e67e22;">排队较久，API服务器可能繁忙，请耐心等待或取消重试</span>' : ''}`;
+                const extra = queueCount > 10 ? '<br><span style="font-size:10px;color:#e67e22;">排队较久，API服务器可能繁忙，请耐心等待或取消重试</span>' : '';
+                if (pendingStatusEl) {
+                    pendingStatusEl.innerHTML = `<span class="loading" style="display:inline-block;"></span> 排队等待中...（已等${elapsed}秒，第${i+1}次查询）${extra}`;
+                } else if (ph) {
+                    ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 排队等待中...（已等${elapsed}秒，第${i+1}次查询）${extra}`;
+                }
             } else {
-                if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（${elapsed}秒，第${i+1}次查询）`;
+                if (pendingStatusEl) {
+                    pendingStatusEl.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（${elapsed}秒，第${i+1}次查询）`;
+                } else if (ph) {
+                    ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（${elapsed}秒，第${i+1}次查询）`;
+                }
             }
             if (activeQueue === qi) setApiProgress(40 + Math.min(55, 30 * Math.log10(i + 1)));
         } catch (e) {
@@ -9167,3 +12763,3047 @@ function _startPollWithBackoff(apiKey, baseUrl, attempt) {
         } catch (e) { /* 静默忽略 */ }
     }, 5000);
 })();
+
+// ========== 拆图模式（独立模块） ==========
+
+// 非裁剪模式固定前缀（不可删除/修改，{N}自动替换为编号）
+const SPLIT_NOCROP_FIXED_PREFIX = '为我生成图片的第{N}张 ';
+
+// ========== 拆图模板管理系统 ==========
+const SPLIT_TEMPLATE_MAX = 10;
+const SPLIT_TEMPLATE_STORAGE_KEY = 'gridSplitTemplates_v2';
+
+function _getSplitTemplates() {
+    try {
+        const raw = localStorage.getItem(SPLIT_TEMPLATE_STORAGE_KEY);
+        if (raw) return JSON.parse(raw);
+    } catch (e) {}
+    // 默认模板
+    return {
+        crop: [
+            { name: '默认', content: '为我生成图片第{N}张的单独图片 要保持画面不变，超写实人像，原相机直出，高清 8K，超细腻皮肤，自然原生肤质，轻微皮肤肌理，不磨皮过度，真实光影，室内柔光，层次渐变光影，胶片质感，真人实拍，高级写真质感，景深虚化，构图专业，色彩自然真实，无 AI 畸形，无假脸，无塑料皮肤 耳边胎毛碎发，轻微自然凌乱微风吹动发丝轻轻飘动，发丝透气不结块，自然蓬松，真实头皮衔接，不僵硬不假发 发质真实有层次，发丝根根分明，脸颊两侧鬓角各垂两缕轻薄碎发 表情要灵动自然纹理' }
+        ],
+        nocrop: [
+            { name: '默认', content: ' 要保持画面不变，超写实人像，原相机直出，高清 8K，超细腻皮肤，自然原生肤质，轻微皮肤肌理，不磨皮过度，真实光影，室内柔光，层次渐变光影，胶片质感，真人实拍，高级写真质感，景深虚化，构图专业，色彩自然真实，无 AI 畸形，无假脸，无塑料皮肤 耳边胎毛碎发，轻微自然凌乱微风吹动发丝轻轻飘动，发丝透气不结块，自然蓬松，真实头皮衔接，不僵硬不假发 发质真实有层次，发丝根根分明，脸颊两侧鬓角各垂两缕轻薄碎发 表情要灵动自然纹理' }
+        ]
+    };
+}
+
+function _saveSplitTemplates(templates) {
+    localStorage.setItem(SPLIT_TEMPLATE_STORAGE_KEY, JSON.stringify(templates));
+}
+
+function _getCurrentModeTemplates() {
+    const mode = getCurrentSplitMode();
+    const all = _getSplitTemplates();
+    return all[mode] || [];
+}
+
+function renderSplitTemplateButtons() {
+    const bar = document.getElementById('split-template-btn-bar');
+    if (!bar) return;
+    bar.innerHTML = '';
+    const mode = getCurrentSplitMode();
+    const templates = _getCurrentModeTemplates();
+    templates.forEach((t, idx) => {
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-compact';
+        btn.style.cssText = 'font-size:10px;padding:2px 8px;border-radius:4px;';
+        btn.textContent = t.name;
+        btn.title = t.content.substring(0, 60) + (t.content.length > 60 ? '...' : '');
+        btn.addEventListener('click', () => {
+            const templateEl = document.getElementById('split-prompt-template');
+            if (!templateEl) return;
+            if (mode === 'nocrop') {
+                templateEl.value = SPLIT_NOCROP_FIXED_PREFIX + t.content;
+            } else {
+                templateEl.value = t.content;
+            }
+            _updateSplitTemplateReadOnlyStyle(templateEl, mode);
+            // 高亮当前选中
+            bar.querySelectorAll('button').forEach(b => b.style.background = '');
+            btn.style.background = 'var(--accent)';
+            btn.style.color = '#fff';
+        });
+        bar.appendChild(btn);
+    });
+}
+
+function openSplitTemplateAddModal() {
+    // 直接打开管理弹窗，并自动添加一个空白模板行
+    openSplitTemplateManageModal(true);
+}
+
+function openSplitTemplateManageModal(autoAddNew) {
+    const mode = getCurrentSplitMode();
+    const all = _getSplitTemplates();
+    if (!all[mode]) all[mode] = [];
+
+    // 创建管理弹窗
+    let modal = document.getElementById('modal-split-template-manage');
+    if (modal) modal.remove();
+
+    modal = document.createElement('div');
+    modal.id = 'modal-split-template-manage';
+    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:10000;display:flex;align-items:center;justify-content:center;';
+
+    const box = document.createElement('div');
+    box.className = 'resizable-modal';
+    box.style.cssText = 'background:var(--card-bg);border-radius:12px;padding:20px;min-width:420px;width:720px;max-width:92vw;min-height:300px;height:70vh;max-height:90vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,0.3);resize:both;overflow:hidden;';
+
+    const headerRow = document.createElement('div');
+    headerRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-shrink:0;';
+    const title = document.createElement('h3');
+    title.textContent = `${mode === 'crop' ? '裁剪' : '非裁剪'}模式模板管理`;
+    title.style.cssText = 'margin:0;font-size:15px;';
+    const closeBtn = document.createElement('button');
+    closeBtn.innerHTML = '&times;';
+    closeBtn.style.cssText = 'background:none;border:none;font-size:20px;cursor:pointer;color:var(--text-muted);padding:0 4px;line-height:1;';
+    closeBtn.addEventListener('click', () => modal.remove());
+    headerRow.appendChild(title);
+    headerRow.appendChild(closeBtn);
+    box.appendChild(headerRow);
+
+    const listWrap = document.createElement('div');
+    listWrap.style.cssText = 'flex:1;overflow-y:auto;margin-bottom:12px;';
+
+    function renderTemplateRows() {
+        listWrap.innerHTML = '';
+        const templates = all[mode] || [];
+        if (templates.length === 0) {
+            listWrap.innerHTML = '<div style="color:var(--text-muted);font-size:12px;padding:16px 0;text-align:center;">暂无模板，点击下方「添加模板」新建</div>';
+            return;
+        }
+        templates.forEach((t, idx) => {
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;padding:8px;background:var(--bg);border-radius:6px;';
+
+            const nameInput = document.createElement('input');
+            nameInput.type = 'text';
+            nameInput.value = t.name;
+            nameInput.placeholder = '模板名称';
+            nameInput.style.cssText = 'flex:0 0 100px;padding:6px 8px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--input-bg);color:var(--text);';
+
+            const contentInput = document.createElement('textarea');
+            contentInput.value = t.content;
+            contentInput.rows = 3;
+            contentInput.placeholder = '提示词内容';
+            contentInput.style.cssText = 'flex:1;padding:6px 8px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--input-bg);color:var(--text);resize:vertical;min-height:60px;';
+
+            const delBtn = document.createElement('button');
+            delBtn.textContent = '删除';
+            delBtn.className = 'btn btn-compact';
+            delBtn.style.cssText = 'font-size:10px;padding:4px 8px;color:#e74c3c;border-color:#e74c3c;flex-shrink:0;';
+            delBtn.addEventListener('click', () => {
+                all[mode].splice(idx, 1);
+                renderTemplateRows();
+            });
+
+            row.appendChild(nameInput);
+            row.appendChild(contentInput);
+            row.appendChild(delBtn);
+            listWrap.appendChild(row);
+        });
+    }
+
+    renderTemplateRows();
+    box.appendChild(listWrap);
+
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;justify-content:space-between;gap:8px;flex-shrink:0;';
+
+    // 添加模板按钮
+    const addBtn = document.createElement('button');
+    addBtn.textContent = '+ 添加模板';
+    addBtn.className = 'btn btn-outline btn-compact';
+    addBtn.style.cssText = 'font-size:12px;';
+    addBtn.addEventListener('click', () => {
+        if (all[mode].length >= SPLIT_TEMPLATE_MAX) {
+            showToast(`最多添加 ${SPLIT_TEMPLATE_MAX} 个模板`, 'warning');
+            return;
+        }
+        all[mode].push({ name: '', content: '' });
+        renderTemplateRows();
+        // 滚动到底部并聚焦新行的名称输入框
+        listWrap.scrollTop = listWrap.scrollHeight;
+        const lastRow = listWrap.lastElementChild;
+        if (lastRow) {
+            const nameInput = lastRow.querySelector('input');
+            if (nameInput) nameInput.focus();
+        }
+    });
+
+    const rightBtns = document.createElement('div');
+    rightBtns.style.cssText = 'display:flex;gap:8px;';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.textContent = '取消';
+    cancelBtn.className = 'btn btn-outline btn-compact';
+    cancelBtn.addEventListener('click', () => modal.remove());
+
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = '保存修改';
+    saveBtn.className = 'btn btn-compact';
+    saveBtn.style.cssText = 'background:var(--accent);color:#fff;';
+    saveBtn.addEventListener('click', () => {
+        const rows = listWrap.querySelectorAll('div[style*="margin-bottom"]');
+        const updated = [];
+        rows.forEach(row => {
+            const inputs = row.querySelectorAll('input, textarea');
+            const name = inputs[0].value.trim();
+            const content = inputs[1].value.trim();
+            if (name && content) updated.push({ name, content });
+        });
+        if (updated.length === 0) {
+            showToast('至少保留一个模板', 'warning');
+            return;
+        }
+        all[mode] = updated;
+        _saveSplitTemplates(all);
+        modal.remove();
+        renderSplitTemplateButtons();
+        showToast('模板已更新', 'success');
+    });
+
+    rightBtns.appendChild(cancelBtn);
+    rightBtns.appendChild(saveBtn);
+    btnRow.appendChild(addBtn);
+    btnRow.appendChild(rightBtns);
+    box.appendChild(btnRow);
+    modal.appendChild(box);
+    document.body.appendChild(modal);
+    modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+
+    // 如果是从"添加模板"按钮进入，自动添加一个空白行
+    if (autoAddNew) {
+        if (all[mode].length < SPLIT_TEMPLATE_MAX) {
+            all[mode].push({ name: '', content: '' });
+            renderTemplateRows();
+            listWrap.scrollTop = listWrap.scrollHeight;
+            const lastRow = listWrap.lastElementChild;
+            if (lastRow) {
+                const nameInput = lastRow.querySelector('input');
+                if (nameInput) nameInput.focus();
+            }
+        }
+    }
+}
+
+// ========== 拆图素材槽位 ==========
+
+function _initSplitMaterialSlots() {
+    document.querySelectorAll('.split-material-slot').forEach(slot => {
+        if (slot.dataset.splitMatBound) return;
+        slot.dataset.splitMatBound = '1';
+        const slotIdx = parseInt(slot.dataset.slot, 10);
+        slot.addEventListener('click', () => _handleSplitMaterialSlotClick(slotIdx));
+        slot.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); slot.classList.add('drag-over'); });
+        slot.addEventListener('dragleave', (e) => {
+            if (slot.contains(e.relatedTarget)) return;
+            slot.classList.remove('drag-over');
+        });
+        slot.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            slot.classList.remove('drag-over');
+            const lib = parseLibMaterialDragPayload(e.dataTransfer);
+            if (lib?.url) {
+                applyLibraryPayloadToSplitMaterialSlot(slotIdx, lib);
+                return;
+            }
+            const files = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
+            if (!files.length) return;
+            const qItem = getActiveSplitWorkItem(activeSplitQueue);
+            if (!qItem) {
+                showToast('请先完成九宫格拆分并选中编号', 'warning');
+                return;
+            }
+            try {
+                const fd = new FormData();
+                fd.append('file', files[0]);
+                const resp = await fetch('/api/upload-image', { method: 'POST', body: fd });
+                const result = await resp.json();
+                if (result.url) {
+                    if (!qItem.materials) qItem.materials = [null, null, null];
+                    qItem.materials[slotIdx] = result.url;
+                    _renderSplitMaterialSlot(slotIdx);
+                    saveSplitQueueData();
+                    showToast('素材已添加', 'success');
+                } else {
+                    showToast('上传失败: ' + (result.error || ''), 'error');
+                }
+            } catch (err) {
+                showToast('上传失败: ' + err.message, 'error');
+            }
+        });
+    });
+}
+
+function _handleSplitMaterialSlotClick(slotIdx) {
+    const qi = activeSplitQueue;
+    if (qi < 0 || qi >= splitQueueData.length) return;
+    const qd = splitQueueData[qi];
+    const item = getActiveSplitWorkItem(qi);
+    if (!item) return;
+
+    // 初始化素材数组
+    if (!item.materials) item.materials = [null, null, null];
+
+    // 如果已有素材，点击删除
+    if (item.materials[slotIdx]) {
+        item.materials[slotIdx] = null;
+        _renderSplitMaterialSlot(slotIdx);
+        saveSplitQueueData();
+        return;
+    }
+
+    // 没有素材，点击上传
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        try {
+            const fd = new FormData();
+            fd.append('file', file);
+            const resp = await fetch('/api/upload-image', { method: 'POST', body: fd });
+            const result = await resp.json();
+            if (result.url) {
+                if (!item.materials) item.materials = [null, null, null];
+                item.materials[slotIdx] = result.url;
+                _renderSplitMaterialSlot(slotIdx);
+                saveSplitQueueData();
+                showToast('素材已添加', 'success');
+            } else {
+                showToast('上传失败: ' + (result.error || ''), 'error');
+            }
+        } catch (err) {
+            showToast('上传失败: ' + err.message, 'error');
+        }
+    };
+    input.click();
+}
+
+function _renderSplitMaterialSlot(slotIdx) {
+    const qi = activeSplitQueue;
+    if (qi < 0 || qi >= splitQueueData.length) return;
+    const item = getActiveSplitWorkItem(qi);
+    const slot = document.querySelector(`.split-material-slot[data-slot="${slotIdx}"]`);
+    if (!slot) return;
+
+    const url = item?.materials?.[slotIdx];
+    if (url) {
+        slot.innerHTML = `<img src="${url}" style="width:100%;height:100%;object-fit:cover;border-radius:3px;">
+            <div style="position:absolute;top:1px;right:1px;width:14px;height:14px;background:rgba(231,76,60,0.9);border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:9px;color:#fff;line-height:1;">×</div>`;
+        slot.style.borderStyle = 'solid';
+        slot.style.borderColor = 'var(--accent)';
+    } else {
+        slot.innerHTML = '<span style="font-size:16px;color:var(--text-muted);">+</span>';
+        slot.style.borderStyle = 'dashed';
+        slot.style.borderColor = 'var(--border)';
+    }
+}
+
+function _renderAllSplitMaterialSlots() {
+    [0, 1, 2].forEach(i => _renderSplitMaterialSlot(i));
+}
+
+/** 多素材时对每个九宫格分别尝试文件名自动拆分 */
+async function splitAutoDetectFilenameAllMaterials(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd) return;
+    normalizeSplitQueueMaterials(qd);
+    if (!qd.materials || qd.materials.length <= 1) {
+        await maybeAutoSplitFromFilename(qi);
+        return;
+    }
+    persistActiveSplitMaterial(qd);
+    const savedIdx = Math.max(0, Math.min(qd.activeMaterialIndex || 0, qd.materials.length - 1));
+    for (let mi = 0; mi < qd.materials.length; mi++) {
+        loadActiveSplitMaterialIntoQueue(qd, mi);
+        splitImageUrl = qd.gridImageUrl || '';
+        splitGridImageUrl = splitImageUrl;
+        const imgEl = document.getElementById('split-img');
+        if (imgEl && splitImageUrl) imgEl.src = splitImageUrl;
+        await maybeAutoSplitFromFilename(qi);
+        persistActiveSplitMaterial(qd);
+    }
+    loadActiveSplitMaterialIntoQueue(qd, savedIdx);
+    splitImageUrl = qd.gridImageUrl || '';
+    splitGridImageUrl = splitImageUrl;
+    const imgEl2 = document.getElementById('split-img');
+    if (imgEl2) imgEl2.src = splitImageUrl || '';
+    renderSplitMaterialTabs(qi);
+    renderSplitNumSelectionForQueue(qi);
+    renderSplitWorkItemTabs(qi);
+    loadSplitQueueToUI(qi);
+}
+
+// 拆图上传处理（单文件 / 多文件）
+async function handleSplitUpload(source) {
+    const files = Array.isArray(source)
+        ? source.filter(Boolean)
+        : (source instanceof FileList ? Array.from(source) : (source ? [source] : []));
+    const images = files.filter(f => f && f.type && f.type.startsWith('image/'));
+    if (!images.length) return;
+
+    try {
+        switchMode('split');
+        const qi = activeSplitQueue;
+        const qd = splitQueueData[qi];
+        if (!qd) return;
+
+        if (images.length > 1) {
+            let take = images;
+            if (images.length > SPLIT_MAX_MATERIALS) {
+                showToast(`最多上传 ${SPLIT_MAX_MATERIALS} 张，已仅保留前 ${SPLIT_MAX_MATERIALS} 张`, 'warning');
+                take = images.slice(0, SPLIT_MAX_MATERIALS);
+            }
+            saveCurrentSplitQueueData();
+            const uploaded = [];
+            for (const file of take) {
+                const fd = new FormData();
+                fd.append('file', file);
+                uploaded.push({ url: await uploadImage(fd), name: file.name || '' });
+            }
+            qd.progressTotal = 0;
+            qd.progressDone = 0;
+            qd.materials = uploaded.map(({ url, name }) => ({
+                gridImageUrl: url,
+                sourceFilename: name,
+                selectedNums: [],
+                learnedGridLayout: null,
+                cropPreset: qd.cropPreset ?? null,
+                workItems: []
+            }));
+            qd.activeMaterialIndex = 0;
+            loadActiveSplitMaterialIntoQueue(qd, 0);
+            splitImageUrl = qd.gridImageUrl || '';
+            splitGridImageUrl = splitImageUrl;
+            const imgEl = document.getElementById('split-img');
+            if (imgEl) imgEl.src = splitImageUrl;
+            const previewEl = document.getElementById('split-preview');
+            const dropZoneEl = document.getElementById('split-drop-zone');
+            if (previewEl) previewEl.style.display = '';
+            if (dropZoneEl) dropZoneEl.style.display = 'none';
+            renderSplitMaterialTabs(qi);
+            renderSplitWorkItemTabs(qi);
+            updateSplitGenerateBtnState();
+            await splitAutoDetectFilenameAllMaterials(qi);
+            saveSplitQueueData();
+            renderSplitQueueNumberBar();
+            showToast(`已加载 ${take.length} 张素材，可用上方「素材」切换`, 'success');
+            return;
+        }
+
+        const file = images[0];
+        const formData = new FormData();
+        formData.append('file', file);
+        const url = await uploadImage(formData);
+
+        normalizeSplitQueueMaterials(qd);
+        persistActiveSplitMaterial(qd);
+
+        if (qd.materials.length > 1) {
+            const idx = Math.max(0, Math.min(qd.activeMaterialIndex || 0, qd.materials.length - 1));
+            const m = qd.materials[idx];
+            if (m) {
+                m.gridImageUrl = url;
+                m.sourceFilename = file.name || '';
+                m.workItems = [];
+                m.selectedNums = [];
+                m.learnedGridLayout = null;
+            }
+            loadActiveSplitMaterialIntoQueue(qd, idx);
+            splitImageUrl = url;
+            splitGridImageUrl = url;
+            persistActiveSplitMaterial(qd);
+        } else {
+            splitImageUrl = url;
+            splitGridImageUrl = url;
+            qd.gridImageUrl = url;
+            qd.workItems = [];
+            qd.activeItemIndex = 0;
+            qd.learnedGridLayout = null;
+            qd.sourceFilename = file.name || '';
+            normalizeSplitQueueMaterials(qd);
+            persistActiveSplitMaterial(qd);
+        }
+
+        const imgEl = document.getElementById('split-img');
+        if (imgEl) imgEl.src = url;
+        document.getElementById('split-preview').style.display = '';
+        document.getElementById('split-drop-zone').style.display = 'none';
+        renderSplitMaterialTabs(qi);
+        renderSplitWorkItemTabs(activeSplitQueue);
+        updateSplitGenerateBtnState();
+        await maybeAutoSplitFromFilename(activeSplitQueue);
+        saveSplitQueueData();
+        renderSplitQueueNumberBar();
+    } catch (e) {
+        showToast('上传九宫格图片失败: ' + e.message, 'error');
+    }
+}
+
+function resetSplitPreview() {
+    splitImageUrl = '';
+    const qd = splitQueueData[activeSplitQueue];
+    if (qd) {
+        qd.gridImageUrl = '';
+        qd.sourceFilename = '';
+        qd.learnedGridLayout = null;
+        qd.materials = [];
+        qd.activeMaterialIndex = 0;
+        normalizeSplitQueueMaterials(qd);
+        loadActiveSplitMaterialIntoQueue(qd, 0);
+    }
+    document.getElementById('split-preview').style.display = 'none';
+    document.getElementById('split-drop-zone').style.display = '';
+    document.getElementById('split-img').src = '';
+    const fileInput = document.getElementById('split-file');
+    if (fileInput) fileInput.value = '';
+    renderSplitMaterialTabs(activeSplitQueue);
+    renderSplitWorkItemTabs(activeSplitQueue);
+    updateSplitGenerateBtnState();
+}
+
+function loadSplitTemplate(mode) {
+    const templateEl = document.getElementById('split-prompt-template');
+    if (!templateEl) return;
+
+    const templates = _getSplitTemplates();
+    const modeTemplates = templates[mode] || [];
+    // 加载第一个模板（默认模板）
+    const firstTemplate = modeTemplates[0];
+
+    if (mode === 'nocrop') {
+        const userPart = firstTemplate ? firstTemplate.content : '';
+        templateEl.value = SPLIT_NOCROP_FIXED_PREFIX + userPart;
+        templateEl.dataset.nocropMode = '1';
+        templateEl.dataset.fixedPrefixLen = String(SPLIT_NOCROP_FIXED_PREFIX.length);
+        _updateSplitTemplateReadOnlyStyle(templateEl, mode);
+    } else {
+        templateEl.value = firstTemplate ? firstTemplate.content : '';
+        templateEl.dataset.nocropMode = '0';
+        templateEl.dataset.fixedPrefixLen = '0';
+        _updateSplitTemplateReadOnlyStyle(templateEl, mode);
+    }
+
+    // 渲染模板按钮
+    renderSplitTemplateButtons();
+}
+
+// 非裁剪模式下，阻止用户删除/修改固定前缀
+function _updateSplitTemplateReadOnlyStyle(templateEl, mode) {
+    if (mode === 'nocrop') {
+        // 使用beforeinput事件阻止对固定前缀的修改
+        if (!templateEl._nocropGuardInstalled) {
+            templateEl._nocropGuardInstalled = true;
+            templateEl.addEventListener('beforeinput', (e) => {
+                if (templateEl.dataset.nocropMode !== '1') return;
+                const fixedLen = parseInt(templateEl.dataset.fixedPrefixLen || '0', 10);
+                if (fixedLen <= 0) return;
+                const selStart = templateEl.selectionStart;
+                const selEnd = templateEl.selectionEnd;
+                // 如果选区与固定前缀区域有重叠，阻止操作
+                if (selStart < fixedLen) {
+                    e.preventDefault();
+                    // 将光标移到固定前缀之后
+                    templateEl.setSelectionRange(fixedLen, Math.max(selEnd, fixedLen));
+                    showToast('固定前缀不可修改，只能编辑后续内容', 'warning');
+                }
+            });
+            // 阻止退格键删除固定前缀
+            templateEl.addEventListener('keydown', (e) => {
+                if (templateEl.dataset.nocropMode !== '1') return;
+                const fixedLen = parseInt(templateEl.dataset.fixedPrefixLen || '0', 10);
+                if (fixedLen <= 0) return;
+                const pos = templateEl.selectionStart;
+                if (e.key === 'Backspace' && pos <= fixedLen && templateEl.selectionStart === templateEl.selectionEnd) {
+                    e.preventDefault();
+                    if (pos > 0) templateEl.setSelectionRange(fixedLen, fixedLen);
+                }
+                if (e.key === 'Home') {
+                    e.preventDefault();
+                    templateEl.setSelectionRange(fixedLen, fixedLen);
+                }
+            });
+            // 粘贴时确保不覆盖固定前缀
+            templateEl.addEventListener('paste', (e) => {
+                if (templateEl.dataset.nocropMode !== '1') return;
+                const fixedLen = parseInt(templateEl.dataset.fixedPrefixLen || '0', 10);
+                if (fixedLen <= 0) return;
+                if (templateEl.selectionStart < fixedLen) {
+                    e.preventDefault();
+                    // 在固定前缀之后粘贴
+                    const pastedText = (e.clipboardData || window.clipboardData).getData('text');
+                    const before = templateEl.value.substring(0, fixedLen);
+                    const after = templateEl.value.substring(templateEl.selectionEnd);
+                    templateEl.value = before + pastedText + after;
+                    templateEl.setSelectionRange(fixedLen + pastedText.length, fixedLen + pastedText.length);
+                }
+            });
+        }
+    }
+}
+
+function saveSplitTemplate(mode, template) {
+    const key = mode === 'crop' ? 'gridSplitPromptTemplate_crop' : 'gridSplitPromptTemplate_nocrop';
+    try { localStorage.setItem(key, template); } catch(e) {}
+}
+
+function getCurrentSplitMode() {
+    return document.querySelector('input[name="split-mode"]:checked')?.value || 'crop';
+}
+
+function saveCurrentSplitTemplate() {
+    const templateEl = document.getElementById('split-prompt-template');
+    if (!templateEl) return;
+    const mode = getCurrentSplitMode();
+    const template = templateEl.value?.trim() || '';
+    if (!template) {
+        showToast('模板不能为空', 'warning');
+        return;
+    }
+    // 保存到模板列表的第一个（默认模板）
+    const all = _getSplitTemplates();
+    if (!all[mode] || all[mode].length === 0) {
+        all[mode] = [{ name: '默认', content: '' }];
+    }
+    if (mode === 'nocrop') {
+        const fixedLen = parseInt(templateEl.dataset.fixedPrefixLen || '0', 10);
+        all[mode][0].content = templateEl.value.substring(fixedLen);
+    } else {
+        all[mode][0].content = template;
+    }
+    _saveSplitTemplates(all);
+    renderSplitTemplateButtons();
+    showToast(`${mode === 'crop' ? '裁剪' : '非裁剪'}模式模板已保存`, 'success');
+}
+
+// ---------- 拆图左侧素材库（与图生图同一套 renderLibraryPanel） ----------
+async function renderSplitLibrary() {
+    const body = document.getElementById('split-library-body');
+    if (!body) return;
+
+    if (!imageState.loaded || !Array.isArray(imageState.library) || imageState.library.length === 0) {
+        try {
+            const libData = await api('GET', '/api/image-library');
+            imageState.library = libData.categories || [];
+            imageState.loaded = true;
+        } catch (e) {
+            body.innerHTML = '<p class="empty-hint">加载素材库失败</p>';
+            return;
+        }
+    }
+
+    const kw = (document.getElementById('split-img-lib-search')?.value || '').trim().toLowerCase();
+    await renderLibraryPanel({
+        containerId: 'split-library-body',
+        keyword: kw,
+        context: 'split'
+    });
+}
+
+/** 从文件名解析拆图编号：末尾连续 1-9，或纯数字名；去重保序 */
+function parseSplitNumbersFromFilename(filename) {
+    const base = getFileBaseName(filename).trim();
+    if (!base) return null;
+    let digitRun = '';
+    const suffixMatch = base.match(/([1-9]+)$/);
+    if (suffixMatch) digitRun = suffixMatch[1];
+    else if (/^[1-9]+$/.test(base)) digitRun = base;
+    else return null;
+    if (!digitRun || digitRun.length > 24) return null;
+    const nums = [];
+    const seen = new Set();
+    for (const ch of digitRun) {
+        const n = ch.charCodeAt(0) - 48;
+        if (n >= 1 && n <= 9 && !seen.has(n)) {
+            seen.add(n);
+            nums.push(n);
+        }
+    }
+    return nums.length ? nums : null;
+}
+
+function waitSplitImageNaturalSize(maxMs = 4000) {
+    return new Promise(resolve => {
+        const img = document.getElementById('split-img');
+        const deadline = Date.now() + maxMs;
+        function tick() {
+            if (img?.naturalWidth > 0 && img?.naturalHeight > 0) {
+                resolve(true);
+                return;
+            }
+            if (Date.now() > deadline) {
+                resolve(false);
+                return;
+            }
+            requestAnimationFrame(tick);
+        }
+        tick();
+    });
+}
+
+function inferSplitGridColsRows(qd, calibratedCropRect, calibratedNumber) {
+    const nums = (qd.workItems || []).map(it => it.number).filter(n => Number.isFinite(n) && n >= 1 && n <= 9);
+    const maxN = Math.max(calibratedNumber, ...nums, 1);
+    if (maxN > 4) return { cols: 3, rows: 3 };
+    const preset = qd.cropPreset || qd.workItems?.find(it => it.cropPreset)?.cropPreset;
+    const ps = preset ? String(preset) : '';
+    if (ps.startsWith('4grid')) return { cols: 2, rows: 2 };
+    if (ps.includes('grid') && !ps.startsWith('4grid')) return { cols: 3, rows: 3 };
+    const w = calibratedCropRect.w;
+    if (w >= 0.41) return { cols: 2, rows: 2 };
+    if (w <= 0.36) return { cols: 3, rows: 3 };
+    return maxN <= 4 ? { cols: 2, rows: 2 } : { cols: 3, rows: 3 };
+}
+
+/** 用户校准某一编号后，推导格子并把同一队列其他编号的裁剪框对齐 */
+function propagateLearnedSplitCropLayout(queueIdx, calibratedNumber, cropRect) {
+    const qd = splitQueueData[queueIdx];
+    if (!qd || !Array.isArray(qd.workItems) || qd.workItems.length === 0) return;
+    if (!cropRect || calibratedNumber < 1 || calibratedNumber > 9) return;
+
+    const { cols, rows } = inferSplitGridColsRows(qd, cropRect, calibratedNumber);
+    const idx = calibratedNumber - 1;
+    const col = idx % cols;
+    const row = Math.floor(idx / cols);
+    if (row >= rows || col >= cols) return;
+
+    const cellW = cropRect.w;
+    const cellH = cropRect.h;
+    let ox = cropRect.x - col * cellW;
+    let oy = cropRect.y - row * cellH;
+    ox = Math.max(0, Math.min(ox, 1 - cols * cellW));
+    oy = Math.max(0, Math.min(oy, 1 - rows * cellH));
+
+    qd.learnedGridLayout = {
+        cols,
+        rows,
+        cellW,
+        cellH,
+        originX: ox,
+        originY: oy,
+        calibratedFrom: calibratedNumber
+    };
+
+    const gridUrl = qd.gridImageUrl || splitImageUrl || '';
+
+    qd.workItems.forEach(item => {
+        const n = item.number;
+        if (!Number.isFinite(n) || n < 1 || n > 9) return;
+        item.gridImageUrl = item.gridImageUrl || gridUrl;
+        if (n === calibratedNumber) {
+            item.cropRect = { x: cropRect.x, y: cropRect.y, w: cropRect.w, h: cropRect.h };
+            item.croppedImageUrl = '';
+            return;
+        }
+        const i2 = n - 1;
+        const c2 = i2 % cols;
+        const r2 = Math.floor(i2 / cols);
+        if (r2 >= rows || c2 >= cols) return;
+        let nx = ox + c2 * cellW;
+        let ny = oy + r2 * cellH;
+        nx = Math.max(0, Math.min(nx, 1 - cellW));
+        ny = Math.max(0, Math.min(ny, 1 - cellH));
+        item.cropRect = { x: nx, y: ny, w: cellW, h: cellH };
+        item.croppedImageUrl = '';
+        if (item.cropPreset === undefined || item.cropPreset === null) item.cropPreset = qd.cropPreset;
+    });
+
+    syncActiveSplitItemToQueue(queueIdx);
+}
+
+/**
+ * 将选中编号写入拆图队列 workItems。
+ * @returns {boolean}
+ */
+function applySplitGridToQueue(targetQueue, numbers, opts = {}) {
+    const skipOverwriteConfirm = opts.skipOverwriteConfirm === true;
+    const silent = opts.silent === true;
+
+    if (!splitImageUrl) {
+        if (!silent) showToast('请先上传九宫格图片', 'warning');
+        return false;
+    }
+    if (!numbers || numbers.length === 0) return false;
+
+    const mode = opts.mode ?? document.querySelector('input[name="split-mode"]:checked')?.value ?? 'crop';
+    const promptTemplate = opts.promptTemplate ?? document.getElementById('split-prompt-template')?.value.trim();
+    if (!promptTemplate) {
+        if (!silent) showToast('请填写提示词模板', 'warning');
+        return false;
+    }
+
+    readSplitApiConfigToQueue(targetQueue);
+
+    const targetQdPre = splitQueueData[targetQueue];
+    normalizeSplitQueueMaterials(targetQdPre);
+    persistActiveSplitMaterial(targetQdPre);
+
+    const qdRef = splitQueueData[targetQueue];
+    const currentApiConfig = {
+        apiPlatform: qdRef.apiPlatform || 'oaihk',
+        rhModelId: qdRef.rhModelId || '',
+        oaihkModelId: qdRef.oaihkModelId || 'fal-ai/banana/v3.1/flash/2k',
+        rhAspectRatio: qdRef.rhAspectRatio || '3:4',
+        oaihkAspectRatio: qdRef.oaihkAspectRatio || '3:4',
+        rhResolution: qdRef.rhResolution || '1k',
+        rhCount: qdRef.rhCount || 1,
+        rhSeedMode: qdRef.rhSeedMode || 'random',
+        rhSeed: qdRef.rhSeed || '',
+        downloadPath: qdRef.downloadPath || '',
+        imagePrefix: qdRef.imagePrefix || '',
+        autoBackup: qdRef.autoBackup !== false
+    };
+
+    const targetQd = splitQueueData[targetQueue];
+    const oldCount = (targetQd?.workItems || []).length;
+    if (oldCount > 0 && !skipOverwriteConfirm) {
+        const matHint = (targetQd.materials || []).length > 1 ? `（当前素材 ${(targetQd.activeMaterialIndex || 0) + 1}）` : '';
+        if (!confirm(`当前素材已有 ${oldCount} 个格子工作项${matHint}，确认覆盖？`)) return false;
+    }
+
+    const currentItem = getActiveSplitWorkItem(targetQueue);
+    const inheritedPrefixIds = Array.isArray(currentItem?.selectedPrefixIds) ? [...currentItem.selectedPrefixIds] : [];
+    const inheritedSuffixIds = Array.isArray(currentItem?.selectedSuffixIds) ? [...currentItem.selectedSuffixIds] : [];
+    const effectivePreset = targetQd?.cropPreset || state.modelConfig?.defaultCropPreset || null;
+
+    const splitImgEl = document.getElementById('split-img');
+    const imgW = splitImgEl?.naturalWidth || 0;
+    const imgH = splitImgEl?.naturalHeight || 0;
+
+    const workItems = [];
+    for (let i = 0; i < numbers.length; i++) {
+        let defaultCropRect = null;
+        if (mode === 'crop') {
+            const n = numbers[i];
+            if (effectivePreset && imgW && imgH) {
+                defaultCropRect = getSplitCropPresetRect(effectivePreset, n, imgW, imgH);
+            }
+            if (!defaultCropRect) {
+                const row = Math.floor((n - 1) / 3);
+                const col = (n - 1) % 3;
+                defaultCropRect = { x: col / 3, y: row / 3, w: 1 / 3, h: 1 / 3 };
+            }
+        }
+        workItems.push({
+            imageUrl: splitImageUrl,
+            croppedImageUrl: '',
+            gridImageUrl: splitImageUrl,
+            cropRect: defaultCropRect,
+            cropPreset: effectivePreset,
+            promptCn: (promptTemplate.replace(/\{N\}/g, String(numbers[i])) || '').trim(),
+            number: numbers[i],
+            selectedPrefixIds: dedupeTemplateIds(inheritedPrefixIds),
+            selectedSuffixIds: dedupeTemplateIds(inheritedSuffixIds)
+        });
+    }
+
+    const materialsPreserve = splitQueueData[targetQueue].materials;
+    const activeMiPreserve = splitQueueData[targetQueue].activeMaterialIndex;
+
+    Object.assign(splitQueueData[targetQueue], currentApiConfig);
+    splitQueueData[targetQueue].materials = materialsPreserve;
+    splitQueueData[targetQueue].activeMaterialIndex = activeMiPreserve;
+    splitQueueData[targetQueue].lastSplitPromptTemplate = promptTemplate;
+    splitQueueData[targetQueue].gridImageUrl = splitImageUrl;
+    splitQueueData[targetQueue].selectedNums = [...numbers];
+    splitQueueData[targetQueue].cropPreset = effectivePreset;
+    splitQueueData[targetQueue].workItems = workItems;
+    splitQueueData[targetQueue].progressTotal = numbers.length;
+    splitQueueData[targetQueue].progressDone = 0;
+    splitQueueData[targetQueue].activeItemIndex = 0;
+    splitQueueData[targetQueue].learnedGridLayout = null;
+    splitQueueData[targetQueue].splitAspectRatioManualOverride = false;
+
+    persistActiveSplitMaterial(splitQueueData[targetQueue]);
+
+    syncActiveSplitItemToQueue(targetQueue);
+    splitGridImageUrl = splitImageUrl;
+    splitMode = mode;
+
+    return true;
+}
+
+async function maybeAutoSplitFromFilename(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd?.sourceFilename) return;
+    const nums = parseSplitNumbersFromFilename(qd.sourceFilename);
+    if (!nums?.length) return;
+
+    await waitSplitImageNaturalSize();
+
+    qd.selectedNums = [...nums];
+    renderSplitNumSelectionForQueue(qi);
+
+    const ok = applySplitGridToQueue(qi, nums, { skipOverwriteConfirm: true, silent: true });
+    if (!ok) return;
+
+    saveSplitQueueData();
+    renderSplitNumSelectionForQueue(qi);
+    renderSplitWorkItemTabs(qi);
+    loadSplitQueueToUI(qi);
+    renderSplitQueueNumberBar();
+    updateSplitGenerateBtnState();
+    showToast(`已从文件名识别编号：${nums.join('、')}，已填入队列`, 'success');
+}
+
+// 确认拆图：裁剪图片 → 填入拆图队列
+async function confirmSplitGrid() {
+    if (!splitImageUrl) {
+        showToast('请先上传九宫格图片', 'warning');
+        return;
+    }
+    const queueSelectedNums = Array.isArray(splitQueueData[activeSplitQueue]?.selectedNums) ? splitQueueData[activeSplitQueue].selectedNums : [];
+    if (queueSelectedNums.length === 0) {
+        showToast('请点选格子编号（1–9）', 'warning');
+        return;
+    }
+
+    const ok = applySplitGridToQueue(activeSplitQueue, [...queueSelectedNums], { skipOverwriteConfirm: false });
+    if (!ok) return;
+
+    saveSplitQueueData();
+    renderSplitNumSelectionForQueue(activeSplitQueue);
+    loadSplitQueueToUI(activeSplitQueue);
+    renderSplitQueueNumberBar();
+    updateSplitGenerateBtnState();
+
+    const qdPost = splitQueueData[activeSplitQueue];
+    if (qdPost) normalizeSplitQueueMaterials(qdPost);
+    const mh = qdPost && qdPost.materials.length > 1 ? `，素材 ${(qdPost.activeMaterialIndex || 0) + 1}` : '';
+    showToast(`已在拆图队列 ${activeSplitQueue + 1}${mh} 创建 ${queueSelectedNums.length} 个格子工作项，可使用「拆图生成」或「批量生成」`, 'success');
+}
+
+// 拆图生成：只生成当前队列的当前选中项（单张）
+async function runSplitGenerate(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd || !Array.isArray(qd.workItems) || qd.workItems.length === 0) {
+        showToast('该队列没有拆图数据', 'warning');
+        return { cancelled: false, skipped: true };
+    }
+    const qs = splitGenerateStates[qi];
+    if (qs.running) {
+        showToast(`拆图队列${qi+1}正在生成中`, 'error');
+        return { cancelled: false, skipped: true };
+    }
+
+    // 保存当前数据
+    saveCurrentSplitQueueData();
+
+    // 只生成当前活跃项（用户正在查看/编辑的那一张）
+    const activeIdx = qd.activeItemIndex || 0;
+    const item = qd.workItems[activeIdx];
+    if (!item) {
+        showToast('当前没有选中的拆图项', 'warning');
+        return { cancelled: false, skipped: true };
+    }
+
+    // 校验提示词
+    const prompt = (item.promptCn || '').trim();
+    if (!prompt) {
+        showToast(`格子编号 ${item.number || activeIdx + 1} 缺少提示词，请填写后再生成`, 'error');
+        return { cancelled: false, skipped: true };
+    }
+
+    const platform = qd.apiPlatform || 'oaihk';
+    if (platform === 'oaihk') {
+        if (!OAIHK_MODELS[qd.oaihkModelId]) { showToast('请选择 OpenAI-HK 模型', 'error'); return { cancelled: false, skipped: true }; }
+    } else {
+        if (!RH_MODELS[qd.rhModelId]) { showToast('请选择模型', 'error'); return { cancelled: false, skipped: true }; }
+    }
+
+    qs.running = true;
+    qs.cancelled = false;
+    qs.abortController = new AbortController();
+    const signal = qs.abortController.signal;
+    qs.batchVisualTotal = 1;
+    qs.batchVisualFilled = 0;
+    updateSplitGenerateBtnState();
+
+    const progressWrap = document.getElementById('split-progress-bar-wrap');
+    const progressBar = document.getElementById('split-progress-bar');
+    const progressText = document.getElementById('split-progress-text');
+    if (qi === activeSplitQueue) {
+        if (progressWrap) progressWrap.style.display = '';
+        if (progressText) progressText.style.display = '';
+        if (progressBar) progressBar.style.width = '0%';
+        if (progressText) progressText.textContent = `队列${qi+1} 正在生成第${activeIdx+1}张...`;
+        const splitGrid = document.getElementById('split-result-grid');
+        renderSplitQueueResults(qi);
+        appendSplitResultPendingSlots(splitGrid, 1);
+    }
+
+    const allResults = [];
+    try {
+        try {
+        // 裁剪模式：优先按cropRect从原图实时裁剪
+        let sourceUrl = '';
+        const cropSourceUrl = getSplitCropSourceUrl(item, qd);
+        if (item.cropRect && cropSourceUrl) {
+            try {
+                const cropResult = await api('POST', '/api/free-crop-image', {
+                    image_url: cropSourceUrl,
+                    x: item.cropRect.x, y: item.cropRect.y,
+                    w: item.cropRect.w, h: item.cropRect.h
+                });
+                if (cropResult.ok && cropResult.url) {
+                    sourceUrl = cropResult.url;
+                    item.croppedImageUrl = cropResult.url;
+                } else {
+                    showToast(`格子编号 ${item.number} 裁剪失败`, 'warning');
+                }
+            } catch (e) {
+                showToast(`格子编号 ${item.number} 裁剪请求失败: ${e.message}`, 'error');
+            }
+        }
+        if (!sourceUrl) {
+            sourceUrl = item.croppedImageUrl || item.imageUrl;
+        }
+        if (!sourceUrl) {
+            showToast('没有可用的图片源', 'warning');
+            if (qi === activeSplitQueue) {
+                fillNextSplitPendingCard(document.getElementById('split-result-grid'), splitPendingStubCard('skip', '无可用图源'));
+            }
+        } else {
+            let imageUrls = [sourceUrl];
+            if (item.materials) {
+                item.materials.forEach(m => { if (m) imageUrls.push(m); });
+            }
+            if (platform !== 'oaihk') {
+                imageUrls = imageUrls.map(u => u.startsWith('/') ? window.location.origin + u : u);
+            }
+            const fullPrompt = buildSplitFullPrompt(item);
+            const task = { prompt: fullPrompt, imageUrls, queueLabel: `拆图${item.number || (activeIdx + 1)}` };
+            const taskResults = await generateSingleTaskForSplit(qi, task, platform, qd, signal);
+            if (taskResults.length > 0) {
+                const mid = qd.activeMaterialIndex || 0;
+                for (const r of taskResults) {
+                    r._regenPrompt = fullPrompt;
+                    r._regenImageUrl = sourceUrl;
+                    r.prompt = fullPrompt;
+                    r._materialIndex = mid;
+                }
+                allResults.push(...taskResults);
+                qd.results = (qd.results || []).concat(taskResults);
+                saveSplitQueueData();
+                if (qi === activeSplitQueue) {
+                    const grid = document.getElementById('split-result-grid');
+                    const results = qd.results || [];
+                    const idx = results.length - 1;
+                    fillNextSplitPendingCard(grid, createSplitResultCardElement(qi, results[idx], idx, results));
+                }
+            } else {
+                showToast(`第${activeIdx+1}张未返回图片`, 'warning');
+                if (qi === activeSplitQueue) {
+                    fillNextSplitPendingCard(document.getElementById('split-result-grid'), splitPendingStubCard('fail', '未返图'));
+                }
+            }
+        }
+        } finally {
+            const st = splitGenerateStates[qi];
+            if (st && (st.batchVisualTotal || 0) > 0) {
+                st.batchVisualFilled = Math.min(st.batchVisualTotal, (st.batchVisualFilled || 0) + 1);
+            }
+        }
+    } catch (e) {
+        if (!qs.cancelled) showToast(`拆图队列${qi+1}生成失败: ${e.message}`, 'error');
+        if (qi === activeSplitQueue && document.getElementById('split-result-grid')?.querySelector('.split-result-pending-card')) {
+            fillNextSplitPendingCard(document.getElementById('split-result-grid'), splitPendingStubCard('fail', '异常'));
+        }
+    }
+
+    // 统一入图库
+    if (allResults.length > 0 && qd.autoBackup !== false) {
+        await autoBackupSplitResults(allResults, qi);
+    }
+
+    if (qi === activeSplitQueue) {
+        clearRemainingSplitResultPendingSlots(document.getElementById('split-result-grid'));
+        renderSplitQueueResults(qi);
+    }
+
+    persistActiveSplitMaterial(qd);
+
+    qs.running = false;
+    qs.cancelled = false;
+    qs.abortController = null;
+    qs.progressPercent = 0;
+    qs.progressText = '';
+    qs.batchVisualTotal = 0;
+    qs.batchVisualFilled = 0;
+    if (progressWrap) progressWrap.style.display = 'none';
+    if (progressText) progressText.style.display = 'none';
+    renderSplitQueueNumberBar();
+    updateSplitGenerateBtnState();
+    syncSplitProgressUI();
+    saveSplitQueueData();
+
+    if (allResults.length > 0) {
+        showToast(`拆图队列 ${qi + 1} 格子编号 ${item.number || activeIdx + 1} 生成完成`, 'success');
+    } else if (!qs.cancelled) {
+        showToast('生成未产出结果', 'warning');
+    }
+    return { cancelled: qs.cancelled, skipped: false };
+}
+
+async function pollUntilDoneForSplit(apiKey, baseUrl, taskId, splitQueueIndex, signal, startTime = Date.now()) {
+    const maxPolls = 120;
+    const qsRh = splitGenerateStates[splitQueueIndex];
+    for (let i = 0; i < maxPolls; i++) {
+        if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
+        await waitForSplitPollTick(signal, 3000);
+        if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
+        const elapsedSec = (i + 1) * 3;
+        if (qsRh?.running) {
+            qsRh.progressText = `队列${splitQueueIndex + 1}: RH 任务查询中…（约 ${elapsedSec}s）`;
+            syncSplitProgressUI();
+        }
+        try {
+            const data = await api('POST', '/api/rh-proxy', {
+                action: 'query',
+                api_key: apiKey,
+                base_url: baseUrl,
+                task_id: taskId
+            }, 90000, signal);
+            if (data.status === 'SUCCESS') return data;
+            if (data.status === 'FAILED') return null;
+        } catch (e) {
+            if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
+            console.warn('[拆图-RH轮询]', e);
+        }
+    }
+    if (!splitGenerateStates[splitQueueIndex]?.cancelled) {
+        showToast(`RunningHub 拆图任务轮询超时（约 ${maxPolls * 3}s），请检查任务状态或稍后重试`, 'warning');
+    }
+    return null;
+}
+
+async function pollOAIHKForSplit(pollEndpoint, requestId, splitQueueIndex, signal, taskLabel = '') {
+    const maxPolls = 120;
+    const qsPoll = splitGenerateStates[splitQueueIndex];
+    const label = (taskLabel || '拆图').slice(0, 40);
+    for (let i = 0; i < maxPolls; i++) {
+        if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
+        await waitForSplitPollTick(signal, 3000);
+        if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
+        const elapsedSec = (i + 1) * 3;
+        if (qsPoll?.running) {
+            qsPoll.progressText = `队列${splitQueueIndex + 1}: ${label} 等待出图…（约 ${elapsedSec}s，第 ${i + 1}/${maxPolls} 次查询）`;
+            syncSplitProgressUI();
+        }
+        try {
+            const data = await api('POST', '/api/oaihk-proxy', {
+                action: 'poll',
+                api_key: '',
+                base_url: '',
+                poll_endpoint: pollEndpoint,
+                request_id: requestId
+            }, 90000, signal);
+            if (data.images && data.images.length > 0) return data;
+            if (data.status === 'FAILED') return null;
+        } catch (e) {
+            if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
+            console.warn('[拆图-HK轮询]', label, e);
+        }
+    }
+    if (!splitGenerateStates[splitQueueIndex]?.cancelled) {
+        showToast(`「${label}」OpenAI-HK 轮询超时（约 ${maxPolls * 3}s），可能仍在远端排队，可稍后单独对该格子「再生」`, 'warning');
+    }
+    return null;
+}
+
+async function waitForSplitPollTick(signal, totalMs = 3000) {
+    // 分段等待，保证取消操作可以在200ms级别生效
+    const step = 200;
+    let elapsed = 0;
+    while (elapsed < totalMs) {
+        if (signal?.aborted) return;
+        await new Promise(r => setTimeout(r, Math.min(step, totalMs - elapsed)));
+        if (signal?.aborted) return;
+        elapsed += step;
+    }
+}
+
+async function enqueueSplitApiGeneration(qi, taskLabel, runner) {
+    const jobId = ++splitApiDispatchSeq;
+    const run = async () => {
+        const state = splitGenerateStates[qi];
+        if (state?.cancelled) return [];
+        if (state?.running) {
+            state.progressText = `队列${qi + 1}: ${taskLabel}（排队#${jobId}）`;
+            syncSplitProgressUI();
+        }
+        return await runner();
+    };
+    const queued = splitApiDispatchChain.then(run, run);
+    splitApiDispatchChain = queued.catch(() => {});
+    return queued;
+}
+
+// 拆图专用：与图生图队列状态完全隔离，允许并行运行
+async function generateSingleTaskForSplit(qi, task, platform, qd, signal, opts = {}) {
+    if (opts?.bypassDispatchChain) {
+        return generateSingleTaskForSplitCore(qi, task, platform, qd, signal);
+    }
+    return enqueueSplitApiGeneration(qi, task.queueLabel || '任务提交', () =>
+        generateSingleTaskForSplitCore(qi, task, platform, qd, signal)
+    );
+}
+
+async function generateSingleTaskForSplitCore(qi, task, platform, qd, signal) {
+    const qs = splitGenerateStates[qi];
+    const results = [];
+    try {
+        if (platform === 'oaihk') {
+            const modelId = qd.oaihkModelId;
+            const model = OAIHK_MODELS[modelId];
+            const aspectRatio = qd.oaihkAspectRatio || '3:4';
+            const shortEdge = model?.shortEdge || 1536;
+            const publicUrls = [];
+            const imgs = task.imageUrls || [];
+            for (let ii = 0; ii < imgs.length; ii++) {
+                if (qs.cancelled) break;
+                if (qs.running) {
+                    qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 预处理参考图 ${ii + 1}/${imgs.length}…`;
+                    syncSplitProgressUI();
+                }
+                publicUrls.push(await uploadToTmpfiles(imgs[ii], aspectRatio, shortEdge));
+            }
+            if (qs.cancelled) return results;
+
+            const splitHkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 600000);
+            if (model?.isGptImage) {
+                if (qs.running) {
+                    qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 已提交 GPT，同步生成中（较慢）…`;
+                    syncSplitProgressUI();
+                }
+                announceOaihkSubmit('拆图-GPT', {
+                    model: model.modelId || 'gpt-image-2',
+                    size: getOaihkImageSize(model, aspectRatio),
+                    quality: getOaihkGptQuality(model)
+                });
+                const gptResp = await api('POST', '/api/oaihk-gpt-image', {
+                    action: publicUrls.length > 0 ? 'edits' : 'generations',
+                    model: model.modelId || 'gpt-image-2',
+                    prompt: task.prompt,
+                    size: getOaihkImageSize(model, aspectRatio),
+                    quality: getOaihkGptQuality(model),
+                    n: 1,
+                    image_base64_list: publicUrls
+                }, splitHkTm, signal);
+                if (qs.cancelled) return results;
+                if (gptResp.data && Array.isArray(gptResp.data)) {
+                    for (const item of gptResp.data) {
+                        const displayUrl = await displayUrlFromOaihkGptItem(item, signal);
+                        if (!displayUrl) continue;
+                        if (!item.b64_json && item.url && displayUrl === item.url) {
+                            showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL（入图库可能失败）`, 'warning');
+                        }
+                        results.push({ url: displayUrl, checked: false, filename: `拆图_${task.queueLabel}_${results.length + 1}.jpg`, outputType: 'png' });
+                    }
+                }
+            } else {
+                const payload = { prompt: task.prompt, image_urls: publicUrls, num_images: 1, aspect_ratio: aspectRatio };
+                if (model?.modelId) payload.model = model.modelId;
+                if (qs.running) {
+                    qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 已提交，等待排队/出图…`;
+                    syncSplitProgressUI();
+                }
+                const submitData = await api('POST', '/api/oaihk-proxy', {
+                    action: 'submit', api_key: '', base_url: '', endpoint: model.endpoint, model_id: modelId, params: payload
+                }, splitHkTm, signal);
+                if (!submitData.request_id) {
+                    const errTxt = typeof submitData.error === 'string'
+                        ? submitData.error
+                        : (submitData.error?.message || submitData.detail || JSON.stringify(submitData).slice(0, 400));
+                    if (!qs.cancelled) showToast(`${task.queueLabel || '拆图'} 提交失败: ${errTxt}`, 'error');
+                    return results;
+                }
+                const result = await pollOAIHKForSplit(model.pollEndpoint, submitData.request_id, qi, signal, task.queueLabel || '');
+                if (qs.cancelled) return results;
+                if (result && result.images) {
+                    for (const img of result.images) {
+                        if (img.url) {
+                            let displayUrl = img.url;
+                            try {
+                                const dlResp = await api('POST', '/api/download-image', { url: img.url }, splitHkTm, signal);
+                                if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                            } catch (e) {
+                                console.warn(`[拆图-OAIHK] 图片下载失败，使用原始URL: ${e.message}`);
+                                showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL（入图库可能失败）`, 'warning');
+                            }
+                            results.push({ url: displayUrl, checked: false, filename: `拆图_${task.queueLabel}_${results.length + 1}.jpg`, outputType: 'png' });
+                        }
+                    }
+                }
+            }
+        } else {
+            const modelId = qd.rhModelId;
+            const model = RH_MODELS[modelId];
+            const rhApiKey = state.modelConfig.rh_api_key || '';
+            const rhBaseUrl = state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
+            const payload = { prompt: task.prompt };
+            if (model?.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
+            if (model?.hasResolution) payload.resolution = qd.rhResolution || '1k';
+            if (qd.rhAspectRatio) payload.aspectRatio = qd.rhAspectRatio;
+
+            if (qs.running) {
+                qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} RH 提交中…`;
+                syncSplitProgressUI();
+            }
+            const data = await api('POST', '/api/rh-proxy', {
+                action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
+            }, 180000, signal);
+            if (data.status === 'FAILED') return results;
+            if (!data.taskId) {
+                if (!qs.cancelled) showToast(`${task.queueLabel || '拆图'} RH 提交未返回 taskId`, 'error');
+                return results;
+            }
+
+            const result = await pollUntilDoneForSplit(rhApiKey, rhBaseUrl, data.taskId, qi, signal, Date.now());
+            if (qs.cancelled) return results;
+            if (result && result.results) {
+                for (const r of result.results) {
+                    if (r.url) results.push({ url: r.url, checked: false, filename: `拆图_${task.queueLabel}_${results.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' });
+                }
+            }
+        }
+    } catch (e) {
+        if (!qs.cancelled) showToast(`${task.queueLabel}生成失败: ${e.message}`, 'error');
+    }
+    return results;
+}
+
+async function submitSingleTaskForSplitAsync(qi, task, platform, qd, signal) {
+    const qs = splitGenerateStates[qi];
+    if (platform === 'oaihk') {
+        const modelId = qd.oaihkModelId;
+        const model = OAIHK_MODELS[modelId];
+        if (model?.isGptImage) {
+            const taskResults = await generateSingleTaskForSplitCore(qi, task, platform, qd, signal);
+            return { waitForResults: async () => taskResults };
+        }
+        const aspectRatio = qd.oaihkAspectRatio || '3:4';
+        const shortEdge = model?.shortEdge || 1536;
+        const publicUrls = [];
+        const imgs = task.imageUrls || [];
+        for (let ii = 0; ii < imgs.length; ii++) {
+            if (qs.cancelled || signal?.aborted) throw createSplitAbortError();
+            if (qs.running) {
+                qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 预处理参考图 ${ii + 1}/${imgs.length}…`;
+                syncSplitProgressUI();
+            }
+            publicUrls.push(await uploadToTmpfiles(imgs[ii], aspectRatio, shortEdge));
+        }
+        if (qs.cancelled || signal?.aborted) throw createSplitAbortError();
+        const payload = { prompt: task.prompt, image_urls: publicUrls, num_images: 1, aspect_ratio: aspectRatio };
+        if (model?.modelId) payload.model = model.modelId;
+        const splitHkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 600000);
+        if (qs.running) {
+            qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 已提交，继续下一张…`;
+            syncSplitProgressUI();
+        }
+        const submitData = await api('POST', '/api/oaihk-proxy', {
+            action: 'submit', api_key: '', base_url: '', endpoint: model.endpoint, model_id: modelId, params: payload
+        }, splitHkTm, signal);
+        if (!submitData.request_id) {
+            const errTxt = typeof submitData.error === 'string'
+                ? submitData.error
+                : (submitData.error?.message || submitData.detail || JSON.stringify(submitData).slice(0, 400));
+            throw new Error(`${task.queueLabel || '拆图'} 提交失败: ${errTxt}`);
+        }
+        return {
+            waitForResults: async () => {
+                const results = [];
+                const result = await pollOAIHKForSplit(model.pollEndpoint, submitData.request_id, qi, signal, task.queueLabel || '');
+                if (qs.cancelled || signal?.aborted) return results;
+                if (result && result.images) {
+                    for (const img of result.images) {
+                        if (!img.url) continue;
+                        let displayUrl = img.url;
+                        try {
+                            const dlResp = await api('POST', '/api/download-image', { url: img.url }, splitHkTm, signal);
+                            if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                        } catch (e) {
+                            console.warn(`[拆图-OAIHK] 图片下载失败，使用原始URL: ${e.message}`);
+                            showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL（入图库可能失败）`, 'warning');
+                        }
+                        results.push({ url: displayUrl, checked: false, filename: `拆图_${task.queueLabel}_${results.length + 1}.jpg`, outputType: 'png' });
+                    }
+                }
+                return results;
+            }
+        };
+    }
+
+    const modelId = qd.rhModelId;
+    const model = RH_MODELS[modelId];
+    const rhApiKey = state.modelConfig.rh_api_key || '';
+    const rhBaseUrl = state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
+    const payload = { prompt: task.prompt };
+    if (model?.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
+    if (model?.hasResolution) payload.resolution = qd.rhResolution || '1k';
+    if (qd.rhAspectRatio) payload.aspectRatio = qd.rhAspectRatio;
+    if (qs.running) {
+        qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} RH 已提交，继续下一张…`;
+        syncSplitProgressUI();
+    }
+    const data = await api('POST', '/api/rh-proxy', {
+        action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
+    }, 180000, signal);
+    if (data.status === 'FAILED') throw new Error(`${task.queueLabel || '拆图'} RH 提交失败`);
+    if (!data.taskId) throw new Error(`${task.queueLabel || '拆图'} RH 提交未返回 taskId`);
+    return {
+        waitForResults: async () => {
+            const results = [];
+            const result = await pollUntilDoneForSplit(rhApiKey, rhBaseUrl, data.taskId, qi, signal, Date.now());
+            if (qs.cancelled || signal?.aborted) return results;
+            if (result && result.results) {
+                for (const r of result.results) {
+                    if (r.url) results.push({ url: r.url, checked: false, filename: `拆图_${task.queueLabel}_${results.length + 1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' });
+                }
+            }
+            return results;
+        }
+    };
+}
+
+// 拆图批量生成：所有有数据的队列
+async function runSplitBatchGenerate() {
+    const qi = activeSplitQueue;
+    const qd = splitQueueData[qi];
+    if (!qd || !Array.isArray(qd.workItems) || qd.workItems.length === 0) {
+        showToast('当前队列没有拆图数据', 'warning');
+        return { cancelled: false, skipped: true };
+    }
+    const qs = splitGenerateStates[qi];
+    if (qs.running) {
+        showToast(`队列${qi+1}正在生成中`, 'error');
+        return { cancelled: false, skipped: true };
+    }
+
+    saveCurrentSplitQueueData();
+
+    const validItems = (qd.workItems || []).filter(item => (item?.cropRect && getSplitCropSourceUrl(item, qd)) || item?.croppedImageUrl || item?.imageUrl);
+    if (validItems.length === 0) {
+        showToast('当前队列没有可生成的拆图项', 'warning');
+        return { cancelled: false, skipped: true };
+    }
+
+    const platform = qd.apiPlatform || 'oaihk';
+    if (platform === 'oaihk') {
+        if (!OAIHK_MODELS[qd.oaihkModelId]) { showToast('请选择 OpenAI-HK 模型', 'error'); return { cancelled: false, skipped: true }; }
+    } else {
+        if (!RH_MODELS[qd.rhModelId]) { showToast('请选择模型', 'error'); return { cancelled: false, skipped: true }; }
+    }
+
+    qs.running = true;
+    qs.cancelled = false;
+    qs.abortController = new AbortController();
+    const signal = qs.abortController.signal;
+    const batchSlotCount = Math.max(1, qd.workItems.length);
+    qs.batchVisualTotal = batchSlotCount;
+    qs.batchVisualFilled = 0;
+    updateSplitGenerateBtnState();
+
+    const progressWrap = document.getElementById('split-progress-bar-wrap');
+    const progressBar = document.getElementById('split-progress-bar');
+    const progressText = document.getElementById('split-progress-text');
+    if (progressWrap) progressWrap.style.display = '';
+    if (progressText) progressText.style.display = '';
+    if (progressBar) progressBar.style.width = '0%';
+
+    const totalItems = Math.max(1, validItems.length);
+    let completedItems = 0;
+    let processedItems = 0;
+    qd.progressTotal = totalItems;
+    qd.progressDone = 0;
+    qd.failedItems = [];
+    updateSplitFailedUI(qi);
+    saveSplitQueueData();
+    renderSplitQueueNumberBar();
+
+    if (qi === activeSplitQueue) {
+        const grid = document.getElementById('split-result-grid');
+        renderSplitQueueResults(qi);
+        appendSplitResultPendingSlots(grid, batchSlotCount);
+    }
+
+    const allResults = [];
+    const splitGrid = qi === activeSplitQueue ? document.getElementById('split-result-grid') : null;
+    try {
+        const totalJobs = totalItems;
+        const finishedJobs = { n: 0 };
+        const pendingResultPromises = [];
+        const bumpSplitBatchVisualFilled = () => {
+            const st = splitGenerateStates[qi];
+            if (!st) return;
+            const cap = st.batchVisualTotal || 0;
+            st.batchVisualFilled = Math.min(cap, (st.batchVisualFilled || 0) + 1);
+        };
+
+        for (let itemIdx = 0; itemIdx < qd.workItems.length; itemIdx++) {
+            if (splitGenerateStates[qi]?.cancelled) break;
+            const item = qd.workItems[itemIdx];
+
+            let sourceUrl = '';
+            const cropSourceUrl = getSplitCropSourceUrl(item, qd);
+            if (item.cropRect && cropSourceUrl) {
+                try {
+                    const cropResult = await api('POST', '/api/free-crop-image', {
+                        image_url: cropSourceUrl,
+                        x: item.cropRect.x, y: item.cropRect.y,
+                        w: item.cropRect.w, h: item.cropRect.h
+                    });
+                    if (cropResult.ok && cropResult.url) {
+                        sourceUrl = cropResult.url;
+                        item.croppedImageUrl = cropResult.url;
+                    } else {
+                        showToast(`格子编号 ${item.number} 裁剪失败，跳过`, 'warning');
+                        recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum: item.number || (itemIdx + 1), reason: '裁剪失败' });
+                        processedItems++;
+                        if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '裁剪失败'));
+                        bumpSplitBatchVisualFilled();
+                        continue;
+                    }
+                } catch (e) {
+                    showToast(`格子编号 ${item.number} 裁剪请求失败: ${e.message}`, 'error');
+                    recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum: item.number || (itemIdx + 1), reason: '裁剪异常' });
+                    processedItems++;
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '裁剪异常'));
+                    bumpSplitBatchVisualFilled();
+                    continue;
+                }
+            }
+            if (!sourceUrl) {
+                sourceUrl = item.croppedImageUrl || item.imageUrl;
+            }
+            if (!sourceUrl) {
+                recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum: item.number || (itemIdx + 1), reason: '无图源' });
+                processedItems++;
+                if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '无图源'));
+                bumpSplitBatchVisualFilled();
+                continue;
+            }
+
+            let imageUrls = [sourceUrl];
+            if (item.materials) {
+                item.materials.forEach(m => { if (m) imageUrls.push(m); });
+            }
+            if (platform !== 'oaihk') {
+                imageUrls = imageUrls.map(u => u.startsWith('/') ? window.location.origin + u : u);
+            }
+            const prompt = buildSplitFullPrompt(item);
+            const task = { prompt, imageUrls, queueLabel: `拆图${item.number || (itemIdx + 1)}` };
+            const gridNum = item.number || (itemIdx + 1);
+            const materialIndex = qd.activeMaterialIndex || 0;
+            const job = { itemIdx, materialIndex, gridNum, task, prompt, sourceUrl };
+            processedItems++;
+            if (progressText) {
+                progressText.textContent = `队列${qi + 1} 正在提交 ${processedItems}/${totalItems}：格子 ${gridNum}`;
+            }
+            qs.progressText = `队列${qi + 1}: 已提交 ${Math.max(0, processedItems - 1)}/${totalItems}，等待返回 ${finishedJobs.n}/${totalItems}`;
+            syncSplitProgressUI();
+
+            try {
+                const submitted = await submitSingleTaskForSplitAsync(qi, task, platform, qd, signal);
+                qs.progressText = `队列${qi + 1}: 已提交 ${processedItems}/${totalItems}，等待返回 ${finishedJobs.n}/${totalItems}`;
+                syncSplitProgressUI();
+                pendingResultPromises.push(submitted.waitForResults().then(taskResults => ({ status: 'fulfilled', taskResults, job }), reason => ({ status: 'rejected', reason, job })).then(ent => {
+                    if (splitGenerateStates[qi]?.cancelled) return;
+                    const { itemIdx, prompt, sourceUrl, gridNum, materialIndex } = ent.job;
+                let taskResults = [];
+                    if (ent.status === 'fulfilled') {
+                        taskResults = ent.taskResults || [];
+                } else {
+                    console.warn('[拆图批量] 任务异常', ent.reason);
+                        recordSplitFailure(qi, { materialIndex, itemIndex: itemIdx, gridNum, reason: '请求异常' });
+                    if (!qs.cancelled) showToast(`格子编号 ${gridNum} 请求失败`, 'error');
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '请求异常'));
+                    bumpSplitBatchVisualFilled();
+                    finishedJobs.n++;
+                    if (progressText) progressText.textContent = `队列${qi + 1} 已处理 ${finishedJobs.n}/${totalJobs}（成功出图 ${completedItems}）`;
+                    if (progressBar) progressBar.style.width = `${Math.round((finishedJobs.n / totalJobs) * 100)}%`;
+                    qs.progressText = `队列${qi + 1}: 已完成 ${finishedJobs.n}/${totalJobs}（成功 ${completedItems}）`;
+                    qs.progressPercent = Math.round((finishedJobs.n / totalJobs) * 100);
+                    syncSplitProgressUI();
+                    return;
+                }
+
+                if (taskResults.length > 0) {
+                    for (const r of taskResults) {
+                        r._regenPrompt = prompt;
+                        r._regenImageUrl = sourceUrl;
+                        r.prompt = prompt;
+                            r._materialIndex = materialIndex;
+                    }
+                    allResults.push(...taskResults);
+                    qd.results = (qd.results || []).concat(taskResults);
+                    saveSplitQueueData();
+                    if (splitGrid) {
+                        const results = qd.results || [];
+                        const start = results.length - taskResults.length;
+                        for (let k = start; k < results.length; k++) {
+                            const el = createSplitResultCardElement(qi, results[k], k, results);
+                            if (k === start) fillSplitPendingSlotAt(splitGrid, itemIdx, el);
+                            else splitGrid.appendChild(el);
+                        }
+                    }
+                    completedItems++;
+                        removeSplitFailure(qi, materialIndex, itemIdx);
+                    qd.progressDone = completedItems;
+                    saveSplitQueueData();
+                    renderSplitQueueNumberBar();
+                } else {
+                    recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum, reason: '未返图' });
+                    if (!qs.cancelled) showToast(`格子编号 ${gridNum} 未返回图片`, 'warning');
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '未返图'));
+                }
+                bumpSplitBatchVisualFilled();
+                finishedJobs.n++;
+                if (progressText) progressText.textContent = `队列${qi + 1} 已处理 ${finishedJobs.n}/${totalJobs}（成功出图 ${completedItems}）`;
+                if (progressBar) progressBar.style.width = `${Math.round((finishedJobs.n / totalJobs) * 100)}%`;
+                qs.progressText = `队列${qi + 1}: 已完成 ${finishedJobs.n}/${totalJobs}（成功 ${completedItems}）`;
+                qs.progressPercent = Math.round((finishedJobs.n / totalJobs) * 100);
+                syncSplitProgressUI();
+                }));
+            } catch (e) {
+                if (!qs.cancelled) {
+                    console.warn('[拆图批量] 提交异常', e);
+                    recordSplitFailure(qi, { materialIndex, itemIndex: itemIdx, gridNum, reason: '提交异常' });
+                    showToast(`格子编号 ${gridNum} 提交失败`, 'error');
+                }
+                if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '提交异常'));
+                bumpSplitBatchVisualFilled();
+                finishedJobs.n++;
+            }
+        }
+
+        if (pendingResultPromises.length > 0) await Promise.allSettled(pendingResultPromises);
+    } catch (e) {
+        if (!qs.cancelled) showToast(`批量生成失败: ${e.message}`, 'error');
+    }
+
+    persistActiveSplitMaterial(qd);
+
+    if (allResults.length > 0 && qd.autoBackup !== false) {
+        await autoBackupSplitResults(allResults, qi);
+    }
+
+    const wasCancelled = qs.cancelled;
+    qs.running = false;
+    qs.cancelled = false;
+    qs.abortController = null;
+    qs.progressPercent = 0;
+    qs.progressText = '';
+    qs.batchVisualTotal = 0;
+    qs.batchVisualFilled = 0;
+    if (progressWrap) progressWrap.style.display = 'none';
+    if (progressText) progressText.style.display = 'none';
+    if (qi === activeSplitQueue) {
+        clearRemainingSplitResultPendingSlots(document.getElementById('split-result-grid'));
+        renderSplitQueueResults(qi);
+    }
+    renderSplitQueueNumberBar();
+    updateSplitGenerateBtnState();
+    syncSplitProgressUI();
+    saveSplitQueueData();
+
+    const failedCount = qd.failedItems?.length || 0;
+    if (allResults.length > 0) {
+        showToast(failedCount > 0 ? `队列${qi+1}批量完成：成功 ${allResults.length} 张，失败 ${failedCount} 张` : `队列${qi+1}批量生成完成！共${allResults.length}张`, failedCount > 0 ? 'warning' : 'success');
+        if (!wasCancelled) playSplitQueueCompleteChime();
+    } else if (wasCancelled) {
+        showToast(`队列${qi+1}已取消`, 'info');
+    } else {
+        showToast('生成未产出结果', 'warning');
+    }
+    return { cancelled: wasCancelled, skipped: false };
+}
+
+/** 当前队列全部素材：对各素材内已就绪的格子工作项顺序逐张生成 */
+async function runSplitBatchGenerateAllMaterials() {
+    const qi = activeSplitQueue;
+    const qd = splitQueueData[qi];
+    if (!qd) return { cancelled: false, skipped: true };
+
+    normalizeSplitQueueMaterials(qd);
+    persistActiveSplitMaterial(qd);
+
+    let totalWorkSlots = 0;
+    for (const m of qd.materials || []) {
+        totalWorkSlots += (m.workItems || []).length;
+    }
+    if (totalWorkSlots === 0) {
+        showToast('当前队列各素材均无格子工作项', 'warning');
+        return { cancelled: false, skipped: true };
+    }
+
+    let validPrefetch = 0;
+    for (const m of qd.materials || []) {
+        const qdCtx = Object.assign({}, qd, { gridImageUrl: m.gridImageUrl || '' });
+        for (const item of (m.workItems || [])) {
+            if ((item?.cropRect && getSplitCropSourceUrl(item, qdCtx)) || item?.croppedImageUrl || item?.imageUrl) {
+                validPrefetch++;
+            }
+        }
+    }
+    if (validPrefetch === 0) {
+        showToast('当前队列没有可生成的拆图项', 'warning');
+        return { cancelled: false, skipped: true };
+    }
+
+    const qs = splitGenerateStates[qi];
+    if (qs.running) {
+        showToast(`队列${qi + 1}正在生成中`, 'error');
+        return { cancelled: false, skipped: true };
+    }
+
+    saveCurrentSplitQueueData();
+
+    const platform = qd.apiPlatform || 'oaihk';
+    if (platform === 'oaihk') {
+        if (!OAIHK_MODELS[qd.oaihkModelId]) { showToast('请选择 OpenAI-HK 模型', 'error'); return { cancelled: false, skipped: true }; }
+    } else {
+        if (!RH_MODELS[qd.rhModelId]) { showToast('请选择模型', 'error'); return { cancelled: false, skipped: true }; }
+    }
+
+    const savedActiveMat = Math.max(0, Math.min(qd.activeMaterialIndex || 0, Math.max(0, qd.materials.length - 1)));
+
+    qs.running = true;
+    qs.cancelled = false;
+    qs.abortController = new AbortController();
+    const signal = qs.abortController.signal;
+    const batchSlotCount = Math.max(1, totalWorkSlots);
+    qs.batchVisualTotal = batchSlotCount;
+    qs.batchVisualFilled = 0;
+    updateSplitGenerateBtnState();
+
+    const progressWrap = document.getElementById('split-progress-bar-wrap');
+    const progressBar = document.getElementById('split-progress-bar');
+    const progressText = document.getElementById('split-progress-text');
+    if (progressWrap) progressWrap.style.display = '';
+    if (progressText) progressText.style.display = '';
+    if (progressBar) progressBar.style.width = '0%';
+
+    const totalItems = Math.max(1, validPrefetch);
+    let completedItems = 0;
+    qd.progressTotal = totalItems;
+    qd.progressDone = 0;
+    qd.failedItems = [];
+    updateSplitFailedUI(qi);
+    saveSplitQueueData();
+    renderSplitQueueNumberBar();
+
+    if (qi === activeSplitQueue) {
+        const grid = document.getElementById('split-result-grid');
+        renderSplitQueueResults(qi);
+        appendSplitResultPendingSlots(grid, batchSlotCount);
+    }
+
+    const allResults = [];
+    const splitGrid = qi === activeSplitQueue ? document.getElementById('split-result-grid') : null;
+
+    try {
+        const bumpSplitBatchVisualFilled = () => {
+            const st = splitGenerateStates[qi];
+            if (!st) return;
+            const cap = st.batchVisualTotal || 0;
+            st.batchVisualFilled = Math.min(cap, (st.batchVisualFilled || 0) + 1);
+        };
+
+        let globalSlot = 0;
+        const totalJobsAll = Math.max(1, validPrefetch);
+        const finishedJobsAll = { n: 0 };
+        const pendingResultPromises = [];
+        if (progressText) {
+            progressText.textContent = `队列${qi + 1} 全部素材 共 ${validPrefetch} 张，按顺序裁剪提交`;
+        }
+        qs.progressText = `队列${qi + 1}: 全部素材已提交 0/${totalJobsAll}，等待返回 0/${totalJobsAll}`;
+        qs.progressPercent = 2;
+        syncSplitProgressUI();
+
+        for (let mi = 0; mi < qd.materials.length; mi++) {
+            if (splitGenerateStates[qi]?.cancelled) break;
+            const m = qd.materials[mi];
+            const qdCtx = Object.assign({}, qd, { gridImageUrl: m.gridImageUrl || '' });
+            const items = m.workItems || [];
+            for (let wi = 0; wi < items.length; wi++) {
+                if (splitGenerateStates[qi]?.cancelled) break;
+                const item = items[wi];
+                const slotIdx = globalSlot++;
+
+                let sourceUrl = '';
+                const cropSourceUrl = getSplitCropSourceUrl(item, qdCtx);
+                if (item.cropRect && cropSourceUrl) {
+                    try {
+                        const cropResult = await api('POST', '/api/free-crop-image', {
+                            image_url: cropSourceUrl,
+                            x: item.cropRect.x, y: item.cropRect.y,
+                            w: item.cropRect.w, h: item.cropRect.h
+                        });
+                        if (cropResult.ok && cropResult.url) {
+                            sourceUrl = cropResult.url;
+                            item.croppedImageUrl = cropResult.url;
+                        } else {
+                            showToast(`素材 ${mi + 1} · 格子编号 ${item.number} 裁剪失败，跳过`, 'warning');
+                            recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '裁剪失败' });
+                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '裁剪失败'));
+                            bumpSplitBatchVisualFilled();
+                            continue;
+                        }
+                    } catch (e) {
+                        showToast(`素材 ${mi + 1} · 格子编号 ${item.number} 裁剪异常: ${e.message}`, 'error');
+                        recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '裁剪异常' });
+                        if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '裁剪异常'));
+                        bumpSplitBatchVisualFilled();
+                        continue;
+                    }
+                }
+                if (!sourceUrl) {
+                    sourceUrl = item.croppedImageUrl || item.imageUrl;
+                }
+                if (!sourceUrl) {
+                    recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '无图源' });
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '无图源'));
+                    bumpSplitBatchVisualFilled();
+                    continue;
+                }
+
+                let imageUrls = [sourceUrl];
+                if (item.materials) {
+                    item.materials.forEach(mat => { if (mat) imageUrls.push(mat); });
+                }
+                if (platform !== 'oaihk') {
+                    imageUrls = imageUrls.map(u => u.startsWith('/') ? window.location.origin + u : u);
+                }
+                const prompt = buildSplitFullPrompt(item);
+                const task = { prompt, imageUrls, queueLabel: `拆图M${mi + 1}-${item.number || (wi + 1)}` };
+                const gridNum = item.number || (wi + 1);
+                const job = { itemIdx: slotIdx, itemIndexInMaterial: wi, materialIndex: mi, gridNum, task, prompt, sourceUrl };
+                if (progressText) {
+                    progressText.textContent = `队列${qi + 1} 正在提交素材 ${mi + 1} · 格子 ${gridNum}`;
+                }
+                try {
+                    const submitted = await submitSingleTaskForSplitAsync(qi, task, platform, qd, signal);
+                    qs.progressText = `队列${qi + 1}: 全部素材已提交 ${pendingResultPromises.length + 1}/${totalJobsAll}，等待返回 ${finishedJobsAll.n}/${totalJobsAll}`;
+                    syncSplitProgressUI();
+                    pendingResultPromises.push(submitted.waitForResults().then(taskResults => ({ status: 'fulfilled', taskResults, job }), reason => ({ status: 'rejected', reason, job })).then(ent => {
+                        if (splitGenerateStates[qi]?.cancelled) return;
+                        const { itemIdx, itemIndexInMaterial, prompt, sourceUrl, materialIndex, gridNum } = ent.job;
+                        let taskResults = [];
+                        if (ent.status === 'fulfilled') {
+                            taskResults = ent.taskResults || [];
+                        } else {
+                            console.warn('[拆图全部素材] 任务异常', ent.reason);
+                            recordSplitFailure(qi, { materialIndex, itemIndex: itemIndexInMaterial, gridNum, reason: '请求异常' });
+                            if (!qs.cancelled) showToast(`素材 ${materialIndex + 1} · 格子编号 ${gridNum} 请求失败`, 'error');
+                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '请求异常'));
+                            bumpSplitBatchVisualFilled();
+                            finishedJobsAll.n++;
+                            if (progressText) progressText.textContent = `队列${qi + 1} 全部素材 已返回 ${finishedJobsAll.n}/${totalJobsAll}（成功 ${completedItems}）`;
+                            if (progressBar) progressBar.style.width = `${Math.round((finishedJobsAll.n / totalJobsAll) * 100)}%`;
+                            qs.progressText = `队列${qi + 1}: 全部素材返回 ${finishedJobsAll.n}/${totalJobsAll}（成功 ${completedItems}）`;
+                            qs.progressPercent = Math.round((finishedJobsAll.n / totalJobsAll) * 100);
+                            syncSplitProgressUI();
+                            return;
+                        }
+
+                        if (taskResults.length > 0) {
+                            for (const r of taskResults) {
+                                r._regenPrompt = prompt;
+                                r._regenImageUrl = sourceUrl;
+                                r.prompt = prompt;
+                                r._materialIndex = materialIndex;
+                            }
+                            allResults.push(...taskResults);
+                            qd.results = (qd.results || []).concat(taskResults);
+                            saveSplitQueueData();
+                            if (splitGrid) {
+                                const results = qd.results || [];
+                                const start = results.length - taskResults.length;
+                                for (let k = start; k < results.length; k++) {
+                                    const el = createSplitResultCardElement(qi, results[k], k, results);
+                                    if (k === start) fillSplitPendingSlotAt(splitGrid, itemIdx, el);
+                                    else splitGrid.appendChild(el);
+                                }
+                            }
+                            completedItems++;
+                            removeSplitFailure(qi, materialIndex, itemIndexInMaterial);
+                            qd.progressDone = completedItems;
+                            saveSplitQueueData();
+                            renderSplitQueueNumberBar();
+                        } else {
+                            recordSplitFailure(qi, { materialIndex, itemIndex: itemIndexInMaterial, gridNum, reason: '未返图' });
+                            if (!qs.cancelled) showToast(`素材 ${materialIndex + 1} · 格子编号 ${gridNum} 未返回图片`, 'warning');
+                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '未返图'));
+                        }
+                        bumpSplitBatchVisualFilled();
+                        finishedJobsAll.n++;
+                        if (progressText) progressText.textContent = `队列${qi + 1} 全部素材 已返回 ${finishedJobsAll.n}/${totalJobsAll}（成功 ${completedItems}）`;
+                        if (progressBar) progressBar.style.width = `${Math.round((finishedJobsAll.n / totalJobsAll) * 100)}%`;
+                        qs.progressText = `队列${qi + 1}: 全部素材返回 ${finishedJobsAll.n}/${totalJobsAll}（成功 ${completedItems}）`;
+                        qs.progressPercent = Math.round((finishedJobsAll.n / totalJobsAll) * 100);
+                        syncSplitProgressUI();
+                    }));
+                } catch (e) {
+                    if (!qs.cancelled) {
+                        console.warn('[拆图全部素材] 提交异常', e);
+                        recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum, reason: '提交异常' });
+                        showToast(`素材 ${mi + 1} · 格子编号 ${gridNum} 提交失败`, 'error');
+                    }
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('fail', '提交异常'));
+                    bumpSplitBatchVisualFilled();
+                    finishedJobsAll.n++;
+                }
+            }
+        }
+
+        if (pendingResultPromises.length > 0) await Promise.allSettled(pendingResultPromises);
+    } catch (e) {
+        if (!qs.cancelled) showToast(`全部素材批量失败: ${e.message}`, 'error');
+    }
+
+    persistActiveSplitMaterial(qd);
+    loadActiveSplitMaterialIntoQueue(qd, savedActiveMat);
+    splitImageUrl = qd.gridImageUrl || '';
+    splitGridImageUrl = splitImageUrl;
+
+    if (allResults.length > 0 && qd.autoBackup !== false) {
+        await autoBackupSplitResults(allResults, qi);
+    }
+
+    const wasCancelled = qs.cancelled;
+    qs.running = false;
+    qs.cancelled = false;
+    qs.abortController = null;
+    qs.progressPercent = 0;
+    qs.progressText = '';
+    qs.batchVisualTotal = 0;
+    qs.batchVisualFilled = 0;
+    if (progressWrap) progressWrap.style.display = 'none';
+    if (progressText) progressText.style.display = 'none';
+    if (qi === activeSplitQueue) {
+        clearRemainingSplitResultPendingSlots(document.getElementById('split-result-grid'));
+        renderSplitQueueResults(qi);
+        loadSplitQueueToUI(qi);
+        renderSplitMaterialTabs(qi);
+    }
+    renderSplitQueueNumberBar();
+    updateSplitGenerateBtnState();
+    syncSplitProgressUI();
+
+    const failedCount = qd.failedItems?.length || 0;
+    if (allResults.length > 0) {
+        showToast(failedCount > 0 ? `队列${qi + 1} 全部素材完成：成功 ${allResults.length} 张，失败 ${failedCount} 张` : `队列${qi + 1} 全部素材批量完成！共 ${allResults.length} 张`, failedCount > 0 ? 'warning' : 'success');
+        if (!wasCancelled) playSplitQueueCompleteChime();
+    } else if (wasCancelled) {
+        showToast(`队列${qi + 1}已取消`, 'info');
+    } else {
+        showToast('全部素材生成未产出结果', 'warning');
+    }
+    return { cancelled: wasCancelled, skipped: false };
+}
+
+async function runSplitRetryFailed() {
+    const qi = activeSplitQueue;
+    const qd = splitQueueData[qi];
+    const failed = Array.isArray(qd?.failedItems) ? [...qd.failedItems] : [];
+    if (!qd || failed.length === 0) {
+        showToast('当前拆图队列没有失败项', 'info');
+        return;
+    }
+    const qs = splitGenerateStates[qi];
+    if (qs.running) {
+        showToast(`队列${qi + 1}正在生成中`, 'error');
+        return;
+    }
+    saveCurrentSplitQueueData();
+    const platform = qd.apiPlatform || 'oaihk';
+    if (platform === 'oaihk') {
+        if (!OAIHK_MODELS[qd.oaihkModelId]) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
+    } else if (!RH_MODELS[qd.rhModelId]) {
+        showToast('请选择模型', 'error');
+        return;
+    }
+
+    qs.running = true;
+    qs.cancelled = false;
+    qs.abortController = new AbortController();
+    const signal = qs.abortController.signal;
+    qs.batchVisualTotal = failed.length;
+    qs.batchVisualFilled = 0;
+    qd.failedItems = [];
+    updateSplitFailedUI(qi);
+    updateSplitGenerateBtnState();
+
+    const progressWrap = document.getElementById('split-progress-bar-wrap');
+    const progressBar = document.getElementById('split-progress-bar');
+    const progressText = document.getElementById('split-progress-text');
+    if (progressWrap) progressWrap.style.display = '';
+    if (progressText) progressText.style.display = '';
+    if (progressBar) progressBar.style.width = '0%';
+    if (progressText) progressText.textContent = `队列${qi + 1} 重试失败项 0/${failed.length}（顺序逐张提交）`;
+
+    const grid = document.getElementById('split-result-grid');
+    renderSplitQueueResults(qi);
+    appendSplitResultPendingSlots(grid, failed.length);
+
+    const apiJobs = [];
+    let slotIdx = 0;
+    for (const f of failed) {
+        const mi = Number.isFinite(f.materialIndex) ? f.materialIndex : (qd.activeMaterialIndex || 0);
+        const wi = Number.isFinite(f.itemIndex) ? f.itemIndex : 0;
+        const material = qd.materials?.[mi];
+        const item = material?.workItems?.[wi] || qd.workItems?.[wi];
+        if (!item) {
+            recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: f.gridNum, reason: '工作项不存在' });
+            continue;
+        }
+        const qdCtx = Object.assign({}, qd, { gridImageUrl: material?.gridImageUrl || qd.gridImageUrl || '' });
+        let sourceUrl = '';
+        const cropSourceUrl = getSplitCropSourceUrl(item, qdCtx);
+        if (item.cropRect && cropSourceUrl) {
+            try {
+                const cropResult = await api('POST', '/api/free-crop-image', {
+                    image_url: cropSourceUrl,
+                    x: item.cropRect.x, y: item.cropRect.y,
+                    w: item.cropRect.w, h: item.cropRect.h
+                });
+                if (cropResult.ok && cropResult.url) {
+                    sourceUrl = cropResult.url;
+                    item.croppedImageUrl = cropResult.url;
+                }
+            } catch (e) {
+                recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || f.gridNum, reason: '裁剪异常' });
+                fillSplitPendingSlotAt(grid, slotIdx++, splitPendingStubCard('fail', '裁剪异常'));
+                continue;
+            }
+        }
+        if (!sourceUrl) sourceUrl = item.croppedImageUrl || item.imageUrl;
+        if (!sourceUrl) {
+            recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || f.gridNum, reason: '无图源' });
+            fillSplitPendingSlotAt(grid, slotIdx++, splitPendingStubCard('fail', '无图源'));
+            continue;
+        }
+        let imageUrls = [sourceUrl];
+        if (item.materials) item.materials.forEach(mat => { if (mat) imageUrls.push(mat); });
+        if (platform !== 'oaihk') imageUrls = imageUrls.map(u => u.startsWith('/') ? window.location.origin + u : u);
+        const prompt = buildSplitFullPrompt(item);
+        apiJobs.push({ slotIndex: slotIdx++, materialIndex: mi, itemIndex: wi, gridNum: item.number || f.gridNum || (wi + 1), prompt, sourceUrl, task: { prompt, imageUrls, queueLabel: `重试M${mi + 1}-${item.number || (wi + 1)}` } });
+    }
+
+    let successCount = 0;
+    const allResults = [];
+    await mapWithConcurrency(apiJobs, SPLIT_GEN_CONCURRENCY, job =>
+        runWithSplitGlobalConcurrency(() =>
+            generateSingleTaskForSplit(qi, job.task, platform, qd, signal, { bypassDispatchChain: true }).then(taskResults => ({ job, taskResults }))
+        , signal),
+        (_idx, ent) => {
+            const job = apiJobs[_idx];
+            if (!job || qs.cancelled) return;
+            let taskResults = ent.status === 'fulfilled' ? (ent.value.taskResults || []) : [];
+            if (taskResults.length > 0) {
+                for (const r of taskResults) {
+                    r._regenPrompt = job.prompt;
+                    r._regenImageUrl = job.sourceUrl;
+                    r.prompt = job.prompt;
+                    r._materialIndex = job.materialIndex;
+                }
+                allResults.push(...taskResults);
+                qd.results = (qd.results || []).concat(taskResults);
+                successCount++;
+                qd.progressDone = (qd.progressDone || 0) + 1;
+                const results = qd.results || [];
+                const start = results.length - taskResults.length;
+                for (let k = start; k < results.length; k++) {
+                    const el = createSplitResultCardElement(qi, results[k], k, results);
+                    if (k === start) fillSplitPendingSlotAt(grid, job.slotIndex, el);
+                    else grid.appendChild(el);
+                }
+                saveSplitQueueData();
+            } else {
+                const reason = ent.status === 'rejected' ? '请求异常' : '未返图';
+                recordSplitFailure(qi, { materialIndex: job.materialIndex, itemIndex: job.itemIndex, gridNum: job.gridNum, reason });
+                fillSplitPendingSlotAt(grid, job.slotIndex, splitPendingStubCard('fail', reason));
+            }
+            const done = successCount + (qd.failedItems?.length || 0);
+            if (progressText) progressText.textContent = `队列${qi + 1} 重试失败项 ${Math.min(done, failed.length)}/${failed.length}（成功 ${successCount}）`;
+            if (progressBar) progressBar.style.width = `${Math.round((Math.min(done, failed.length) / failed.length) * 100)}%`;
+            qs.batchVisualFilled = Math.min(failed.length, (qs.batchVisualFilled || 0) + 1);
+            updateSplitFailedUI(qi);
+            renderSplitQueueNumberBar();
+        }
+    );
+
+    if (allResults.length > 0 && qd.autoBackup !== false) await autoBackupSplitResults(allResults, qi);
+    const remaining = qd.failedItems?.length || 0;
+    qs.running = false;
+    qs.cancelled = false;
+    qs.abortController = null;
+    qs.batchVisualTotal = 0;
+    qs.batchVisualFilled = 0;
+    if (progressWrap) progressWrap.style.display = 'none';
+    if (progressText) progressText.style.display = 'none';
+    clearRemainingSplitResultPendingSlots(grid);
+    renderSplitQueueResults(qi);
+    renderSplitQueueNumberBar();
+    updateSplitGenerateBtnState();
+    updateSplitFailedUI(qi);
+    saveSplitQueueData();
+    showToast(remaining > 0 ? `重试完成：成功 ${successCount} 张，仍失败 ${remaining} 张` : `失败项已全部重试成功，共 ${successCount} 张`, remaining > 0 ? 'warning' : 'success');
+}
+
+// 取消拆图生成
+function cancelSplitGenerate(targetQueue = activeSplitQueue) {
+    // 兼容直接作为点击事件回调时传入 PointerEvent
+    if (targetQueue && typeof targetQueue === 'object') {
+        targetQueue = activeSplitQueue;
+    }
+    targetQueue = Number.isInteger(targetQueue) ? targetQueue : activeSplitQueue;
+    const cancelByQueue = (q) => {
+        const state = splitGenerateStates[q];
+        if (!state?.running) return false;
+        state.cancelled = true;
+        state.abortController?.abort();
+        state.progressText = `队列${q + 1}取消中...`;
+        showToast(`已取消拆图队列${q + 1}生成`, 'info');
+        syncSplitProgressUI();
+        return true;
+    };
+    if (cancelByQueue(targetQueue)) return;
+    if (isAnySplitQueueGenerating()) {
+        showToast(`当前是队列${targetQueue + 1}，该队列未在生成。请切换到正在生成的队列再取消。`, 'info');
+    } else {
+        showToast('当前没有拆图任务在生成', 'info');
+    }
+}
+
+// 自动备份拆图结果（转JPG）
+async function autoBackupSplitResults(results, qi) {
+    const qd = splitQueueData[qi];
+    const downloadPath = getEffectiveSplitDownloadPath(qi);
+    const imagePrefix = qd.imagePrefix || document.getElementById('split-cfg-image-prefix')?.value?.trim() || '';
+    let counterStart = 1;
+    try {
+        const counterResp = await api('POST', '/api/next-image-counter', { count: results.length });
+        counterStart = counterResp.start;
+    } catch (e) {
+        console.error('获取拆图图片计数器失败:', e);
+    }
+
+    let idx = 0;
+    let backupCount = 0;
+    let failCount = 0;
+    const failReasons = [];
+    for (const item of results) {
+        if (!item?.url || item.url.startsWith('/api/gallery-image') || item.url.startsWith('/static/')) continue;
+        const num = formatImageNumber(counterStart + idx);
+        const filename = `${(imagePrefix || 'split').trim() || 'split'}-${num}.jpg`;
+        idx++;
+        const detail = await backupImageToLocalDetailed(item.url, filename, downloadPath);
+        if (detail.ok && detail.localUrl) {
+            item.url = detail.localUrl;
+            item.localUrl = detail.localUrl;
+            item.filename = filename;
+            backupCount++;
+        } else {
+            failCount++;
+            if (detail.error && failReasons.length < 3) failReasons.push(detail.error);
+        }
+    }
+
+    qd.results = qd.results || [];
+    saveSplitQueueData();
+    if (qi === activeSplitQueue) renderSplitQueueResults(qi);
+
+    if (backupCount > 0) {
+        showToast(`${backupCount}张拆图结果已统一入图库`, 'success');
+    }
+    if (failCount > 0) {
+        const reason = failReasons.length > 0 ? `，原因示例：${failReasons.join('；')}` : '';
+        const msg = `${failCount}张拆图结果入图库失败（请确认后端已重启到最新版本）${reason}`;
+        console.warn(msg, { qi, results });
+        showToast(msg, 'error');
+    }
+}
+
+// JPG下载函数（复用已有逻辑）
+async function downloadImageAsJpg(url, prefix, downloadPath) {
+    try {
+        const ts = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const defaultPrefix = (prefix || 'split').trim() || 'split';
+        const filename = `${defaultPrefix}_${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.jpg`;
+        const resp = await api('POST', '/api/save-image-to-path', {
+            url: url,
+            path: downloadPath || '~/Downloads/AI生图/',
+            filename
+        });
+        if (resp.ok || resp.success) {
+            logAction('download', '自动下载图片(JPG)', { url, path: downloadPath });
+            return { ok: true, path: resp.path || '' };
+        }
+        return { ok: false, error: resp.error || '保存失败' };
+    } catch(e) {
+        console.error('自动下载失败:', e);
+        return { ok: false, error: e?.message || '请求失败' };
+    }
+}
+
+// ========== 拆图自由裁剪编辑器 ==========
+
+let splitCropState = {
+    image: null,
+    imageUrl: '',
+    queueIdx: -1,
+    imgDisplayX: 0, imgDisplayY: 0, imgDisplayW: 0, imgDisplayH: 0,
+    cropX: 0, cropY: 0, cropW: 0, cropH: 0,
+    dragging: false, dragType: '',
+    dragStartX: 0, dragStartY: 0,
+    cropStartX: 0, cropStartY: 0, cropStartW: 0, cropStartH: 0,
+    imgStartX: 0, imgStartY: 0,
+    viewScale: 1,
+    spaceDown: false,
+    cropWheelMode: false,
+    activePreset: null,
+};
+
+const SPLIT_CROP_HANDLE_SIZE = 8;
+
+function resizeSplitCropCanvasForImage(canvas, img) {
+    if (!canvas || !img) return;
+    const viewportW = window.innerWidth || 0;
+    const viewportH = window.innerHeight || 0;
+    const maxW = viewportW > 0 ? Math.min(980, viewportW - 96) : 960;
+    const maxH = viewportH > 0 ? Math.min(720, viewportH - 210) : 720;
+    const aspect = img.width / img.height || 1;
+    let canvasW = maxW;
+    let canvasH = canvasW / aspect;
+    if (canvasH > maxH) {
+        canvasH = maxH;
+        canvasW = canvasH * aspect;
+    }
+    if (canvasW < 520) {
+        canvasW = 520;
+        canvasH = canvasW / aspect;
+    }
+    if (canvasH < 360 && maxH >= 360) {
+        canvasH = 360;
+        canvasW = canvasH * aspect;
+    }
+    canvas.width = Math.round(canvasW);
+    canvas.height = Math.round(canvasH);
+}
+
+function getSplitCropRelRect() {
+    const s = splitCropState;
+    if (!s.imgDisplayW || !s.imgDisplayH) return { x: 0, y: 0, w: 1, h: 1 };
+    return {
+        x: (s.cropX - s.imgDisplayX) / s.imgDisplayW,
+        y: (s.cropY - s.imgDisplayY) / s.imgDisplayH,
+        w: s.cropW / s.imgDisplayW,
+        h: s.cropH / s.imgDisplayH
+    };
+}
+
+function setSplitCropFromRelRect(rect) {
+    const s = splitCropState;
+    const r = rect || { x: 0, y: 0, w: 1, h: 1 };
+    s.cropX = s.imgDisplayX + r.x * s.imgDisplayW;
+    s.cropY = s.imgDisplayY + r.y * s.imgDisplayH;
+    s.cropW = r.w * s.imgDisplayW;
+    s.cropH = r.h * s.imgDisplayH;
+}
+
+function constrainSplitImageView(canvas) {
+    const s = splitCropState;
+    const cw = canvas.width;
+    const ch = canvas.height;
+    if (s.imgDisplayW <= cw) {
+        s.imgDisplayX = (cw - s.imgDisplayW) / 2;
+    } else {
+        s.imgDisplayX = Math.min(0, Math.max(cw - s.imgDisplayW, s.imgDisplayX));
+    }
+    if (s.imgDisplayH <= ch) {
+        s.imgDisplayY = (ch - s.imgDisplayH) / 2;
+    } else {
+        s.imgDisplayY = Math.min(0, Math.max(ch - s.imgDisplayH, s.imgDisplayY));
+    }
+}
+
+function zoomSplitCropImage(canvas, scaleFactor, centerX, centerY) {
+    const s = splitCropState;
+    if (!s.image) return;
+    const relRect = getSplitCropRelRect();
+    const nextScale = Math.max(1, Math.min(6, s.viewScale * scaleFactor));
+    if (Math.abs(nextScale - s.viewScale) < 0.001) return;
+    const imagePointX = (centerX - s.imgDisplayX) / s.imgDisplayW;
+    const imagePointY = (centerY - s.imgDisplayY) / s.imgDisplayH;
+    s.viewScale = nextScale;
+    s.imgDisplayW = canvas.width * nextScale;
+    s.imgDisplayH = canvas.height * nextScale;
+    s.imgDisplayX = centerX - imagePointX * s.imgDisplayW;
+    s.imgDisplayY = centerY - imagePointY * s.imgDisplayH;
+    constrainSplitImageView(canvas);
+    setSplitCropFromRelRect(relRect);
+    drawSplitCropCanvas(canvas);
+}
+
+function panSplitCropImage(canvas, dx, dy) {
+    const s = splitCropState;
+    const relRect = getSplitCropRelRect();
+    s.imgDisplayX = s.imgStartX + dx;
+    s.imgDisplayY = s.imgStartY + dy;
+    constrainSplitImageView(canvas);
+    setSplitCropFromRelRect(relRect);
+    drawSplitCropCanvas(canvas);
+}
+
+// 预设模式裁剪框计算：根据预设类型和编号，返回归一化坐标 {x,y,w,h}
+function getSplitCropPresetRect(preset, itemNumber, imgW, imgH) {
+    if (!preset || !itemNumber || itemNumber < 1) return null;
+    const is4 = preset.startsWith('4grid');
+    const isPortrait = preset.endsWith('portrait');
+    const cols = is4 ? 2 : 3;
+    const rows = is4 ? 2 : 3;
+    // 每格目标宽高比
+    const cellAspect = isPortrait ? 3 / 4 : 4 / 3; // w/h
+
+    // 整图宽高比
+    const imgAspect = imgW / imgH;
+
+    // 计算网格总区域：在整图中居中放置，使每格恰好满足目标宽高比
+    // 每格宽 = gridW/cols, 每格高 = gridH/rows
+    // cellAspect = (gridW/cols) / (gridH/rows) = gridW*rows / (gridH*cols)
+    // gridW/gridH = cellAspect * cols / rows
+    const gridAspect = cellAspect * cols / rows;
+
+    let gridW, gridH, gridX, gridY;
+    if (imgAspect > gridAspect) {
+        // 图更宽，grid高度占满
+        gridH = 1;
+        gridW = gridAspect / imgAspect;
+        gridX = (1 - gridW) / 2;
+        gridY = 0;
+    } else {
+        // 图更高，grid宽度占满
+        gridW = 1;
+        gridH = (imgAspect / gridAspect);
+        gridX = 0;
+        gridY = (1 - gridH) / 2;
+    }
+
+    const cellW = gridW / cols;
+    const cellH = gridH / rows;
+    const idx = itemNumber - 1;
+    const col = idx % cols;
+    const row = Math.floor(idx / cols);
+
+    if (row >= rows) return null; // 编号超出网格范围
+
+    return {
+        x: gridX + col * cellW,
+        y: gridY + row * cellH,
+        w: cellW,
+        h: cellH
+    };
+}
+
+function openSplitCropEditor(queueIdx) {
+    const qd = splitQueueData[queueIdx];
+    if (!qd) return;
+    const item = getActiveSplitWorkItem(queueIdx);
+    // 裁剪预览模式：始终加载原图（gridImageUrl），这样用户可以调整裁剪框恢复被裁掉的画面
+    const imageUrl = item?.gridImageUrl || item?.croppedImageUrl || item?.imageUrl;
+    if (!imageUrl) return;
+
+    splitCropState.queueIdx = queueIdx;
+    splitCropState.imageUrl = imageUrl;
+
+    // 确定当前应激活的预设：workItem > 队列 > 全局默认
+    const effectivePreset = item?.cropPreset || qd.cropPreset || state.modelConfig?.defaultCropPreset || null;
+    splitCropState.activePreset = effectivePreset;
+
+    const modal = document.getElementById('modal-split-crop');
+    const canvas = document.getElementById('split-crop-canvas');
+    if (!modal || !canvas) return;
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+        splitCropState.image = img;
+        resizeSplitCropCanvasForImage(canvas, img);
+        const cw = canvas.width;
+        const ch = canvas.height;
+        const dx = 0;
+        const dy = 0;
+        const dw = cw;
+        const dh = ch;
+
+        splitCropState.imgDisplayX = dx;
+        splitCropState.imgDisplayY = dy;
+        splitCropState.imgDisplayW = dw;
+        splitCropState.imgDisplayH = dh;
+        splitCropState.viewScale = 1;
+        splitCropState.dragging = false;
+        splitCropState.dragType = '';
+        splitCropState.spaceDown = false;
+        splitCropState.cropWheelMode = false;
+
+        // 手动调整过的裁剪框必须优先，预设只用于首次创建或用户重新点预设。
+        let appliedPreset = false;
+        if (item?.cropRect) {
+            const r = item.cropRect;
+            splitCropState.cropX = dx + r.x * dw;
+            splitCropState.cropY = dy + r.y * dh;
+            splitCropState.cropW = r.w * dw;
+            splitCropState.cropH = r.h * dh;
+        } else if (effectivePreset && item?.number) {
+            const presetRect = getSplitCropPresetRect(effectivePreset, item.number, img.width, img.height);
+            if (presetRect) {
+                splitCropState.cropX = dx + presetRect.x * dw;
+                splitCropState.cropY = dy + presetRect.y * dh;
+                splitCropState.cropW = presetRect.w * dw;
+                splitCropState.cropH = presetRect.h * dh;
+                appliedPreset = true;
+            }
+        }
+        if (!item?.cropRect && !appliedPreset) {
+            splitCropState.cropX = dx;
+            splitCropState.cropY = dy;
+            splitCropState.cropW = dw;
+            splitCropState.cropH = dh;
+        }
+
+        // 更新预设按钮高亮状态
+        updateSplitCropPresetButtons();
+
+        drawSplitCropCanvas(canvas);
+        modal.style.display = '';
+    };
+    img.src = imageUrl;
+}
+
+// 更新预设按钮高亮和默认星标
+function updateSplitCropPresetButtons() {
+    const btns = document.querySelectorAll('.split-crop-preset-btn');
+    const defaultPreset = state.modelConfig?.defaultCropPreset || null;
+    btns.forEach(btn => {
+        const p = btn.dataset.preset;
+        btn.classList.toggle('active', p === splitCropState.activePreset);
+        btn.classList.toggle('is-default', p === defaultPreset);
+    });
+}
+
+// 应用预设模式到当前裁剪框
+function applySplitCropPreset(preset) {
+    const s = splitCropState;
+    if (!s.image) return;
+    const item = getActiveSplitWorkItem(s.queueIdx);
+    if (!item?.number) return;
+
+    const presetRect = getSplitCropPresetRect(preset, item.number, s.image.width, s.image.height);
+    if (!presetRect) {
+        showToast('编号超出该预设网格范围', 'warning');
+        return;
+    }
+
+    s.activePreset = preset;
+    s.cropX = s.imgDisplayX + presetRect.x * s.imgDisplayW;
+    s.cropY = s.imgDisplayY + presetRect.y * s.imgDisplayH;
+    s.cropW = presetRect.w * s.imgDisplayW;
+    s.cropH = presetRect.h * s.imgDisplayH;
+
+    const canvas = document.getElementById('split-crop-canvas');
+    if (canvas) drawSplitCropCanvas(canvas);
+    updateSplitCropPresetButtons();
+}
+
+function drawSplitCropCanvas(canvas) {
+    const ctx = canvas.getContext('2d');
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const s = splitCropState;
+
+    ctx.clearRect(0, 0, cw, ch);
+    if (s.image) ctx.drawImage(s.image, s.imgDisplayX, s.imgDisplayY, s.imgDisplayW, s.imgDisplayH);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, cw, s.cropY);
+    ctx.fillRect(0, s.cropY + s.cropH, cw, ch - s.cropY - s.cropH);
+    ctx.fillRect(0, s.cropY, s.cropX, s.cropH);
+    ctx.fillRect(s.cropX + s.cropW, s.cropY, cw - s.cropX - s.cropW, s.cropH);
+
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(s.cropX, s.cropY, s.cropW, s.cropH);
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i <= 2; i++) {
+        const xLine = s.cropX + (s.cropW * i) / 3;
+        ctx.beginPath(); ctx.moveTo(xLine, s.cropY); ctx.lineTo(xLine, s.cropY + s.cropH); ctx.stroke();
+        const yLine = s.cropY + (s.cropH * i) / 3;
+        ctx.beginPath(); ctx.moveTo(s.cropX, yLine); ctx.lineTo(s.cropX + s.cropW, yLine); ctx.stroke();
+    }
+
+    const hs = SPLIT_CROP_HANDLE_SIZE;
+    ctx.fillStyle = '#fff';
+    const corners = [[s.cropX, s.cropY], [s.cropX + s.cropW, s.cropY], [s.cropX, s.cropY + s.cropH], [s.cropX + s.cropW, s.cropY + s.cropH]];
+    for (const [cx, cy] of corners) ctx.fillRect(cx - hs/2, cy - hs/2, hs, hs);
+}
+
+function getSplitCropCanvasPos(canvas, e) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: (e.clientX - rect.left) * (canvas.width / rect.width), y: (e.clientY - rect.top) * (canvas.height / rect.height) };
+}
+
+function getSplitCropHitZone(mx, my) {
+    const s = splitCropState;
+    const hs = SPLIT_CROP_HANDLE_SIZE + 4;
+    if (Math.abs(mx - s.cropX) < hs && Math.abs(my - s.cropY) < hs) return 'tl';
+    if (Math.abs(mx - (s.cropX + s.cropW)) < hs && Math.abs(my - s.cropY) < hs) return 'tr';
+    if (Math.abs(mx - s.cropX) < hs && Math.abs(my - (s.cropY + s.cropH)) < hs) return 'bl';
+    if (Math.abs(mx - (s.cropX + s.cropW)) < hs && Math.abs(my - (s.cropY + s.cropH)) < hs) return 'br';
+    if (mx >= s.cropX && mx <= s.cropX + s.cropW && my >= s.cropY && my <= s.cropY + s.cropH) return 'move';
+    return '';
+}
+
+function constrainSplitCropBox() {
+    const s = splitCropState;
+    const minSize = 20;
+    s.cropW = Math.max(minSize, s.cropW);
+    s.cropH = Math.max(minSize, s.cropH);
+    if (s.cropX < s.imgDisplayX) s.cropX = s.imgDisplayX;
+    if (s.cropY < s.imgDisplayY) s.cropY = s.imgDisplayY;
+    if (s.cropX + s.cropW > s.imgDisplayX + s.imgDisplayW) s.cropX = s.imgDisplayX + s.imgDisplayW - s.cropW;
+    if (s.cropY + s.cropH > s.imgDisplayY + s.imgDisplayH) s.cropY = s.imgDisplayY + s.imgDisplayH - s.cropH;
+    if (s.cropX < s.imgDisplayX) { s.cropX = s.imgDisplayX; s.cropW = Math.max(minSize, s.imgDisplayW); }
+    if (s.cropY < s.imgDisplayY) { s.cropY = s.imgDisplayY; s.cropH = Math.max(minSize, s.imgDisplayH); }
+}
+
+async function confirmSplitCrop() {
+    const s = splitCropState;
+    if (!s.image) return;
+
+    const relX = (s.cropX - s.imgDisplayX) / s.imgDisplayW;
+    const relY = (s.cropY - s.imgDisplayY) / s.imgDisplayH;
+    const relW = s.cropW / s.imgDisplayW;
+    const relH = s.cropH / s.imgDisplayH;
+    const x = Math.max(0, Math.min(1, relX));
+    const y = Math.max(0, Math.min(1, relY));
+    const w = Math.max(0.01, Math.min(1 - x, relW));
+    const h = Math.max(0.01, Math.min(1 - y, relH));
+
+    // 预览模式：只更新cropRect，不调用裁剪API，运行拆图时才实际裁剪
+    const activeItem = getActiveSplitWorkItem(s.queueIdx);
+    if (activeItem) {
+        activeItem.gridImageUrl = activeItem.gridImageUrl || splitQueueData[s.queueIdx]?.gridImageUrl || s.imageUrl || activeItem.imageUrl || '';
+        activeItem.cropRect = { x, y, w, h };
+        activeItem.croppedImageUrl = '';  // 清除旧裁剪缓存，下次生成时重新裁剪
+        // 写入预设到workItem
+        activeItem.cropPreset = s.activePreset || null;
+        syncActiveSplitItemToQueue(s.queueIdx);
+    }
+    // 队列继承：将预设写入队列，后续图自动使用
+    if (s.activePreset && s.queueIdx >= 0) {
+        const qd = splitQueueData[s.queueIdx];
+        if (qd) qd.cropPreset = s.activePreset;
+    }
+    const splitModeRadio = document.querySelector('input[name="split-mode"]:checked')?.value || 'crop';
+    if (splitModeRadio === 'crop' && activeItem?.number) {
+        propagateLearnedSplitCropLayout(s.queueIdx, activeItem.number, { x, y, w, h });
+        const afterItem = getActiveSplitWorkItem(s.queueIdx);
+        if (s.queueIdx === activeSplitQueue) updateSplitCropOverlay(afterItem);
+    } else if (s.queueIdx === activeSplitQueue) {
+        updateSplitCropOverlay(activeItem);
+    }
+    const qdCropQueue = splitQueueData[s.queueIdx];
+    if (qdCropQueue) qdCropQueue.splitAspectRatioManualOverride = false;
+    applySplitAutoAspectRatioFromCrop(s.queueIdx);
+    saveSplitQueueData();
+    showToast('裁剪框已更新', 'success');
+    document.getElementById('modal-split-crop').style.display = 'none';
+}
+
+// ========== 拆图模式事件绑定 ==========
+
+document.addEventListener('DOMContentLoaded', () => {
+    renderDiagStatusBar();
+    runDiagHealthCheck();
+    setInterval(runDiagHealthCheck, 20000);
+    document.getElementById('btn-diag-refresh')?.addEventListener('click', runDiagHealthCheck);
+
+    // 后端能力自检：避免前端新版本 + 后端旧版本导致“结果丢失/图库空”
+    (async () => {
+        try {
+            await api('GET', '/api/split-queue-data', null, 12000);
+        } catch (e) {
+            if ((e?.message || '').includes('404')) {
+                showToast('后端版本过旧：缺少拆图队列接口，请重启软件后端', 'error');
+            }
+        }
+        try {
+            await api('GET', '/api/gallery', null, 12000);
+        } catch (e) {
+            if ((e?.message || '').includes('404')) {
+                showToast('后端版本过旧：缺少图库接口，请重启软件后端', 'error');
+            }
+        }
+    })();
+
+    // 拆图左侧素材库：搜索与新增分类
+    document.getElementById('split-img-lib-search')?.addEventListener('input', () => renderSplitLibrary());
+    document.getElementById('btn-split-add-img-lib-category')?.addEventListener('click', async () => {
+        const name = await showPrompt('输入新素材分类名称', '', '分类名称');
+        if (!name || !name.trim()) return;
+        try {
+            const cat = await api('POST', '/api/image-library', { name: name.trim() });
+            imageState.library.push(cat);
+            imageState.expandedLibCategory = cat.id;
+            imageState.loaded = true;
+            await renderImageLibrary();
+            showToast('素材分类添加成功', 'success');
+        } catch (e) {
+            showToast('添加分类失败: ' + e.message, 'error');
+        }
+    });
+
+    // 编号点选按钮
+    document.querySelectorAll('.split-num-btn').forEach(btn => {
+        // 仅绑定九宫格编号选择，不绑定工作项tab按钮
+        if (!btn.closest('.grid-split-number-row')) return;
+        btn.addEventListener('click', () => {
+            const num = parseInt(btn.dataset.num, 10);
+            if (!Number.isFinite(num)) return;
+            const qd = splitQueueData[activeSplitQueue];
+            if (!qd) return;
+            if (!Array.isArray(qd.selectedNums)) qd.selectedNums = [];
+            const idx = qd.selectedNums.indexOf(num);
+            if (idx >= 0) {
+                qd.selectedNums.splice(idx, 1);
+            } else {
+                qd.selectedNums.push(num);
+            }
+            renderSplitNumSelectionForQueue(activeSplitQueue);
+            saveSplitQueueData();
+        });
+    });
+
+    // 确认拆图按钮
+    document.getElementById('btn-split-confirm')?.addEventListener('click', confirmSplitGrid);
+
+    // 拆图模式切换时加载对应模板
+    document.querySelectorAll('input[name="split-mode"]').forEach(radio => {
+        radio.addEventListener('change', () => loadSplitTemplate(radio.value));
+    });
+    document.getElementById('btn-split-template-add')?.addEventListener('click', openSplitTemplateAddModal);
+    document.getElementById('btn-split-template-manage')?.addEventListener('click', openSplitTemplateManageModal);
+    // 初始化模板按钮
+    renderSplitTemplateButtons();
+    // 初始化素材槽位
+    _initSplitMaterialSlots();
+
+    // 上传区域
+    const splitDropZone = document.getElementById('split-drop-zone');
+    const splitFileInput = document.getElementById('split-file');
+    if (splitDropZone && splitFileInput) {
+        const openSplitGallery = () => {
+            galleryPickerContext = { mode: 'split', recentDays: 3 };
+            galleryRecentDays = 3;
+            openModal('modal-gallery');
+            loadGallery();
+        };
+        splitDropZone.addEventListener('click', (ev) => {
+            if (ev.target.closest('#btn-split-pick-local') || ev.target.closest('#split-open-gallery')) return;
+            openSplitGallery();
+        });
+        document.getElementById('btn-split-pick-local')?.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            splitFileInput.click();
+        });
+        document.getElementById('split-open-gallery')?.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            openSplitGallery();
+        });
+        splitFileInput.addEventListener('change', (e) => {
+            const fl = e.target.files;
+            if (fl?.length) handleSplitUpload(fl);
+            e.target.value = '';
+        });
+        splitDropZone.addEventListener('dragover', (e) => { e.preventDefault(); splitDropZone.classList.add('dragover'); });
+        splitDropZone.addEventListener('dragleave', () => splitDropZone.classList.remove('dragover'));
+        splitDropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            splitDropZone.classList.remove('dragover');
+            const fl = e.dataTransfer?.files;
+            if (fl?.length) handleSplitUpload(fl);
+        });
+    }
+
+    // 预览图删除
+    document.getElementById('split-delete-preview')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        resetSplitPreview();
+    });
+
+    // 拆图生成按钮
+    document.getElementById('btn-split-generate')?.addEventListener('click', () => runSplitGenerate(activeSplitQueue));
+    document.getElementById('btn-split-batch-generate')?.addEventListener('click', runSplitBatchGenerate);
+    document.getElementById('btn-split-batch-generate-all')?.addEventListener('click', runSplitBatchGenerateAllMaterials);
+    document.getElementById('btn-split-cancel')?.addEventListener('click', () => cancelSplitGenerate(activeSplitQueue));
+
+    // 拆图提示词输入
+    document.getElementById('split-prompt-cn')?.addEventListener('input', () => {
+        const item = getActiveSplitWorkItem(activeSplitQueue);
+        if (item) item.promptCn = document.getElementById('split-prompt-cn').value;
+    });
+    document.getElementById('btn-split-sync-prompt-all')?.addEventListener('click', syncSplitPromptToAllWorkItems);
+
+    // 拆图API平台切换（切换通道后按裁剪横竖重算默认比例）
+    document.getElementById('split-cfg-api-platform')?.addEventListener('change', () => {
+        readSplitApiConfigToQueue(activeSplitQueue);
+        const qdPl = splitQueueData[activeSplitQueue];
+        syncSplitRhAspectRatioSelectForQueue(qdPl);
+        applySplitAutoAspectRatioFromCrop(activeSplitQueue);
+        updateSplitApiPlatformUI();
+        saveSplitQueueData();
+    });
+    document.getElementById('split-cfg-rh-seed-mode')?.addEventListener('change', () => {
+        const seedInput = document.getElementById('split-cfg-rh-seed');
+        if (seedInput) seedInput.disabled = document.getElementById('split-cfg-rh-seed-mode')?.value !== 'fixed';
+    });
+    document.getElementById('split-cfg-download-path')?.addEventListener('change', () => {
+        const qd = splitQueueData[activeSplitQueue];
+        if (!qd) return;
+        const el = document.getElementById('split-cfg-download-path');
+        if (el) el.dataset.downloadPathInherited = '0';
+        qd.downloadPath = cleanDownloadPath(el?.value);
+        saveSplitQueueData();
+    });
+    document.getElementById('split-cfg-image-prefix')?.addEventListener('change', () => {
+        const qd = splitQueueData[activeSplitQueue];
+        if (!qd) return;
+        qd.imagePrefix = document.getElementById('split-cfg-image-prefix')?.value?.trim() || '';
+        saveSplitQueueData();
+    });
+    document.getElementById('split-cfg-auto-backup')?.addEventListener('change', () => {
+        const qd = splitQueueData[activeSplitQueue];
+        if (!qd) return;
+        qd.autoBackup = document.getElementById('split-cfg-auto-backup')?.checked ?? true;
+        saveSplitQueueData();
+    });
+
+    // 拆图文件夹选择
+    document.getElementById('btn-split-select-folder')?.addEventListener('click', async () => {
+        try {
+            const currentPath = getEffectiveSplitDownloadPath(activeSplitQueue);
+            const resp = await api('POST', '/api/select-folder', { initial_dir: currentPath });
+            if (resp && resp.path) {
+                markDownloadPathInputAsOwn('split-cfg-download-path', resp.path);
+                splitQueueData[activeSplitQueue].downloadPath = resp.path;
+                saveSplitQueueData();
+                showToast(`拆图队列${activeSplitQueue + 1}已设置下载路径: ${resp.path}`, 'success');
+            }
+        } catch(e) {
+            showToast('选择文件夹失败: ' + e.message, 'error');
+        }
+    });
+
+    // 拆图清除结果按钮
+    document.getElementById('btn-split-clear-results')?.addEventListener('click', () => {
+        if (!confirm('确认清除当前队列所有生成结果？')) return;
+        const qd = splitQueueData[activeSplitQueue];
+        if (!qd) return;
+        // 若该队列仍在生成，先阻止清除，避免状态错乱
+        if (splitGenerateStates[activeSplitQueue]?.running) {
+            showToast('当前队列仍在生成，请先取消后再清除结果', 'warning');
+            return;
+        }
+        qd.results = [];
+        // 清除顶部“总数-已完成”状态标记
+        qd.progressTotal = 0;
+        qd.progressDone = 0;
+        // 清除工作区引用（九宫格/工作项），恢复空白队列状态
+        qd.gridImageUrl = '';
+        qd.sourceFilename = '';
+        qd.learnedGridLayout = null;
+        qd.workItems = [];
+        qd.activeItemIndex = 0;
+        qd.imageUrl = '';
+        qd.croppedImageUrl = '';
+        qd.promptCn = '';
+        qd.number = 0;
+        qd.selectedNums = [];
+        qd.selectedPrefixIds = [];
+        qd.selectedSuffixIds = [];
+        qd.splitAspectRatioManualOverride = false;
+        qd.materials = [];
+        qd.activeMaterialIndex = 0;
+        normalizeSplitQueueMaterials(qd);
+        loadActiveSplitMaterialIntoQueue(qd, 0);
+        // 恢复该队列模型到拆图默认模型
+        const splitConfig = getSplitDefaultModelConfig();
+        if (splitConfig) {
+            qd.apiPlatform = splitConfig.platform || 'oaihk';
+            qd.rhModelId = splitConfig.rhModelId || qd.rhModelId || '';
+            qd.oaihkModelId = splitConfig.oaihkModelId || qd.oaihkModelId || 'fal-ai/banana/v3.1/flash/2k';
+            qd.rhResolution = splitConfig.rhResolution || qd.rhResolution || '1k';
+            qd.rhAspectRatio = splitConfig.rhAspectRatio || qd.rhAspectRatio || '3:4';
+            qd.oaihkAspectRatio = splitConfig.oaihkAspectRatio || qd.oaihkAspectRatio || '3:4';
+        } else {
+            qd.apiPlatform = 'oaihk';
+            qd.oaihkModelId = 'fal-ai/banana/v3.1/flash/2k';
+            qd.oaihkAspectRatio = '3:4';
+            qd.rhResolution = qd.rhResolution || '1k';
+            qd.rhAspectRatio = '3:4';
+        }
+        saveSplitQueueData();
+        writeSplitApiConfigFromQueue(activeSplitQueue);
+        applySplitSourcePreview(activeSplitQueue);
+        renderSplitMaterialTabs(activeSplitQueue);
+        renderSplitNumSelectionForQueue(activeSplitQueue);
+        renderSplitWorkItemTabs(activeSplitQueue);
+        renderSplitQueueResults(activeSplitQueue);
+        renderSplitQueueNumberBar();
+        updateSplitGenerateBtnState();
+        updateSplitDefaultModelBadge();
+        showToast('已清除该列队结果与状态，模型已恢复默认', 'success');
+    });
+
+    // 拆图下载按钮
+    const splitDownloadAllHandler = async () => {
+        const qd = splitQueueData[activeSplitQueue];
+        if (!qd || !qd.results || qd.results.length === 0) { showToast('没有可下载的结果', 'warning'); return; }
+        let okCount = 0;
+        let failCount = 0;
+        const failReasons = [];
+        for (const item of qd.results) {
+            const resp = await downloadImageAsJpg(item.url, qd.imagePrefix || 'split', getEffectiveSplitDownloadPath(activeSplitQueue));
+            if (resp.ok) okCount++;
+            else {
+                failCount++;
+                if (resp.error && failReasons.length < 3) failReasons.push(resp.error);
+            }
+        }
+        if (okCount > 0) showToast(`已下载 ${okCount} 张`, 'success');
+        if (failCount > 0) {
+            const detail = failReasons.join('；') || '未知错误';
+            if (detail.includes('pro.filesystem.site')) {
+                showToast(`${failCount}张下载失败：${detail}（请重启后端使白名单生效）`, 'error');
+            } else {
+                showToast(`${failCount}张下载失败：${detail}`, 'error');
+            }
+        }
+    };
+    document.getElementById('btn-split-download-all-btn')?.addEventListener('click', splitDownloadAllHandler);
+    // 兼容旧按钮ID
+    document.getElementById('btn-split-download-all')?.addEventListener('click', splitDownloadAllHandler);
+    document.getElementById('btn-split-download-checked')?.addEventListener('click', async () => {
+        const qd = splitQueueData[activeSplitQueue];
+        if (!qd || !qd.results || qd.results.length === 0) { showToast('没有可下载的结果', 'warning'); return; }
+        const selected = qd.results.filter(r => r.checked);
+        if (selected.length === 0) { showToast('请先勾选要下载的图片', 'warning'); return; }
+        let okCount = 0;
+        let failCount = 0;
+        const failReasons = [];
+        for (const item of selected) {
+            const resp = await downloadImageAsJpg(item.url, qd.imagePrefix || 'split', getEffectiveSplitDownloadPath(activeSplitQueue));
+            if (resp.ok) okCount++;
+            else {
+                failCount++;
+                if (resp.error && failReasons.length < 3) failReasons.push(resp.error);
+            }
+        }
+        if (okCount > 0) showToast(`已下载勾选 ${okCount} 张`, 'success');
+        if (failCount > 0) {
+            const detail = failReasons.join('；') || '未知错误';
+            if (detail.includes('pro.filesystem.site')) {
+                showToast(`${failCount}张下载失败：${detail}（请重启后端使白名单生效）`, 'error');
+            } else {
+                showToast(`${failCount}张下载失败：${detail}`, 'error');
+            }
+        }
+    });
+    document.getElementById('btn-split-retry-failed')?.addEventListener('click', runSplitRetryFailed);
+
+    // 拆图打开文件夹按钮
+    document.getElementById('btn-split-open-folder')?.addEventListener('click', async () => {
+        const path = getEffectiveSplitDownloadPath(activeSplitQueue);
+        try {
+            await api('POST', '/api/open-download-folder', { path });
+        } catch(e) {
+            showToast('打开文件夹失败', 'error');
+        }
+    });
+
+    // 编辑裁剪按钮
+    document.getElementById('btn-split-edit-crop')?.addEventListener('click', () => {
+        const item = getActiveSplitWorkItem(activeSplitQueue);
+        if (item?.imageUrl || item?.croppedImageUrl) {
+            openSplitCropEditor(activeSplitQueue);
+        }
+    });
+
+    // 点击图片进入编辑
+    document.getElementById('split-current-img')?.addEventListener('click', () => {
+        const item = getActiveSplitWorkItem(activeSplitQueue);
+        if (item?.imageUrl || item?.croppedImageUrl) {
+            openSplitCropEditor(activeSplitQueue);
+        }
+    });
+    document.getElementById('split-current-img')?.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        const qd = splitQueueData[activeSplitQueue];
+        const item = getActiveSplitWorkItem(activeSplitQueue);
+        if (!qd || !item || (!item.imageUrl && !item.croppedImageUrl)) return;
+        if (!confirm('确认清除当前拆图工作区图片？')) return;
+        qd.workItems.splice(qd.activeItemIndex, 1);
+        if (qd.activeItemIndex >= qd.workItems.length) qd.activeItemIndex = Math.max(0, qd.workItems.length - 1);
+        syncActiveSplitItemToQueue(activeSplitQueue);
+        saveSplitQueueData();
+        loadSplitQueueToUI(activeSplitQueue);
+        renderSplitQueueNumberBar();
+        updateSplitGenerateBtnState();
+        showToast('已清除当前拆图工作区图片', 'success');
+    });
+
+    // 裁剪确认按钮
+    document.getElementById('btn-split-crop-confirm')?.addEventListener('click', confirmSplitCrop);
+
+    // 预设裁剪按钮事件
+    document.querySelectorAll('.split-crop-preset-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            applySplitCropPreset(btn.dataset.preset);
+        });
+        btn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            const preset = btn.dataset.preset;
+            state.modelConfig.defaultCropPreset = preset;
+            api('PUT', '/api/model-config', { defaultCropPreset: preset }).catch(() => {});
+            updateSplitCropPresetButtons();
+            showToast(`已将「${btn.textContent.trim()}」设为默认预设`, 'success');
+        });
+    });
+
+    // 裁剪画布鼠标交互
+    const splitCropCanvas = document.getElementById('split-crop-canvas');
+    if (splitCropCanvas) {
+        splitCropCanvas.addEventListener('mousedown', (e) => {
+            const pos = getSplitCropCanvasPos(splitCropCanvas, e);
+            const zone = getSplitCropHitZone(pos.x, pos.y);
+            splitCropState.dragging = true;
+            splitCropState.dragType = (!zone || splitCropState.spaceDown) ? 'pan' : zone;
+            splitCropState.dragStartX = pos.x;
+            splitCropState.dragStartY = pos.y;
+            splitCropState.cropStartX = splitCropState.cropX;
+            splitCropState.cropStartY = splitCropState.cropY;
+            splitCropState.cropStartW = splitCropState.cropW;
+            splitCropState.cropStartH = splitCropState.cropH;
+            splitCropState.imgStartX = splitCropState.imgDisplayX;
+            splitCropState.imgStartY = splitCropState.imgDisplayY;
+            if (splitCropState.dragType !== 'pan') {
+                // 手动拖拽裁剪框时清除预设标记
+                splitCropState.activePreset = null;
+                updateSplitCropPresetButtons();
+            }
+            e.preventDefault();
+        });
+
+        splitCropCanvas.addEventListener('mousemove', (e) => {
+            if (!splitCropState.dragging) {
+                const pos = getSplitCropCanvasPos(splitCropCanvas, e);
+                const zone = getSplitCropHitZone(pos.x, pos.y);
+                if (splitCropState.spaceDown) splitCropCanvas.style.cursor = 'grab';
+                else if (zone === 'tl' || zone === 'br') splitCropCanvas.style.cursor = 'nwse-resize';
+                else if (zone === 'tr' || zone === 'bl') splitCropCanvas.style.cursor = 'nesw-resize';
+                else if (zone === 'move') splitCropCanvas.style.cursor = 'move';
+                else splitCropCanvas.style.cursor = 'grab';
+                return;
+            }
+            const pos = getSplitCropCanvasPos(splitCropCanvas, e);
+            const dx = pos.x - splitCropState.dragStartX;
+            const dy = pos.y - splitCropState.dragStartY;
+            const s = splitCropState;
+            if (s.dragType === 'pan') {
+                splitCropCanvas.style.cursor = 'grabbing';
+                panSplitCropImage(splitCropCanvas, dx, dy);
+                return;
+            } else if (s.dragType === 'move') { s.cropX = s.cropStartX + dx; s.cropY = s.cropStartY + dy; }
+            else if (s.dragType === 'tl') { s.cropX = s.cropStartX + dx; s.cropY = s.cropStartY + dy; s.cropW = s.cropStartW - dx; s.cropH = s.cropStartH - dy; }
+            else if (s.dragType === 'tr') { s.cropY = s.cropStartY + dy; s.cropW = s.cropStartW + dx; s.cropH = s.cropStartH - dy; }
+            else if (s.dragType === 'bl') { s.cropX = s.cropStartX + dx; s.cropW = s.cropStartW - dx; s.cropH = s.cropStartH + dy; }
+            else if (s.dragType === 'br') { s.cropW = s.cropStartW + dx; s.cropH = s.cropStartH + dy; }
+            constrainSplitCropBox();
+            drawSplitCropCanvas(splitCropCanvas);
+        });
+
+        const endDrag = () => { splitCropState.dragging = false; splitCropState.dragType = ''; };
+        document.addEventListener('mouseup', endDrag);
+        splitCropCanvas.addEventListener('mouseleave', () => {
+            if (!splitCropState.dragging) return;
+        });
+
+        splitCropCanvas.addEventListener('wheel', (e) => {
+            e.preventDefault();
+            const s = splitCropState;
+            const pos = getSplitCropCanvasPos(splitCropCanvas, e);
+            if (s.cropWheelMode) {
+                const scale = e.deltaY > 0 ? 0.95 : 1.05;
+                const cx = s.cropX + s.cropW / 2;
+                const cy = s.cropY + s.cropH / 2;
+                s.cropW *= scale;
+                s.cropH *= scale;
+                s.cropX = cx - s.cropW / 2;
+                s.cropY = cy - s.cropH / 2;
+                constrainSplitCropBox();
+                s.activePreset = null;
+                updateSplitCropPresetButtons();
+                drawSplitCropCanvas(splitCropCanvas);
+                return;
+            }
+            zoomSplitCropImage(splitCropCanvas, e.deltaY > 0 ? 0.9 : 1.1, pos.x, pos.y);
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (document.getElementById('modal-split-crop')?.style.display === 'none') return;
+            if (e.code === 'Space') {
+                splitCropState.spaceDown = true;
+                splitCropCanvas.style.cursor = 'grab';
+                e.preventDefault();
+            }
+            if (e.key?.toLowerCase() === 'c') {
+                splitCropState.cropWheelMode = true;
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (e.code === 'Space') splitCropState.spaceDown = false;
+            if (e.key?.toLowerCase() === 'c') splitCropState.cropWheelMode = false;
+        });
+    }
+
+    // 拆图预览大小滑杆
+    document.getElementById('split-preview-size-slider')?.addEventListener('input', (e) => {
+        const grid = document.getElementById('split-result-grid');
+        if (grid) grid.style.gridTemplateColumns = `repeat(auto-fill,minmax(${e.target.value}px,1fr))`;
+    });
+});
+
+// 页面关闭/刷新时保存数据，防止丢失
+window.addEventListener('beforeunload', () => {
+    // Force immediate save - clear debounce timers and save directly
+    if (_saveQueueTimer) { clearTimeout(_saveQueueTimer); _saveQueueTimer = null; }
+    if (_saveSplitQueueTimer) { clearTimeout(_saveSplitQueueTimer); _saveSplitQueueTimer = null; }
+    saveQueueData();
+    saveCurrentSplitQueueData();
+});

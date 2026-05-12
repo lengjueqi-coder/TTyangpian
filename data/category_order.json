@@ -1,40 +1,40 @@
 {
   "order": [
     {
-      "type": "category",
-      "id": "cat_001"
+      "id": "cat_001",
+      "type": "category"
     },
     {
-      "type": "category",
-      "id": "cat_002"
+      "id": "cat_002",
+      "type": "category"
     },
     {
-      "type": "category",
-      "id": "cat_003"
+      "id": "cat_003",
+      "type": "category"
     },
     {
-      "type": "category",
-      "id": "cat_004"
+      "id": "cat_004",
+      "type": "category"
     },
     {
-      "type": "category",
-      "id": "cat_005"
+      "id": "cat_005",
+      "type": "category"
     },
     {
-      "type": "category",
-      "id": "cat_006"
+      "id": "cat_006",
+      "type": "category"
     },
     {
-      "type": "category",
-      "id": "cat_007"
+      "id": "cat_007",
+      "type": "category"
     },
     {
-      "type": "prefix",
-      "id": "prefix"
+      "id": "prefix",
+      "type": "prefix"
     },
     {
-      "type": "suffix",
-      "id": "suffix"
+      "id": "suffix",
+      "type": "suffix"
     }
   ]
 }

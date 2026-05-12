@@ -28,3 +28,22 @@ Thumbs.db
 
 # Dev notes (not needed by users)
 修复指令.md
+
+# Build artifacts
+dist/
+build/
+build_venv/
+*.dmg
+
+# Generated images (user data, not source code)
+static/images/
+
+# Large model files (use Git LFS or download separately)
+models/
+
+# Generated reports
+AUDIT_REPORT.md
+background_color_report.json
+background_contact_sheet.jpg
+background_contact_sheet_renamed.jpg
+background_rename_manifest.json

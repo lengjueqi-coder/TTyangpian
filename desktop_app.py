@@ -60,7 +60,7 @@ if __name__ == '__main__':
     # 打开 pywebview 原生窗口
     import webview
     window = webview.create_window(
-        '人像 Prompt 生成器 PRO',
+        '样片工厂',
         f'http://127.0.0.1:{port}',
         width=1400,
         height=900,

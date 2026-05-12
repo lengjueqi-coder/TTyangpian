@@ -9,9 +9,10 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# 检查并创建虚拟环境（如果 venv 不存在或不完整则重建）
-if [ ! -f "venv/bin/activate" ]; then
-    echo "首次运行，创建虚拟环境..."
+# 检查并创建虚拟环境（如果 venv 不存在、缺文件或 Python 链接失效则重建）
+if [ ! -f "venv/bin/activate" ] || [ ! -x "venv/bin/python3" ]; then
+    echo "首次运行或虚拟环境已失效，创建虚拟环境..."
+    rm -rf venv
     python3 -m venv venv
 fi
 
