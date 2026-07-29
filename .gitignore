@@ -1,49 +1,65 @@
-# Python
-venv/
+# Python and test caches
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
 
-# User data (keep on local only)
-data/model_config.json
-data/prompt_history.json
-data/image_library.json
-data/queue_data.json
-data/usage_log.json
-data/last_selection.json
-data/*.bak
-backups/
+# Virtual environments and package/build output
+venv/
+.venv/
+build_venv/
+build/
+dist/
+*.dmg
+*.exe
+*.msi
+*.zip
+*.sha256
+
+# Mutable application state (never source-controlled)
+data/
 logs/
+backups/
+models/
+static/images/
+output/
+outputs/
+_运行缓存/
+_成品输出/
+_代码备份/
+.uploads/
+rh_smoke*/
 
-# OS
+# Browser/dev-tool caches
+.playwright-cli/
+.trae-html-share-packages/
+.cache/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config/
+*.local.json
+*.pem
+*.key
+
+# OS and IDE metadata
 .DS_Store
 Thumbs.db
-
-# IDE
+desktop.ini
 .vscode/
 .idea/
-
-# Claude
 .claude/
+.agents/
+.codex/
 
-# Dev notes (not needed by users)
+# Local exports and scratch documents
+情人节爱自己摄影创意方案.html
+样片工厂.html
 修复指令.md
-
-# Build artifacts
-dist/
-build/
-build_venv/
-*.dmg
-
-# Generated images (user data, not source code)
-static/images/
-
-# Large model files (use Git LFS or download separately)
-models/
-
-# Generated reports
 AUDIT_REPORT.md
 background_color_report.json
-background_contact_sheet.jpg
-background_contact_sheet_renamed.jpg
+background_contact_sheet*.jpg
 background_rename_manifest.json

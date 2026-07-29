@@ -6,6 +6,9 @@
 # 获取脚本所在目录
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
+APP_SUPPORT_DIR="$HOME/Library/Application Support/样片工厂"
+VENV_DIR="$APP_SUPPORT_DIR/venv"
+mkdir -p "$APP_SUPPORT_DIR"
 
 # 扫描 5800-5819 端口范围，检测是否已有本程序实例在运行
 EXISTING_PORT=""
@@ -64,17 +67,22 @@ if [ -n "$EXISTING_PORT" ]; then
     sleep 2
 fi
 
-# 检查虚拟环境（如果 venv 不存在、缺文件或 Python 链接失效则重建）
-if [ ! -f "venv/bin/activate" ] || [ ! -x "venv/bin/python3" ]; then
+# 检查虚拟环境（放在项目目录外，避免软件文件夹被依赖撑大）
+if [ ! -f "$VENV_DIR/bin/activate" ] || [ ! -x "$VENV_DIR/bin/python3" ]; then
     echo "首次运行或虚拟环境已失效，正在创建虚拟环境并安装依赖..."
-    rm -rf venv
-    python3 -m venv venv
-    source venv/bin/activate
+    rm -rf "$VENV_DIR"
+    python3 -m venv "$VENV_DIR"
+    source "$VENV_DIR/bin/activate"
     python3 -m pip install Flask==3.1.3 pillow==11.3.0 requests==2.32.5
     echo "安装完成！"
 else
-    source venv/bin/activate
+    source "$VENV_DIR/bin/activate"
 fi
+
+# 每次启动都补齐依赖，避免升级后缺少 DWPose 运行环境
+echo "检查依赖..."
+python3 -m pip install -q --upgrade pip
+python3 -m pip install -q -r requirements.txt
 
 # 启动服务
 echo ""

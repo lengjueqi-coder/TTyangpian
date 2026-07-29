@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import socket
+import urllib.request
 
 # PyInstaller frozen 模式标识（必须在 import app 之前设置）
 if getattr(sys, 'frozen', False):
@@ -15,8 +16,8 @@ if getattr(sys, 'frozen', False):
 from app import app, _init_default_data, _migrate_legacy_data
 
 # 初始化默认数据和迁移旧数据
-_init_default_data()
 _migrate_legacy_data()
+_init_default_data()
 
 
 def find_free_port(start_port=5800, max_tries=20):
@@ -56,6 +57,20 @@ if __name__ == '__main__':
             break
         except OSError:
             time.sleep(0.5)
+
+    if '--smoke-test' in sys.argv:
+        try:
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/', timeout=10) as response:
+                if response.status != 200 or b'<!DOCTYPE html>' not in response.read(4096):
+                    raise RuntimeError('首页响应无效')
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/model-config', timeout=10) as response:
+                if response.status != 200:
+                    raise RuntimeError('配置接口响应无效')
+            print('PACKAGED_SMOKE_TEST_OK')
+            sys.exit(0)
+        except Exception as exc:
+            print(f'PACKAGED_SMOKE_TEST_FAILED: {exc}', file=sys.stderr)
+            sys.exit(2)
 
     # 打开 pywebview 原生窗口
     import webview

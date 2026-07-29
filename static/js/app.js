@@ -1,12 +1,21 @@
 // ========== 全局状态 ==========
 const SLOT_COUNT = 10;
-const QUEUE_COUNT = 10;
+const QUEUE_COUNT = 10; // 拆图队列固定数量
+const DEFAULT_MULTI_QUEUE_COUNT = 10;
+const MAX_MULTI_QUEUE_COUNT = 20;
+let multiQueueCount = DEFAULT_MULTI_QUEUE_COUNT;
 /** 单条拆图队列内最多素材（九宫格张数） */
 const SPLIT_MAX_MATERIALS = 10;
-/** 单条拆图队列严格顺序提交：裁一张、带提示词发一张、处理完再下一张 */
-const SPLIT_GEN_CONCURRENCY = 1;
-/** 多条拆图队列不做人为等待上限；每个队列按自身顺序提交 */
-const SPLIT_GLOBAL_GEN_CONCURRENCY = Number.POSITIVE_INFINITY;
+/** 批量/失败重试最多同时跑几个槽位；每个槽位仍是裁一张、发一张、等一张 */
+const SPLIT_GEN_CONCURRENCY = 4;
+/** 全局拆图外部生图请求上限，防止十几张图一次性压垮本地/平台 */
+const SPLIT_GLOBAL_GEN_CONCURRENCY = 6;
+/**
+ * 本地参考图逐张预处理、逐张上传。
+ * 实拍原图常有三千万像素以上，并行解码 3 张会让浏览器 + Flask 瞬间占用数百 MB 内存，
+ * 严重时本地服务会直接退出，所有请求随后都只剩下 Failed to fetch。
+ */
+const IMAGE_UPLOAD_CONCURRENCY = 1;
 const DEFAULT_PRESET_TAGS = ['肖像', '写真', '日系写真', '纯欲写真', '私房写真', '外景写真', '樱花写真', '新中式', '古风', '旗袍', '韩杂', '日杂', '杂志', '氛围感肖像', '胶片写真', '暗黑写真', '欧美肖像', '商业写真', '复古写真', '纪实写真'];
 
 const state = {
@@ -130,15 +139,28 @@ async function api(method, url, body, timeoutMs = 60000, cancelSignal, skipGloba
     try {
         const resp = await fetch(url, opts);
         clearTimeout(timer);
-        const data = await resp.json();
+        let data = null;
+        try {
+            data = await resp.json();
+        } catch (jsonErr) {
+            data = { error: `响应不是JSON (HTTP ${resp.status})` };
+        }
         if (!resp.ok) {
             const errMsg = (typeof data.error === 'object' && data.error?.message) ? data.error.message : (data.error || '请求失败');
-            throw new Error(errMsg);
+            const err = new Error(errMsg);
+            err.status = resp.status;
+            err.code = data.code || data.error?.code || '';
+            err.data = data;
+            throw err;
         }
         return data;
     } catch (e) {
         clearTimeout(timer);
         if (e.name === 'AbortError') throw new Error('请求已取消');
+        // 网络错误友好提示：服务崩溃/未启动/网络断开时给中文提示
+        if (e instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(e.message || '')) {
+            throw new Error('本地下图服务已断开，请检查「样片工厂」是否在运行，或刷新页面后重试');
+        }
         throw e;
     }
 }
@@ -175,9 +197,21 @@ function enqueueHKParallelResultUi(fn) {
 
 // 上传图片辅助函数：封装fetch + 自动显示上采样警告
 async function uploadImage(formData) {
-    const resp = await fetch('/api/upload-image', { method: 'POST', body: formData });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || '上传失败');
+    let resp;
+    try {
+        resp = await fetch('/api/upload-image', { method: 'POST', body: formData });
+    } catch (err) {
+        if (err instanceof TypeError || /failed to fetch|networkerror|load failed/i.test(err?.message || '')) {
+            throw new Error('本地上传服务已断开，请重新启动“样片工厂”并刷新页面后重试');
+        }
+        throw err;
+    }
+    const raw = await resp.text();
+    let data = null;
+    try { data = raw ? JSON.parse(raw) : {}; }
+    catch (_) { data = { error: `上传接口返回异常（HTTP ${resp.status}）` }; }
+    if (!resp.ok) throw new Error(data.error || `上传失败（HTTP ${resp.status}）`);
+    if (!data?.url) throw new Error('上传接口未返回图片地址');
     if (data.warning) showToast(data.warning, 'warning');
     return data.url;
 }
@@ -193,10 +227,41 @@ function getFileBaseName(filename = '') {
 // API 生成状态（提前声明，供 api() 函数引用）
 let apiGenerateState = { running: false, taskId: null, pollTimer: null, cancelled: false, abortController: null };
 // 多图列队模式下每个队列独立的生成状态
-let queueGenerateStates = Array.from({length: 10}, () => ({ running: false, cancelled: false, abortController: null }));
+let queueGenerateStates = Array.from({length: MAX_MULTI_QUEUE_COUNT}, () => ({ running: false, cancelled: false, abortController: null }));
 // 判断是否有任何队列正在生成
 function isAnyQueueGenerating() {
     return queueGenerateStates.some(s => s.running) || apiGenerateState.running;
+}
+
+function resetApiGlobalGenerateState({ cancelled = false } = {}) {
+    if (apiGenerateState.pollTimer) {
+        clearTimeout(apiGenerateState.pollTimer);
+        apiGenerateState.pollTimer = null;
+    }
+    apiGenerateState.running = false;
+    apiGenerateState.cancelled = cancelled;
+    apiGenerateState.taskId = null;
+    apiGenerateState.abortController = null;
+}
+
+function resetQueueGenerateState(qi, { cancelled = false } = {}) {
+    const qs = queueGenerateStates[qi];
+    if (!qs) return;
+    qs.running = false;
+    qs.cancelled = cancelled;
+    qs.abortController = null;
+}
+
+function syncApiGenerateUiAfterState() {
+    const btn = document.getElementById('btn-api-generate');
+    const cancelBtn = document.getElementById('btn-api-cancel');
+    if (btn) {
+        btn.disabled = false;
+        updateGenerateBtnText();
+    }
+    if (cancelBtn) cancelBtn.style.display = isAnyQueueGenerating() ? 'inline-flex' : 'none';
+    if (!isAnyQueueGenerating()) hideApiProgress();
+    renderQueueNumberBars();
 }
 // API提示词语言：'en'=用英文, 'cn'=用中文（从localStorage恢复）
 let apiPromptLang = localStorage.getItem('apiPromptLang') || 'en';
@@ -214,6 +279,11 @@ let _undoTextEditActiveEl = null;
 function deepClone(obj) {
     try { return structuredClone(obj); } catch (e) { return JSON.parse(JSON.stringify(obj)); }
 }
+
+// 多图队列的提示词/固定槽状态需要在首轮数据加载前初始化。
+let promptedSlotIndices = new Set();
+let pinnedSlotIndices = new Set(safeJsonParse(localStorage.getItem('pinnedSlotIndices'), []));
+let pinnedSlotMasters = safeJsonParse(localStorage.getItem('pinnedSlotMasters'), {});
 
 function cleanDownloadPath(path) {
     return typeof path === 'string' ? path.trim() : '';
@@ -365,8 +435,10 @@ function getGlobalUndoSnapshot() {
         activeSplitQueue,
         splitModeLoaded,
         vars: {
+            multiQueueCount,
             promptedSlotIndices: undoSetToArray(promptedSlotIndices),
             pinnedSlotIndices: undoSetToArray(pinnedSlotIndices),
+            pinnedSlotMasters: undoJson(pinnedSlotMasters, {}),
             selectedPrefixIds: undoSetToArray(selectedPrefixIds),
             selectedSuffixIds: undoSetToArray(selectedSuffixIds),
             activePromptPresetIds: undoSetToArray(activePromptPresetIds),
@@ -432,12 +504,14 @@ function applyUndoModeVisibility(mode) {
     document.querySelectorAll('.mode-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.mode === currentMode);
     });
-    const promptMode = document.querySelector('.main-content:not(#image-mode):not(#split-mode)');
+    const promptMode = document.querySelector('main.main-content');
     const imageMode = document.getElementById('image-mode');
     const splitModeEl = document.getElementById('split-mode');
+    const ecommerceMode = document.getElementById('ecommerce-mode');
     if (promptMode) promptMode.style.display = currentMode === 'prompt' ? 'flex' : 'none';
     if (imageMode) imageMode.style.display = currentMode === 'image' ? 'flex' : 'none';
     if (splitModeEl) splitModeEl.style.display = currentMode === 'split' ? 'flex' : 'none';
+    if (ecommerceMode) ecommerceMode.style.display = currentMode === 'ecommerce' ? 'block' : 'none';
 }
 
 function buildUndoPersistPayload(snapshot) {
@@ -459,9 +533,12 @@ function buildUndoPersistPayload(snapshot) {
             },
             'queue_data.json': {
                 queues: snapshot.queueData || [],
+                queueCount: snapshot.vars?.multiQueueCount || DEFAULT_MULTI_QUEUE_COUNT,
                 activeQueue: snapshot.activeQueue || 0,
                 queueMode: snapshot.queueMode || 'same',
-                slots: snapshot.queueMode === 'same' ? (snapshot.imageState?.slots || []) : []
+                slots: snapshot.queueMode === 'same' ? (snapshot.imageState?.slots || []) : [],
+                pinnedSlotIndices: snapshot.vars?.pinnedSlotIndices || [],
+                pinnedSlotMasters: snapshot.vars?.pinnedSlotMasters || {}
             },
             'split_queue_data.json': {
                 queues: snapshot.splitQueueData || [],
@@ -514,8 +591,12 @@ async function undo() {
         splitModeLoaded = !!snapshot.splitModeLoaded;
 
         const vars = snapshot.vars || {};
+        multiQueueCount = Math.max(DEFAULT_MULTI_QUEUE_COUNT, Math.min(MAX_MULTI_QUEUE_COUNT,
+            parseInt(vars.multiQueueCount, 10) || Math.max(DEFAULT_MULTI_QUEUE_COUNT, queueData.length)));
+        activeQueue = Math.max(0, Math.min(activeQueue, multiQueueCount - 1));
         promptedSlotIndices = new Set(vars.promptedSlotIndices || []);
         pinnedSlotIndices = new Set(vars.pinnedSlotIndices || []);
+        pinnedSlotMasters = undoJson(vars.pinnedSlotMasters, {});
         selectedPrefixIds = new Set(vars.selectedPrefixIds || []);
         selectedSuffixIds = new Set(vars.selectedSuffixIds || []);
         activePromptPresetIds = new Set(vars.activePromptPresetIds || []);
@@ -697,7 +778,12 @@ function closeModal(id) {
     const el = document.getElementById(id);
     if (!el) return;
     el.style.display = 'none';
-    if (id === 'modal-crop') { cropQueue = []; cropQueueActive = false; updateCropProgress(); }
+    if (id === 'modal-crop') {
+        cropQueue = [];
+        cropQueueActive = false;
+        cropState = null;
+        updateCropProgress();
+    }
 }
 
 function escHtml(str) {
@@ -756,6 +842,11 @@ async function loadAllData() {
             }
             if (queueDataResp.queueMode) queueMode = queueDataResp.queueMode;
             if (typeof queueDataResp.activeQueue === 'number') activeQueue = queueDataResp.activeQueue;
+            const storedQueueCount = parseInt(queueDataResp.queueCount, 10);
+            multiQueueCount = Math.max(DEFAULT_MULTI_QUEUE_COUNT, Math.min(MAX_MULTI_QUEUE_COUNT,
+                Number.isInteger(storedQueueCount) ? storedQueueCount : queueData.length));
+            queueData = queueData.slice(0, MAX_MULTI_QUEUE_COUNT);
+            restorePinnedSlotsFromPayload(queueDataResp);
             // 同图抽卡模式下恢复 slots
             if (queueMode === 'same' && Array.isArray(queueDataResp.slots) && queueDataResp.slots.length > 0) {
                 imageState.slots = queueDataResp.slots;
@@ -766,12 +857,16 @@ async function loadAllData() {
                 const savedQD = localStorage.getItem('queue-data');
                 if (savedQD) {
                     const parsed = JSON.parse(savedQD);
-                    if (Array.isArray(parsed) && parsed.length > 0) queueData = parsed;
+                    if (Array.isArray(parsed) && parsed.length > 0) {
+                        queueData = parsed.slice(0, MAX_MULTI_QUEUE_COUNT);
+                        multiQueueCount = Math.max(DEFAULT_MULTI_QUEUE_COUNT, Math.min(MAX_MULTI_QUEUE_COUNT, queueData.length));
+                    }
                 }
                 const savedQM = localStorage.getItem('queue-mode');
                 if (savedQM) queueMode = savedQM;
                 const savedAQ = localStorage.getItem('active-queue');
                 if (savedAQ) activeQueue = parseInt(savedAQ, 10) || 0;
+                restorePinnedSlotsFromPayload({});
                 const savedSlots = localStorage.getItem('image-slots');
                 if (savedSlots) {
                     const parsed = JSON.parse(savedSlots);
@@ -786,14 +881,12 @@ async function loadAllData() {
                 localStorage.removeItem('image-slots');
             } catch(e) {}
         }
-        // 确保有10个队列
-        while (queueData.length < QUEUE_COUNT) {
-            queueData.push({
-                slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' })),
-                promptCn: '',
-                promptEn: ''
-            });
+        // 多图队列默认10个，可由用户逐个增加到20个。
+        while (queueData.length < multiQueueCount) {
+            queueData.push(createEmptyMultiQueue());
         }
+        activeQueue = Math.max(0, Math.min(activeQueue, multiQueueCount - 1));
+        if (queueMode === 'multi') applyPinnedSlotsToAllQueues();
 
         // 恢复道具缩放设置
         try {
@@ -850,6 +943,11 @@ async function loadAllData() {
                 hkModel.value = state.modelConfig.oaihk_model;
                 updateOaihkModelParamsInline();
             }
+        }
+        if (state.modelConfig.oaihk_aspect_ratio) {
+            const hkArSelect = document.getElementById('cfg-oaihk-aspect-ratio-inline');
+            const hkModel = OAIHK_MODELS[document.getElementById('cfg-oaihk-model-inline')?.value];
+            fillAspectRatioSelect(hkArSelect, hkModel?.aspectRatios, state.modelConfig.oaihk_aspect_ratio);
         }
     } catch (e) {
         console.error('加载数据失败:', e);
@@ -2460,31 +2558,56 @@ $('#btn-cleanup-images').addEventListener('click', async () => {
 });
 
 async function refreshCleanupStats() {
-    const el = document.getElementById('cleanup-dwpose-stats');
-    if (!el) return;
-    el.textContent = '统计中...';
+    const dwEl = document.getElementById('cleanup-dwpose-stats');
+    const orphanEl = document.getElementById('cleanup-orphan-stats');
+    const fmtSize = (kb) => kb > 1024 ? `${(kb / 1024).toFixed(1)}MB` : `${Math.round(kb)}KB`;
+    if (orphanEl) orphanEl.textContent = '孤立图片统计中...';
+    if (dwEl) dwEl.textContent = 'DWPose缓存统计中...';
+    try {
+        const orphanStats = await api('GET', '/api/cleanup-images-preview');
+        if (orphanEl) {
+            orphanEl.textContent = `孤立图片：${orphanStats.count || 0} 张，${fmtSize(orphanStats.size_kb || 0)}`;
+        }
+    } catch (e) {
+        if (orphanEl) orphanEl.textContent = '孤立图片统计失败';
+    }
     try {
         const stats = await api('GET', '/api/dwpose-cache-stats');
-        const size = stats.size_kb > 1024 ? `${(stats.size_kb / 1024).toFixed(1)}MB` : `${Math.round(stats.size_kb)}KB`;
-        el.textContent = `DWPose缓存：${stats.count || 0} 个，${size}`;
+        if (dwEl) dwEl.textContent = `DWPose缓存：${stats.count || 0} 个，${fmtSize(stats.size_kb || 0)}`;
     } catch (e) {
-        el.textContent = 'DWPose缓存统计失败';
+        if (dwEl) dwEl.textContent = 'DWPose缓存统计失败';
     }
 }
 
-document.getElementById('btn-cleanup-orphans')?.addEventListener('click', () => {
-    showConfirm('将未被任何数据引用的内部图片移到回收站，不会永久删除。继续吗？', async () => {
+document.getElementById('btn-cleanup-orphans')?.addEventListener('click', async () => {
+    let stats;
+    try {
+        stats = await api('GET', '/api/cleanup-images-preview');
+    } catch (e) {
+        showToast('统计孤立图片失败: ' + e.message, 'error');
+        return;
+    }
+    const count = stats.count || 0;
+    const sizeKb = stats.size_kb || 0;
+    const size = sizeKb > 1024 ? `${(sizeKb / 1024).toFixed(1)}MB` : `${Math.round(sizeKb)}KB`;
+    if (count <= 0) {
+        showToast('没有发现孤立图片', 'info');
+        await refreshCleanupStats();
+        return;
+    }
+    showConfirm(`发现 ${count} 张未被数据引用的内部图片，约 ${size}。清理时会先集中到一个临时文件夹，再把这个文件夹一次性移到回收站，不会永久删除。继续吗？`, async () => {
         try {
             const result = await api('POST', '/api/cleanup-images');
             if (result.success && result.deleted > 0) {
-                showToast(`已移到回收站 ${result.deleted} 张，释放约 ${result.freed_kb}KB`, 'success');
+                showToast(`已打包移到回收站 ${result.deleted} 张，释放约 ${result.freed_kb}KB`, 'success');
+                await refreshCleanupStats();
             } else {
                 showToast('没有发现孤立图片', 'info');
             }
         } catch (e) {
             showToast('清理失败: ' + e.message, 'error');
         }
-    }, { title: '清理孤立图片', btnText: '移到回收站' });
+    }, { title: '清理孤立图片', btnText: '打包移到回收站' });
 });
 
 document.getElementById('btn-cleanup-dwpose')?.addEventListener('click', () => {
@@ -2538,7 +2661,7 @@ document.getElementById('btn-cleanup-open-gallery')?.addEventListener('click', (
 let galleryData = { groups: [], total_count: 0, total_size_kb: 0, base_path: '' };
 let gallerySelected = new Set(); // 选中的图片路径集合
 let galleryPickerContext = null; // { mode: 'split', recentDays: 3 }
-let galleryRecentDays = 0; // 0=全部
+let galleryRecentDays = 7; // 默认只加载最近7天，图库很大时避免弹窗一直白屏
 
 function _processGalleryData(rawData, opts = {}) {
     if (!rawData || !rawData.groups) return rawData;
@@ -2589,9 +2712,7 @@ function renderGallery(data) {
 
     const sizeStr = formatSizeFromKb(data.total_size_kb);
     const statsPrefix = galleryRecentDays > 0 ? `最近${galleryRecentDays}天` : '共';
-    document.getElementById('gallery-stats').textContent = galleryPickerContext?.mode === 'split'
-        ? `${statsPrefix} ${data.total_count} 张，${sizeStr}`
-        : `共 ${data.total_count} 张，${sizeStr}`;
+    document.getElementById('gallery-stats').textContent = `${statsPrefix} ${data.total_count} 张，${sizeStr}`;
 
     let html = '';
     for (const group of data.groups) {
@@ -2758,7 +2879,7 @@ async function selectGalleryImageForSplit(path) {
 // 图库按钮
 document.getElementById('btn-gallery')?.addEventListener('click', () => {
     galleryPickerContext = null;
-    galleryRecentDays = 0;
+    galleryRecentDays = 7;
     openModal('modal-gallery');
     loadGallery();
 });
@@ -2851,8 +2972,17 @@ $('#btn-model-config').addEventListener('click', async () => {
         // OpenAI-HK 配置
         $('#cfg-oaihk-api-key').value = config.oaihk_api_key || '';
         $('#cfg-oaihk-base-url').value = config.oaihk_base_url || '';
+        const gptQualitySelect = document.getElementById('cfg-oaihk-gpt-quality');
+        if (gptQualitySelect) gptQualitySelect.value = config.oaihk_gpt_quality || 'medium';
+        if (config.oaihk_model) setSelectValue('cfg-oaihk-model-inline', config.oaihk_model);
+        if (config.oaihk_aspect_ratio) {
+            const hkModel = OAIHK_MODELS[document.getElementById('cfg-oaihk-model-inline')?.value];
+            fillAspectRatioSelect(document.getElementById('cfg-oaihk-aspect-ratio-inline'), hkModel?.aspectRatios, config.oaihk_aspect_ratio);
+        }
 
         // 上传压缩设置
+        const uploadModeSelect = document.getElementById('cfg-upload-mode');
+        if (uploadModeSelect) uploadModeSelect.value = config.upload_mode === 'original' ? 'original' : 'adaptive';
         const uploadShortEdge = config.upload_short_edge || 1536;
         const seInput = document.getElementById('cfg-upload-short-edge');
         if (seInput) seInput.value = uploadShortEdge;
@@ -2904,7 +3034,11 @@ $('#btn-save-config').addEventListener('click', async () => {
         // OpenAI-HK
         oaihk_api_key: $('#cfg-oaihk-api-key').value,
         oaihk_base_url: $('#cfg-oaihk-base-url').value,
+        oaihk_model: document.getElementById('cfg-oaihk-model-inline')?.value || state.modelConfig.oaihk_model || 'fal-ai/banana/v3.1/flash/2k',
+        oaihk_aspect_ratio: document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || state.modelConfig.oaihk_aspect_ratio || '3:4',
+        oaihk_gpt_quality: document.getElementById('cfg-oaihk-gpt-quality')?.value || state.modelConfig.oaihk_gpt_quality || 'medium',
         // 上传压缩设置
+        upload_mode: document.getElementById('cfg-upload-mode')?.value === 'original' ? 'original' : 'adaptive',
         upload_short_edge: parseInt($('#cfg-upload-short-edge')?.value, 10) || 1536,
         // 系统提示词
         system_prompt_prompt: $('#cfg-system-prompt-prompt').value,
@@ -2950,7 +3084,37 @@ $('#btn-test-connection').addEventListener('click', async () => {
         const result = await api('POST', '/api/test-connection', config);
         showToast(result.success ? result.message : result.message, result.success ? 'success' : 'error');
     } catch (e) { showToast(e.message, 'error'); }
-    finally { btn.disabled = false; btn.textContent = '测试连接'; }
+    finally { btn.disabled = false; btn.textContent = '测试Prompt模型'; }
+});
+
+$('#btn-test-rh-preflight')?.addEventListener('click', async () => {
+    const btn = $('#btn-test-rh-preflight');
+    const status = $('#cfg-rh-preflight-status');
+    btn.disabled = true;
+    btn.textContent = '正在验证…';
+    if (status) status.textContent = '正在调用 RunningHub 官方价格预估接口，不会创建生图任务…';
+    try {
+        const result = await api('POST', '/api/rh-preflight', {
+            api_key: $('#cfg-rh-api-key')?.value || '',
+            base_url: $('#cfg-rh-base-url')?.value || '',
+            model_id: 'rhart-image-g-2-official/image-to-image',
+            resolution: '4k'
+        }, 45000);
+        if (status) {
+            status.textContent = result.message;
+            status.style.color = 'var(--success)';
+        }
+        showToast(result.message, 'success');
+    } catch (e) {
+        if (status) {
+            status.textContent = e.message;
+            status.style.color = 'var(--danger)';
+        }
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '验证企业共享权限（不生图、不扣费）';
+    }
 });
 
 // ========== 删除确认 ==========
@@ -3111,36 +3275,36 @@ const imageState = {
 let splitModeLoaded = false; // 拆图模块是否已完成一次数据加载
 
 // ---------- 多图队列系统 ----------
-// QUEUE_COUNT 已在文件顶部声明
 let queueMode = 'same'; // 'same' = 同图抽卡, 'multi' = 多图队列
-let activeQueue = 0;     // 当前活动的队列编号 (0-9)
+let activeQueue = 0;     // 当前活动的队列编号
 
 // 每个队列独立的数据：{ slots: [...], promptCn: '', promptEn: '', results: [...], apiPlatform, rhModelId, ... }
 let queueData = [];
 let _saveQueueTimer = null; // saveQueueData 防抖定时器
+function createEmptyMultiQueue() {
+    return {
+        slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' })),
+        promptCn: '',
+        promptEn: '',
+        results: [],
+        apiPlatform: 'oaihk',
+        rhModelId: '',
+        oaihkModelId: 'fal-ai/banana/v3.1/flash/2k',
+        rhAspectRatio: '3:4',
+        oaihkAspectRatio: '3:4',
+        rhResolution: '1k',
+        rhCount: 1,
+        rhSeedMode: 'random',
+        rhSeed: '',
+        downloadPath: '',
+        imagePrefix: '',
+        autoBackup: true
+    };
+}
+
 function initQueueData() {
     // 队列数据现在从服务端加载（loadAllData 中处理）
-    // 这里仅确保有10个队列
-    while (queueData.length < QUEUE_COUNT) {
-        queueData.push({
-            slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' })),
-            promptCn: '',
-            promptEn: '',
-            results: [],
-            apiPlatform: 'oaihk',
-            rhModelId: '',
-            oaihkModelId: 'fal-ai/banana/v3.1/flash/2k',
-            rhAspectRatio: '3:4',
-            oaihkAspectRatio: '3:4',
-            rhResolution: '1k',
-            rhCount: 1,
-            rhSeedMode: 'random',
-            rhSeed: '',
-            downloadPath: '',
-            imagePrefix: '',
-            autoBackup: true
-        });
-    }
+    while (queueData.length < multiQueueCount) queueData.push(createEmptyMultiQueue());
     // 兼容旧数据：确保每个队列都有新字段
     for (let q = 0; q < queueData.length; q++) {
         if (!queueData[q].results) queueData[q].results = [];
@@ -3397,12 +3561,105 @@ let splitGenerateStates = Array.from({length: 10}, () => ({
     running: false,
     cancelled: false,
     abortController: null,
+    abortControllers: {},
+    activeJobs: new Set(),
     progressPercent: 0,
     progressText: '',
     /** 当前生成任务在结果区的占位卡总数（与批次迭代次数一致，用于切队列后恢复骨架屏） */
     batchVisualTotal: 0,
     batchVisualFilled: 0
 }));
+
+function ensureSplitRuntimeState(qi) {
+    const st = splitGenerateStates[qi];
+    if (!st) return null;
+    if (!(st.activeJobs instanceof Set)) st.activeJobs = new Set(Array.isArray(st.activeJobs) ? st.activeJobs : []);
+    if (!st.abortControllers || typeof st.abortControllers !== 'object') st.abortControllers = {};
+    st.running = st.activeJobs.size > 0;
+    return st;
+}
+
+function splitJobKey(materialIndex, itemIndex = null, scope = 'single') {
+    const mi = Number.isFinite(materialIndex) ? materialIndex : 0;
+    if (scope === 'all') return 'all';
+    if (scope === 'material') return `m${mi}:batch`;
+    const wi = Number.isFinite(itemIndex) ? itemIndex : 0;
+    return `m${mi}:i${wi}`;
+}
+
+function isSplitJobRunning(qi, key) {
+    const st = ensureSplitRuntimeState(qi);
+    if (!st) return false;
+    if (!key) return st.activeJobs.size > 0;
+    return st.activeJobs.has('all') || st.activeJobs.has(key);
+}
+
+function isSplitMaterialBusy(qi, materialIndex) {
+    const st = ensureSplitRuntimeState(qi);
+    if (!st) return false;
+    if (st.activeJobs.has('all')) return true;
+    const prefix = `m${Number.isFinite(materialIndex) ? materialIndex : 0}:`;
+    for (const key of st.activeJobs) {
+        if (key.startsWith(prefix)) return true;
+    }
+    return false;
+}
+
+function beginSplitJob(qi, key, controller) {
+    const st = ensureSplitRuntimeState(qi);
+    if (!st) return;
+    st.cancelled = false;
+    st.activeJobs.add(key);
+    if (controller) {
+        st.abortControllers[key] = controller;
+        st.abortController = controller;
+    }
+    st.running = true;
+}
+
+function finishSplitJob(qi, key) {
+    const st = ensureSplitRuntimeState(qi);
+    if (!st) return;
+    st.activeJobs.delete(key);
+    if (st.abortControllers) delete st.abortControllers[key];
+    st.running = st.activeJobs.size > 0;
+    if (!st.running) {
+        st.cancelled = !!st.cancelled;
+        st.abortController = null;
+        st.progressPercent = 0;
+        st.progressText = '';
+        st.batchVisualTotal = 0;
+        st.batchVisualFilled = 0;
+    }
+}
+
+function forceStopSplitQueue(qi, { cancelled = true } = {}) {
+    const st = ensureSplitRuntimeState(qi);
+    if (!st) return;
+    Object.values(st.abortControllers || {}).forEach(ctrl => {
+        try { ctrl?.abort?.(); } catch(e) {}
+    });
+    try { st.abortController?.abort?.(); } catch(e) {}
+    st.activeJobs.clear();
+    st.abortControllers = {};
+    st.running = false;
+    st.cancelled = cancelled;
+    st.abortController = null;
+    st.progressPercent = 0;
+    st.progressText = '';
+    st.batchVisualTotal = 0;
+    st.batchVisualFilled = 0;
+}
+
+function getActiveSplitSingleJobKey(qi = activeSplitQueue) {
+    const qd = splitQueueData[qi];
+    return splitJobKey(qd?.activeMaterialIndex || 0, qd?.activeItemIndex || 0, 'single');
+}
+
+function getActiveSplitMaterialJobKey(qi = activeSplitQueue) {
+    const qd = splitQueueData[qi];
+    return splitJobKey(qd?.activeMaterialIndex || 0, null, 'material');
+}
 // 拆图生成允许多队列并发进入，但外部 API 请求统一串行 FIFO
 let splitApiDispatchChain = Promise.resolve();
 let splitApiDispatchSeq = 0;
@@ -3447,16 +3704,21 @@ let splitMode = 'crop'; // 'crop' | 'nocrop'
 let splitGridImageUrl = ''; // 原始九宫格URL
 
 let _saveSplitQueueTimer = null;
-function saveSplitQueueData() {
+function buildSplitQueueSavePayload(options = {}) {
+    return {
+        queues: splitQueueData,
+        activeQueue: activeSplitQueue,
+        clearResultsQueues: Array.isArray(options.clearResultsQueues) ? options.clearResultsQueues : [],
+        clearFailuresQueues: Array.isArray(options.clearFailuresQueues) ? options.clearFailuresQueues : []
+    };
+}
+function saveSplitQueueData(options = {}) {
     syncUndoBaselineAfterMutation();
     // 无论后端是否可用，先落本地，保证刷新不丢
     saveSplitQueueLocalFallback();
     if (_saveSplitQueueTimer) clearTimeout(_saveSplitQueueTimer);
     _saveSplitQueueTimer = setTimeout(() => {
-        api('PUT', '/api/split-queue-data', {
-            queues: splitQueueData,
-            activeQueue: activeSplitQueue
-        }, 60000, undefined, true).catch(e => {
+        api('PUT', '/api/split-queue-data', buildSplitQueueSavePayload(options), 60000, undefined, true).catch(e => {
             console.error('保存拆图队列数据失败:', e);
             if ((e?.message || '').includes('404')) {
                 showToast('拆图后端接口不可用，已改为本地临时保存（请重启软件后端）', 'warning');
@@ -3464,14 +3726,11 @@ function saveSplitQueueData() {
         });
     }, 300);
 }
-async function saveSplitQueueDataNow() {
+async function saveSplitQueueDataNow(options = {}) {
     syncUndoBaselineAfterMutation();
     saveSplitQueueLocalFallback();
     if (_saveSplitQueueTimer) { clearTimeout(_saveSplitQueueTimer); _saveSplitQueueTimer = null; }
-    await api('PUT', '/api/split-queue-data', {
-        queues: splitQueueData,
-        activeQueue: activeSplitQueue
-    }, 60000, undefined, true).catch(e => {
+    await api('PUT', '/api/split-queue-data', buildSplitQueueSavePayload(options), 60000, undefined, true).catch(e => {
         console.error('立即保存拆图队列失败:', e);
         if ((e?.message || '').includes('404')) {
             showToast('拆图后端接口不可用，已改为本地临时保存（请重启软件后端）', 'warning');
@@ -3480,7 +3739,7 @@ async function saveSplitQueueDataNow() {
 }
 
 function isAnySplitQueueGenerating() {
-    return splitGenerateStates.some(s => s.running);
+    return splitGenerateStates.some((_, i) => isSplitJobRunning(i));
 }
 
 function getSplitQueueProgressStat(qi) {
@@ -3552,6 +3811,7 @@ async function mapWithConcurrency(items, limit, mapper, onEach) {
 
 let splitGlobalActiveJobs = 0;
 const splitGlobalJobQueue = [];
+const SPLIT_PENDING_EXPECTED_MS = 10 * 60 * 1000;
 
 function createSplitAbortError() {
     try {
@@ -3601,6 +3861,49 @@ function runWithSplitGlobalConcurrency(taskFn, signal) {
                         splitGlobalActiveJobs = Math.max(0, splitGlobalActiveJobs - 1);
                         pumpSplitGlobalJobQueue();
                     });
+            }
+        };
+        const onAbort = () => {
+            entry.cancelled = true;
+            removeSplitGlobalQueuedJob(entry);
+            finish(reject, createSplitAbortError());
+        };
+        if (signal?.aborted) {
+            onAbort();
+            return;
+        }
+        if (signal?.addEventListener) signal.addEventListener('abort', onAbort, { once: true });
+        splitGlobalJobQueue.push(entry);
+        pumpSplitGlobalJobQueue();
+    });
+}
+
+function acquireSplitGlobalJobSlot(signal) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let released = false;
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            if (signal?.removeEventListener) signal.removeEventListener('abort', onAbort);
+            fn(value);
+        };
+        const release = () => {
+            if (released) return;
+            released = true;
+            splitGlobalActiveJobs = Math.max(0, splitGlobalActiveJobs - 1);
+            pumpSplitGlobalJobQueue();
+        };
+        const entry = {
+            cancelled: false,
+            start: () => {
+                if (entry.cancelled || settled) return;
+                if (signal?.aborted) {
+                    finish(reject, createSplitAbortError());
+                    return;
+                }
+                splitGlobalActiveJobs++;
+                finish(resolve, release);
             }
         };
         const onAbort = () => {
@@ -3763,19 +4066,15 @@ function syncSplitRhAspectRatioSelectForQueue(qd) {
     const model = RH_MODELS[modelId];
     const ratios = model?.aspectRatios;
     if (!ratios?.length) return;
-    aspectSelect.innerHTML = '';
-    for (const ratio of ratios) {
-        const opt = document.createElement('option');
-        opt.value = ratio;
-        opt.textContent = ratio === 'auto' ? '自适应' : ratio;
-        aspectSelect.appendChild(opt);
-    }
-    let val = qd.rhAspectRatio;
-    if (!ratios.includes(val)) {
-        val = ratios.includes('3:4') ? '3:4' : ratios.includes('4:3') ? '4:3' : ratios[0];
-        qd.rhAspectRatio = val;
-    }
-    aspectSelect.value = val;
+    qd.rhAspectRatio = fillAspectRatioSelect(aspectSelect, ratios, qd.rhAspectRatio);
+}
+
+function syncSplitOaihkAspectRatioSelectForQueue(qd) {
+    const aspectSelect = document.getElementById('split-cfg-oaihk-aspect-ratio');
+    if (!aspectSelect || !qd) return;
+    const modelId = qd.oaihkModelId || document.getElementById('split-cfg-oaihk-model')?.value || '';
+    const model = OAIHK_MODELS[modelId];
+    qd.oaihkAspectRatio = fillAspectRatioSelect(aspectSelect, model?.aspectRatios, qd.oaihkAspectRatio || state.modelConfig?.oaihk_aspect_ratio || '3:4');
 }
 
 function pickAspectRatioFromAllowedList(allowed, pref) {
@@ -3816,10 +4115,10 @@ function applyPreferredAspectToSplitQueue(qd, pref, qi) {
         }
     } else {
         const model = OAIHK_MODELS[qd.oaihkModelId];
-        const allowed = ['3:4', '2:3', '1:1', '9:16', '4:3', '16:9'];
+        const allowed = model?.aspectRatios || DEFAULT_IMAGE_ASPECT_RATIOS;
         const picked = pickAspectRatioFromAllowedList(allowed, pref);
         qd.oaihkAspectRatio = picked;
-        if (qi === activeSplitQueue && !model?.isGptImage) {
+        if (qi === activeSplitQueue) {
             const sel = document.getElementById('split-cfg-oaihk-aspect-ratio');
             if (sel && [...sel.options].some(o => o.value === picked)) sel.value = picked;
         }
@@ -3844,7 +4143,7 @@ function writeSplitApiConfigFromQueue(qi) {
     setVal('split-cfg-rh-model', qd.rhModelId || '');
     setVal('split-cfg-oaihk-model', qd.oaihkModelId || 'fal-ai/banana/v3.1/flash/2k');
     syncSplitRhAspectRatioSelectForQueue(qd);
-    setVal('split-cfg-oaihk-aspect-ratio', qd.oaihkAspectRatio || '3:4');
+    syncSplitOaihkAspectRatioSelectForQueue(qd);
     setVal('split-cfg-rh-resolution', qd.rhResolution || '1k');
     setVal('split-cfg-rh-count', qd.rhCount || 1);
     setVal('split-cfg-rh-seed-mode', qd.rhSeedMode || 'random');
@@ -3862,18 +4161,15 @@ function updateSplitApiPlatformUI() {
     const rhModelGroup = document.getElementById('split-cfg-rh-model');
     const oaihkModelGroup = document.getElementById('split-cfg-oaihk-model');
     const oaihkArGroup = document.getElementById('split-oaihk-aspect-ratio-group');
+    const rhArGroup = document.getElementById('split-cfg-rh-aspect-ratio')?.parentElement;
     const rhResGroup = document.getElementById('split-rh-resolution-group');
     if (rhModelGroup) rhModelGroup.style.display = platform === 'runninghub' ? '' : 'none';
     if (oaihkModelGroup) oaihkModelGroup.style.display = platform === 'oaihk' ? '' : 'none';
     if (oaihkArGroup) {
-        if (platform === 'oaihk') {
-            const hkModel = OAIHK_MODELS[oaihkModelGroup?.value];
-            oaihkArGroup.style.display = hkModel?.isGptImage ? 'none' : 'flex';
-        } else {
-            oaihkArGroup.style.display = 'none';
-        }
+        oaihkArGroup.style.display = platform === 'oaihk' ? 'flex' : 'none';
     }
     if (rhResGroup) rhResGroup.style.display = platform === 'runninghub' ? 'flex' : 'none';
+    if (rhArGroup) rhArGroup.style.display = platform === 'runninghub' ? 'flex' : 'none';
     const seedInput = document.getElementById('split-cfg-rh-seed');
     const seedMode = document.getElementById('split-cfg-rh-seed-mode')?.value;
     if (seedInput) seedInput.disabled = seedMode !== 'fixed';
@@ -3882,11 +4178,32 @@ function updateSplitApiPlatformUI() {
     const rhPriceTag = document.getElementById('split-rh-price-tag');
     if (platform === 'oaihk') {
         const model = OAIHK_MODELS[oaihkModelGroup?.value];
+        const qd = splitQueueData[activeSplitQueue];
+        if (qd) {
+            qd.oaihkModelId = oaihkModelGroup?.value || qd.oaihkModelId;
+            syncSplitOaihkAspectRatioSelectForQueue(qd);
+        }
         if (oaihkPriceTag) { oaihkPriceTag.textContent = model?.price || ''; oaihkPriceTag.style.display = ''; }
         if (rhPriceTag) rhPriceTag.style.display = 'none';
     } else {
         const rhModel = RH_MODELS?.[rhModelGroup?.value];
-        if (rhPriceTag) { rhPriceTag.textContent = rhModel?.price || ''; rhPriceTag.style.display = rhModel?.price ? '' : 'none'; }
+        const rhResolution = document.getElementById('split-cfg-rh-resolution')?.value || '1k';
+        const rhPrice = getRhPriceLabel(rhModel, rhResolution);
+        const rhResolutionSelect = document.getElementById('split-cfg-rh-resolution');
+        if (rhResolutionSelect && rhModel) {
+            if (rhModel.fixedResolution) {
+                rhResolutionSelect.value = rhModel.fixedResolution;
+                rhResolutionSelect.disabled = true;
+            } else {
+                rhResolutionSelect.disabled = false;
+            }
+        }
+        const qd = splitQueueData[activeSplitQueue];
+        if (qd) {
+            qd.rhModelId = rhModelGroup?.value || qd.rhModelId;
+            syncSplitRhAspectRatioSelectForQueue(qd);
+        }
+        if (rhPriceTag) { rhPriceTag.textContent = rhPrice; rhPriceTag.style.display = rhPrice ? '' : 'none'; }
         if (oaihkPriceTag) oaihkPriceTag.style.display = 'none';
     }
     updateSplitDefaultModelBadge();
@@ -4248,6 +4565,83 @@ function getSplitCropSourceUrl(item, qd) {
     return item?.gridImageUrl || qd?.gridImageUrl || item?.imageUrl || '';
 }
 
+function getSplitResultSourceMeta(qi, materialIndex, itemIndex, gridNum) {
+    return {
+        queueIndex: qi,
+        materialIndex: Number.isFinite(materialIndex) ? materialIndex : 0,
+        itemIndex: Number.isFinite(itemIndex) ? itemIndex : 0,
+        gridNum: gridNum || (Number.isFinite(itemIndex) ? itemIndex + 1 : '')
+    };
+}
+
+function attachSplitResultSourceMeta(result, meta) {
+    if (!result || !meta) return;
+    result._splitQueueIndex = meta.queueIndex;
+    result._materialIndex = meta.materialIndex;
+    result._splitItemIndex = meta.itemIndex;
+    result._splitGridNum = meta.gridNum;
+}
+
+function getSplitResultSourceLabel(result, fallbackQi) {
+    const qi = Number.isFinite(result?._splitQueueIndex) ? result._splitQueueIndex : fallbackQi;
+    const mi = Number.isFinite(result?._materialIndex) ? result._materialIndex : 0;
+    const gridNum = result?._splitGridNum || '';
+    const parts = [`${qi + 1}号队列`];
+    parts.push(`${result?._sourceDeleted ? '已删' : ''}图片${mi + 1}`);
+    if (gridNum) parts.push(`${gridNum}号`);
+    return parts.join(' · ');
+}
+
+function getSplitSourceWorkItem(qi, result) {
+    const qd = splitQueueData[qi];
+    if (!qd) return null;
+    normalizeSplitQueueMaterials(qd);
+    const mi = Number.isFinite(result?._materialIndex) ? result._materialIndex : (qd.activeMaterialIndex || 0);
+    const wi = Number.isFinite(result?._splitItemIndex) ? result._splitItemIndex : -1;
+    const mat = qd.materials?.[mi];
+    return mat?.workItems?.[wi] || qd.workItems?.[wi] || null;
+}
+
+function locateSplitResultSource(qi, result, { silent = false } = {}) {
+    if (result?._sourceDeleted) {
+        if (!silent) showToast('这张结果的原九宫格素材已删除，无法定位', 'warning');
+        return false;
+    }
+    const sourceQi = Number.isFinite(result?._splitQueueIndex) ? result._splitQueueIndex : qi;
+    const qd = splitQueueData[sourceQi];
+    if (!qd) {
+        if (!silent) showToast('找不到来源队列', 'error');
+        return false;
+    }
+    normalizeSplitQueueMaterials(qd);
+    const mi = Math.max(0, Math.min(Number.isFinite(result?._materialIndex) ? result._materialIndex : 0, qd.materials.length - 1));
+    const mat = qd.materials?.[mi];
+    const desiredGridNum = result?._splitGridNum;
+    let wi = Number.isFinite(result?._splitItemIndex) ? result._splitItemIndex : -1;
+    if ((!Number.isFinite(wi) || wi < 0 || !mat?.workItems?.[wi]) && desiredGridNum) {
+        wi = (mat?.workItems || []).findIndex(it => String(it?.number) === String(desiredGridNum));
+    }
+    if (!mat || wi < 0 || !mat.workItems?.[wi]) {
+        if (!silent) showToast('找不到来源图片或格子，可能已被覆盖', 'error');
+        return false;
+    }
+
+    if (activeSplitQueue !== sourceQi) switchToSplitQueue(sourceQi);
+    const targetQd = splitQueueData[sourceQi];
+    normalizeSplitQueueMaterials(targetQd);
+    persistActiveSplitMaterial(targetQd);
+    loadActiveSplitMaterialIntoQueue(targetQd, mi);
+    targetQd.activeItemIndex = Math.max(0, Math.min(wi, targetQd.workItems.length - 1));
+    splitImageUrl = targetQd.gridImageUrl || '';
+    splitGridImageUrl = splitImageUrl;
+    renderSplitMaterialTabs(sourceQi);
+    loadSplitQueueToUI(sourceQi);
+    renderSplitQueueNumberBar();
+    saveSplitQueueData();
+    if (!silent) showToast(`已定位到${getSplitResultSourceLabel(result, sourceQi)}`, 'success');
+    return true;
+}
+
 function validateSplitWorkItemsForGenerate(qi) {
     const qd = splitQueueData[qi];
     if (!qd || !Array.isArray(qd.workItems) || qd.workItems.length === 0) {
@@ -4272,8 +4666,7 @@ function createSplitResultCardElement(qi, item, idx, results) {
     card.className = 'api-result-card';
     card.dataset.index = String(idx);
     card.style.position = 'relative';
-    const qdCard = splitQueueData[qi];
-    const showMatLabel = qdCard && (qdCard.materials || []).length > 1 && Number.isFinite(item?._materialIndex);
+    const sourceLabel = getSplitResultSourceLabel(item, qi);
     const imgEl = document.createElement('img');
     imgEl.alt = '拆图结果';
     imgEl.loading = 'lazy';
@@ -4294,6 +4687,15 @@ function createSplitResultCardElement(qi, item, idx, results) {
         fallback.textContent = '加载失败';
         card.insertBefore(fallback, card.firstChild);
     };
+    const sourceBadge = document.createElement('button');
+    sourceBadge.type = 'button';
+    sourceBadge.className = 'split-result-source-badge';
+    sourceBadge.title = '点击回到这张结果对应的拆图来源';
+    sourceBadge.textContent = sourceLabel;
+    sourceBadge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        locateSplitResultSource(qi, item);
+    });
     const actionsDiv = document.createElement('div');
     actionsDiv.className = 'api-result-actions';
     const downloadBtn = document.createElement('button');
@@ -4306,17 +4708,27 @@ function createSplitResultCardElement(qi, item, idx, results) {
     });
     const regenBtn = document.createElement('button');
     regenBtn.className = 'btn-icon';
-    regenBtn.title = '再次生成';
+    regenBtn.title = '定位到来源，并按当前提示词/参考图再次生成';
     regenBtn.style.cssText = 'color:#7c3aed;font-size:10px;';
     regenBtn.textContent = '再生';
     regenBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         await regenerateSplitResult(qi, idx);
     });
+    const locateBtn = document.createElement('button');
+    locateBtn.className = 'btn-icon';
+    locateBtn.title = '回到来源队列/图片/格子';
+    locateBtn.style.cssText = 'color:#2563eb;font-size:10px;';
+    locateBtn.textContent = '定位';
+    locateBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        locateSplitResultSource(qi, item);
+    });
     actionsDiv.appendChild(downloadBtn);
+    actionsDiv.appendChild(locateBtn);
     actionsDiv.appendChild(regenBtn);
     const checkDiv = document.createElement('div');
-    checkDiv.style.cssText = 'position:absolute;top:4px;left:4px;';
+    checkDiv.style.cssText = 'position:absolute;top:28px;left:4px;';
     checkDiv.innerHTML = '<input type="checkbox" class="split-result-checkbox" style="width:14px;height:14px;cursor:pointer;" title="勾选下载">';
     const cb = checkDiv.querySelector('.split-result-checkbox');
     if (cb) cb.checked = !!item.checked;
@@ -4326,54 +4738,180 @@ function createSplitResultCardElement(qi, item, idx, results) {
             saveSplitQueueData();
         });
     }
+    card.appendChild(sourceBadge);
     card.appendChild(imgEl);
-    if (showMatLabel) {
-        const lab = document.createElement('div');
-        lab.style.cssText = 'position:absolute;top:22px;left:4px;font-size:9px;padding:1px 5px;border-radius:3px;background:rgba(124,58,237,0.92);color:#fff;font-weight:600;pointer-events:none;z-index:2;';
-        lab.textContent = `素材 ${item._materialIndex + 1}`;
-        card.style.position = 'relative';
-        card.appendChild(lab);
-    }
     card.appendChild(actionsDiv);
     card.appendChild(checkDiv);
     return card;
 }
 
-function appendSplitResultPendingSlots(grid, count) {
+function createSplitFailureCardElement(qi, failure, idx) {
+    const card = document.createElement('div');
+    card.className = 'api-result-card split-result-failed-card';
+    card.dataset.failedIndex = String(idx);
+    card.style.position = 'relative';
+    card.style.border = '1px solid rgba(220,38,38,.35)';
+    card.style.background = 'rgba(254,242,242,.72)';
+
+    const snapshot = buildSplitFailureSnapshot(qi, failure);
+    const previewUrl = snapshot.sourceUrlSnapshot || snapshot.sourceUrl || snapshot.imageUrls?.[0] || snapshot.gridImageUrlSnapshot || '';
+    const preview = document.createElement(previewUrl ? 'img' : 'div');
+    if (previewUrl) {
+        preview.alt = '失败任务参考图';
+        preview.loading = 'lazy';
+        preview.src = previewUrl;
+        preview.style.cssText = 'width:100%;aspect-ratio:3/4;object-fit:cover;display:block;filter:saturate(.78);';
+        preview.onerror = () => {
+            preview.replaceWith(createSplitFailureEmptyPreview('参考图加载失败'));
+        };
+    } else {
+        preview.style.cssText = 'width:100%;aspect-ratio:3/4;display:flex;align-items:center;justify-content:center;background:rgba(254,226,226,.9);color:#991b1b;font-size:11px;text-align:center;padding:8px;';
+        preview.textContent = '未返图';
+    }
+
+    const badge = document.createElement('button');
+    badge.type = 'button';
+    badge.className = 'split-result-source-badge';
+    badge.title = '载入这个失败任务继续编辑';
+    badge.textContent = getSplitFailureLabel(qi, failure);
+    badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        restoreSplitFailureToEditor(qi, idx);
+    });
+
+    const reason = document.createElement('div');
+    reason.style.cssText = 'position:absolute;left:4px;right:4px;bottom:28px;background:rgba(127,29,29,.86);color:#fff;font-size:10px;line-height:1.35;padding:4px;border-radius:3px;text-align:center;';
+    reason.textContent = compactSplitFailureReason(failure?.reason || '未返图');
+
+    const actions = document.createElement('div');
+    actions.className = 'api-result-actions';
+    const editBtn = document.createElement('button');
+    editBtn.className = 'btn-icon';
+    editBtn.title = '载入失败任务，编辑提示词和参考图';
+    editBtn.style.cssText = 'color:#2563eb;font-size:10px;';
+    editBtn.textContent = '编辑';
+    editBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        restoreSplitFailureToEditor(qi, idx);
+    });
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'btn-icon';
+    retryBtn.title = '按失败时保存的提示词和参考图重试';
+    retryBtn.style.cssText = 'color:#7c3aed;font-size:10px;';
+    retryBtn.textContent = '重试';
+    retryBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        retrySingleSplitFailureFromList(qi, idx);
+    });
+    actions.appendChild(editBtn);
+    actions.appendChild(retryBtn);
+
+    card.appendChild(preview);
+    card.appendChild(badge);
+    card.appendChild(reason);
+    card.appendChild(actions);
+    return card;
+}
+
+function createSplitFailureEmptyPreview(text = '未返图') {
+    const el = document.createElement('div');
+    el.style.cssText = 'width:100%;aspect-ratio:3/4;display:flex;align-items:center;justify-content:center;background:rgba(254,226,226,.9);color:#991b1b;font-size:11px;text-align:center;padding:8px;';
+    el.textContent = text;
+    return el;
+}
+
+function appendSplitResultPendingSlots(grid, count, options = {}) {
     if (!grid || count < 1) return;
+    grid.querySelector('#split-result-placeholder')?.remove();
+    const keyPrefix = options.keyPrefix || options.key || '';
+    const startIndex = Number.isFinite(options.startIndex) ? options.startIndex : 0;
+    const labelPrefix = options.labelPrefix || '';
     const frag = document.createDocumentFragment();
     for (let i = 0; i < count; i++) {
         const card = document.createElement('div');
         card.className = 'split-result-pending-card api-result-pending-card';
-        card.dataset.slotIndex = String(i);
+        const slotIndex = startIndex + i;
+        card.dataset.slotIndex = String(slotIndex);
+        card.dataset.startedAt = String(Date.now());
+        card.dataset.expectedMs = String(options.expectedMs || SPLIT_PENDING_EXPECTED_MS);
+        if (keyPrefix) card.dataset.pendingKey = count === 1 ? keyPrefix : `${keyPrefix}:${slotIndex}`;
+        const label = labelPrefix ? `${labelPrefix}` : `${i + 1} / ${count}`;
         card.innerHTML = `<div class="split-result-pending-inner api-result-pending-inner">
             <div class="split-result-pending-shimmer api-result-pending-shimmer"></div>
             <div class="split-result-pending-status api-result-pending-status"><span class="loading" style="display:inline-block;"></span> 等待返图…</div>
-            <div class="split-result-pending-num api-result-pending-num">${i + 1} / ${count}</div>
+            <div class="split-result-pending-progress" style="height:4px;background:rgba(148,163,184,.28);border-radius:999px;overflow:hidden;margin:8px 0 4px;">
+                <div class="split-result-pending-progress-fill" style="height:100%;width:4%;background:linear-gradient(90deg,#22c55e,#06b6d4);border-radius:999px;transition:width .4s ease;"></div>
+            </div>
+            <div class="split-result-pending-time" style="font-size:9px;color:var(--text-muted);">刚刚开始</div>
+            <div class="split-result-pending-num api-result-pending-num">${label}</div>
         </div>`;
         frag.appendChild(card);
+        startSplitPendingProgressTimer(card);
     }
     grid.appendChild(frag);
 }
 
-function fillNextSplitPendingCard(grid, element) {
+function startSplitPendingProgressTimer(card) {
+    if (!card) return;
+    const tick = () => {
+        if (!card.isConnected) return;
+        const startedAt = parseInt(card.dataset.startedAt || `${Date.now()}`, 10);
+        const expectedMs = Math.max(60000, parseInt(card.dataset.expectedMs || `${SPLIT_PENDING_EXPECTED_MS}`, 10));
+        const elapsed = Math.max(0, Date.now() - startedAt);
+        const pct = Math.min(96, Math.max(4, Math.round((elapsed / expectedMs) * 92) + 4));
+        const fill = card.querySelector('.split-result-pending-progress-fill');
+        const time = card.querySelector('.split-result-pending-time');
+        if (fill) fill.style.width = `${pct}%`;
+        if (time) {
+            const sec = Math.round(elapsed / 1000);
+            const min = Math.floor(sec / 60);
+            const rest = sec % 60;
+            time.textContent = min > 0 ? `已等待 ${min}分${rest}秒` : `已等待 ${rest}秒`;
+        }
+        setTimeout(tick, 1000);
+    };
+    setTimeout(tick, 250);
+}
+
+function setSplitPendingCardStatus(grid, pendingKey, html) {
+    if (!grid || !pendingKey) return;
+    const el = grid.querySelector(`.split-result-pending-card[data-pending-key="${CSS.escape(pendingKey)}"] .split-result-pending-status`);
+    if (el) el.innerHTML = html;
+}
+
+function fillNextSplitPendingCard(grid, element, pendingKey = '') {
     if (!grid || !element) return;
-    const pending = grid.querySelector('.split-result-pending-card');
+    const pending = pendingKey
+        ? grid.querySelector(`.split-result-pending-card[data-pending-key="${CSS.escape(pendingKey)}"]`)
+        : grid.querySelector('.split-result-pending-card');
     if (pending) pending.replaceWith(element);
     else grid.appendChild(element);
 }
 
-function fillSplitPendingSlotAt(grid, slotIndex, element) {
+function fillSplitPendingSlotAt(grid, slotIndex, element, pendingKey = '') {
     if (!grid || !element) return;
-    const ph = grid.querySelector(`.split-result-pending-card[data-slot-index="${slotIndex}"]`);
+    const ph = pendingKey
+        ? grid.querySelector(`.split-result-pending-card[data-pending-key="${CSS.escape(pendingKey)}"]`)
+        : grid.querySelector(`.split-result-pending-card[data-slot-index="${slotIndex}"]`);
     if (ph) ph.replaceWith(element);
-    else fillNextSplitPendingCard(grid, element);
+    else fillNextSplitPendingCard(grid, element, pendingKey);
 }
 
-function clearRemainingSplitResultPendingSlots(grid) {
+function clearRemainingSplitResultPendingSlots(grid, pendingKey = '') {
     const g = grid || document.getElementById('split-result-grid');
     if (!g) return;
-    g.querySelectorAll('.split-result-pending-card').forEach(el => el.remove());
+    const selector = pendingKey
+        ? `.split-result-pending-card[data-pending-key="${CSS.escape(pendingKey)}"]`
+        : '.split-result-pending-card';
+    g.querySelectorAll(selector).forEach(el => el.remove());
+}
+
+function clearSplitPendingCardsByPrefix(grid, pendingPrefix = '') {
+    const g = grid || document.getElementById('split-result-grid');
+    if (!g || !pendingPrefix) return;
+    g.querySelectorAll('.split-result-pending-card').forEach(el => {
+        if ((el.dataset.pendingKey || '').startsWith(pendingPrefix)) el.remove();
+    });
 }
 
 function splitPendingStubCard(kind, detail) {
@@ -4390,24 +4928,102 @@ function splitPendingStubCard(kind, detail) {
 function clearSplitFailures(qi) {
     const qd = splitQueueData[qi];
     if (qd) qd.failedItems = [];
-    updateSplitFailedUI(qi);
+    updateSplitFailedUI(qi, { skipInfer: true });
+    saveSplitQueueDataNow({ clearFailuresQueues: [qi] });
 }
 
-function recordSplitFailure(qi, failure) {
+function normalizeSplitFailureImages(images) {
+    if (!Array.isArray(images)) return [];
+    const seen = new Set();
+    const out = [];
+    images.forEach(url => {
+        if (typeof url !== 'string') return;
+        const clean = url.trim();
+        if (!clean || seen.has(clean)) return;
+        seen.add(clean);
+        out.push(clean);
+    });
+    return out;
+}
+
+function compactSplitFailureReason(reason, fallback = '未返图') {
+    const raw = typeof reason === 'string' ? reason : (reason?.message || String(reason || ''));
+    const clean = raw.trim() || fallback;
+    return clean.length > 180 ? `${clean.slice(0, 177)}...` : clean;
+}
+
+function getSplitFailureIdentity(failure) {
+    const mi = Number.isFinite(failure?.materialIndex) ? failure.materialIndex : 0;
+    const wi = Number.isFinite(failure?.itemIndex) ? failure.itemIndex : 0;
+    return `${mi}:${wi}`;
+}
+
+function buildSplitFailureSnapshot(qi, failure = {}) {
     const qd = splitQueueData[qi];
-    if (!qd) return;
+    const materialIndex = Number.isFinite(failure.materialIndex) ? failure.materialIndex : (qd?.activeMaterialIndex || 0);
+    const itemIndex = Number.isFinite(failure.itemIndex) ? failure.itemIndex : 0;
+    const material = qd?.materials?.[materialIndex];
+    const item = failure.item || material?.workItems?.[itemIndex] || (materialIndex === (qd?.activeMaterialIndex || 0) ? qd?.workItems?.[itemIndex] : null);
+    const promptBody = (failure.promptBodySnapshot || failure.promptBody || item?.promptCn || '').trim();
+    const prompt = (failure.promptSnapshot || failure.prompt || (item ? buildSplitFullPrompt(item) : '') || promptBody || '').trim();
+    const sourceUrl = failure.sourceUrlSnapshot || failure.sourceUrl || failure.croppedImageUrlSnapshot || item?.croppedImageUrl || item?.imageUrl || '';
+    let imageUrls = normalizeSplitFailureImages(failure.imageUrlsSnapshot || failure.imageUrls);
+    if (imageUrls.length === 0) {
+        if (sourceUrl) imageUrls.push(sourceUrl);
+        const refs = Array.isArray(failure.referenceImages) ? failure.referenceImages : (Array.isArray(item?.materials) ? item.materials : []);
+        refs.forEach(url => {
+            if (url) imageUrls.push(url);
+        });
+        imageUrls = normalizeSplitFailureImages(imageUrls);
+    }
+    const referenceImages = normalizeSplitFailureImages(failure.referenceImages || imageUrls.slice(1));
+    const cropRect = failure.cropRectSnapshot || item?.cropRect || null;
+    return {
+        prompt,
+        promptSnapshot: prompt,
+        promptBodySnapshot: promptBody,
+        sourceUrl,
+        sourceUrlSnapshot: sourceUrl,
+        imageUrls,
+        imageUrlsSnapshot: [...imageUrls],
+        referenceImages,
+        itemImageUrlSnapshot: failure.itemImageUrlSnapshot || item?.imageUrl || sourceUrl,
+        croppedImageUrlSnapshot: failure.croppedImageUrlSnapshot || item?.croppedImageUrl || sourceUrl,
+        gridImageUrlSnapshot: failure.gridImageUrlSnapshot || material?.gridImageUrl || qd?.gridImageUrl || '',
+        cropRectSnapshot: cropRect ? deepClone(cropRect) : null,
+        selectedPrefixIdsSnapshot: Array.isArray(failure.selectedPrefixIdsSnapshot) ? [...failure.selectedPrefixIdsSnapshot] : (Array.isArray(item?.selectedPrefixIds) ? [...item.selectedPrefixIds] : []),
+        selectedSuffixIdsSnapshot: Array.isArray(failure.selectedSuffixIdsSnapshot) ? [...failure.selectedSuffixIdsSnapshot] : (Array.isArray(item?.selectedSuffixIds) ? [...item.selectedSuffixIds] : []),
+        apiPlatform: failure.apiPlatform || qd?.apiPlatform || 'oaihk',
+        oaihkModelId: failure.oaihkModelId || qd?.oaihkModelId || '',
+        oaihkAspectRatio: failure.oaihkAspectRatio || qd?.oaihkAspectRatio || '3:4',
+        rhModelId: failure.rhModelId || qd?.rhModelId || '',
+        rhResolution: failure.rhResolution || qd?.rhResolution || '1k',
+        rhAspectRatio: failure.rhAspectRatio || qd?.rhAspectRatio || '3:4',
+        rhCount: failure.rhCount || qd?.rhCount || 1,
+        rhSeedMode: failure.rhSeedMode || qd?.rhSeedMode || 'random',
+        rhSeed: failure.rhSeed || qd?.rhSeed || ''
+    };
+}
+
+function recordSplitFailure(qi, failure = {}) {
+    const qd = splitQueueData[qi];
+    if (!qd) return null;
     if (!Array.isArray(qd.failedItems)) qd.failedItems = [];
+    const snapshot = buildSplitFailureSnapshot(qi, failure);
     const item = {
         materialIndex: Number.isFinite(failure.materialIndex) ? failure.materialIndex : (qd.activeMaterialIndex || 0),
         itemIndex: Number.isFinite(failure.itemIndex) ? failure.itemIndex : 0,
         gridNum: failure.gridNum || '',
-        reason: failure.reason || '未返图',
-        ts: Date.now()
+        reason: compactSplitFailureReason(failure.reason || '未返图'),
+        ts: Date.now(),
+        ...snapshot
     };
-    const key = `${item.materialIndex}:${item.itemIndex}`;
-    qd.failedItems = qd.failedItems.filter(x => `${x.materialIndex}:${x.itemIndex}` !== key);
+    const key = getSplitFailureIdentity(item);
+    qd.failedItems = qd.failedItems.filter(x => getSplitFailureIdentity(x) !== key);
     qd.failedItems.push(item);
     updateSplitFailedUI(qi);
+    saveSplitQueueData();
+    return item;
 }
 
 function removeSplitFailure(qi, materialIndex, itemIndex) {
@@ -4415,6 +5031,26 @@ function removeSplitFailure(qi, materialIndex, itemIndex) {
     if (!qd || !Array.isArray(qd.failedItems)) return;
     qd.failedItems = qd.failedItems.filter(x => !(x.materialIndex === materialIndex && x.itemIndex === itemIndex));
     updateSplitFailedUI(qi);
+}
+
+function pruneInvalidSplitFailures(qi) {
+    const qd = splitQueueData[qi];
+    if (!qd || !Array.isArray(qd.failedItems) || qd.failedItems.length === 0) return;
+    normalizeSplitQueueMaterials(qd);
+    const resolvedKeys = new Set((qd.results || []).map(result => {
+        const mi = Number.isFinite(result?._materialIndex) ? result._materialIndex : 0;
+        const wi = Number.isFinite(result?._splitItemIndex) ? result._splitItemIndex : 0;
+        return `${mi}:${wi}:${result?._splitGridNum || ''}`;
+    }));
+    qd.failedItems = qd.failedItems.filter(f => {
+        const mi = Number.isFinite(f?.materialIndex) ? f.materialIndex : 0;
+        const wi = Number.isFinite(f?.itemIndex) ? f.itemIndex : 0;
+        if (resolvedKeys.has(`${mi}:${wi}:${f?.gridNum || ''}`)) return false;
+        const material = qd.materials?.[mi];
+        const item = material?.workItems?.[wi] || (mi === (qd.activeMaterialIndex || 0) ? qd.workItems?.[wi] : null);
+        const hasSnapshot = !!(f?.promptSnapshot || f?.sourceUrlSnapshot || f?.gridImageUrlSnapshot || normalizeSplitFailureImages(f?.imageUrlsSnapshot || f?.imageUrls).length);
+        return (!!item && !item._sourceDeleted) || hasSnapshot;
+    });
 }
 
 function inferMissingSplitFailures(qi) {
@@ -4428,16 +5064,99 @@ function inferMissingSplitFailures(qi) {
             const source = item.croppedImageUrl || item.imageUrl || '';
             if (!source) return;
             if (!resultKeys.has(`${mi}:${source}`)) {
-                inferred.push({ materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '未返图', ts: Date.now() });
+                const base = { materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '未返图', ts: Date.now() };
+                inferred.push({ ...base, ...buildSplitFailureSnapshot(qi, base) });
             }
         });
     });
     if (inferred.length > 0) qd.failedItems = inferred.slice(0, Math.max(0, qd.progressTotal - qd.progressDone));
 }
 
-function updateSplitFailedUI(qi = activeSplitQueue) {
+function hydrateSplitFailureSnapshots(qi) {
     const qd = splitQueueData[qi];
-    inferMissingSplitFailures(qi);
+    if (!qd || !Array.isArray(qd.failedItems) || qd.failedItems.length === 0) return;
+    qd.failedItems = qd.failedItems.map(failure => {
+        const needsSnapshot = !(failure.promptSnapshot || failure.sourceUrlSnapshot || normalizeSplitFailureImages(failure.imageUrlsSnapshot || failure.imageUrls).length);
+        if (!needsSnapshot) return failure;
+        const snapshot = buildSplitFailureSnapshot(qi, failure);
+        return {
+            ...failure,
+            ...snapshot,
+            materialIndex: Number.isFinite(failure.materialIndex) ? failure.materialIndex : 0,
+            itemIndex: Number.isFinite(failure.itemIndex) ? failure.itemIndex : 0,
+            gridNum: failure.gridNum || '',
+            reason: compactSplitFailureReason(failure.reason || '未返图'),
+            ts: failure.ts || Date.now()
+        };
+    });
+}
+
+function getSplitFailureLabel(qi, failure) {
+    const mi = Number.isFinite(failure?.materialIndex) ? failure.materialIndex : 0;
+    const gridNum = failure?.gridNum || (Number.isFinite(failure?.itemIndex) ? failure.itemIndex + 1 : '');
+    return `队列${qi + 1} · 图片${mi + 1}${gridNum ? ` · ${gridNum}号` : ''}`;
+}
+
+function renderSplitFailedList(qi, qd) {
+    const list = document.getElementById('split-failed-list');
+    if (!list) return;
+    const failed = Array.isArray(qd?.failedItems) ? qd.failedItems : [];
+    list.innerHTML = '';
+    list.style.display = failed.length > 0 ? 'flex' : 'none';
+    if (failed.length === 0) return;
+    failed.forEach((failure, idx) => {
+        const snapshot = buildSplitFailureSnapshot(qi, failure);
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;justify-content:space-between;padding:5px 6px;border:1px solid var(--border);border-radius:4px;background:rgba(254,242,242,.72);';
+
+        const textWrap = document.createElement('button');
+        textWrap.type = 'button';
+        textWrap.style.cssText = 'min-width:0;flex:1;text-align:left;background:transparent;border:0;padding:0;cursor:pointer;';
+        const title = document.createElement('div');
+        title.style.cssText = 'font-size:10px;font-weight:600;color:#991b1b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        title.textContent = getSplitFailureLabel(qi, failure);
+        const detail = document.createElement('div');
+        detail.style.cssText = 'font-size:9px;color:#7f1d1d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;';
+        const refs = normalizeSplitFailureImages(snapshot.imageUrlsSnapshot || snapshot.imageUrls);
+        detail.textContent = `${compactSplitFailureReason(failure.reason)}${snapshot.promptSnapshot ? ' · 已保存提示词' : ''}${refs.length ? ` · 参考图${refs.length}张` : ''}`;
+        textWrap.appendChild(title);
+        textWrap.appendChild(detail);
+        textWrap.addEventListener('click', () => restoreSplitFailureToEditor(qi, idx));
+
+        const actions = document.createElement('div');
+        actions.style.cssText = 'display:flex;align-items:center;gap:4px;flex:0 0 auto;';
+        const loadBtn = document.createElement('button');
+        loadBtn.type = 'button';
+        loadBtn.className = 'btn btn-outline btn-compact';
+        loadBtn.style.cssText = 'font-size:9px;padding:2px 6px;';
+        loadBtn.textContent = '载入编辑';
+        loadBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            restoreSplitFailureToEditor(qi, idx);
+        });
+        const retryBtn = document.createElement('button');
+        retryBtn.type = 'button';
+        retryBtn.className = 'btn btn-outline btn-compact';
+        retryBtn.style.cssText = 'font-size:9px;padding:2px 6px;color:#7c3aed;border-color:#7c3aed;';
+        retryBtn.textContent = '重试此项';
+        retryBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            retrySingleSplitFailureFromList(qi, idx);
+        });
+        actions.appendChild(loadBtn);
+        actions.appendChild(retryBtn);
+
+        row.appendChild(textWrap);
+        row.appendChild(actions);
+        list.appendChild(row);
+    });
+}
+
+function updateSplitFailedUI(qi = activeSplitQueue, options = {}) {
+    const qd = splitQueueData[qi];
+    pruneInvalidSplitFailures(qi);
+    if (!options?.skipInfer) inferMissingSplitFailures(qi);
+    hydrateSplitFailureSnapshots(qi);
     const count = Array.isArray(qd?.failedItems) ? qd.failedItems.length : 0;
     const summary = document.getElementById('split-failed-summary');
     const btn = document.getElementById('btn-split-retry-failed');
@@ -4449,22 +5168,191 @@ function updateSplitFailedUI(qi = activeSplitQueue) {
         btn.style.display = count > 0 ? 'inline-flex' : 'none';
         btn.disabled = !!splitGenerateStates[qi]?.running;
     }
+    renderSplitFailedList(qi, qd);
+}
+
+function createSplitMaterialFromFailure(failure) {
+    return {
+        gridImageUrl: failure?.gridImageUrlSnapshot || '',
+        sourceFilename: '',
+        selectedNums: [],
+        learnedGridLayout: null,
+        cropPreset: null,
+        workItems: []
+    };
+}
+
+function applySplitFailureApiSnapshotToQueue(qd, failure) {
+    if (!qd || !failure) return;
+    if (failure.apiPlatform) qd.apiPlatform = failure.apiPlatform;
+    if (failure.oaihkModelId) qd.oaihkModelId = failure.oaihkModelId;
+    if (failure.oaihkAspectRatio) qd.oaihkAspectRatio = failure.oaihkAspectRatio;
+    if (failure.rhModelId) qd.rhModelId = failure.rhModelId;
+    if (failure.rhResolution) qd.rhResolution = failure.rhResolution;
+    if (failure.rhAspectRatio) qd.rhAspectRatio = failure.rhAspectRatio;
+    if (failure.rhCount) qd.rhCount = failure.rhCount;
+    if (failure.rhSeedMode) qd.rhSeedMode = failure.rhSeedMode;
+    if (failure.rhSeed !== undefined) qd.rhSeed = failure.rhSeed;
+}
+
+function restoreSplitFailureToEditor(qi, failedIndex) {
+    const srcQd = splitQueueData[qi];
+    const rawFailure = typeof failedIndex === 'number' ? srcQd?.failedItems?.[failedIndex] : failedIndex;
+    if (!srcQd || !rawFailure) {
+        showToast('找不到失败记录', 'warning');
+        return false;
+    }
+    const failure = { ...rawFailure, ...buildSplitFailureSnapshot(qi, rawFailure) };
+    saveCurrentSplitQueueData();
+    switchMode('split');
+    if (activeSplitQueue !== qi) switchToSplitQueue(qi);
+
+    const qd = splitQueueData[qi];
+    if (!qd) return false;
+    normalizeSplitQueueMaterials(qd);
+    persistActiveSplitMaterial(qd);
+
+    const rawMaterialIndex = Number.isFinite(failure.materialIndex) ? failure.materialIndex : (qd.activeMaterialIndex || 0);
+    const materialIndex = Math.max(0, rawMaterialIndex);
+    while (qd.materials.length <= materialIndex) {
+        qd.materials.push(createSplitMaterialFromFailure(failure));
+    }
+    if (!qd.materials[materialIndex].gridImageUrl && failure.gridImageUrlSnapshot) {
+        qd.materials[materialIndex].gridImageUrl = failure.gridImageUrlSnapshot;
+    }
+
+    loadActiveSplitMaterialIntoQueue(qd, materialIndex);
+    const desiredItemIndex = Math.max(0, Number.isFinite(failure.itemIndex) ? failure.itemIndex : 0);
+    let targetItemIndex = desiredItemIndex;
+    let item = qd.workItems[targetItemIndex];
+    if (!item) {
+        targetItemIndex = qd.workItems.length;
+        item = {
+            number: failure.gridNum || (targetItemIndex + 1),
+            imageUrl: failure.itemImageUrlSnapshot || failure.sourceUrlSnapshot || '',
+            croppedImageUrl: failure.croppedImageUrlSnapshot || failure.sourceUrlSnapshot || '',
+            gridImageUrl: failure.gridImageUrlSnapshot || qd.gridImageUrl || '',
+            promptCn: '',
+            selectedPrefixIds: [],
+            selectedSuffixIds: [],
+            materials: [null, null, null]
+        };
+        qd.workItems.push(item);
+    }
+
+    const imageUrls = normalizeSplitFailureImages(failure.imageUrlsSnapshot || failure.imageUrls);
+    const sourceUrl = failure.sourceUrlSnapshot || failure.sourceUrl || imageUrls[0] || '';
+    const prompt = (failure.promptSnapshot || failure.prompt || '').trim();
+    const promptBody = (failure.promptBodySnapshot || failure.promptBody || '').trim();
+    if (failure.gridNum && !item.number) item.number = failure.gridNum;
+    if (promptBody) item.promptCn = promptBody;
+    else if (prompt) item.promptCn = prompt;
+    if (sourceUrl) {
+        item.croppedImageUrl = sourceUrl;
+        if (!item.imageUrl) item.imageUrl = failure.itemImageUrlSnapshot || sourceUrl;
+    }
+    if (failure.gridImageUrlSnapshot && !item.gridImageUrl) item.gridImageUrl = failure.gridImageUrlSnapshot;
+    if (failure.cropRectSnapshot) item.cropRect = deepClone(failure.cropRectSnapshot);
+    if (promptBody) {
+        if (Array.isArray(failure.selectedPrefixIdsSnapshot)) item.selectedPrefixIds = [...failure.selectedPrefixIdsSnapshot];
+        if (Array.isArray(failure.selectedSuffixIdsSnapshot)) item.selectedSuffixIds = [...failure.selectedSuffixIdsSnapshot];
+    } else if (prompt) {
+        item.selectedPrefixIds = [];
+        item.selectedSuffixIds = [];
+    }
+
+    const refs = normalizeSplitFailureImages(failure.referenceImages || imageUrls.slice(1));
+    if (!Array.isArray(item.materials)) item.materials = [null, null, null];
+    if (refs.length > 0) {
+        item.materials = [null, null, null];
+        refs.slice(0, 3).forEach((url, idx) => { item.materials[idx] = url; });
+    }
+
+    applySplitFailureApiSnapshotToQueue(qd, failure);
+    qd.activeItemIndex = Math.max(0, Math.min(targetItemIndex, qd.workItems.length - 1));
+    splitImageUrl = qd.gridImageUrl || failure.gridImageUrlSnapshot || '';
+    splitGridImageUrl = splitImageUrl;
+    syncActiveSplitItemToQueue(qi);
+    persistActiveSplitMaterial(qd);
+    loadSplitQueueToUI(qi);
+    renderSplitMaterialTabs(qi);
+    renderSplitQueueNumberBar();
+    updateSplitGenerateBtnState();
+    updateSplitFailedUI(qi, { skipInfer: true });
+    saveSplitQueueData();
+    showToast(`已载入${getSplitFailureLabel(qi, failure)}的失败任务，可修改后重新生成`, 'success');
+    return true;
+}
+
+function mergeSplitFailureLists(...lists) {
+    const map = new Map();
+    lists.flat().filter(Boolean).forEach(item => {
+        map.set(getSplitFailureIdentity(item), item);
+    });
+    return Array.from(map.values());
+}
+
+async function retrySingleSplitFailureFromList(qi, failedIndex) {
+    const qd = splitQueueData[qi];
+    const failures = Array.isArray(qd?.failedItems) ? [...qd.failedItems] : [];
+    const target = failures[failedIndex];
+    if (!qd || !target) {
+        showToast('找不到要重试的失败项', 'warning');
+        return;
+    }
+    if (isSplitJobRunning(qi)) {
+        showToast(`队列${qi + 1}正在生成中`, 'warning');
+        return;
+    }
+    const others = failures.filter((_, idx) => idx !== failedIndex);
+    if (activeSplitQueue !== qi) switchToSplitQueue(qi);
+    const activeQd = splitQueueData[qi];
+    activeQd.failedItems = [target];
+    updateSplitFailedUI(qi, { skipInfer: true });
+    saveSplitQueueData();
+    await runSplitRetryFailed();
+    activeQd.failedItems = mergeSplitFailureLists(others, activeQd.failedItems || []);
+    updateSplitFailedUI(qi, { skipInfer: true });
+    saveSplitQueueData();
+}
+
+function getAllSplitResultsForDisplay() {
+    const rows = [];
+    (splitQueueData || []).forEach((qd, qi) => {
+        (qd?.results || []).forEach(item => rows.push({ qi, item }));
+    });
+    return rows;
+}
+
+function getAllSplitFailuresForDisplay() {
+    const rows = [];
+    (splitQueueData || []).forEach((qd, qi) => {
+        (qd?.failedItems || []).forEach((failure, idx) => rows.push({ qi, failure, idx }));
+    });
+    return rows;
 }
 
 function renderSplitQueueResults(qi) {
     const grid = document.getElementById('split-result-grid');
     if (!grid) return;
-    const qd = splitQueueData[qi];
-    const results = qd?.results || [];
+    const preservedPending = Array.from(grid.querySelectorAll('.split-result-pending-card'));
     grid.innerHTML = '';
-    updateSplitFailedUI(qi);
-    if (results.length === 0) {
+    updateSplitFailedUI(qi, { skipInfer: !!splitGenerateStates[qi]?.running });
+    const displayRows = getAllSplitResultsForDisplay();
+    const failureRows = getAllSplitFailuresForDisplay();
+    if (displayRows.length === 0 && failureRows.length === 0 && preservedPending.length === 0) {
         grid.innerHTML = '<div id="split-result-placeholder" style="grid-column:1/-1;text-align:center;padding:30px 0;color:var(--text-muted);font-size:11px;"><div>上传九宫格图片，选择编号后点击「拆分并填入队列」</div></div>';
         return;
     }
-    results.forEach((item, idx) => {
-        grid.appendChild(createSplitResultCardElement(qi, item, idx, results));
+    displayRows.forEach(({ qi: rowQi, item }) => {
+        const sourceResults = splitQueueData[rowQi]?.results || [];
+        const idx = sourceResults.indexOf(item);
+        grid.appendChild(createSplitResultCardElement(rowQi, item, idx >= 0 ? idx : 0, sourceResults));
     });
+    failureRows.forEach(({ qi: rowQi, failure, idx }) => {
+        grid.appendChild(createSplitFailureCardElement(rowQi, failure, idx));
+    });
+    preservedPending.forEach(el => grid.appendChild(el));
 }
 
 /** 当前队列仍在生成时，在已有结果后补上剩余占位卡（切换回该队列时调用） */
@@ -4483,79 +5371,108 @@ function updateSplitGenerateBtnState() {
     const batchBtn = document.getElementById('btn-split-batch-generate');
     const batchAllBtn = document.getElementById('btn-split-batch-generate-all');
     const cancelBtn = document.getElementById('btn-split-cancel');
-    const activeState = splitGenerateStates[activeSplitQueue];
+    const activeState = ensureSplitRuntimeState(activeSplitQueue);
     const qd = splitQueueData[activeSplitQueue];
     if (qd) normalizeSplitQueueMaterials(qd);
     const activeQueueHasData = (qd?.workItems || []).length > 0;
     const multiMaterial =
         !!qd && Array.isArray(qd.materials) && qd.materials.length > 1 &&
         qd.materials.some(m => (m?.workItems || []).length > 0);
+    const singleRunning = isSplitJobRunning(activeSplitQueue, getActiveSplitSingleJobKey(activeSplitQueue));
+    const activeMaterialIndex = qd?.activeMaterialIndex || 0;
+    const materialRunning = isSplitMaterialBusy(activeSplitQueue, activeMaterialIndex);
+    const queueBusy = isSplitJobRunning(activeSplitQueue);
+    const allJobRunning = isSplitJobRunning(activeSplitQueue, 'all');
     const thisQueueGenerating = !!activeState?.running;
     if (singleBtn) {
         // 有工作项时始终显示；加载文案仅在本队列生成时出现（其它队列批量生成不影响当前队列按钮）
         singleBtn.style.display = activeQueueHasData ? '' : 'none';
-        singleBtn.disabled = thisQueueGenerating;
-        singleBtn.innerHTML = thisQueueGenerating ? '<span class="loading"></span> 生成中...' : '拆图生成';
+        singleBtn.disabled = singleRunning || allJobRunning;
+        singleBtn.innerHTML = singleRunning ? '<span class="loading"></span> 本格生成中...' : '拆图生成';
     }
     if (batchBtn) {
         batchBtn.style.display = activeQueueHasData ? '' : 'none';
-        batchBtn.disabled = thisQueueGenerating;
-        batchBtn.innerHTML = thisQueueGenerating ? '<span class="loading"></span> 批量生成中...' : '批量生成';
+        batchBtn.disabled = materialRunning || allJobRunning;
+        batchBtn.innerHTML = materialRunning ? '<span class="loading"></span> 本素材生成中...' : '批量生成';
     }
     if (batchAllBtn) {
         batchAllBtn.style.display = multiMaterial ? '' : 'none';
-        batchAllBtn.disabled = thisQueueGenerating;
-        batchAllBtn.textContent = thisQueueGenerating ? '全部素材生成中…' : '全部素材生成';
+        batchAllBtn.disabled = queueBusy;
+        batchAllBtn.textContent = allJobRunning ? '全部素材生成中…' : '全部素材生成';
     }
     if (cancelBtn) cancelBtn.style.display = thisQueueGenerating ? '' : 'none';
 }
 
 async function downloadSplitResultImage(url, qi, idx) {
-    const resp = await downloadImageAsJpg(url, splitQueueData[qi]?.imagePrefix || 'split', getEffectiveSplitDownloadPath(qi));
-    if (resp.ok) {
-        showToast('下载成功', 'success');
-    } else {
-        const err = resp.error || '未知错误';
-        if (String(err).includes('pro.filesystem.site')) {
-            showToast(`下载失败: ${err}（请重启后端使白名单生效）`, 'error');
-        } else {
-            showToast(`下载失败: ${err}`, 'error');
-        }
-    }
+    const qd = splitQueueData[qi];
+    const item = qd?.results?.[idx] || { url };
+    await manualDownloadSplitResults([item], qi, '下载');
 }
 
 async function regenerateSplitResult(qi, idx) {
     const qd = splitQueueData[qi];
     const item = qd?.results?.[idx];
     if (!qd || !item) return;
-    const platform = qd.apiPlatform || 'oaihk';
-    if (platform === 'oaihk' && !OAIHK_MODELS[qd.oaihkModelId]) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
-    if (platform !== 'oaihk' && !RH_MODELS[qd.rhModelId]) { showToast('请选择模型', 'error'); return; }
+    const sourceQi = Number.isFinite(item._splitQueueIndex) ? item._splitQueueIndex : qi;
+    const located = locateSplitResultSource(sourceQi, item);
+    if (!located) return;
+    const sourceQd = splitQueueData[sourceQi];
+    const sourceItem = getActiveSplitWorkItem(sourceQi);
+    if (!sourceQd || !sourceItem) {
+        showToast('来源工作项不存在，无法再次生成', 'error');
+        return;
+    }
+    const platform = sourceQd.apiPlatform || 'oaihk';
+    if (platform === 'oaihk' && !OAIHK_MODELS[sourceQd.oaihkModelId]) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
+    if (platform !== 'oaihk' && !RH_MODELS[sourceQd.rhModelId]) { showToast('请选择模型', 'error'); return; }
 
-    const prompt = (item._regenPrompt || item.prompt || '').trim();
-    const source = item._regenImageUrl || '';
-    if (!prompt || !source) {
-        showToast('缺少再次生成所需的原始提示词或参考图', 'error');
+    saveCurrentSplitQueueData();
+    const prompt = buildSplitFullPrompt(sourceItem).trim();
+    if (!prompt) {
+        showToast('来源格子缺少提示词，请填写后再生成', 'error');
         return;
     }
 
-    const qs = splitGenerateStates[qi];
-    if (qs?.running) {
-        showToast(`拆图队列${qi + 1}正在生成中，请稍后`, 'warning');
+    const qs = ensureSplitRuntimeState(sourceQi);
+    const regenMaterialIndex = Number.isFinite(item._materialIndex) ? item._materialIndex : (sourceQd.activeMaterialIndex || 0);
+    const regenItemIndex = Number.isFinite(item._splitItemIndex) ? item._splitItemIndex : (sourceQd.activeItemIndex || 0);
+    const jobKey = splitJobKey(regenMaterialIndex, regenItemIndex, 'single');
+    if (isSplitJobRunning(sourceQi, jobKey)) {
+        showToast(`队列${sourceQi + 1} 图片${regenMaterialIndex + 1} 的这个格子正在生成中`, 'warning');
         return;
     }
-    qs.running = true;
-    qs.cancelled = false;
-    qs.abortController = new AbortController();
+    const controller = new AbortController();
+    beginSplitJob(sourceQi, jobKey, controller);
     qs.progressPercent = 0;
     qs.progressText = '';
-    const signal = qs.abortController.signal;
+    const signal = controller.signal;
     updateSplitGenerateBtnState();
 
     try {
-        const imageUrls = platform !== 'oaihk' && source.startsWith('/') ? [window.location.origin + source] : [source];
-        const task = { prompt, imageUrls, queueLabel: `再生${idx + 1}` };
-        const newResults = await generateSingleTaskForSplit(qi, task, platform, qd, signal);
+        let source = '';
+        const cropSourceUrl = getSplitCropSourceUrl(sourceItem, sourceQd);
+        if (sourceItem.cropRect && cropSourceUrl) {
+            const cropResult = await api('POST', '/api/free-crop-image', {
+                image_url: cropSourceUrl,
+                x: sourceItem.cropRect.x, y: sourceItem.cropRect.y,
+                w: sourceItem.cropRect.w, h: sourceItem.cropRect.h
+            });
+            if (cropResult.ok && cropResult.url) {
+                source = cropResult.url;
+                sourceItem.croppedImageUrl = cropResult.url;
+            }
+        }
+        if (!source) source = sourceItem.croppedImageUrl || sourceItem.imageUrl;
+        if (!source) {
+            showToast('来源格子没有可用参考图', 'error');
+            return;
+        }
+        let imageUrls = [source];
+        if (sourceItem.materials) sourceItem.materials.forEach(m => { if (m) imageUrls.push(m); });
+        if (platform !== 'oaihk') imageUrls = imageUrls.map(u => u.startsWith('/') ? window.location.origin + u : u);
+        const meta = getSplitResultSourceMeta(sourceQi, sourceQd.activeMaterialIndex || 0, sourceQd.activeItemIndex || 0, sourceItem.number || (sourceQd.activeItemIndex + 1));
+        const task = { prompt, imageUrls, queueLabel: `再生${meta.queueIndex + 1}-${meta.materialIndex + 1}-${meta.gridNum}` };
+        const newResults = await generateSingleTaskForSplit(sourceQi, task, platform, sourceQd, signal);
         if (newResults.length === 0) {
             showToast('再次生成未返回结果', 'warning');
             return;
@@ -4563,18 +5480,18 @@ async function regenerateSplitResult(qi, idx) {
         for (const r of newResults) {
             r._regenPrompt = prompt;
             r._regenImageUrl = source;
+            r.prompt = prompt;
+            attachSplitResultSourceMeta(r, meta);
         }
-        if (qd.autoBackup !== false) await autoBackupSplitResults(newResults, qi);
-        qd.results.splice(idx, 1, ...newResults);
+        if (sourceQd.autoBackup !== false) await autoBackupSplitResults(newResults, sourceQi);
+        sourceQd.results = (sourceQd.results || []).concat(newResults);
         saveSplitQueueData();
-        if (qi === activeSplitQueue) renderSplitQueueResults(qi);
+        if (sourceQi === activeSplitQueue) renderSplitQueueResults(sourceQi);
         showToast('再次生成完成', 'success');
     } catch (e) {
         if (!qs.cancelled) showToast('再次生成失败: ' + e.message, 'error');
     } finally {
-        qs.running = false;
-        qs.cancelled = false;
-        qs.abortController = null;
+        finishSplitJob(sourceQi, jobKey);
         updateSplitGenerateBtnState();
         renderSplitQueueNumberBar();
     }
@@ -4749,16 +5666,18 @@ function applySplitSourcePreview(qi) {
 }
 function saveQueueData() {
     syncUndoBaselineAfterMutation();
-    // 保存全局 pinnedSlotIndices
-    try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
+    savePinnedSlotsLocal();
     // 防抖：300ms 内的多次调用只执行一次
     if (_saveQueueTimer) clearTimeout(_saveQueueTimer);
     _saveQueueTimer = setTimeout(() => {
         api('PUT', '/api/queue-data', {
             queues: queueData,
+            queueCount: multiQueueCount,
             activeQueue: activeQueue,
             queueMode: queueMode,
-            slots: queueMode === 'same' ? imageState.slots : []
+            slots: queueMode === 'same' ? imageState.slots : [],
+            pinnedSlotIndices: [...pinnedSlotIndices],
+            pinnedSlotMasters: serializePinnedSlotMasters()
         }, 60000, undefined, true).catch(e => console.error('保存队列数据失败:', e)); // skipGlobalAbort
     }, 300);
 }
@@ -4766,12 +5685,15 @@ function saveQueueData() {
 async function saveQueueDataNow() {
     syncUndoBaselineAfterMutation();
     if (_saveQueueTimer) { clearTimeout(_saveQueueTimer); _saveQueueTimer = null; }
-    try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
+    savePinnedSlotsLocal();
     await api('PUT', '/api/queue-data', {
         queues: queueData,
+        queueCount: multiQueueCount,
         activeQueue: activeQueue,
         queueMode: queueMode,
-        slots: queueMode === 'same' ? imageState.slots : []
+        slots: queueMode === 'same' ? imageState.slots : [],
+        pinnedSlotIndices: [...pinnedSlotIndices],
+        pinnedSlotMasters: serializePinnedSlotMasters()
     }, 60000, undefined, true);
 }
 
@@ -4779,16 +5701,18 @@ async function saveQueueDataNow() {
 function copyQueue1ToAll() {
     pushUndoSnapshot();
     const q1 = queueData[0];
-    for (let q = 1; q < QUEUE_COUNT; q++) {
+    for (let q = 1; q < multiQueueCount; q++) {
         queueData[q].slots = deepClone(q1.slots);
         queueData[q].promptCn = q1.promptCn;
         queueData[q].promptEn = q1.promptEn;
     }
+    applyPinnedSlotsToAllQueues();
     saveQueueData();
 }
 
 // 切换到指定队列
 async function switchToQueue(qIndex) {
+    if (!Number.isInteger(qIndex) || qIndex < 0 || qIndex >= multiQueueCount) return;
     pushUndoSnapshot();
     // 保存当前队列数据
     saveCurrentQueueData();
@@ -4823,6 +5747,7 @@ function saveCurrentQueueData(qi) {
     const q = queueData[idx];
     if (!q) return; // 防御性检查
     q.slots = deepClone(imageState.slots);
+    applyPinnedSlotsToQueue(q);
     q.promptCn = document.getElementById('img-prompt-cn')?.value || '';
     q.promptEn = document.getElementById('img-prompt-en')?.value || '';
     // 保存 API 配置
@@ -4895,6 +5820,7 @@ function loadQueueData(qIndex) {
     const q = queueData[qIndex];
     if (!q) return; // 防御性检查
     imageState.slots = deepClone(q.slots);
+    applyPinnedSlotsToQueue({ slots: imageState.slots });
     // 兼容旧数据：确保每个槽位有 DW 字段
     for (let s = 0; s < imageState.slots.length; s++) {
         if (imageState.slots[s].dwEnabled === undefined) imageState.slots[s].dwEnabled = false;
@@ -4916,7 +5842,6 @@ function loadQueueData(qIndex) {
     activePromptPresetIds = new Set(q.activePromptPresetIds || []);
     prevPromptCn = q.prevPromptCn || '';
     promptedSlotIndices = new Set(q.promptedSlotIndices || []);
-    pinnedSlotIndices = new Set(q.pinnedSlotIndices || []);
     // 恢复语言/前缀/自动prompt
     apiPromptLang = q.promptLang || 'en';
     const langBtn = document.getElementById('btn-api-prompt-lang');
@@ -4983,10 +5908,18 @@ function renderQueueNumberBars() {
     const isMulti = queueMode === 'multi';
     bar1.style.display = isMulti ? 'flex' : 'none';
     bar2.style.display = isMulti ? 'flex' : 'none';
+    const applyPromptAllBtn = document.getElementById('btn-apply-prompt-all-queues');
+    if (applyPromptAllBtn) applyPromptAllBtn.style.display = isMulti ? 'inline-flex' : 'none';
+    const saveAllQueuesWrap = document.getElementById('save-all-queues-wrap');
+    if (saveAllQueuesWrap) saveAllQueuesWrap.style.display = isMulti ? 'inline-flex' : 'none';
+    if (!isMulti) {
+        const saveAllQueues = document.getElementById('save-all-queues');
+        if (saveAllQueues) saveAllQueues.checked = false;
+    }
 
     if (!isMulti) return;
 
-    const html = Array.from({length: QUEUE_COUNT}, (_, i) => {
+    const numberHtml = Array.from({length: multiQueueCount}, (_, i) => {
         const isActive = i === activeQueue;
         const qd = queueData[i];
         const hasData = (qd?.slots || []).some(s => s.image || s.label) || (qd?.promptCn || '');
@@ -4995,18 +5928,64 @@ function renderQueueNumberBars() {
         const stateIcon = isGenerating ? ' <span class="queue-gen-indicator"></span>' : '';
         return `<button class="queue-num-btn ${isActive ? 'active' : ''}${stateClass}" data-queue="${i}" title="队列 ${i+1}">${i+1}${hasData ? ' <span class="dot">●</span>' : ''}${stateIcon}</button>`;
     }).join('');
+    const addDisabled = multiQueueCount >= MAX_MULTI_QUEUE_COUNT;
+    const addHtml = `<button class="queue-num-btn queue-add-btn" data-add-queue="1" ${addDisabled ? 'disabled' : ''} title="${addDisabled ? '已达到20个队列上限' : `添加队列（当前${multiQueueCount}/20）`}">＋队列</button>`;
+    const html = numberHtml + addHtml;
 
     bar1.innerHTML = html;
     bar2.innerHTML = html;
 
     // 绑定点击事件
     bar1.querySelectorAll('.queue-num-btn').forEach(btn => {
-        btn.addEventListener('click', () => switchToQueue(parseInt(btn.dataset.queue, 10)));
+        if (!btn.dataset.addQueue) btn.addEventListener('click', () => switchToQueue(parseInt(btn.dataset.queue, 10)));
     });
     bar2.querySelectorAll('.queue-num-btn').forEach(btn => {
-        btn.addEventListener('click', () => switchToQueue(parseInt(btn.dataset.queue, 10)));
+        if (!btn.dataset.addQueue) btn.addEventListener('click', () => switchToQueue(parseInt(btn.dataset.queue, 10)));
     });
+    bar1.querySelector('[data-add-queue]')?.addEventListener('click', addMultiQueue);
+    bar2.querySelector('[data-add-queue]')?.addEventListener('click', addMultiQueue);
 }
+
+async function addMultiQueue() {
+    if (multiQueueCount >= MAX_MULTI_QUEUE_COUNT) {
+        showToast('多图队列最多20个', 'info');
+        return;
+    }
+    pushUndoSnapshot();
+    saveCurrentQueueData();
+    multiQueueCount++;
+    initQueueData();
+    await saveQueueDataNow();
+    await switchToQueue(multiQueueCount - 1);
+    showToast(`已添加队列${multiQueueCount}（上限20）`, 'success');
+}
+
+document.getElementById('btn-apply-prompt-all-queues')?.addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (queueMode !== 'multi') return;
+    const promptCn = document.getElementById('img-prompt-cn')?.value || '';
+    const promptEn = document.getElementById('img-prompt-en')?.value || '';
+    if (!promptCn.trim() && !promptEn.trim()) {
+        showToast('当前提示词为空，没有可同步的内容', 'info');
+        return;
+    }
+    pushUndoSnapshot();
+    saveCurrentQueueData();
+    for (let q = 0; q < multiQueueCount; q++) {
+        if (!queueData[q]) continue;
+        queueData[q].promptCn = promptCn;
+        queueData[q].promptEn = promptEn;
+        queueData[q].promptLang = apiPromptLang;
+        queueData[q].lastAutoPrompt = promptCn;
+        queueData[q].prevPromptCn = promptCn;
+    }
+    imageState.promptCn = promptCn;
+    imageState.promptEn = promptEn;
+    await saveQueueDataNow();
+    renderQueueNumberBars();
+    showToast(`当前中英文提示词已同步到全部${multiQueueCount}个队列`, 'success');
+});
 
 // 队列模式切换
 function switchQueueMode(mode) {
@@ -5019,8 +5998,7 @@ function switchQueueMode(mode) {
     if (apiGenerateState.running) {
         apiGenerateState.cancelled = true;
         apiGenerateState.abortController?.abort();
-        apiGenerateState.running = false;
-        apiGenerateState.abortController = null;
+        resetApiGlobalGenerateState({ cancelled: true });
     }
     // 取消当前队列的生成
     if (queueMode === 'multi') {
@@ -5028,8 +6006,7 @@ function switchQueueMode(mode) {
         if (qs?.running) {
             qs.cancelled = true;
             qs.abortController?.abort();
-            qs.running = false;
-            qs.abortController = null;
+            resetQueueGenerateState(activeQueue, { cancelled: true });
         }
     }
 
@@ -5065,11 +6042,12 @@ function switchQueueMode(mode) {
         queueData[0].activePromptPresetIds = [...activePromptPresetIds];
         queueData[0].prevPromptCn = prevPromptCn;
         queueData[0].promptedSlotIndices = [...promptedSlotIndices];
+        queueData[0].pinnedSlotIndices = [...pinnedSlotIndices];
         queueData[0].promptLang = apiPromptLang;
         queueData[0].activePrefix = activePrefix;
         queueData[0].lastAutoPrompt = lastAutoPrompt;
         // 队列2-10：仅当它们没有独立数据时才复制队列0的完整配置
-        for (let q = 1; q < QUEUE_COUNT; q++) {
+        for (let q = 1; q < multiQueueCount; q++) {
             const qd = queueData[q];
             const hasOwnData = qd.slots.some(s => s.image || s.label) || qd.promptCn?.trim() || qd.promptEn?.trim();
             if (!hasOwnData) {
@@ -5093,14 +6071,15 @@ function switchQueueMode(mode) {
                 queueData[q].activePromptPresetIds = [...queueData[0].activePromptPresetIds];
                 queueData[q].prevPromptCn = queueData[0].prevPromptCn;
                 queueData[q].promptedSlotIndices = [...queueData[0].promptedSlotIndices];
-                queueData[q].pinnedSlotIndices = [...queueData[0].pinnedSlotIndices];
+                queueData[q].pinnedSlotIndices = [...pinnedSlotIndices];
                 queueData[q].promptLang = queueData[0].promptLang;
                 queueData[q].activePrefix = queueData[0].activePrefix;
                 queueData[q].lastAutoPrompt = queueData[0].lastAutoPrompt;
             }
         }
-        saveQueueData();
         activeQueue = 0;
+        applyPinnedSlotsToAllQueues();
+        saveQueueData();
     } else {
         // 切换回同图抽卡：从队列0恢复数据（包括 API 配置）
         activeQueue = 0;
@@ -5134,6 +6113,10 @@ document.getElementById('btn-clear-current-group')?.addEventListener('click', ()
     pushUndoSnapshot();
     logAction('slot', '清除当前组图片和提示词', { queue: queueMode === 'multi' ? activeQueue + 1 : 'same' });
     for (let i = 0; i < imageState.slots.length; i++) {
+        if (queueMode === 'multi' && pinnedSlotIndices.has(i) && isFilledSlot(pinnedSlotMasters[String(i)])) {
+            imageState.slots[i] = deepClone(pinnedSlotMasters[String(i)]);
+            continue;
+        }
         imageState.slots[i] = { image: '', label: '', prefixTemplate: imageState.slots[i].prefixTemplate || '请参考' };
     }
     // 清除提示词
@@ -5149,6 +6132,7 @@ document.getElementById('btn-clear-current-group')?.addEventListener('click', ()
     state.selectedItems = {};
     if (queueMode === 'multi') {
         queueData[activeQueue].slots = deepClone(imageState.slots);
+        applyPinnedSlotsToQueue(queueData[activeQueue]);
         queueData[activeQueue].promptCn = '';
         queueData[activeQueue].promptEn = '';
     }
@@ -5163,7 +6147,7 @@ document.getElementById('btn-clear-current-group')?.addEventListener('click', ()
 document.getElementById('btn-clear-all-groups')?.addEventListener('click', () => {
     let totalImages = 0;
     let totalPrompts = 0;
-    for (let q = 0; q < QUEUE_COUNT; q++) {
+    for (let q = 0; q < multiQueueCount; q++) {
         totalImages += queueData[q].slots.filter(s => s.image).length;
         if (queueData[q].promptCn || queueData[q].promptEn) totalPrompts++;
     }
@@ -5171,12 +6155,16 @@ document.getElementById('btn-clear-all-groups')?.addEventListener('click', () =>
     if (!confirm(`确认清除所有组的图片素材和提示词？共${totalImages}张图片（不会删除本地文件）`)) return;
     pushUndoSnapshot();
     logAction('slot', '清除所有组图片和提示词', { totalImages });
-    for (let q = 0; q < QUEUE_COUNT; q++) {
+    pinnedSlotIndices = new Set();
+    pinnedSlotMasters = {};
+    savePinnedSlotsLocal();
+    for (let q = 0; q < multiQueueCount; q++) {
         for (let i = 0; i < queueData[q].slots.length; i++) {
             queueData[q].slots[i] = { image: '', label: '', prefixTemplate: queueData[q].slots[i].prefixTemplate || '请参考' };
         }
         queueData[q].promptCn = '';
         queueData[q].promptEn = '';
+        queueData[q].pinnedSlotIndices = [];
     }
     // 同步当前显示
     imageState.slots = deepClone(queueData[activeQueue].slots);
@@ -5222,25 +6210,35 @@ function switchMode(mode) {
         btn.classList.toggle('active', btn.dataset.mode === mode);
     });
 
-    const promptMode = document.querySelector('.main-content:not(#image-mode):not(#split-mode)');
+    const promptMode = document.querySelector('main.main-content');
     const imageMode = document.getElementById('image-mode');
     const splitMode = document.getElementById('split-mode');
+    const ecommerceMode = document.getElementById('ecommerce-mode');
 
     if (mode === 'image') {
         if (promptMode) promptMode.style.display = 'none';
         if (imageMode) imageMode.style.display = 'flex';
         if (splitMode) splitMode.style.display = 'none';
+        if (ecommerceMode) ecommerceMode.style.display = 'none';
         if (!imageState.loaded) loadImageModeData();
     } else if (mode === 'split') {
         if (promptMode) promptMode.style.display = 'none';
         if (imageMode) imageMode.style.display = 'none';
         if (splitMode) splitMode.style.display = 'flex';
+        if (ecommerceMode) ecommerceMode.style.display = 'none';
         if (!splitModeLoaded) loadSplitModeData();
         else renderSplitLibrary();
+    } else if (mode === 'ecommerce') {
+        if (promptMode) promptMode.style.display = 'none';
+        if (imageMode) imageMode.style.display = 'none';
+        if (splitMode) splitMode.style.display = 'none';
+        if (ecommerceMode) ecommerceMode.style.display = 'block';
+        setTimeout(() => loadEcommerceModeData(), 0);
     } else {
         if (promptMode) promptMode.style.display = 'flex';
         if (imageMode) imageMode.style.display = 'none';
         if (splitMode) splitMode.style.display = 'none';
+        if (ecommerceMode) ecommerceMode.style.display = 'none';
     }
 
     // 切换后恢复提示词文本
@@ -5262,6 +6260,8 @@ if (currentMode === 'image') {
     switchMode('image');
 } else if (currentMode === 'split') {
     switchMode('split');
+} else if (currentMode === 'ecommerce') {
+    switchMode('ecommerce');
 }
 
 // ---------- 数据加载 ----------
@@ -5283,8 +6283,13 @@ async function loadImageModeData() {
 
 function renderImageMode() {
     renderImageLibrary();
-    renderImageSlots();
+    if (queueMode === 'multi') loadQueueData(activeQueue);
+    else renderImageSlots();
     renderImagePresets();
+    renderQueueNumberBars();
+    updateClearButtonsVisibility();
+    const batchBtn = document.getElementById('btn-api-batch-generate');
+    if (batchBtn) batchBtn.style.display = queueMode === 'multi' ? 'inline-flex' : 'none';
 }
 
 // ---------- 素材库渲染（子分类结构，图生图 / 拆图共用 DOM 逻辑） ----------
@@ -5674,6 +6679,7 @@ function fillSlotFromMaterial(item, categoryName) {
         imageState.slots[idx].dwOriginalImage = '';
         // 语义标签自动设为分类名（如"五官"、"发型"）
         imageState.slots[idx].label = categoryName || item.name;
+        syncPinnedSlotFromCurrent(idx);
         renderImageSlots();
         updateLocalPrompt();
         showToast(`已填入 Image ${idx + 1}，语义：${categoryName || item.name}`, 'success');
@@ -6212,10 +7218,12 @@ function renderImageSlots() {
     for (let i = 0; i < SLOT_COUNT; i++) {
         const slot = imageState.slots[i];
         const isActive = imageState.activeSlotIndex === i;
+        const isPinned = queueMode === 'multi' && pinnedSlotIndices.has(i);
 
         const slotEl = document.createElement('div');
-        slotEl.className = `image-slot-compact ${isActive ? 'active' : ''}`;
+        slotEl.className = `image-slot-compact ${isActive ? 'active' : ''} ${isPinned ? 'pinned-slot' : ''}`;
         slotEl.dataset.slotIndex = i;
+        slotEl.draggable = !!slot.image;
 
         const imgHtml = slot.image
             ? `<img src="${escHtml(slot.image)}" class="slot-compact-img" alt="Image ${i+1}" style="width:${imgSize}px;height:${imgSize}px;">`
@@ -6224,12 +7232,15 @@ function renderImageSlots() {
         const prefix = slot.prefixTemplate || '请参考';
         const semantic = slot.label || '';
 
-        const pinBtn = (queueMode === 'multi' && slot.image) ? `<button class="slot-pin-btn ${pinnedSlotIndices.has(i) ? 'pinned' : ''}" title="${pinnedSlotIndices.has(i) ? '取消全列队' : '应用全列队'}">${pinnedSlotIndices.has(i) ? '📌' : '📍'}</button>` : '';
+        const pinBtn = (queueMode === 'multi' && slot.image) ? `<button class="slot-pin-btn ${isPinned ? 'pinned' : ''}" title="${isPinned ? '取消固定槽（保留当前图片）' : '固定到全队列'}">${isPinned ? '📌' : '📍'}</button>` : '';
         const dwBtn = slot.image
-            ? `<button class="slot-dw-btn ${slot.dwEnabled ? 'active' : ''}" title="DWPose 姿态提取">${slot._dwLoading ? '<span class="dw-spinner"></span>' : 'DW'}</button>`
+            ? `<button class="slot-dw-btn ${slot.dwEnabled ? 'active' : ''}" title="DWPose 姿态提取" ${slot._dwLoading ? 'disabled' : ''}>${slot._dwLoading ? '<span class="dw-spinner"></span>' : 'DW'}</button>`
+            : '';
+        const dwProgress = slot._dwLoading
+            ? `<div class="slot-dw-progress" aria-live="polite"><span class="slot-dw-progress-text">DW姿态图生成中...</span><span class="slot-dw-progress-bar"><span></span></span></div>`
             : '';
         slotEl.innerHTML = `
-            <div class="slot-compact-image-area ${slot.dwEnabled ? 'dw-active' : ''}">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}${dwBtn}</div>
+            <div class="slot-compact-image-area ${slot.dwEnabled ? 'dw-active' : ''} ${slot._dwLoading ? 'dw-loading' : ''}">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}${dwBtn}${dwProgress}</div>
             <div class="slot-compact-label">
                 <span class="slot-prefix" title="点击编辑前缀">${escHtml(prefix)}</span><span class="slot-auto-text">图${i+1}${semantic ? '的' + escHtml(semantic) : ''}</span>
             </div>
@@ -6285,7 +7296,7 @@ function renderImageSlots() {
         let clickTimer = null;
         imgArea.addEventListener('click', (e) => {
             e.stopPropagation();
-            if (e.target.closest('.slot-change-btn') || e.target.closest('.slot-pin-btn')) return;
+            if (e.target.closest('.slot-change-btn') || e.target.closest('.slot-pin-btn') || slotEl.classList.contains('slot-dragging')) return;
             if (imageState.activeSlotIndex !== i) {
                 imageState.activeSlotIndex = i;
                 renderImageSlots();
@@ -6326,65 +7337,7 @@ function renderImageSlots() {
                 logAction('slot', '素材库拖拽到槽', { slotIndex: i });
                 return;
             }
-            const imageFiles = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
-            if (!imageFiles.length) return;
-            if (imageFiles.length === 1) {
-                // 单张：裁剪 → 分配素材 → 加载到槽位
-                const reader = new FileReader();
-                reader.onload = () => {
-                    showCropModal(reader.result, async (croppedBlob) => {
-                        const formData = new FormData();
-                        formData.append('file', croppedBlob, 'cropped.jpg');
-                        try {
-                            const url = await uploadImage(formData);
-                            // 弹出分配素材弹窗
-                            const assignResult = await showAssignMaterial(url, imageFiles[0].name);
-                            imageState.slots[i].image = url;
-                            imageState.slots[i].dwEnabled = false;
-                            imageState.slots[i].dwOriginalImage = '';
-                            if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
-                                imageState.slots[i].label = assignResult.labels.join('、');
-                            }
-                            renderImageSlots();
-                            updateLocalPrompt();
-                            if (assignResult && assignResult.savedToLib) {
-                                showToast('图片已存入素材库并加载到槽位', 'success');
-                            } else {
-                                showToast('图片已加载到槽位', 'success');
-                            }
-                            logAction('slot', '拖拽上传图片到槽', { slotIndex: i });
-                        } catch (err) { showToast(err.message, 'error'); }
-                    });
-                };
-                reader.readAsDataURL(imageFiles[0]);
-            } else {
-                // 多张：批量裁剪队列，每张裁剪后弹出分配弹窗
-                startBatchCrop(imageFiles, i, (targetSlot, idx, total) => {
-                    return async (croppedBlob) => {
-                        const formData = new FormData();
-                        formData.append('file', croppedBlob, 'cropped.jpg');
-                        try {
-                            const url = await uploadImage(formData);
-                            // 弹出分配素材弹窗
-                            const assignResult = await showAssignMaterial(url, imageFiles[idx].name);
-                            if (targetSlot < SLOT_COUNT) {
-                                imageState.slots[targetSlot].image = url;
-                                imageState.slots[targetSlot].dwEnabled = false;
-                                imageState.slots[targetSlot].dwOriginalImage = '';
-                                if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
-                                    imageState.slots[targetSlot].label = assignResult.labels.join('、');
-                                }
-                                renderImageSlots();
-                                updateLocalPrompt();
-                                logAction('slot', '拖拽批量上传图片到槽', { slotIndex: targetSlot });
-                            }
-                            if (idx === total - 1) {
-                                showToast('批量上传完成：' + total + '张', 'success');
-                            }
-                        } catch (err) { showToast('第' + (idx+1) + '张上传失败：' + err.message, 'error'); }
-                    };
-                });
-            }
+            uploadFilesToImageSlots(e.dataTransfer.files, i, '拖拽上传图片到槽');
         });
 
         // 右键菜单：清除/本地上传
@@ -6414,67 +7367,183 @@ function renderImageSlots() {
 // 实时拼接本地Prompt（无AI）
 // 记录上次拼接的内容，用于增量更新
 let lastAutoPrompt = '';
-// 记录已经参与提示词拼接的图片槽位索引集合
-let promptedSlotIndices = new Set();
-// 记录已应用全列队的图片槽位索引
-let pinnedSlotIndices = new Set(JSON.parse(localStorage.getItem('pinnedSlotIndices') || '[]'));
-// 记录固定前其他队列的原始槽位数据，用于取消固定时恢复
-let pinnedSlotOriginals = {}; // { slotIndex: { queueIndex: slotData } }
 
-// 应用/取消全列队：将当前槽位图片复制到所有列队的同一槽位
+function safeJsonParse(raw, fallback) {
+    try {
+        const parsed = raw ? JSON.parse(raw) : fallback;
+        return parsed === undefined || parsed === null ? fallback : parsed;
+    } catch(e) {
+        return fallback;
+    }
+}
+
+function createEmptyImageSlot(prefixTemplate = '请参考') {
+    return { image: '', label: '', prefixTemplate, dwEnabled: false, dwOriginalImage: '' };
+}
+
+function ensureQueueSlots(q, minLen = SLOT_COUNT) {
+    if (!q.slots) q.slots = [];
+    while (q.slots.length < minLen) q.slots.push(createEmptyImageSlot());
+}
+
+function isFilledSlot(slot) {
+    return !!(slot && (slot.image || slot.label));
+}
+
+function serializePinnedSlotMasters() {
+    const normalized = {};
+    for (const index of pinnedSlotIndices) {
+        const key = String(index);
+        const master = pinnedSlotMasters[key];
+        if (isFilledSlot(master)) normalized[key] = deepClone(master);
+    }
+    return normalized;
+}
+
+function savePinnedSlotsLocal() {
+    try {
+        localStorage.setItem('pinnedSlotIndices', JSON.stringify([...pinnedSlotIndices]));
+        localStorage.setItem('pinnedSlotMasters', JSON.stringify(serializePinnedSlotMasters()));
+    } catch(e) {}
+}
+
+function restorePinnedSlotsFromPayload(payload = {}) {
+    const masters = payload.pinnedSlotMasters || safeJsonParse(localStorage.getItem('pinnedSlotMasters'), {});
+    const indices = Array.isArray(payload.pinnedSlotIndices)
+        ? payload.pinnedSlotIndices
+        : safeJsonParse(localStorage.getItem('pinnedSlotIndices'), []);
+    pinnedSlotMasters = {};
+    pinnedSlotIndices = new Set();
+
+    const mergedIndices = new Set(indices || []);
+    // 兼容旧版与部分迁移数据：即使根级已经有一部分置顶，也要合并各队列残留的置顶索引。
+    if (Array.isArray(queueData)) {
+        for (const q of queueData) {
+            for (const rawIndex of q?.pinnedSlotIndices || []) mergedIndices.add(rawIndex);
+        }
+    }
+
+    for (const rawIndex of mergedIndices) {
+        const index = parseInt(rawIndex, 10);
+        if (!Number.isInteger(index) || index < 0 || index >= SLOT_COUNT) continue;
+        const sourceQueue = Array.isArray(queueData) ? queueData.find(q => isFilledSlot(q?.slots?.[index])) : null;
+        const master = masters?.[String(index)] || masters?.[index] || sourceQueue?.slots?.[index];
+        if (isFilledSlot(master)) {
+            pinnedSlotMasters[String(index)] = deepClone(master);
+            pinnedSlotIndices.add(index);
+        }
+    }
+    savePinnedSlotsLocal();
+}
+
+function applyPinnedSlotsToQueue(q) {
+    if (!q) return;
+    ensureQueueSlots(q);
+    for (const index of pinnedSlotIndices) {
+        const master = pinnedSlotMasters[String(index)];
+        if (isFilledSlot(master)) q.slots[index] = deepClone(master);
+    }
+    q.pinnedSlotIndices = [...pinnedSlotIndices];
+}
+
+function applyPinnedSlotsToAllQueues() {
+    while (queueData.length < multiQueueCount) {
+        queueData.push({ slots: [], promptCn: '', promptEn: '', results: [] });
+    }
+    for (let q = 0; q < multiQueueCount; q++) applyPinnedSlotsToQueue(queueData[q]);
+    if (queueMode === 'multi') {
+        applyPinnedSlotsToQueue({ slots: imageState.slots });
+    }
+    savePinnedSlotsLocal();
+}
+
+function setPinnedSlotMaster(slotIndex, slot) {
+    if (!Number.isInteger(slotIndex) || slotIndex < 0 || slotIndex >= SLOT_COUNT) return;
+    if (!isFilledSlot(slot)) return;
+    pinnedSlotMasters[String(slotIndex)] = deepClone(slot);
+    pinnedSlotIndices.add(slotIndex);
+    applyPinnedSlotsToAllQueues();
+}
+
+function syncPinnedSlotFromCurrent(slotIndex) {
+    if (queueMode !== 'multi' || !pinnedSlotIndices.has(slotIndex)) return;
+    const slot = imageState.slots[slotIndex];
+    if (isFilledSlot(slot)) {
+        setPinnedSlotMaster(slotIndex, slot);
+    } else {
+        pinnedSlotIndices.delete(slotIndex);
+        delete pinnedSlotMasters[String(slotIndex)];
+        applyPinnedSlotsToAllQueues();
+    }
+}
+
+function movePinnedSlotIndex(fromIndex, toIndex) {
+    const fromPinned = pinnedSlotIndices.has(fromIndex);
+    const toPinned = pinnedSlotIndices.has(toIndex);
+    const fromMaster = pinnedSlotMasters[String(fromIndex)];
+    const toMaster = pinnedSlotMasters[String(toIndex)];
+
+    if (fromPinned) delete pinnedSlotMasters[String(fromIndex)];
+    if (toPinned) delete pinnedSlotMasters[String(toIndex)];
+    pinnedSlotIndices.delete(fromIndex);
+    pinnedSlotIndices.delete(toIndex);
+
+    if (fromPinned && isFilledSlot(fromMaster)) {
+        pinnedSlotIndices.add(toIndex);
+        pinnedSlotMasters[String(toIndex)] = deepClone(fromMaster);
+    }
+    if (toPinned && isFilledSlot(toMaster)) {
+        pinnedSlotIndices.add(fromIndex);
+        pinnedSlotMasters[String(fromIndex)] = deepClone(toMaster);
+    }
+    applyPinnedSlotsToAllQueues();
+}
+
+function swapImageSlots(fromIndex, toIndex) {
+    if (fromIndex === toIndex) return;
+    if (fromIndex < 0 || toIndex < 0 || fromIndex >= SLOT_COUNT || toIndex >= SLOT_COUNT) return;
+    while (imageState.slots.length < SLOT_COUNT) imageState.slots.push(createEmptyImageSlot());
+    const tmp = imageState.slots[fromIndex];
+    imageState.slots[fromIndex] = imageState.slots[toIndex] || createEmptyImageSlot();
+    imageState.slots[toIndex] = tmp || createEmptyImageSlot();
+    if (queueMode === 'multi') {
+        for (const q of queueData) {
+            if (!q) continue;
+            ensureQueueSlots(q);
+            const qTmp = q.slots[fromIndex];
+            q.slots[fromIndex] = q.slots[toIndex] || createEmptyImageSlot();
+            q.slots[toIndex] = qTmp || createEmptyImageSlot();
+        }
+    }
+    movePinnedSlotIndex(fromIndex, toIndex);
+    if (queueMode === 'multi') saveCurrentQueueData();
+    updateLocalPrompt();
+    renderImageSlots();
+    saveQueueData();
+    showToast(`已交换图${fromIndex + 1}和图${toIndex + 1}的位置`, 'success');
+}
+
+// 应用/取消全列队：固定槽以全局主数据为准。取消固定时保留各队列当前副本，不清图。
 function togglePinSlotToAllQueues(slotIndex) {
     if (queueMode !== 'multi') return;
     const currentSlot = imageState.slots[slotIndex];
     if (!currentSlot.image && !currentSlot.label) return;
 
-    // 确保queueData有QUEUE_COUNT个队列
-    while (queueData.length < QUEUE_COUNT) {
-        queueData.push({
-            slots: Array.from({length: SLOT_COUNT}, () => ({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' })),
-            promptCn: '', promptEn: '', results: []
-        });
-    }
-
     if (pinnedSlotIndices.has(slotIndex)) {
-        // 取消：恢复其他列队该槽位的原始数据
-        const originals = pinnedSlotOriginals[slotIndex] || {};
-        for (let q = 0; q < QUEUE_COUNT; q++) {
-            if (q === activeQueue) continue;
-            if (!queueData[q].slots) queueData[q].slots = [];
-            while (queueData[q].slots.length <= slotIndex) {
-                queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
-            }
-            if (originals[q]) {
-                queueData[q].slots[slotIndex] = deepClone(originals[q]);
-            } else {
-                queueData[q].slots[slotIndex] = { image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' };
-            }
-        }
-        delete pinnedSlotOriginals[slotIndex];
         pinnedSlotIndices.delete(slotIndex);
-        try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
-        saveQueueData();
-        renderImageSlots();
-        showToast(`已取消图${slotIndex + 1}的全列队应用`, 'info');
-    } else {
-        // 应用：先保存其他列队的原始数据，再复制
-        const slotCopy = deepClone(currentSlot);
-        pinnedSlotOriginals[slotIndex] = {};
-        for (let q = 0; q < QUEUE_COUNT; q++) {
-            if (q === activeQueue) continue;
-            if (!queueData[q].slots) queueData[q].slots = [];
-            while (queueData[q].slots.length <= slotIndex) {
-                queueData[q].slots.push({ image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' });
-            }
-            // 保存原始数据
-            pinnedSlotOriginals[slotIndex][q] = deepClone(queueData[q].slots[slotIndex]);
-            queueData[q].slots[slotIndex] = slotCopy;
+        delete pinnedSlotMasters[String(slotIndex)];
+        for (let q = 0; q < multiQueueCount; q++) {
+            if (queueData[q]) queueData[q].pinnedSlotIndices = [...pinnedSlotIndices];
         }
-        pinnedSlotIndices.add(slotIndex);
-        try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
+        savePinnedSlotsLocal();
         saveQueueData();
         renderImageSlots();
-        showToast(`已将图${slotIndex + 1}应用到所有列队`, 'success');
+        showToast(`已取消图${slotIndex + 1}固定，队列中的现有图片保留`, 'info');
+    } else {
+        setPinnedSlotMaster(slotIndex, currentSlot);
+        saveQueueData();
+        renderImageSlots();
+        showToast(`已将图${slotIndex + 1}固定并同步到所有队列`, 'success');
     }
 }
 
@@ -6482,6 +7551,7 @@ function togglePinSlotToAllQueues(slotIndex) {
 async function toggleDW(slotIndex) {
     const slot = imageState.slots[slotIndex];
     if (!slot.image) return;
+    if (slot._dwLoading) return;
 
     if (slot.dwEnabled) {
         // 关闭：恢复原图
@@ -6490,6 +7560,7 @@ async function toggleDW(slotIndex) {
             slot.dwOriginalImage = '';
         }
         slot.dwEnabled = false;
+        syncPinnedSlotFromCurrent(slotIndex);
         renderImageSlots();
         if (queueMode === 'multi') saveCurrentQueueData();
         return;
@@ -6499,6 +7570,7 @@ async function toggleDW(slotIndex) {
     const originalImage = slot.image;
     slot._dwLoading = true;
     renderImageSlots();
+    showToast('正在生成 DW 姿态图，请稍等...', 'info');
 
     try {
         const result = await api('POST', '/api/dwpose-process', { imageUrl: originalImage });
@@ -6511,12 +7583,57 @@ async function toggleDW(slotIndex) {
         slot.dwOriginalImage = originalImage;
         slot.image = result.poseImageUrl;
         slot.dwEnabled = true;
+        showToast(result.cached ? '已使用缓存的 DW 姿态图' : 'DW 姿态图生成完成', 'success');
     } catch (e) {
         showToast('DWPose 处理失败: ' + e.message, 'error');
     }
     slot._dwLoading = false;
+    syncPinnedSlotFromCurrent(slotIndex);
     renderImageSlots();
     if (queueMode === 'multi') saveCurrentQueueData();
+}
+
+function normalizeReferenceImageUrl(url, makeAbsolute = false) {
+    if (!url) return '';
+    if (makeAbsolute && url.startsWith('/')) return window.location.origin + url;
+    return url;
+}
+
+function buildGenerationReferencePayload(slots, prompt, lang = 'cn', makeAbsolute = false) {
+    const imageUrls = [];
+    const dwPairs = [];
+    const sourceSlots = (slots || []).filter(s => s && s.image);
+
+    for (const slot of sourceSlots) {
+        if (slot.dwEnabled && slot.dwOriginalImage && slot.image) {
+            imageUrls.push(normalizeReferenceImageUrl(slot.dwOriginalImage, makeAbsolute));
+            const originalIndex = imageUrls.length;
+            imageUrls.push(normalizeReferenceImageUrl(slot.image, makeAbsolute));
+            const poseIndex = imageUrls.length;
+            const slotLabel = slot.label || '动作参考';
+            dwPairs.push({ originalIndex, poseIndex, slotLabel });
+        } else {
+            imageUrls.push(normalizeReferenceImageUrl(slot.image, makeAbsolute));
+        }
+    }
+
+    if (dwPairs.length === 0) {
+        return { prompt, imageUrls };
+    }
+
+    const isChinese = lang === 'cn';
+    const pairText = dwPairs.map(pair => {
+        if (isChinese) {
+            return `第${pair.originalIndex}张图片是“${pair.slotLabel}”的原始动作参考图，第${pair.poseIndex}张图片是它对应的 DWPose 骨架姿态图`;
+        }
+        return `Image ${pair.originalIndex} is the original pose reference for "${pair.slotLabel}", and Image ${pair.poseIndex} is its corresponding DWPose skeleton pose map`;
+    }).join(isChinese ? '；' : '; ');
+
+    const instruction = isChinese
+        ? `重要参考说明：${pairText}。这些原始图和 DWPose 图都只用于参考人物动作、身体朝向、肢体姿态、坐站关系和构图位置；不要参考这些图中的人物身份、脸、服装、背景、道具、色彩、文字或画风。请以 DWPose 骨架图作为主要动作约束，原始动作图只用于辅助理解被遮挡或识别不完整的肢体。`
+        : `Important reference note: ${pairText}. These original images and DWPose images are only for body pose, body direction, limb position, sitting/standing relationship, and composition placement. Do not copy identity, face, clothing, background, props, colors, text, or visual style from these images. Use the DWPose skeleton map as the primary pose constraint, and use the original pose image only to understand occluded or incomplete limbs.`;
+
+    return { prompt: `${instruction}\n\n${prompt}`, imageUrls };
 }
 
 function updateLocalPrompt() {
@@ -6647,6 +7764,7 @@ function renderPrefixBatchBar() {
             // 批量设置前缀，但跳过第1个槽位（Image 1保留用户手动设置的值）
             for (let i = 1; i < SLOT_COUNT; i++) {
                 imageState.slots[i].prefixTemplate = prefix;
+                syncPinnedSlotFromCurrent(i);
             }
             // 更新按钮高亮
             document.querySelectorAll('.prefix-batch-btn').forEach(b => b.classList.toggle('active', b.dataset.prefix === prefix));
@@ -6728,71 +7846,247 @@ document.getElementById('btn-add-prefix-old')?.addEventListener('click', async (
     showToast(`已添加"${newPrefix.trim()}"`, 'success');
 });
 
+function normalizeImageFiles(files) {
+    const supportedExt = /\.(jpe?g|png|webp)$/i;
+    return Array.from(files || []).filter(f => {
+        if (!f) return false;
+        return f.type?.startsWith('image/') || supportedExt.test(f.name || '');
+    });
+}
+
+function dataTransferHasImageFiles(dataTransfer) {
+    if (!dataTransfer) return false;
+    if (normalizeImageFiles(dataTransfer.files).length > 0) return true;
+    return Array.from(dataTransfer.items || []).some(item => item.kind === 'file' && item.type?.startsWith('image/'));
+}
+
+function getFirstEmptyImageSlotIndex() {
+    const idx = imageState.slots.findIndex(s => !s.image && !s.label);
+    return idx >= 0 ? idx : Math.min(imageState.slots.length, SLOT_COUNT - 1);
+}
+
+async function applyCroppedImageFileToSlot(croppedBlob, file, targetSlot, idx, total, sourceLabel) {
+    if (!croppedBlob || targetSlot >= SLOT_COUNT) return;
+    const formData = new FormData();
+    formData.append('file', croppedBlob, 'cropped.jpg');
+    try {
+        const url = await uploadImage(formData);
+        const assignResult = total === 1 ? await showAssignMaterial(url, file.name) : null;
+        imageState.slots[targetSlot].image = url;
+        imageState.slots[targetSlot].dwEnabled = false;
+        imageState.slots[targetSlot].dwOriginalImage = '';
+        if (assignResult?.labels?.length > 0) {
+            imageState.slots[targetSlot].label = assignResult.labels.join('、');
+        } else {
+            imageState.slots[targetSlot].label = getFileBaseName(file.name);
+        }
+        syncPinnedSlotFromCurrent(targetSlot);
+        renderImageSlots();
+        updateLocalPrompt();
+        if (queueMode === 'multi') saveCurrentQueueData();
+        logAction('slot', sourceLabel, { slotIndex: targetSlot, fileName: file.name });
+        if (total === 1) {
+            showToast(assignResult?.savedToLib ? '图片已存入素材库并加载到槽位' : '图片已加载到槽位', 'success');
+        } else if (idx === total - 1) {
+            showToast(`批量上传完成：${total}张`, 'success');
+        }
+    } catch (err) {
+        showToast(total === 1 ? err.message : `第${idx + 1}张上传失败：${err.message}`, 'error');
+    }
+}
+
+function uploadFilesToImageSlots(files, startSlot, sourceLabel = '上传图片到槽') {
+    const imageFiles = normalizeImageFiles(files);
+    if (!imageFiles.length) return false;
+    const safeStart = Math.max(0, Math.min(startSlot || 0, SLOT_COUNT - 1));
+    const usableFiles = imageFiles.slice(0, SLOT_COUNT - safeStart);
+    if (usableFiles.length < imageFiles.length) {
+        showToast(`参考图槽最多还能放 ${usableFiles.length} 张，已自动忽略多余图片`, 'warning');
+    }
+    if (!usableFiles.length) return false;
+    if (state.modelConfig?.upload_mode === 'original') {
+        uploadOriginalFilesToSlots(usableFiles, safeStart, sourceLabel);
+        return true;
+    }
+    // 多图拖入要求松手后自动完成：按方向中心裁成 3:4 / 4:3，限并发上传，不逐张弹裁剪框。
+    if (usableFiles.length > 1) {
+        uploadAdaptiveFilesToSlots(usableFiles, safeStart, sourceLabel);
+        return true;
+    }
+    startBatchCrop(usableFiles, safeStart, (targetSlot, idx, total) => {
+        return (croppedBlob) => applyCroppedImageFileToSlot(croppedBlob, usableFiles[idx], targetSlot, idx, total, sourceLabel);
+    });
+    return true;
+}
+
+async function settleWithConcurrency(items, concurrency, worker) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    async function runWorker() {
+        while (cursor < items.length) {
+            const idx = cursor++;
+            try {
+                results[idx] = { status: 'fulfilled', value: await worker(items[idx], idx) };
+            } catch (reason) {
+                results[idx] = { status: 'rejected', reason };
+            }
+        }
+    }
+    const count = Math.max(1, Math.min(concurrency, items.length));
+    await Promise.all(Array.from({ length: count }, () => runWorker()));
+    return results;
+}
+
+function canvasToCompressedJpeg(canvas, maxBytes = 2 * 1024 * 1024) {
+    return new Promise((resolve, reject) => {
+        let quality = 0.92;
+        const encode = () => {
+            canvas.toBlob((blob) => {
+                if (!blob) {
+                    reject(new Error('浏览器无法压缩这张图片'));
+                    return;
+                }
+                if (blob.size <= maxBytes || quality <= 0.52) {
+                    resolve(blob);
+                    return;
+                }
+                quality -= 0.08;
+                encode();
+            }, 'image/jpeg', quality);
+        };
+        encode();
+    });
+}
+
+async function decodeUploadImage(file) {
+    if (typeof createImageBitmap === 'function') {
+        try {
+            return await createImageBitmap(file, { imageOrientation: 'from-image' });
+        } catch (_) {
+            try { return await createImageBitmap(file); } catch (_) { /* 使用兼容方案 */ }
+        }
+    }
+    const objectUrl = URL.createObjectURL(file);
+    try {
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = () => reject(new Error(`无法读取图片：${file.name || '未命名图片'}`));
+            img.src = objectUrl;
+        });
+        return img;
+    } catch (err) {
+        URL.revokeObjectURL(objectUrl);
+        throw err;
+    }
+}
+
+/** 多图自适应上传：在浏览器先中心裁剪和缩小，避免把多张超大原图交给 Flask 解码。 */
+async function prepareAdaptiveUpload(file) {
+    const source = await decodeUploadImage(file);
+    const sourceW = source.width || source.naturalWidth;
+    const sourceH = source.height || source.naturalHeight;
+    if (!sourceW || !sourceH) throw new Error(`无法读取图片尺寸：${file.name || '未命名图片'}`);
+
+    const landscape = sourceW >= sourceH;
+    const targetRatio = landscape ? 4 / 3 : 3 / 4;
+    let cropW = sourceW;
+    let cropH = sourceH;
+    if (sourceW / sourceH > targetRatio) cropW = Math.round(sourceH * targetRatio);
+    else if (sourceW / sourceH < targetRatio) cropH = Math.round(sourceW / targetRatio);
+    const sourceX = Math.max(0, Math.floor((sourceW - cropW) / 2));
+    const sourceY = Math.max(0, Math.floor((sourceH - cropH) / 2));
+
+    const allowedShortEdges = [768, 1536, 2304, 3072];
+    const configured = parseInt(state.modelConfig?.upload_short_edge, 10);
+    const shortEdge = allowedShortEdges.includes(configured) ? configured : 1536;
+    const outW = landscape ? Math.round(shortEdge * 4 / 3) : shortEdge;
+    const outH = landscape ? shortEdge : Math.round(shortEdge * 4 / 3);
+    const canvas = document.createElement('canvas');
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = canvas.getContext('2d', { alpha: false });
+    if (!ctx) throw new Error('浏览器无法创建图片处理画布');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, sourceX, sourceY, cropW, cropH, 0, 0, outW, outH);
+
+    try {
+        return await canvasToCompressedJpeg(canvas);
+    } finally {
+        if (typeof source.close === 'function') source.close();
+        if (source.src?.startsWith?.('blob:')) URL.revokeObjectURL(source.src);
+        canvas.width = 1;
+        canvas.height = 1;
+    }
+}
+
+function commitUploadedFilesToSlots(settled, files, startSlot, sourceLabel, uploadMode) {
+    let successCount = 0;
+    const errors = [];
+    settled.forEach((result, idx) => {
+        if (result.status !== 'fulfilled') {
+            const message = result.reason?.message || '上传失败';
+            errors.push(`第${idx + 1}张：${message}`);
+            showToast(`第${idx + 1}张上传失败：${message}`, 'error');
+            return;
+        }
+        const targetSlot = startSlot + idx;
+        if (targetSlot >= SLOT_COUNT) return;
+        const file = files[idx];
+        const previousPrefix = imageState.slots[targetSlot]?.prefixTemplate || '请参考';
+        imageState.slots[targetSlot] = {
+            image: result.value.url,
+            label: getFileBaseName(file.name),
+            prefixTemplate: previousPrefix,
+            dwEnabled: false,
+            dwOriginalImage: ''
+        };
+        syncPinnedSlotFromCurrent(targetSlot);
+        successCount++;
+    });
+    renderImageSlots();
+    updateLocalPrompt();
+    if (queueMode === 'multi') saveCurrentQueueData();
+    else saveQueueData();
+    logAction('slot', sourceLabel, { startSlot, total: files.length, successCount, uploadMode, errors });
+    if (successCount) {
+        const modeText = uploadMode === 'original' ? '保留原始尺寸' : '自动裁剪压缩';
+        showToast(`批量上传完成：${successCount}/${files.length}张，${modeText}并按拖入顺序排列`, successCount === files.length ? 'success' : 'warning');
+    } else {
+        showToast(`批量上传全部失败：${errors[0] || '请查看运行日志'}`, 'error');
+    }
+}
+
+async function uploadAdaptiveFilesToSlots(files, startSlot, sourceLabel) {
+    pushUndoSnapshot();
+    const settled = await settleWithConcurrency(files, IMAGE_UPLOAD_CONCURRENCY, async (file) => {
+        const preparedBlob = await prepareAdaptiveUpload(file);
+        const formData = new FormData();
+        formData.append('file', preparedBlob, `${getFileBaseName(file.name)}.jpg`);
+        return { file, url: await uploadImage(formData) };
+    });
+    commitUploadedFilesToSlots(settled, files, startSlot, sourceLabel, 'adaptive');
+}
+
+async function uploadOriginalFilesToSlots(files, startSlot, sourceLabel) {
+    pushUndoSnapshot();
+    const settled = await settleWithConcurrency(files, IMAGE_UPLOAD_CONCURRENCY, async (file) => {
+        const formData = new FormData();
+        formData.append('file', file, file.name);
+        formData.append('preserve_original', '1');
+        return { file, url: await uploadImage(formData) };
+    });
+    commitUploadedFilesToSlots(settled, files, startSlot, sourceLabel, 'original');
+}
+
 // 上传图片到槽位（本地上传）
 function uploadSlotImage(slotIndex) {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.jpg,.jpeg,.png,.webp';
     input.multiple = true;
-    input.onchange = async (e) => {
-        const files = Array.from(e.target.files || []);
-        if (!files.length) return;
-        if (files.length === 1) {
-            // 单张：裁剪 → 分配素材 → 加载到槽位
-            const reader = new FileReader();
-            reader.onload = () => {
-                showCropModal(reader.result, async (croppedBlob) => {
-                    const formData = new FormData();
-                    formData.append('file', croppedBlob, 'cropped.jpg');
-                    try {
-                        const url = await uploadImage(formData);
-                        const assignResult = await showAssignMaterial(url, files[0].name);
-                        imageState.slots[slotIndex].image = url;
-                        imageState.slots[slotIndex].dwEnabled = false;
-                        imageState.slots[slotIndex].dwOriginalImage = '';
-                        if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
-                            imageState.slots[slotIndex].label = assignResult.labels.join('、');
-                        }
-                        renderImageSlots();
-                        updateLocalPrompt();
-                        if (assignResult && assignResult.savedToLib) {
-                            showToast('图片已存入素材库并加载到槽位', 'success');
-                        } else {
-                            showToast('图片已加载到槽位', 'success');
-                        }
-                        logAction('slot', '上传图片到槽', { slotIndex });
-                    } catch (err) { showToast(err.message, 'error'); }
-                });
-            };
-            reader.readAsDataURL(files[0]);
-        } else {
-            // 多张：批量裁剪队列，每张裁剪后弹出分配弹窗
-            startBatchCrop(files, slotIndex, (targetSlot, idx, total) => {
-                return async (croppedBlob) => {
-                    const formData = new FormData();
-                    formData.append('file', croppedBlob, 'cropped.jpg');
-                    try {
-                        const url = await uploadImage(formData);
-                        const assignResult = await showAssignMaterial(url, files[idx].name);
-                        if (targetSlot < SLOT_COUNT) {
-                            imageState.slots[targetSlot].image = url;
-                            imageState.slots[targetSlot].dwEnabled = false;
-                            imageState.slots[targetSlot].dwOriginalImage = '';
-                            if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
-                                imageState.slots[targetSlot].label = assignResult.labels.join('、');
-                            }
-                            renderImageSlots();
-                            updateLocalPrompt();
-                            logAction('slot', '批量上传图片到槽', { slotIndex: targetSlot });
-                        }
-                        if (idx === total - 1) {
-                            showToast(`批量上传完成：${total}张`, 'success');
-                        }
-                    } catch (err) { showToast(`第${idx+1}张上传失败：${err.message}`, 'error'); }
-                };
-            });
-        }
-    };
+    input.onchange = (e) => uploadFilesToImageSlots(e.target.files, slotIndex, '上传图片到槽');
     input.click();
 }
 
@@ -7638,7 +8932,8 @@ async function savePromptPresets() {
 
 function getActivePromptPresetGroupId() {
     try {
-        return localStorage.getItem('activePromptPresetGroupId') || PROMPT_PRESET_ALL_GROUP;
+        const saved = localStorage.getItem('activePromptPresetGroupId');
+        return saved === null ? PROMPT_PRESET_ALL_GROUP : saved;
     } catch {}
     return PROMPT_PRESET_ALL_GROUP;
 }
@@ -7857,6 +9152,7 @@ document.getElementById('btn-prompt-preset-add')?.addEventListener('click', () =
     const text = document.getElementById('prompt-preset-new-text')?.value.trim();
     const groupId = document.getElementById('prompt-preset-new-group')?.value || '';
     if (!name || !text) { showToast('请填写预设名称和内容', 'error'); return; }
+    const wasEditing = !!editingPromptPresetId;
     if (editingPromptPresetId) {
         const preset = promptPresets.find(p => p.id === editingPromptPresetId);
         if (preset) {
@@ -7877,7 +9173,7 @@ document.getElementById('btn-prompt-preset-add')?.addEventListener('click', () =
     document.getElementById('prompt-preset-new-text').value = '';
     const groupSelect = document.getElementById('prompt-preset-new-group');
     if (groupSelect) groupSelect.value = '';
-    showToast(editingPromptPresetId ? '预设已更新' : '预设已保存', 'success');
+    showToast(wasEditing ? '预设已更新' : '预设已保存', 'success');
 });
 
 // 弹窗关闭
@@ -8457,7 +9753,7 @@ document.getElementById('btn-img-save-preset').addEventListener('click', () => {
     // 显示参数摘要
     const slotsInfo = document.getElementById('img-preset-slots-info');
     const platform = document.getElementById('cfg-api-platform')?.value || '';
-    const platformLabel = platform === 'oaihk' ? '通道二 HK' : '通道一 RH';
+    const platformLabel = getImagePlatformLabel(platform);
     const model = platform === 'oaihk'
         ? document.getElementById('cfg-oaihk-model-inline')?.value || ''
         : document.getElementById('cfg-rh-model-inline')?.value || '';
@@ -9088,7 +10384,8 @@ document.getElementById('btn-crop-confirm')?.addEventListener('click', () => {
 
     // 输出JPEG blob，用compressToUnder2MB确保不超过上传限制
     compressToUnder2MB(cropCanvas, (blob) => {
-        closeModal('modal-crop');
+        const modal = document.getElementById('modal-crop');
+        if (modal) modal.style.display = 'none';
         cropState = null;
         if (callback) callback(blob);
     });
@@ -9151,8 +10448,40 @@ if (seedModeSelect && seedInput) {
 
 // ---------- RunningHub 模型配置系统（内联版） ----------
 const RH_MODELS = {
+    'rhart-image-g-2/image-to-image-2k': {
+        name: 'ChatGPT Image 2｜2K请求｜低价渠道（可能返1K）', shortName: 'GPT2低价-2K', price: '¥0.10/张', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2/image-to-image', fixedResolution: '2k',
+        channel: 'low-cost', resolutionGuaranteed: false,
+        maxImages: 10, maxImageMB: 30, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-g-2/image-to-image-4k': {
+        name: 'ChatGPT Image 2｜4K请求｜低价渠道（多数返1K）', shortName: 'GPT2低价-4K', price: '¥0.10/张', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2/image-to-image', fixedResolution: '4k',
+        channel: 'low-cost', resolutionGuaranteed: false,
+        maxImages: 10, maxImageMB: 30, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-g-2-official/image-to-image-2k': {
+        name: 'ChatGPT Image 2｜2K｜官方稳定版', shortName: 'GPT2官方-2K', price: '¥2.77/张', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2-official/image-to-image', fixedResolution: '2k',
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','1:2','2:1','1:3','3:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-g-2-official/image-to-image-4k': {
+        name: 'ChatGPT Image 2｜4K｜官方稳定版', shortName: 'GPT2官方-4K', price: '¥4.16/张', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2-official/image-to-image', fixedResolution: '4k',
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','1:2','2:1','1:3','3:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatioRequired: false
+    },
     'rhart-image-v1/edit': {
-        name: 'V1-图生图-低价渠道版', shortName: 'V1', price: '0.05', type: 'image-to-image',
+        name: 'V1-图生图-低价渠道版', shortName: 'V1', priceUsd: '0.05', price: '约¥0.34', type: 'image-to-image',
         maxImages: 5, maxImageMB: 10, hasResolution: false,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: true
@@ -9164,103 +10493,221 @@ const RH_MODELS = {
         aspectRatioRequired: true
     },
     'rhart-image-n-g31-flash/image-to-image': {
-        name: 'V2-图生图-低价渠道版', shortName: 'V2', price: '0.16', type: 'image-to-image',
+        name: 'V2(Gemini Flash)-图生图-低价渠道版', shortName: 'V2低价', price: '¥0.19/张', type: 'image-to-image',
+        priceByResolution: { '1k': '¥0.19/张', '2k': '¥0.19/张', '4k': '¥0.30/张' },
+        channel: 'low-cost', resolutionGuaranteed: false,
         maxImages: 10, maxImageMB: 30, hasResolution: true,
-        aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-n-g31-flash/image-to-image-2k': {
+        name: 'Nano Banana 2｜2K｜低价渠道', shortName: 'NB2低价-2K', price: '¥0.19/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-g31-flash/image-to-image', fixedResolution: '2k',
+        channel: 'low-cost', resolutionGuaranteed: false,
+        maxImages: 10, maxImageMB: 30, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-n-g31-flash/image-to-image-4k': {
+        name: 'Nano Banana 2｜4K｜低价渠道（已实测真4K）', shortName: 'NB2低价-4K', price: '¥0.30/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-g31-flash/image-to-image', fixedResolution: '4k',
+        channel: 'low-cost', resolutionGuaranteed: false,
+        maxImages: 10, maxImageMB: 30, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
     },
     'rhart-image-n-g31-flash-official/image-to-image': {
-        name: 'V2-图生图-官方稳定版', shortName: 'V2-official', price: '0.74', type: 'image-to-image',
+        name: 'V2(Gemini Flash)-图生图-官方稳定版', shortName: 'V2官方', price: '¥0.74～0.99/张', type: 'image-to-image',
+        channel: 'official', resolutionGuaranteed: true,
         maxImages: 14, maxImageMB: 10, hasResolution: true,
-        aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-n-g31-flash-official/image-to-image-2k': {
+        name: 'Nano Banana 2｜2K｜官方稳定版', shortName: 'NB2官方-2K', price: '¥0.74/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-g31-flash-official/image-to-image', fixedResolution: '2k',
+        channel: 'official', resolutionGuaranteed: true,
+        maxImages: 14, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-n-g31-flash-official/image-to-image-4k': {
+        name: 'Nano Banana 2｜4K｜官方稳定版', shortName: 'NB2官方-4K', price: '¥0.99/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-g31-flash-official/image-to-image', fixedResolution: '4k',
+        channel: 'official', resolutionGuaranteed: true,
+        maxImages: 14, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
     },
     'rhart-image-n-pro/edit': {
-        name: 'PRO-图生图-低价渠道版', shortName: 'PRO', price: '0.4', type: 'image-to-image',
+        name: 'PRO(Gemini Pro)-图生图-低价渠道版', shortName: 'PRO低价', price: '¥0.40/张', type: 'image-to-image',
+        priceByResolution: { '1k': '¥0.40/张', '2k': '¥0.40/张', '4k': '¥0.50/张' },
+        channel: 'low-cost', resolutionGuaranteed: false,
         maxImages: 10, maxImageMB: 10, hasResolution: true,
-        aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-n-pro/edit-2k': {
+        name: 'Nano Banana Pro｜2K｜低价渠道', shortName: 'NBPro低价-2K', price: '¥0.40/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-pro/edit', fixedResolution: '2k',
+        channel: 'low-cost', resolutionGuaranteed: false,
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-n-pro/edit-4k': {
+        name: 'Nano Banana Pro｜4K｜低价渠道', shortName: 'NBPro低价-4K', price: '¥0.50/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-pro/edit', fixedResolution: '4k',
+        channel: 'low-cost', resolutionGuaranteed: false,
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
     },
     'rhart-image-n-pro-official/edit': {
         name: 'PRO-图生图-官方稳定版', shortName: 'PRO-official', price: '1', type: 'image-to-image',
         maxImages: 10, maxImageMB: 10, hasResolution: true,
-        aspectRatios: ['1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
     }
 };
 
-// OpenAI-HK 模型配置
+function getRhPriceLabel(model, resolution) {
+    if (!model) return '';
+    const res = model.fixedResolution || resolution || '1k';
+    return model.priceByResolution?.[res] || model.price || '';
+}
+
+// OpenAI-HK 模型配置。Gemini 3.1 / 3 Pro 尺寸来自 Google 官方规格表。
+const GEMINI_IMAGE_ASPECT_RATIOS = ['auto', '3:4', '4:3', '1:1', '16:9', '9:16', '2:3', '3:2', '4:5', '5:4', '21:9'];
+const GEMINI_IMAGE_SIZES_1K = { '1:1': '1024x1024', '2:3': '848x1264', '3:2': '1264x848', '3:4': '896x1200', '4:3': '1200x896', '4:5': '928x1152', '5:4': '1152x928', '9:16': '768x1376', '16:9': '1376x768', '21:9': '1584x672' };
+const GEMINI_IMAGE_SIZES_2K = { '1:1': '2048x2048', '2:3': '1696x2528', '3:2': '2528x1696', '3:4': '1792x2400', '4:3': '2400x1792', '4:5': '1856x2304', '5:4': '2304x1856', '9:16': '1536x2752', '16:9': '2752x1536', '21:9': '3168x1344' };
+const GEMINI_IMAGE_SIZES_4K = { '1:1': '4096x4096', '2:3': '3392x5056', '3:2': '5056x3392', '3:4': '3584x4800', '4:3': '4800x3584', '4:5': '3712x4608', '5:4': '4608x3712', '9:16': '3072x5504', '16:9': '5504x3072', '21:9': '6336x2688' };
+const GPT_IMAGE_ASPECT_RATIOS = ['auto', '3:4', '4:3', '1:1', '16:9', '9:16', '2:3', '3:2', '4:5', '5:4', '21:9'];
+
 const OAIHK_MODELS = {
     'fal-ai/banana/v2': {
-        name: 'proK', shortName: 'proK', price: '0.48',
+        name: 'Nano Banana Pro 1K', shortName: 'NBPro-1K', price: '¥0.48/张',
         endpoint: 'fal-ai/banana/v2',
         modelId: 'fal-ai/banana/v2',
         pollEndpoint: 'fal-ai/nano-banana/requests',
-        shortEdge: 1024
+        shortEdge: 1024,
+        sizes: GEMINI_IMAGE_SIZES_1K,
+        aspectRatios: GEMINI_IMAGE_ASPECT_RATIOS
     },
     'fal-ai/banana/v2/2k': {
-        name: 'pro2K', shortName: 'pro2K', price: '0.48',
+        name: 'Nano Banana Pro 2K', shortName: 'NBPro-2K', price: '¥0.48/张',
         endpoint: 'fal-ai/banana/v2/2k',
         modelId: 'fal-ai/banana/v2/2k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
-        shortEdge: 1536
+        shortEdge: 1536,
+        sizes: GEMINI_IMAGE_SIZES_2K,
+        aspectRatios: GEMINI_IMAGE_ASPECT_RATIOS
     },
     'fal-ai/banana/v2/4k': {
-        name: 'pro4K', shortName: 'pro4K', price: '0.48',
+        name: 'Nano Banana Pro 4K', shortName: 'NBPro-4K', price: '¥0.48/张',
         endpoint: 'fal-ai/banana/v2/4k',
         modelId: 'fal-ai/banana/v2/4k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
-        shortEdge: 2048
+        shortEdge: 2048,
+        sizes: GEMINI_IMAGE_SIZES_4K,
+        aspectRatios: GEMINI_IMAGE_ASPECT_RATIOS
     },
     'fal-ai/banana/v3.1/flash': {
-        name: 'nano2-3.1 1K', shortName: '3.1-1K', price: '0.2',
+        name: 'Nano Banana 2 1K', shortName: 'NB2-1K', price: '¥0.20/张',
         endpoint: 'fal-ai/banana/v3.1/flash',
         modelId: 'fal-ai/banana/v3.1/flash',
         pollEndpoint: 'fal-ai/nano-banana/requests',
-        shortEdge: 1024
+        shortEdge: 1024,
+        sizes: GEMINI_IMAGE_SIZES_1K,
+        aspectRatios: GEMINI_IMAGE_ASPECT_RATIOS
     },
     'fal-ai/banana/v3.1/flash/2k': {
-        name: 'nano2-3.1 2K', shortName: '3.1-2K', price: '0.3',
+        name: 'Nano Banana 2 2K', shortName: 'NB2-2K', price: '¥0.30/张',
         endpoint: 'fal-ai/banana/v3.1/flash/2k',
         modelId: 'fal-ai/banana/v3.1/flash/2k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
-        shortEdge: 1536
+        shortEdge: 1536,
+        sizes: GEMINI_IMAGE_SIZES_2K,
+        aspectRatios: GEMINI_IMAGE_ASPECT_RATIOS
     },
     'fal-ai/banana/v3.1/flash/4k': {
-        name: 'nano2-3.1 4K', shortName: '3.1-4K', price: '0.48',
+        name: 'Nano Banana 2 4K', shortName: 'NB2-4K', price: '¥0.48/张',
         endpoint: 'fal-ai/banana/v3.1/flash/4k',
         modelId: 'fal-ai/banana/v3.1/flash/4k',
         pollEndpoint: 'fal-ai/nano-banana/requests',
-        shortEdge: 2048
+        shortEdge: 2048,
+        sizes: GEMINI_IMAGE_SIZES_4K,
+        aspectRatios: GEMINI_IMAGE_ASPECT_RATIOS
     },
     'gpt-image-2': {
-        name: 'GPT-img-2 1K', shortName: 'GPT2-1K', price: '0.04',
+        name: 'ChatGPT Image 2 1K', shortName: 'GPT2-1K', price: '¥0.04/张',
         endpoint: 'gpt-image-2',
         modelId: 'gpt-image-2',
         pollEndpoint: null,
         shortEdge: 1024,
-        sizes: { '3:4': '1024x1536', '2:3': '1024x1536', '1:1': '1024x1024', '9:16': '1024x1820', '4:3': '1536x1024', '16:9': '1820x1024' },
+        sizes: { '3:4': '768x1024', '2:3': '672x1008', '3:2': '1008x672', '1:1': '1024x1024', '9:16': '720x1280', '4:3': '1024x768', '16:9': '1280x720', '4:5': '832x1040', '5:4': '1040x832', '21:9': '1344x576' },
+        aspectRatios: GPT_IMAGE_ASPECT_RATIOS,
         isGptImage: true
     },
     'gpt-image-2/2k': {
-        name: 'GPT-img-2 2K', shortName: 'GPT2-2K', price: '0.08',
+        name: 'ChatGPT Image 2 2K请求', shortName: 'GPT2-2K', price: '¥0.08/张',
         endpoint: 'gpt-image-2',
         modelId: 'gpt-image-2',
         pollEndpoint: null,
         shortEdge: 1536,
-        sizes: { '3:4': '1536x2048', '2:3': '1536x2048', '1:1': '1536x1536', '9:16': '1536x2730', '4:3': '2048x1536', '16:9': '2730x1536' },
+        sizes: { '3:4': '1536x2048', '2:3': '1376x2064', '3:2': '2064x1376', '1:1': '2048x2048', '9:16': '1152x2048', '4:3': '2048x1536', '16:9': '2048x1152', '4:5': '1664x2080', '5:4': '2080x1664', '21:9': '2016x864' },
+        aspectRatios: GPT_IMAGE_ASPECT_RATIOS,
         isGptImage: true
     },
     'gpt-image-2/4k': {
-        name: 'GPT-img-2 4K', shortName: 'GPT2-4K', price: '0.16',
+        name: 'ChatGPT Image 2 4K请求（HK实测可能仅返1K）', shortName: 'GPT2-4K⚠', price: '¥0.16/张',
         endpoint: 'gpt-image-2',
         modelId: 'gpt-image-2',
         pollEndpoint: null,
         shortEdge: 2048,
-        sizes: { '3:4': '2160x2880', '2:3': '2160x3240', '1:1': '2160x2160', '9:16': '2160x3840', '4:3': '2880x2160', '16:9': '3840x2160' },
-        isGptImage: true
+        sizes: { '3:4': '2448x3264', '2:3': '2336x3504', '3:2': '3504x2336', '1:1': '2880x2880', '9:16': '2160x3840', '4:3': '3264x2448', '16:9': '3840x2160', '4:5': '2560x3200', '5:4': '3200x2560', '21:9': '3808x1632' },
+        aspectRatios: GPT_IMAGE_ASPECT_RATIOS,
+        isGptImage: true,
+        resolutionGuaranteed: false
     }
 };
+
+// 所有生图入口共享的平台元数据。以后新增平台时先在这里登记，
+// 再为该平台提供独立模型表与后端适配器，避免把不同协议混在一起。
+const IMAGE_PLATFORM_META = Object.freeze({
+    runninghub: { label: 'RunningHub（企业 API）', shortLabel: 'RunningHub', verified: true },
+    oaihk: { label: 'OpenAI-HK（原平台）', shortLabel: 'OpenAI-HK', verified: true }
+});
+
+function getImagePlatformLabel(platform) {
+    return IMAGE_PLATFORM_META[platform]?.label || platform || '未知平台';
+}
+
+function getImagePlatformShortLabel(platform) {
+    return IMAGE_PLATFORM_META[platform]?.shortLabel || platform || '未知平台';
+}
+
+function getImageModelMeta(platform, modelKey) {
+    return platform === 'runninghub' ? RH_MODELS[modelKey] : OAIHK_MODELS[modelKey];
+}
+
+const DEFAULT_IMAGE_ASPECT_RATIOS = ['auto', '3:4', '4:3', '1:1', '16:9', '9:16', '2:3', '3:2'];
+
+function fillAspectRatioSelect(select, ratios, preferred = '3:4') {
+    if (!select) return preferred || '3:4';
+    const allowed = (Array.isArray(ratios) && ratios.length ? ratios : DEFAULT_IMAGE_ASPECT_RATIOS).filter(Boolean);
+    const current = preferred || select.value || '3:4';
+    select.innerHTML = '';
+    for (const ratio of allowed) {
+        const opt = document.createElement('option');
+        opt.value = ratio;
+        opt.textContent = ratio === 'auto' ? '自动（跟随参考图）' : ratio;
+        select.appendChild(opt);
+    }
+    let value = allowed.includes(current) ? current : (allowed.includes('3:4') ? '3:4' : allowed[0]);
+    select.value = value;
+    return value;
+}
 
 function parseAspectRatio(ratio) {
     if (!ratio || typeof ratio !== 'string' || !ratio.includes(':')) return null;
@@ -9273,6 +10720,7 @@ function parseAspectRatio(ratio) {
 
 function getOaihkImageSize(model, aspectRatio = '3:4') {
     const ratio = aspectRatio || '3:4';
+    if (ratio === 'auto') return 'auto';
     // 1) 优先使用模型给出的官方size映射
     if (model?.sizes?.[ratio]) return model.sizes[ratio];
     if (model?.size) return model.size;
@@ -9296,8 +10744,3837 @@ function getOaihkImageSize(model, aspectRatio = '3:4') {
     return `${width}x${height}`;
 }
 
+// ---------- 电商批量生图 ----------
+const ecommerceState = {
+    loaded: false,
+    batches: [],
+    scanned: null,
+    importActions: null,
+    rhConfig: null,
+    currentBatchId: '',
+    detail: null,
+    pollTimer: null,
+    renderCache: { batchList: '', tasks: '', folders: '', apiConfig: '' }
+};
+
+function ecommerceEscape(value) {
+    return String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+}
+
+function ecommerceApi(method, url, body, timeout = 120000) {
+    return api(method, url, body, timeout, null, true);
+}
+
+function ecommerceConfirm(message) {
+    return new Promise(resolve => {
+        const dialog = document.getElementById('ecommerce-confirm-dialog');
+        const msgEl = document.getElementById('ecommerce-confirm-message');
+        const okBtn = document.getElementById('ecommerce-confirm-ok');
+        const cancelBtn = document.getElementById('ecommerce-confirm-cancel');
+        if (!dialog || !msgEl || !okBtn || !cancelBtn) { resolve(false); return; }
+        msgEl.textContent = message;
+        dialog.hidden = false;
+        const cleanup = result => {
+            dialog.hidden = true;
+            okBtn.removeEventListener('click', onOk);
+            cancelBtn.removeEventListener('click', onCancel);
+            dialog.removeEventListener('click', onBg);
+            document.removeEventListener('keydown', onKey);
+            resolve(result);
+        };
+        const onOk = () => cleanup(true);
+        const onCancel = () => cleanup(false);
+        const onBg = e => { if (e.target === dialog) cleanup(false); };
+        const onKey = e => {
+            if (e.key === 'Enter') { e.preventDefault(); cleanup(true); }
+            else if (e.key === 'Escape') { e.preventDefault(); cleanup(false); }
+        };
+        okBtn.addEventListener('click', onOk);
+        cancelBtn.addEventListener('click', onCancel);
+        dialog.addEventListener('click', onBg);
+        document.addEventListener('keydown', onKey);
+        setTimeout(() => okBtn.focus(), 50);
+    });
+}
+
+function ecommerceToast(message, duration = 3000) {
+    const container = document.getElementById('ecommerce-toast-container');
+    if (!container) return { dismiss: () => {} };
+    const el = document.createElement('div');
+    el.className = 'ecommerce-toast';
+    el.innerHTML = `<span>${ecommerceEscape(message)}</span>`;
+    container.appendChild(el);
+    const dismiss = () => { el.style.opacity = '0'; el.style.transform = 'translateY(8px)'; setTimeout(() => el.remove(), 200); };
+    setTimeout(dismiss, duration);
+    return { el, dismiss };
+}
+
+function ecommerceUndoToast(message, onUndo, duration = 5000) {
+    const container = document.getElementById('ecommerce-toast-container');
+    if (!container) return;
+    const el = document.createElement('div');
+    el.className = 'ecommerce-toast is-undo';
+    el.innerHTML = `<span>${ecommerceEscape(message)}</span><button type="button" class="ecommerce-toast-undo">撤销</button>`;
+    container.appendChild(el);
+    let done = false;
+    const cleanup = () => { done = true; el.style.opacity = '0'; el.style.transform = 'translateY(8px)'; setTimeout(() => el.remove(), 200); };
+    const timer = setTimeout(cleanup, duration);
+    el.querySelector('.ecommerce-toast-undo')?.addEventListener('click', () => {
+        if (done) return;
+        clearTimeout(timer);
+        cleanup();
+        try { onUndo(); } catch(e) { console.error('undo error', e); }
+    });
+}
+
+async function loadEcommerceModeData(force = false) {
+    // 先恢复上次的路径到输入框（无论是否已加载）
+    const restoredPaths = restoreEcommerceInputPaths();
+    if (ecommerceState.loaded && !force) {
+        renderEcommerceBatchList();
+        renderEcommerceRhApiConfig();
+        loadEcommerceWasteStats().catch(() => {});
+        if (ecommerceState.currentBatchId) await refreshEcommerceBatch();
+        return;
+    }
+    try {
+        const [batchData, modelConfig] = await Promise.all([
+            ecommerceApi('GET', '/api/ecommerce/batches'),
+            ecommerceApi('GET', '/api/model-config')
+        ]);
+        ecommerceState.batches = batchData.batches || [];
+        ecommerceState.rhConfig = modelConfig || {};
+        ecommerceState.loaded = true;
+        if (!ecommerceState.currentBatchId && ecommerceState.batches.length) {
+            ecommerceState.currentBatchId = ecommerceState.batches[0].id;
+        }
+        renderEcommerceBatchList();
+        renderEcommerceRhApiConfig();
+        loadEcommerceWasteStats().catch(() => {});
+        if (ecommerceState.currentBatchId) await refreshEcommerceBatch();
+        // 自动恢复：如果有上次的服装目录，自动扫描
+        if (restoredPaths['ecommerce-clothing-root']) {
+            scanEcommerceGarments().catch(e => console.warn('自动扫描服装目录失败:', e));
+        }
+        // 自动恢复：如果有上次的动作目录，自动加载目标参考图
+        if (restoredPaths['ecommerce-action-root']) {
+            try {
+                const scanned = await ecommerceApi('POST', '/api/ecommerce/scan-action-root', { path: restoredPaths['ecommerce-action-root'] });
+                ecommerceState.importActions = scanned;
+                renderEcommerceImportActionPreview(scanned);
+            } catch (e) {
+                console.warn('自动加载动作参考图失败:', e);
+            }
+        }
+    } catch (e) {
+        showToast(`加载电商批量数据失败：${e.message}`, 'error');
+    }
+}
+
+function ecommerceRhApiSwitchBlocked() {
+    return ecommerceState.batches.some(batch => ['running', 'resuming'].includes(batch.status));
+}
+
+function renderEcommerceRhApiConfig() {
+    const config = ecommerceState.rhConfig || state.modelConfig || {};
+    const status = document.getElementById('ecommerce-rh-account-status');
+    const keyInput = document.getElementById('ecommerce-rh-api-key');
+    const baseInput = document.getElementById('ecommerce-rh-base-url');
+    const saveButton = document.getElementById('btn-ecommerce-save-rh-api');
+    const blocked = ecommerceRhApiSwitchBlocked();
+    const maskedKey = config.rh_api_key || '';
+    const baseUrl = config.rh_base_url || 'https://www.runninghub.ai/openapi/v2';
+    const signature = `${maskedKey}|${baseUrl}|${blocked}`;
+    if (signature === ecommerceState.renderCache.apiConfig) return;
+    ecommerceState.renderCache.apiConfig = signature;
+    if (status) {
+        status.textContent = maskedKey
+            ? `当前密钥 ${maskedKey}｜${blocked ? '批次运行中，先暂停再更换' : '可更换'}`
+            : '尚未配置 RunningHub 企业 Key';
+        status.style.color = maskedKey ? (blocked ? '#b45309' : '#166534') : '#b91c1c';
+    }
+    if (keyInput) {
+        if (document.activeElement !== keyInput) keyInput.value = '';
+        keyInput.disabled = blocked;
+    }
+    if (baseInput) {
+        baseInput.value = baseUrl;
+        baseInput.disabled = blocked;
+    }
+    if (saveButton) {
+        saveButton.disabled = blocked;
+        saveButton.title = blocked ? '请先暂停正在运行的电商批次' : '保存当前RunningHub账号并免费验证权限';
+    }
+}
+
+async function saveAndVerifyEcommerceRhApi() {
+    if (ecommerceRhApiSwitchBlocked()) {
+        showToast('请先暂停正在运行的电商批次，再更换RunningHub账号', 'error');
+        return;
+    }
+    const keyInput = document.getElementById('ecommerce-rh-api-key');
+    const baseInput = document.getElementById('ecommerce-rh-base-url');
+    const resultText = document.getElementById('ecommerce-rh-api-result');
+    const button = document.getElementById('btn-ecommerce-save-rh-api');
+    const newKey = keyInput?.value.trim() || '';
+    const baseUrl = baseInput?.value.trim() || 'https://www.runninghub.ai/openapi/v2';
+    if (!newKey && !ecommerceState.rhConfig?.rh_api_key) {
+        showToast('请先粘贴RunningHub企业共享API Key', 'error');
+        return;
+    }
+    const payload = { rh_base_url: baseUrl };
+    if (newKey) payload.rh_api_key = newKey;
+    if (button) { button.disabled = true; button.textContent = '保存并验证中…'; }
+    if (resultText) resultText.textContent = '正在保存本地配置并调用免费价格预估…';
+    try {
+        const saved = await ecommerceApi('PUT', '/api/model-config', payload);
+        ecommerceState.rhConfig = saved || {};
+        state.modelConfig = { ...(state.modelConfig || {}), ...(saved || {}) };
+        const modelKey = document.getElementById('ecommerce-import-rh-model')?.value || 'rhart-image-n-g31-flash/image-to-image-4k';
+        const model = RH_MODELS[modelKey] || {};
+        const modelId = model.endpoint || model.modelId || modelKey.replace(/-(?:2k|4k)$/i, '');
+        const resolution = model.fixedResolution || (String(modelKey).endsWith('/4k') ? '4k' : '2k');
+        const preview = await ecommerceApi('POST', '/api/rh-preflight', { model_id: modelId, resolution }, 45000);
+        if (resultText) {
+            const accountText = preview.account?.remain_money != null
+                ? `；账户余额 ¥${preview.account.remain_money}；Key类型 ${preview.account.api_type || 'SHARED'}；当前任务 ${preview.account.current_tasks || 0}`
+                : '';
+            resultText.textContent = `验证通过：${resolution.toUpperCase()} 企业API预计 ¥${preview.estimated_price}/张${accountText}；本次未生图、未扣费。`;
+            resultText.style.color = 'var(--success)';
+        }
+        renderEcommerceRhApiConfig();
+        showToast('RunningHub企业API已保存并验证通过', 'success');
+    } catch (e) {
+        if (resultText) {
+            resultText.textContent = `保存或验证失败：${e.message}`;
+            resultText.style.color = 'var(--danger)';
+        }
+        showToast(`RunningHub配置失败：${e.message}`, 'error');
+    } finally {
+        if (button) { button.disabled = ecommerceRhApiSwitchBlocked(); button.textContent = '保存并免费验证'; }
+    }
+}
+
+function buildEcommercePromptAction() {
+    const prompt = document.getElementById('ecommerce-standard-prompt')?.value.trim();
+    const platform = document.getElementById('ecommerce-import-platform')?.value || 'runninghub';
+    const modelKey = platform === 'runninghub'
+        ? (document.getElementById('ecommerce-import-rh-model')?.value || '')
+        : (document.getElementById('ecommerce-import-oaihk-model')?.value || '');
+    const ratio = document.getElementById('ecommerce-import-ratio')?.value || 'auto';
+    const model = platform === 'runninghub' ? RH_MODELS[modelKey] : OAIHK_MODELS[modelKey];
+    if (!prompt) throw new Error('提示词不能为空');
+    if (!model) throw new Error('请选择有效生图模型');
+    const common = {
+        prompt, platform, model_key: modelKey,
+        model_id: model.endpoint || model.modelId || modelKey,
+        endpoint: model.endpoint || modelKey,
+        aspect_ratio: ratio,
+    };
+    if (platform === 'runninghub') {
+        return {
+            ...common,
+            resolution: model.fixedResolution || '2k',
+            quality: model.quality || '',
+            channel: model.channel || 'low-cost',
+            resolution_guaranteed: model.resolutionGuaranteed !== false,
+            max_images: model.maxImages || 10,
+            price: model.price || ''
+        };
+    }
+    return {
+        ...common,
+        poll_endpoint: model.pollEndpoint || '',
+        is_gpt_image: !!model.isGptImage,
+        size: getOaihkImageSize(model, ratio),
+        quality: 'medium',
+        short_edge: model.shortEdge || 1536
+    };
+}
+
+function buildCurrentEcommerceTargetActions() {
+    const loaded = ecommerceState.importActions;
+    if (!loaded?.actions?.length) throw new Error('请先加载1～20张目标替换参考图');
+    const settings = buildEcommercePromptAction();
+    return (loaded.actions || []).map((item, index) => ({
+        ...settings,
+        name: item.name || `目标图${index + 1}`,
+        action_image: item.path,
+    }));
+}
+
+let ecommerceTargetDragIndex = null;
+
+function ecommerceTargetImageSource(item) {
+    const raw = item?.path || item?.url || '';
+    return /^(?:https?:|data:|\/static\/)/.test(raw)
+        ? raw
+        : `/api/ecommerce/local-image?path=${encodeURIComponent(raw)}`;
+}
+
+function renderEcommerceImportActionPreview(scanned) {
+    const summary = document.getElementById('ecommerce-import-summary');
+    const preview = document.getElementById('ecommerce-import-preview');
+    const actions = scanned?.actions || [];
+    if (typeof updateEcommerceAutoConcurrency === 'function') updateEcommerceAutoConcurrency(false);
+    if (summary) {
+        const suffix = scanned?.truncated ? `；共${scanned.total_found}张，按上限加载前20张` : '';
+        summary.textContent = actions.length
+            ? `已按当前执行顺序加载 ${actions.length} 张目标替换参考图${suffix}；可拖动下方卡片重排`
+            : '尚未加载目标替换参考图';
+    }
+    if (!preview) return;
+    preview.innerHTML = actions.map((item, index) => {
+        const src = ecommerceTargetImageSource(item);
+        return `<div class="ecommerce-action-item is-target-reference" draggable="true" data-target-index="${index}" title="${ecommerceEscape(item.name || `目标图${index + 1}`)}｜点击查看大图">
+            <img src="${ecommerceEscape(src)}" alt="目标图${index + 1}" loading="lazy">
+            <strong>${index + 1}</strong>
+        </div>`;
+    }).join('');
+    preview.querySelectorAll('.is-target-reference').forEach(card => {
+        // 点击查看大图（不处于拖拽时）
+        let mouseDownPos = null;
+        card.addEventListener('mousedown', e => { mouseDownPos = { x: e.clientX, y: e.clientY }; });
+        card.addEventListener('click', e => {
+            if (mouseDownPos && (Math.abs(e.clientX - mouseDownPos.x) > 5 || Math.abs(e.clientY - mouseDownPos.y) > 5)) return;
+            const index = Number(card.dataset.targetIndex);
+            const images = actions.map((it, i) => ({ url: ecommerceTargetImageSource(it), filename: it.name || `目标图${i + 1}` }));
+            if (typeof openImageViewer === 'function') openImageViewer(images, index);
+        });
+        card.addEventListener('dragstart', event => {
+            ecommerceTargetDragIndex = Number(card.dataset.targetIndex);
+            card.classList.add('is-dragging');
+            if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+        });
+        card.addEventListener('dragend', () => {
+            ecommerceTargetDragIndex = null;
+            preview.querySelectorAll('.is-target-reference').forEach(item => item.classList.remove('is-dragging', 'is-dragover'));
+        });
+        card.addEventListener('dragover', event => {
+            event.preventDefault();
+            card.classList.add('is-dragover');
+        });
+        card.addEventListener('dragleave', () => card.classList.remove('is-dragover'));
+        card.addEventListener('drop', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            const targetIndex = Number(card.dataset.targetIndex);
+            const list = ecommerceState.importActions?.actions;
+            if (!Array.isArray(list) || ecommerceTargetDragIndex === null || ecommerceTargetDragIndex === targetIndex) return;
+            const [moved] = list.splice(ecommerceTargetDragIndex, 1);
+            list.splice(targetIndex, 0, moved);
+            ecommerceTargetDragIndex = null;
+            renderEcommerceImportActionPreview(ecommerceState.importActions);
+        });
+    });
+}
+
+async function chooseAndPreviewEcommerceActions() {
+    const selected = await chooseEcommerceFolder('ecommerce-action-root');
+    if (!selected) return;
+    const summary = document.getElementById('ecommerce-import-summary');
+    if (summary) summary.textContent = '正在读取目标替换参考图…';
+    try {
+        const scanned = await ecommerceApi('POST', '/api/ecommerce/scan-action-root', { path: selected });
+        ecommerceState.importActions = scanned;
+        renderEcommerceImportActionPreview(scanned);
+        showToast(`已自动加载${scanned.action_count || 0}张目标替换参考图`, 'success');
+    } catch (e) {
+        ecommerceState.importActions = null;
+        renderEcommerceImportActionPreview(null);
+        if (summary) summary.textContent = `加载失败：${e.message}`;
+        showToast(`加载目标图片文件夹失败：${e.message}`, 'error');
+    }
+}
+
+function ecommerceNaturalFileSort(files) {
+    return [...files].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN', { numeric: true, sensitivity: 'base' }));
+}
+
+async function loadDroppedEcommerceTargetFiles(fileList) {
+    const allFiles = ecommerceNaturalFileSort(Array.from(fileList || []).filter(file => {
+        const ext = String(file.name || '').toLowerCase().match(/\.[^.]+$/)?.[0] || '';
+        return ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+    }));
+    if (!allFiles.length) return showToast('没有找到可用的JPG、PNG或WEBP图片', 'error');
+    const files = allFiles.slice(0, 20);
+    const summary = document.getElementById('ecommerce-import-summary');
+    const rootInput = document.getElementById('ecommerce-action-root');
+    const fileInput = document.getElementById('ecommerce-target-files');
+    const dropzone = document.getElementById('ecommerce-target-dropzone');
+    const loaded = {
+        ok: true,
+        path: '',
+        source: 'uploaded_files',
+        actions: [],
+        action_count: 0,
+        total_found: allFiles.length,
+        truncated: allFiles.length > 20,
+    };
+    ecommerceState.importActions = loaded;
+    if (rootInput) rootInput.value = '';
+    if (dropzone) dropzone.classList.add('is-uploading');
+    let failed = 0;
+    for (let index = 0; index < files.length; index++) {
+        const file = files[index];
+        if (summary) summary.textContent = `正在原样保存第 ${index + 1}/${files.length} 张：${file.name}`;
+        const form = new FormData();
+        form.append('file', file, file.name);
+        form.append('preserve_original', 'true');
+        try {
+            const response = await fetch('/api/upload-image', { method: 'POST', body: form });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result.url) throw new Error(result.error || `HTTP ${response.status}`);
+            loaded.actions.push({
+                name: String(file.name || `目标图${index + 1}`).replace(/\.[^.]+$/, ''),
+                path: result.url,
+                url: result.url,
+                original_name: file.name,
+            });
+            loaded.action_count = loaded.actions.length;
+            renderEcommerceImportActionPreview(loaded);
+        } catch (e) {
+            failed += 1;
+            console.error('[ecommerce target upload]', file.name, e);
+        }
+    }
+    if (dropzone) dropzone.classList.remove('is-uploading', 'is-dragover');
+    if (fileInput) fileInput.value = '';
+    renderEcommerceImportActionPreview(loaded);
+    if (!loaded.actions.length) {
+        ecommerceState.importActions = null;
+        renderEcommerceImportActionPreview(null);
+        return showToast('目标替换参考图全部加载失败', 'error');
+    }
+    const suffix = failed ? `，${failed}张失败` : '';
+    const capped = allFiles.length > 20 ? `；共${allFiles.length}张，只加载前20张` : '';
+    showToast(`已加载${loaded.actions.length}张目标替换参考图${suffix}${capped}`, failed ? 'error' : 'success');
+}
+
+function clearEcommerceTargetReferences() {
+    ecommerceState.importActions = null;
+    const rootInput = document.getElementById('ecommerce-action-root');
+    const fileInput = document.getElementById('ecommerce-target-files');
+    if (rootInput) rootInput.value = '';
+    if (fileInput) fileInput.value = '';
+    saveEcommerceLastPaths('ecommerce-action-root', '');
+    renderEcommerceImportActionPreview(null);
+    updateEcommerceGenerateButton();
+}
+
+function clearEcommerceGarmentReferences() {
+    ecommerceState.inlineGarment = null;
+    ecommerceState.scanned = null;
+    const rootInput = document.getElementById('ecommerce-clothing-root');
+    const fileInput = document.getElementById('ecommerce-garment-files');
+    const keywordInput = document.getElementById('ecommerce-garment-keyword');
+    const summary = document.getElementById('ecommerce-scan-summary');
+    const list = document.getElementById('ecommerce-garment-list');
+    if (rootInput) rootInput.value = '';
+    if (fileInput) fileInput.value = '';
+    if (keywordInput) keywordInput.value = '';
+    if (summary) summary.textContent = '尚未选择服装图片或文件夹';
+    if (list) list.innerHTML = '';
+    saveEcommerceLastPaths('ecommerce-clothing-root', '');
+    renderEcommerceGarmentPreview();
+    updateEcommerceGenerateButton();
+}
+
+async function chooseEcommerceFolder(inputId) {
+    const input = document.getElementById(inputId);
+    try {
+        const picked = await ecommerceApi('POST', '/api/select-folder', { initial_dir: input?.value || '~/Downloads' }, 130000);
+        if (picked.ok && picked.path && input) {
+            input.value = picked.path;
+            // 记住路径，刷新后自动恢复
+            saveEcommerceLastPaths(inputId, picked.path);
+        }
+        return picked.path || '';
+    } catch (e) {
+        showToast(`选择文件夹失败：${e.message}`, 'error');
+        return '';
+    }
+}
+
+async function checkEcommerceFinalOutputPath(notify = true) {
+    const input = document.getElementById('ecommerce-final-output-path');
+    const status = document.getElementById('ecommerce-final-output-status');
+    const permissionButton = document.getElementById('btn-ecommerce-open-storage-permission');
+    const path = input?.value.trim() || '';
+    if (!path) {
+        if (status) { status.textContent = '使用软件本地成品目录；完整运行缓存会另存一份。'; status.className = 'ecommerce-help ecommerce-output-status'; }
+        if (permissionButton) permissionButton.style.display = 'none';
+        return { writable: true, path: '', external_volume: false, default_local: true };
+    }
+    if (status) { status.textContent = '正在检测目录写入权限…'; status.className = 'ecommerce-help ecommerce-output-status is-checking'; }
+    try {
+        const result = await ecommerceApi('POST', '/api/ecommerce/check-output-path', { path });
+        if (result.writable) {
+            const compatibleWrite = result.write_mode === 'macos_helper';
+            if (status) {
+                const locationLabel = result.external_volume ? '外置盘' : '本机';
+                status.textContent = compatibleWrite
+                    ? `✓ ${locationLabel}目录可写（系统兼容写入模式）：成品会保存到这里，运行缓存另存软件本地。`
+                    : `✓ ${locationLabel}目录可直接写入：成品会保存到这里，运行缓存另存软件本地。`;
+                status.className = 'ecommerce-help ecommerce-output-status is-ok';
+            }
+            if (permissionButton) permissionButton.style.display = 'none';
+            if (notify) showToast(compatibleWrite ? '外置盘兼容写入检测通过' : '成品目录写入检测通过', 'success');
+        } else {
+            const hint = result.hint || result.error || '目录不可写';
+            const extraHint = result.code === 'STORAGE_PATH_INVALID'
+                ? '允许位置：用户主目录、/Volumes/盘名（含盘根目录）、/Users/Shared、/Applications、/Library/Application Support、/tmp'
+                : '';
+            if (status) { status.textContent = `${hint}${extraHint ? '；' + extraHint : ''} 未经确认不会提交付费生图。`; status.className = 'ecommerce-help ecommerce-output-status is-error'; }
+            if (permissionButton) permissionButton.style.display = result.external_volume || result.code === 'STORAGE_PERMISSION_DENIED' ? '' : 'none';
+            if (notify) showToast(`成品目录不可写：${hint}`, 'error');
+        }
+        return result;
+    } catch (error) {
+        const result = { writable: false, ...(error.data || {}), error: error.message };
+        if (status) { status.textContent = `${result.permission_hint || result.hint || error.message} 未经确认不会提交付费生图。`; status.className = 'ecommerce-help ecommerce-output-status is-error'; }
+        if (permissionButton) permissionButton.style.display = result.external_volume || result.code === 'STORAGE_PERMISSION_DENIED' ? '' : 'none';
+        if (notify) showToast(`成品目录检测失败：${error.message}`, 'error');
+        return result;
+    }
+}
+
+// ========== 路径记忆：保存/恢复上次选择的文件夹 ==========
+const ECOMMERCE_PATHS_KEY = 'ecommerce_last_paths';
+function saveEcommerceLastPaths(inputId, path) {
+    try {
+        const stored = JSON.parse(localStorage.getItem(ECOMMERCE_PATHS_KEY) || '{}');
+        stored[inputId] = path;
+        localStorage.setItem(ECOMMERCE_PATHS_KEY, JSON.stringify(stored));
+    } catch (e) { /* localStorage 不可用时静默忽略 */ }
+}
+function loadEcommerceLastPaths() {
+    try {
+        return JSON.parse(localStorage.getItem(ECOMMERCE_PATHS_KEY) || '{}');
+    } catch (e) { return {}; }
+}
+function getEcommerceLastPath(inputId) {
+    return loadEcommerceLastPaths()[inputId] || '';
+}
+// 恢复路径到输入框（不触发扫描，仅填充值）
+// 缓存目录不恢复；成品目录可以恢复，便于长期固定到外置盘。
+function restoreEcommerceInputPaths() {
+    const paths = loadEcommerceLastPaths();
+    const mapping = {
+        'ecommerce-clothing-root': paths['ecommerce-clothing-root'] || '',
+        'ecommerce-action-root': paths['ecommerce-action-root'] || '',
+        'ecommerce-final-output-path': paths['ecommerce-final-output-path'] || '',
+        'ecommerce-output-path': ''  // 不恢复缓存目录，使用后端默认值
+    };
+    for (const [id, val] of Object.entries(mapping)) {
+        const el = document.getElementById(id);
+        if (el && val) el.value = val;
+    }
+    return mapping;
+}
+
+async function scanEcommerceGarments() {
+    const path = document.getElementById('ecommerce-clothing-root')?.value.trim();
+    const keyword = document.getElementById('ecommerce-garment-keyword')?.value.trim() || '';
+    if (!path) return showToast('请先选择服装素材根目录', 'error');
+    ecommerceState.inlineGarment = null;
+    renderEcommerceGarmentPreview();
+    const summary = document.getElementById('ecommerce-scan-summary');
+    if (summary) summary.textContent = '正在扫描文件夹…';
+    // 禁用扫描相关按钮，防止重复点击
+    const selectRootBtn = document.getElementById('btn-ecommerce-select-root');
+    const scanBtn = document.getElementById('btn-ecommerce-scan');
+    const originalSelectText = selectRootBtn?.textContent;
+    if (selectRootBtn) { selectRootBtn.disabled = true; selectRootBtn.textContent = '扫描中…'; }
+    if (scanBtn) { scanBtn.disabled = true; }
+    try {
+        const generationMode = ecommerceState.importActions?.actions?.length ? 'garment_reference' : 'garment_prompt';
+        ecommerceState.scanned = await ecommerceApi('POST', '/api/ecommerce/scan-clothing-root', { path, keyword, generation_mode: generationMode });
+        const valid = ecommerceState.scanned.garments || [];
+        const invalid = ecommerceState.scanned.invalid || [];
+        if (summary) summary.textContent = generationMode === 'garment_prompt'
+            ? `递归识别 ${valid.length} 个来源文件夹、${ecommerceState.scanned.image_total || 0} 张图；每张都将单独使用当前提示词生成。`
+            : `有效服装 ${valid.length} 套；不完整文件夹 ${invalid.length} 个。将创建 ${valid.length} × 目标图数量 个任务。`;
+        const list = document.getElementById('ecommerce-garment-list');
+        if (list) list.innerHTML = valid.slice(0, 100).map(g => `<span title="${ecommerceEscape(g.path)}">${ecommerceEscape(g.name)}</span>`).join('');
+        updateEcommerceGenerateButton();
+        if (!valid.length) showToast('没有找到可用图片', 'error');
+        else showToast(generationMode === 'garment_prompt' ? `已递归加载${ecommerceState.scanned.image_total || 0}张图` : `扫描完成：${valid.length}套服装`, 'success');
+    } catch (e) {
+        ecommerceState.scanned = null;
+        if (summary) summary.textContent = `扫描失败：${e.message}`;
+        showToast(`扫描失败：${e.message}`, 'error');
+    } finally {
+        if (selectRootBtn) { selectRootBtn.disabled = false; selectRootBtn.textContent = originalSelectText || '选择'; }
+        if (scanBtn) { scanBtn.disabled = false; }
+    }
+}
+
+function updateEcommerceGenerateButton() {
+    const button = document.getElementById('btn-ecommerce-create');
+    if (!button || button.disabled || button.textContent.includes('运行中')) return;
+    const promptMode = !ecommerceState.importActions?.actions?.length;
+    const count = promptMode
+        ? (ecommerceState.scanned?.image_total || ecommerceState.inlineGarment?.images?.length || 0)
+        : (ecommerceState.scanned?.garments?.length || (ecommerceState.inlineGarment?.images?.length ? 1 : 0));
+    button.textContent = count > 1 ? '批量生成' : '生成';
+}
+
+function renderEcommerceGarmentPreview() {
+    const preview = document.getElementById('ecommerce-garment-preview');
+    if (!preview) return;
+    const images = ecommerceState.inlineGarment?.images || [];
+    const visible = images.slice(0, 80);
+    preview.innerHTML = visible.map((item, index) => `<figure title="${ecommerceEscape(item.relative_path || item.name)}"><img src="${ecommerceEscape(item.url)}" alt="服装参考${index + 1}" loading="lazy" decoding="async"><figcaption>${index + 1} · ${ecommerceEscape(item.relative_path || item.name)}</figcaption></figure>`).join('')
+        + (images.length > visible.length ? `<span class="ecommerce-help">另有 ${images.length - visible.length} 张已加载，预览区不全部展开</span>` : '');
+}
+
+function ecommerceIsSupportedImageFile(file) {
+    return ['.jpg', '.jpeg', '.png', '.webp'].includes(String(file?.name || '').toLowerCase().match(/\.[^.]+$/)?.[0] || '');
+}
+
+function ecommerceNaturalPathSort(items) {
+    return [...items].sort((a, b) => String(a.relativePath || a.file?.name || '').localeCompare(
+        String(b.relativePath || b.file?.name || ''), 'zh-CN', { numeric: true, sensitivity: 'base' }
+    ));
+}
+
+function ecommerceReadDirectoryBatch(reader) {
+    return new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+}
+
+async function ecommerceReadAllDirectoryEntries(directoryEntry) {
+    const reader = directoryEntry.createReader();
+    const entries = [];
+    while (true) {
+        const batch = await ecommerceReadDirectoryBatch(reader);
+        if (!batch.length) break;
+        entries.push(...batch);
+    }
+    return entries;
+}
+
+function ecommerceEntryFile(entry) {
+    return new Promise((resolve, reject) => entry.file(resolve, reject));
+}
+
+async function collectDroppedEcommerceGarmentFiles(dataTransfer) {
+    const records = [];
+    const skipDirectories = new Set(['_运行缓存', '_生成样本备份', '_废片预览备份', '_重做历史', '_重做临时参考图', '_质检缓存', '_成品输出', '__MACOSX']);
+    const walk = async (entry, parentPath = '') => {
+        if (!entry || entry.name?.startsWith('.')) return;
+        const relativePath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+        if (entry.isDirectory) {
+            if (skipDirectories.has(entry.name) || entry.name.startsWith('AI换装结果-')) return;
+            const children = await ecommerceReadAllDirectoryEntries(entry);
+            children.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN', { numeric: true, sensitivity: 'base' }));
+            for (const child of children) await walk(child, relativePath);
+            return;
+        }
+        if (!entry.isFile) return;
+        const file = await ecommerceEntryFile(entry);
+        if (!ecommerceIsSupportedImageFile(file)) return;
+        const stem = String(file.name || '').replace(/\.[^.]+$/, '');
+        if (/(?:^|-)AI-\d+/i.test(stem) || stem.endsWith('.deleted')) return;
+        records.push({ file, relativePath });
+        if (records.length > 10000) throw new Error('拖入目录超过10000张图片，为防止误提交高额费用，请分批处理');
+    };
+    const entries = Array.from(dataTransfer?.items || [])
+        .filter(item => item.kind === 'file')
+        .map(item => item.webkitGetAsEntry?.())
+        .filter(Boolean);
+    if (entries.length) {
+        for (const entry of entries) await walk(entry);
+        return ecommerceNaturalPathSort(records);
+    }
+    return ecommerceNaturalPathSort(Array.from(dataTransfer?.files || []).map(file => ({
+        file,
+        relativePath: file.webkitRelativePath || file.name,
+    })).filter(item => ecommerceIsSupportedImageFile(item.file)));
+}
+
+function ecommerceInlineGarmentGroups(images, fallbackName) {
+    const groups = new Map();
+    for (const item of images) {
+        const parts = String(item.relative_path || item.name || '').replace(/\\/g, '/').split('/').filter(Boolean);
+        const groupName = parts.length > 1 ? parts.slice(0, -1).join('/') : fallbackName;
+        if (!groups.has(groupName)) groups.set(groupName, []);
+        groups.get(groupName).push(item.url);
+    }
+    return [...groups.entries()].map(([name, urls]) => ({ name, images: urls }));
+}
+
+async function loadDroppedEcommerceGarmentFiles(fileList, options = {}) {
+    const records = ecommerceNaturalPathSort(Array.from(fileList || []).map(item => item?.file ? item : ({
+        file: item,
+        relativePath: item?.webkitRelativePath || item?.name || '',
+    })).filter(item => ecommerceIsSupportedImageFile(item.file)));
+    if (!records.length) return showToast('没有找到可用的JPG、PNG或WEBP图片', 'error');
+    const maxFiles = ecommerceState.importActions?.actions?.length ? 6 : 10000;
+    if (records.length > maxFiles) return showToast(`当前模式一次最多选择${maxFiles}张；当前选择了${records.length}张`, 'error');
+    const summary = document.getElementById('ecommerce-scan-summary');
+    const dropzone = document.getElementById('ecommerce-garment-dropzone');
+    const firstRelativeParts = String(records[0].relativePath || records[0].file.name || '').replace(/\\/g, '/').split('/').filter(Boolean);
+    const isDirectoryDrop = !!options.directoryDrop || records.some(item => String(item.relativePath || '').includes('/'));
+    const loaded = {
+        name: isDirectoryDrop
+            ? (firstRelativeParts[0] || '拖入文件夹')
+            : String(records[0].file.name || '单套测试').replace(/\.[^.]+$/, ''),
+        images: [],
+        directoryDrop: isDirectoryDrop,
+    };
+    ecommerceState.inlineGarment = loaded;
+    ecommerceState.scanned = null;
+    document.getElementById('ecommerce-clothing-root').value = '';
+    if (dropzone) dropzone.classList.add('is-uploading');
+    for (let index = 0; index < records.length; index++) {
+        const { file, relativePath } = records[index];
+        if (summary) summary.textContent = `正在加载服装参考图 ${index + 1}/${records.length}：${relativePath || file.name}`;
+        const form = new FormData();
+        form.append('file', file, file.name);
+        form.append('preserve_original', 'true');
+        try {
+            const response = await fetch('/api/upload-image', { method: 'POST', body: form });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result.url) throw new Error(result.error || `HTTP ${response.status}`);
+            loaded.images.push({ name: file.name, url: result.url, relative_path: relativePath || file.name });
+            if (index < 8 || index === records.length - 1 || index % 20 === 0) renderEcommerceGarmentPreview();
+        } catch (error) {
+            ecommerceState.inlineGarment = null;
+            renderEcommerceGarmentPreview();
+            if (summary) summary.textContent = `加载失败：${file.name}`;
+            return showToast(`服装参考图加载失败：${error.message}`, 'error');
+        }
+    }
+    if (dropzone) dropzone.classList.remove('is-uploading', 'is-dragover');
+    const promptMode = !ecommerceState.importActions?.actions?.length;
+    const inlineGroups = promptMode
+        ? ecommerceInlineGarmentGroups(loaded.images, loaded.name)
+        : [{ name: loaded.name, images: loaded.images.map(item => item.url) }];
+    ecommerceState.scanned = { garments: inlineGroups, invalid: [], garment_count: inlineGroups.length, image_total: loaded.images.length, source: isDirectoryDrop ? 'uploaded_directory' : 'uploaded_files' };
+    if (summary) summary.textContent = ecommerceState.importActions?.actions?.length
+        ? `单套测试：已按文件名顺序加载${loaded.images.length}张服装参考图；将生成 1 × 目标图数量 个任务。`
+        : `${isDirectoryDrop ? `已递归加载${inlineGroups.length}个原目录、` : '已选择'}${loaded.images.length}张服装原图；将按原目录分类并分别使用当前提示词生成。`;
+    updateEcommerceGenerateButton();
+    showToast(isDirectoryDrop ? `已递归加载${inlineGroups.length}个目录、${loaded.images.length}张图` : `已加载${loaded.images.length}张服装参考图`, 'success');
+}
+
+function renderEcommerceBatchList() {
+    const select = document.getElementById('ecommerce-batch-select');
+    if (!select) return;
+    const signature = ecommerceState.batches.map(b => `${b.id}:${b.status}:${b.done_total || 0}:${b.task_total || 0}`).join('|');
+    if (signature === ecommerceState.renderCache.batchList) return;
+    ecommerceState.renderCache.batchList = signature;
+    select.innerHTML = ecommerceState.batches.length
+        ? ecommerceState.batches.map(b => `<option value="${ecommerceEscape(b.id)}">${ecommerceEscape(b.name)}｜${ecommerceStatusText(b.status)}｜${b.done_total || 0}/${b.task_total || 0}</option>`).join('')
+        : '<option value="">暂无批次</option>';
+    if (ecommerceState.batches.some(b => b.id === ecommerceState.currentBatchId)) select.value = ecommerceState.currentBatchId;
+    if (typeof renderEcommerceRerunBatchOptions === 'function') renderEcommerceRerunBatchOptions();
+}
+
+function ecommerceStatusText(status) {
+    return ({draft:'待开始',running:'运行中',resuming:'恢复中',paused:'已暂停',completed:'已完成',interrupted:'有任务中断',cancelled:'已取消',pending:'等待',preparing:'生成中',configuration_required:'需要配置',submitted:'平台排队',awaiting_qc:'等待集中质检',qc:'质检中',retry_pending:'下一轮重生成',accepted:'已生成并归档',manual_review:'人工复核'})[status] || status || '未知';
+}
+
+function ecommerceTaskPassedAiQc(task) {
+    return task?.state === 'accepted' && (task.attempts || []).some(attempt => attempt?.qc?.passed === true || attempt?.qc?.verdict === 'pass');
+}
+
+function ecommerceTaskHadAiQc(task) {
+    return (task?.attempts || []).some(attempt => attempt?.qc && typeof attempt.qc === 'object');
+}
+
+function ecommerceTaskDisplayStatus(task) {
+    if (task?.state === 'accepted') {
+        if (ecommerceTaskPassedAiQc(task)) return 'AI质检通过';
+        return ecommerceTaskHadAiQc(task) ? 'AI未通过·已归档' : '未质检·已归档';
+    }
+    return ecommerceStatusText(task?.state);
+}
+
+async function refreshEcommerceBatch() {
+    if (!ecommerceState.currentBatchId) return;
+    try {
+        const data = await ecommerceApi('GET', `/api/ecommerce/batches/${encodeURIComponent(ecommerceState.currentBatchId)}`);
+        ecommerceState.detail = data.batch;
+        const idx = ecommerceState.batches.findIndex(b => b.id === data.batch.id);
+        const summary = { ...data.batch };
+        delete summary.tasks;
+        if (idx >= 0) ecommerceState.batches[idx] = summary;
+        else ecommerceState.batches.unshift(summary);
+        renderEcommerceBatchList();
+        renderEcommerceBatchDetail();
+        renderEcommerceRhApiConfig();
+        scheduleEcommercePoll(data.batch.status === 'running' || data.batch.status === 'resuming');
+    } catch (e) {
+        showToast(`刷新批次失败：${e.message}`, 'error');
+    }
+}
+
+function scheduleEcommercePoll(shouldPoll) {
+    if (ecommerceState.pollTimer) clearTimeout(ecommerceState.pollTimer);
+    ecommerceState.pollTimer = null;
+    if (shouldPoll && currentMode === 'ecommerce') {
+        ecommerceState.pollTimer = setTimeout(() => refreshEcommerceBatch(), 3000);
+    }
+}
+
+function renderEcommerceBatchDetail() {
+    const b = ecommerceState.detail;
+    const summary = document.getElementById('ecommerce-current-summary');
+    const taskList = document.getElementById('ecommerce-task-list');
+    const start = document.getElementById('btn-ecommerce-start');
+    const pause = document.getElementById('btn-ecommerce-pause');
+    const cancel = document.getElementById('btn-ecommerce-cancel');
+    const panel = document.getElementById('ecommerce-batch-panel');
+    const progressText = document.getElementById('ecommerce-progress-text');
+    const progressStatus = document.getElementById('ecommerce-progress-status');
+    if (!b) {
+        if (panel) panel.classList.remove('is-running');
+        const createBtn0 = document.getElementById('btn-ecommerce-create');
+        if (createBtn0) { createBtn0.disabled = false; updateEcommerceGenerateButton(); }
+        // 没有批次详情时，强制禁用所有控制按钮，避免 HTML 默认 disabled 但无法点击的"假死"状态
+        if (start) start.disabled = true;
+        if (pause) pause.disabled = true;
+        if (cancel) cancel.disabled = true;
+        const forceResetBtn0 = document.getElementById('btn-ecommerce-force-reset');
+        if (forceResetBtn0) forceResetBtn0.style.display = 'none';
+        renderEcommerceResultFolders();
+        return;
+    }
+    const counts = b.task_counts || {};
+    const acceptedTasks = (b.tasks || []).filter(task => task.state === 'accepted');
+    const aiQcPassedCount = acceptedTasks.filter(ecommerceTaskPassedAiQc).length;
+    const aiQcFailedArchivedCount = acceptedTasks.filter(task => ecommerceTaskHadAiQc(task) && !ecommerceTaskPassedAiQc(task)).length;
+    const archivedWithoutQcCount = acceptedTasks.length - aiQcPassedCount - aiQcFailedArchivedCount;
+    const usage = b.usage || {};
+    const isRunning = b.status === 'running' || b.status === 'resuming';
+    const percent = b.task_total ? Math.round((b.done_total || 0) / b.task_total * 100) : 0;
+    const archiveFallback = !!b.settings?.archive_fallback;
+    const archiveSummary = b.final_output_path
+        ? `${b.settings?.final_output_fallback ? `本地回退成品目录：${b.final_output_path}（原目标 ${b.settings.requested_final_output_path} 不可写）` : `成品目录：${b.final_output_path}`}${b.run_code ? `｜运行 ${b.run_code}` : ''}`
+        : archiveFallback
+            ? `旧批次成品位置：${b.settings.archive_fallback_root || b.output_path}`
+            : '旧批次成品写入服装原文件夹';
+    const billingSummary = Number.isFinite(Number(usage.runninghub_billed_cny))
+        ? `｜RunningHub回传费用 ¥${Number(usage.runninghub_billed_cny).toFixed(2)}`
+        : '';
+    const acceptanceSummary = `AI质检通过 ${aiQcPassedCount}，AI未通过但归档 ${aiQcFailedArchivedCount}，未质检归档 ${archivedWithoutQcCount}，人工复核 ${counts.manual_review || 0}`;
+    if (summary) summary.textContent = `${b.name}｜${ecommerceStatusText(b.status)}｜完成 ${b.done_total || 0}/${b.task_total || 0}（${acceptanceSummary}）${billingSummary}｜${archiveSummary}`;
+    const bar = document.getElementById('ecommerce-progress-bar');
+    if (bar) bar.style.width = `${percent}%`;
+    if (progressText) progressText.textContent = `${percent}%`;
+    if (panel) panel.classList.toggle('is-running', isRunning);
+    // 进度状态文字
+    if (progressStatus) {
+        const garmentIdx = b.current_garment_index || 0;
+        const garmentTotal = b.garment_total || 0;
+        const garmentName = b.current_garment_name || '';
+        const failedCount = counts.manual_review || 0;
+        const preparingCount = counts.preparing || 0;
+        const samplesSetting = (b.settings || {}).samples_per_action || 1;
+        if (isRunning) {
+            let statusHtml = `<span class="status-running">● 运行中</span>`;
+            if (garmentName) statusHtml += ` ｜ 正在处理第 ${garmentIdx}/${garmentTotal} 套：<span class="status-garment">${ecommerceEscape(garmentName)}</span>`;
+            statusHtml += ` ｜ 已完成 ${b.done_total || 0}/${b.task_total || 0}`;
+            if (preparingCount > 0) statusHtml += ` ｜ 生成中 ${preparingCount} 张`;
+            if (samplesSetting > 1) statusHtml += `（每张抽${samplesSetting}次）`;
+            if (b.settings && !b.settings.qc_enabled) statusHtml += ` ｜ 滑动窗口并发 ${b.settings.concurrency || 10}（上传4 / 下载6限流）`;
+            progressStatus.innerHTML = statusHtml;
+        } else if (b.status === 'completed') {
+            let statusHtml = `已完成 ｜ AI质检通过 ${aiQcPassedCount}，AI未通过但归档 ${aiQcFailedArchivedCount}，未质检归档 ${archivedWithoutQcCount}，失败 ${failedCount}`;
+            if (failedCount > 0) statusHtml += ` ｜ <span class="status-error">${failedCount} 张需要处理，请检查具体错误；不要在确认API任务状态前直接重跑</span>`;
+            if (archiveFallback) statusHtml += ` ｜ <span class="status-running">外置盘不可写，结果已转存应用缓存</span>`;
+            if (b.settings?.final_output_fallback) statusHtml += ` ｜ <span class="status-running">指定成品目录不可写，本批次按确认保存到本地成品目录</span>`;
+            progressStatus.innerHTML = statusHtml;
+        } else if (b.status === 'paused') {
+            progressStatus.innerHTML = `<span class="status-running">⏸ 已暂停</span> ｜ 已完成 ${b.done_total || 0}/${b.task_total || 0}`;
+        } else if (b.status === 'cancelled') {
+            progressStatus.innerHTML = `已取消 ｜ 已完成 ${b.done_total || 0}/${b.task_total || 0}`;
+        } else {
+            progressStatus.textContent = '等待运行';
+        }
+    }
+    if (start) start.disabled = ['running','resuming','completed','cancelled'].includes(b.status);
+    // 暂停按钮：running 和 resuming 都允许暂停（之前 resuming 状态无法暂停是 bug）
+    if (pause) pause.disabled = !isRunning;
+    if (cancel) cancel.disabled = ['completed','cancelled'].includes(b.status);
+    // 强制重置按钮：只在状态异常（resuming/interrupted）或卡住超过 5 秒的 running 状态显示
+    const forceResetBtn = document.getElementById('btn-ecommerce-force-reset');
+    if (forceResetBtn) {
+        const showForceReset = b.status === 'resuming' || b.status === 'interrupted' || b.status === 'running';
+        forceResetBtn.style.display = showForceReset ? '' : 'none';
+    }
+    // 同步“开始运行”按钮状态：运行中时禁用并显示“正在运行中”
+    const createBtn = document.getElementById('btn-ecommerce-create');
+    if (createBtn) {
+        if (isRunning) {
+            createBtn.disabled = true;
+            createBtn.textContent = '正在运行中…';
+        } else {
+            createBtn.disabled = false;
+            updateEcommerceGenerateButton();
+        }
+    }
+    if (!taskList) { renderEcommerceResultFolders(); return; }
+    const tasks = b.tasks || [];
+    const taskDisclosure = document.querySelector('.ecommerce-results-disclosure');
+    const taskSignature = `${b.id}|${tasks.map(t => `${t.id}:${t.state}:${t.updated_at || ''}:${t.accepted_path || ''}:${t.manual_review_path || ''}:${(t.attempts || []).length}`).join('|')}`;
+    if (!taskDisclosure?.open) {
+        renderEcommerceResultFolders();
+        return;
+    }
+    if (taskSignature === ecommerceState.renderCache.tasks) {
+        renderEcommerceResultFolders();
+        return;
+    }
+    ecommerceState.renderCache.tasks = taskSignature;
+    const rows = tasks.slice(0, 500).map((t, index) => {
+        const last = (t.attempts || []).at(-1) || {};
+        const qc = last.qc || {};
+        const detail = t.last_error || (qc.critical_errors || []).join('；') || (t.state === 'accepted' ? t.accepted_path : t.manual_review_path) || '';
+        const resultPath = t.accepted_path || last.archived_path || last.candidate_path || t.manual_review_path || '';
+        const resultSrcRaw = resultPath
+            ? (/^(?:https?:|data:|\/static\/)/.test(resultPath) ? resultPath : `/api/ecommerce/local-image?path=${encodeURIComponent(resultPath)}`)
+            : '';
+        const resultSrc = ecommerceThumbnailUrl(resultSrcRaw, 160);
+        const sampleCount = (t.attempts || []).filter(a => a.candidate_path || a.archived_path).length;
+        const samplesSetting = (b.settings || {}).samples_per_action || 1;
+        const candidateText = b.settings && !b.settings.qc_enabled ? `${sampleCount}/${samplesSetting}` : `${sampleCount}/3`;
+        return `<div class="ecommerce-task-row">
+            <span>${index + 1}</span><span title="${ecommerceEscape(t.garment_name)}">${ecommerceEscape(t.garment_name)}</span>
+            <span>${ecommerceEscape(t.action_name)}</span><span class="ecommerce-result-thumb">${resultSrc ? `<img src="${ecommerceEscape(resultSrc)}" alt="${ecommerceEscape(t.garment_name)}-${ecommerceEscape(t.action_name)}" loading="lazy" decoding="async">` : '—'}</span><span class="ecommerce-state ${ecommerceEscape(t.state)}">${ecommerceTaskDisplayStatus(t)}</span>
+            <span>${candidateText}</span><span title="${ecommerceEscape(detail)}">${ecommerceEscape(detail || '—')}</span>
+        </div>`;
+    }).join('');
+    taskList.innerHTML = `<div class="ecommerce-task-row is-head"><span>#</span><span>服装</span><span>目标图</span><span>结果预览</span><span>状态</span><span>候选</span><span>说明 / 文件</span></div>${rows || '<div class="ecommerce-empty">暂无任务</div>'}`;
+    renderEcommerceResultFolders();
+}
+
+const ecommerceReferenceReview = { garment: null, index: 0 };
+
+function ecommerceReferenceUrl(path) {
+    return path ? (/^(?:https?:|data:|\/static\/)/.test(path) ? path : `/api/ecommerce/local-image?path=${encodeURIComponent(path)}`) : '';
+}
+
+function updateEcommerceReferenceReview() {
+    const garment = ecommerceReferenceReview.garment;
+    const images = garment?.images || [];
+    if (!garment || !images.length) return;
+    ecommerceReferenceReview.index = (ecommerceReferenceReview.index + images.length) % images.length;
+    const image = document.getElementById('ecommerce-reference-image');
+    const title = document.getElementById('ecommerce-reference-title');
+    if (image) image.src = ecommerceThumbnailUrl(ecommerceReferenceUrl(images[ecommerceReferenceReview.index]), 1200);
+    if (title) title.textContent = `${garment.name || '服装'} · 实拍参考 ${ecommerceReferenceReview.index + 1}/${images.length}`;
+    const thumbs = document.getElementById('ecommerce-reference-thumbnails');
+    if (thumbs) {
+        thumbs.innerHTML = images.map((path, index) => `<button type="button" data-index="${index}" class="${index === ecommerceReferenceReview.index ? 'is-active' : ''}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(ecommerceReferenceUrl(path), 180))}" alt="参考${index + 1}"><span>${index + 1}</span></button>`).join('');
+        thumbs.querySelectorAll('button').forEach(button => button.addEventListener('click', e => {
+            e.stopPropagation(); ecommerceReferenceReview.index = Number(button.dataset.index); updateEcommerceReferenceReview();
+        }));
+    }
+}
+
+function openEcommerceReferenceReview(garment, index = 0) {
+    if (!garment?.images?.length) return showToast('这套服装没有可读取的实拍参考图', 'error');
+    ecommerceReferenceReview.garment = garment;
+    ecommerceReferenceReview.index = index;
+    updateEcommerceReferenceReview();
+    const overlay = document.getElementById('ecommerce-reference-overlay');
+    if (overlay) { overlay.hidden = false; overlay.setAttribute('aria-hidden', 'false'); document.body.classList.add('ecommerce-compare-open'); }
+}
+
+function closeEcommerceReferenceReview() {
+    const overlay = document.getElementById('ecommerce-reference-overlay');
+    if (overlay) { overlay.hidden = true; overlay.setAttribute('aria-hidden', 'true'); }
+    if (document.getElementById('ecommerce-compare-overlay')?.hidden !== false) document.body.classList.remove('ecommerce-compare-open');
+}
+
+// 异步扫描每套服装结果目录中的实际AI图数量，更新进度显示（删除文件后能实时反映）
+async function refreshEcommerceFolderStatusCounts(container, batch) {
+    const statusSpans = container.querySelectorAll('.ecommerce-folder-status[data-result-path]');
+    if (!statusSpans.length || !batch?.id) return;
+    try {
+        // 调用 scan-deleted API 获取每套服装的废片数（即被删除的动作数）
+        const result = await ecommerceApi('POST', '/api/ecommerce/scan-deleted', { batch_id: batch.id });
+        const deletedByGarment = {};
+        for (const item of (result.items || [])) {
+            const gid = item.garment_id;
+            if (!deletedByGarment[gid]) deletedByGarment[gid] = 0;
+            deletedByGarment[gid]++;
+        }
+        statusSpans.forEach(span => {
+            const row = span.closest('.ecommerce-folder-row');
+            const garmentId = row?.dataset?.garmentId;
+            const total = parseInt(span.dataset.taskTotal || '0', 10);
+            if (!garmentId || !total) return;
+            const deleted = deletedByGarment[garmentId] || 0;
+            const remaining = Math.max(0, total - deleted);
+            span.textContent = `${remaining}/${total}`;
+            if (deleted > 0) {
+                span.style.color = '#f79009';
+                span.title = `原有${total}张，已删除${deleted}张，剩余${remaining}张。点击"扫描废片"可重做`;
+            } else {
+                span.style.color = '';
+            }
+        });
+    } catch (e) {
+        // 扫描失败时保持原有的任务状态显示
+        console.warn('刷新文件夹状态计数失败:', e);
+    }
+}
+
+function renderEcommerceResultFolders() {
+    const container = document.getElementById('ecommerce-result-folders');
+    if (!container) return;
+    const b = ecommerceState.detail;
+    if (!b) {
+        container.innerHTML = '<div class="ecommerce-empty">运行后这里会列出每套服装的结果文件夹，点击即可打开。</div>';
+        return;
+    }
+    const garments = Array.isArray(b.garments) ? b.garments : [];
+    if (!garments.length) {
+        container.innerHTML = '<div class="ecommerce-empty">尚未扫描到服装文件夹。</div>';
+        return;
+    }
+    const folderSignature = `${b.id}|${b.run_code || ''}|${garments.map(g => g.id).join(',')}|${(b.tasks || []).map(t => `${t.id}:${t.state}:${t.updated_at || ''}`).join('|')}`;
+    if (folderSignature === ecommerceState.renderCache.folders) return;
+    ecommerceState.renderCache.folders = folderSignature;
+    const tasksByGarment = {};
+    for (const t of (b.tasks || [])) {
+        const key = t.garment_id || t.garment_name;
+        if (!tasksByGarment[key]) tasksByGarment[key] = [];
+        tasksByGarment[key].push(t);
+    }
+    const rows = garments.map((g, index) => {
+        const tasks = tasksByGarment[g.id] || [];
+        const total = tasks.length;
+        const done = tasks.filter(t => ['accepted', 'manual_review', 'skipped', 'cancelled'].includes(t.state)).length;
+        const acceptedTasks = tasks.filter(t => t.state === 'accepted');
+        const qcPassed = acceptedTasks.filter(ecommerceTaskPassedAiQc).length;
+        const qcFailedArchived = acceptedTasks.filter(task => ecommerceTaskHadAiQc(task) && !ecommerceTaskPassedAiQc(task)).length;
+        const archivedOnly = acceptedTasks.length - qcPassed - qcFailedArchived;
+        const resultPath = b.result_dirs?.[g.id]
+            || b.settings?.archive_fallback_garments?.[g.name]
+            || (b.settings?.archive_fallback ? `${b.settings.archive_fallback_root}/${g.name}` : (b.output_path ? `${b.output_path}/_生成样本备份/${g.name}` : ''));
+        // 进度显示：初始用任务状态，稍后异步扫描实际文件数量更新
+        const statusText = total ? `${done}/${total}` : '—';
+        const statusDetail = total ? `AI质检通过${qcPassed}；AI未通过但归档${qcFailedArchived}；未质检归档${archivedOnly}` : '暂无任务';
+        const groupAction = b.generation_mode === 'garment_prompt'
+            ? (b.template?.actions || []).find(action => action.garment_id === g.id)
+            : null;
+        const fallbackTarget = ['target_only', 'garment_prompt'].includes(b.generation_mode)
+            ? (groupAction?.action_image || b.template?.actions?.[0]?.action_image)
+            : '';
+        const referenceUrl = ecommerceThumbnailUrl(ecommerceReferenceUrl(g.images?.[0] || fallbackTarget || ''), 120);
+        return `<div class="ecommerce-folder-row" data-garment-id="${ecommerceEscape(g.id)}" data-result-path="${ecommerceEscape(resultPath)}" data-garment-path="${ecommerceEscape(g.path)}" data-task-total="${total}">
+            <span class="ecommerce-folder-identity" title="${ecommerceEscape(g.path)}"><i>${index + 1}</i><b>${ecommerceEscape(g.name)}</b></span>
+            <span class="ecommerce-folder-status" title="${ecommerceEscape(statusDetail)}" data-result-path="${ecommerceEscape(resultPath)}" data-task-total="${total}">${statusText}</span>
+            <span class="ecommerce-folder-actions">${referenceUrl ? `<img class="ecommerce-folder-ref-thumb ecommerce-folder-compare" src="${ecommerceEscape(referenceUrl)}" alt="${ecommerceEscape(g.name)}参考图" title="查看对比" loading="lazy" decoding="async">` : ''}<button class="btn btn-primary btn-compact ecommerce-folder-compare" type="button">对比</button><button class="btn btn-outline btn-compact ecommerce-folder-open" type="button" title="在访达中打开 ${ecommerceEscape(resultPath)}">📁 打开</button></span>
+        </div>`;
+    }).join('');
+    const identityLabel = b.generation_mode === 'garment_prompt' ? '来源' : (b.generation_mode === 'target_only' ? '模式' : '服装');
+    container.innerHTML = `<div class="ecommerce-folder-row is-head" title="${ecommerceEscape(b.run_code || '')}"><span>${identityLabel}</span><span>进度</span><span>查看</span></div>${rows}`;
+    // 异步扫描实际文件夹中的AI图数量，更新进度显示（删除文件后能实时反映）
+    refreshEcommerceFolderStatusCounts(container, b);
+    container.querySelectorAll('.ecommerce-folder-compare').forEach(control => {
+        control.addEventListener('click', async () => {
+            const row = control.closest('.ecommerce-folder-row');
+            if (!row) return;
+            const singlePathInput = document.getElementById('ecommerce-rerun-result-path');
+            if (singlePathInput) singlePathInput.value = row.dataset.resultPath || '';
+            const button = control.matches('button') ? control : row.querySelector('button.ecommerce-folder-compare');
+            const originalText = button?.textContent || '';
+            if (button) { button.disabled = true; button.textContent = '加载中…'; }
+            try {
+                await openEcommerceGroupCompare(row.dataset.garmentId);
+            } catch (error) {
+                showToast(`对比加载失败：${error.message}`, 'error');
+            } finally {
+                if (button) { button.disabled = false; button.textContent = originalText || '对比'; }
+            }
+        });
+    });
+    container.querySelectorAll('.ecommerce-folder-open').forEach(button => {
+        button.addEventListener('click', async () => {
+            const row = button.closest('.ecommerce-folder-row');
+            const path = row?.dataset.resultPath || '';
+            const garmentPath = row?.dataset.garmentPath || '';
+            const originalText = button.textContent;
+            button.disabled = true;
+            button.textContent = '打开中…';
+            try {
+                const resp = await ecommerceApi('POST', '/api/ecommerce/open-folder', {
+                    path, garment_path: garmentPath, output_path: b.output_path || ''
+                });
+                if (resp.ok) showToast(`已打开: ${resp.path}`, 'success');
+                else showToast(resp.error || '打开文件夹失败', 'error');
+            } catch (e) {
+                showToast('打开文件夹失败: ' + e.message, 'error');
+            } finally {
+                button.disabled = false;
+                button.textContent = originalText;
+            }
+        });
+    });
+}
+
+async function createAndStartEcommerceBatch() {
+    const clothingRoot = document.getElementById('ecommerce-clothing-root')?.value.trim();
+    const inlineGarment = ecommerceState.inlineGarment;
+    const hasGarmentImages = !!(clothingRoot || inlineGarment?.images?.length);
+    const hasTargetImages = !!ecommerceState.importActions?.actions?.length;
+    if (!hasGarmentImages) return showToast('请选择服装图片，或选择包含子文件夹的服装根目录', 'error');
+    const generationMode = hasTargetImages ? 'garment_reference' : 'garment_prompt';
+    // 新建前一定刷新批次索引，避免后台已收尾而页面仍拿旧“运行中”状态阻止下一批。
+    try {
+        const latest = await ecommerceApi('GET', '/api/ecommerce/batches');
+        ecommerceState.batches = latest.batches || [];
+        ecommerceState.renderCache.batchList = '';
+        renderEcommerceBatchList();
+    } catch (error) {
+        return showToast(`无法确认上一批是否已完成：${error.message}`, 'error');
+    }
+    const activeBatch = ecommerceState.batches.find(batch => ['running', 'resuming'].includes(batch.status));
+    if (activeBatch) return showToast(`批次“${activeBatch.name || activeBatch.id}”仍在运行，请等待完成或先暂停，避免重复提交`, 'error');
+    const button = document.getElementById('btn-ecommerce-create');
+    const originalButtonText = button?.textContent || '';
+    if (button) { button.disabled = true; button.textContent = '正在创建…'; }
+    try {
+        const finalOutputPath = document.getElementById('ecommerce-final-output-path')?.value.trim() || '';
+        let allowFinalFallback = false;
+        if (finalOutputPath) {
+            const storageCheck = await checkEcommerceFinalOutputPath(false);
+            if (!storageCheck.writable) {
+                const reason = storageCheck.permission_hint || storageCheck.hint || storageCheck.error || '目录不可写';
+                const continueLocally = confirm(`指定的成品目录当前不可写：\n${finalOutputPath}\n\n${reason}\n\n点“确定”：本批次先保存到软件本地成品目录并继续运行（软件缓存仍另存一份）。\n点“取消”：停止运行，授权外置盘后再试，不会产生生图费用。`);
+                if (!continueLocally) throw new Error('已停止运行；请点击“外置盘权限”，授权后再点“检测”');
+                allowFinalFallback = true;
+            }
+        }
+        const promptAction = buildEcommercePromptAction();
+        const currentActions = hasTargetImages ? buildCurrentEcommerceTargetActions() : [];
+        const runningHubSpecs = new Map();
+        for (const action of (currentActions.length ? currentActions : [promptAction])) {
+            if (action.platform !== 'runninghub') continue;
+            const endpoint = action.endpoint || action.model_id || action.model_key;
+            const resolution = action.resolution || (String(action.model_key || '').endsWith('/4k') ? '4k' : '2k');
+            if (endpoint) runningHubSpecs.set(`${endpoint}|${resolution}`, { endpoint, resolution });
+        }
+        for (const spec of runningHubSpecs.values()) {
+            const preview = await ecommerceApi('POST', '/api/rh-preflight', {
+                model_id: spec.endpoint,
+                resolution: spec.resolution
+            });
+            const price = Number(preview.estimated_price);
+            if (Number.isFinite(price) && price > 0.5) {
+                const proceed = confirm(`RunningHub实时价格预估为 ${price} ${preview.currency || 'CNY'}/张，超过批量安全线0.50元。仍要创建并运行吗？`);
+                if (!proceed) throw new Error('已取消高价模型批次，请改用V2 Flash低价4K');
+            }
+        }
+        const data = await ecommerceApi('POST', '/api/ecommerce/batches', {
+            name: document.getElementById('ecommerce-batch-name')?.value.trim() || '',
+            actions: currentActions,
+            prompt_action: promptAction,
+            template_name: generationMode === 'garment_prompt' ? '服装原图批量提示词' : '本次运行目标图',
+            clothing_root: clothingRoot,
+            garment_images: (inlineGarment?.images || []).map(item => item.url),
+            garment_sources: (inlineGarment?.images || []).map(item => ({
+                source: item.url,
+                name: item.name || '',
+                relative_path: item.relative_path || item.name || '',
+            })),
+            garment_name: inlineGarment?.name || '',
+            generation_mode: generationMode,
+            garment_keyword: document.getElementById('ecommerce-garment-keyword')?.value.trim() || '',
+            final_output_path: finalOutputPath,
+            allow_final_fallback: allowFinalFallback,
+            output_path: document.getElementById('ecommerce-output-path')?.value.trim() || '',
+            concurrency: Number(document.getElementById('ecommerce-concurrency')?.value || 10),
+            garment_limit: 0,
+            action_limit: 0,
+            max_attempts: 3,
+            qc_enabled: generationMode === 'garment_reference' && !!document.getElementById('ecommerce-qc-enabled')?.checked,
+            qc_model: document.getElementById('ecommerce-qc-model')?.value.trim() || 'gemini-2.5-pro',
+            profile_mode: document.getElementById('ecommerce-profile-mode')?.value || 'visual_sheets',
+            qc_threshold: Number(document.getElementById('ecommerce-qc-threshold')?.value || 85),
+            samples_per_action: Number(document.getElementById('ecommerce-samples-per-action')?.value || 1)
+        });
+        ecommerceState.currentBatchId = data.batch.id;
+        ecommerceState.detail = data.batch;
+        ecommerceState.batches.unshift({ ...data.batch, tasks: undefined });
+        renderEcommerceBatchList();
+        renderEcommerceBatchDetail();
+        if (generationMode === 'garment_prompt') {
+            const taskTotal = Number(data.batch.task_total || 0);
+            const sampleCount = Math.max(1, Number(data.batch.settings?.samples_per_action || 1));
+            const paidCallTotal = taskTotal * sampleCount;
+            const proceed = confirm(`已识别 ${taskTotal} 张服装原图。\n\n每张生成 ${sampleCount} 个候选，预计共 ${paidCallTotal} 次付费图生图调用。\n并发上限：${Number(data.batch.settings?.concurrency || 1)}。\n输出会保留原文件夹层级。\n\n确定开始吗？`);
+            if (!proceed) {
+                await ecommerceApi('DELETE', `/api/ecommerce/batches/${encodeURIComponent(data.batch.id)}/record`);
+                ecommerceState.currentBatchId = null;
+                ecommerceState.detail = null;
+                throw new Error('已取消，未提交任何付费生图任务');
+            }
+        }
+        await controlEcommerceBatch('start');
+        showToast(data.warning || `批次已开始：${data.batch.task_total}个任务`, data.warning ? 'warning' : 'success');
+    } catch (e) {
+        showToast(`创建批次失败：${e.message}`, 'error');
+        if (button) { button.disabled = false; button.textContent = originalButtonText; }
+    }
+    // 注意：成功创建后不在 finally 里还原按钮——renderEcommerceBatchDetail 会根据批次运行状态
+    // 自动把按钮设为“正在运行中…”或还原为“开始运行”。仅在出错时手动还原。
+}
+
+async function controlEcommerceBatch(action) {
+    if (!ecommerceState.currentBatchId) return;
+    try {
+        await ecommerceApi('POST', `/api/ecommerce/batches/${encodeURIComponent(ecommerceState.currentBatchId)}/action`, { action });
+        await refreshEcommerceBatch();
+        if (action !== 'start' && action !== 'resume') showToast(`批次${action === 'pause' ? '已暂停' : '已取消'}`, 'success');
+    } catch (e) {
+        showToast(`操作失败：${e.message}`, 'error');
+    }
+}
+
+document.getElementById('btn-ecommerce-select-actions')?.addEventListener('click', chooseAndPreviewEcommerceActions);
+document.getElementById('btn-ecommerce-select-target-files')?.addEventListener('click', () => document.getElementById('ecommerce-target-files')?.click());
+document.getElementById('ecommerce-target-files')?.addEventListener('change', event => loadDroppedEcommerceTargetFiles(event.target.files));
+document.getElementById('btn-ecommerce-clear-targets')?.addEventListener('click', clearEcommerceTargetReferences);
+document.getElementById('btn-ecommerce-clear-garments')?.addEventListener('click', clearEcommerceGarmentReferences);
+const ecommerceTargetDropzone = document.getElementById('ecommerce-target-dropzone');
+if (ecommerceTargetDropzone) {
+    let targetClickTimer = null;
+    ecommerceTargetDropzone.addEventListener('dragenter', event => {
+        event.preventDefault();
+        ecommerceTargetDropzone.classList.add('is-dragover');
+    });
+    ecommerceTargetDropzone.addEventListener('dragover', event => {
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+        ecommerceTargetDropzone.classList.add('is-dragover');
+    });
+    ecommerceTargetDropzone.addEventListener('dragleave', event => {
+        if (!ecommerceTargetDropzone.contains(event.relatedTarget)) ecommerceTargetDropzone.classList.remove('is-dragover');
+    });
+    ecommerceTargetDropzone.addEventListener('drop', event => {
+        event.preventDefault();
+        ecommerceTargetDropzone.classList.remove('is-dragover');
+        loadDroppedEcommerceTargetFiles(event.dataTransfer?.files || []);
+    });
+    ecommerceTargetDropzone.addEventListener('click', event => {
+        if (event.target === ecommerceTargetDropzone || event.target.closest('b, strong, span')) {
+            clearTimeout(targetClickTimer);
+            targetClickTimer = setTimeout(() => document.getElementById('ecommerce-target-files')?.click(), 220);
+        }
+    });
+    ecommerceTargetDropzone.addEventListener('dblclick', event => {
+        event.preventDefault();
+        clearTimeout(targetClickTimer);
+        document.getElementById('btn-ecommerce-select-actions')?.click();
+    });
+    ecommerceTargetDropzone.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            document.getElementById('ecommerce-target-files')?.click();
+        }
+    });
+}
+document.getElementById('btn-ecommerce-select-garment-files')?.addEventListener('click', event => {
+    event.stopPropagation(); document.getElementById('ecommerce-garment-files')?.click();
+});
+document.getElementById('ecommerce-garment-files')?.addEventListener('change', event => {
+    loadDroppedEcommerceGarmentFiles(event.target.files); event.target.value = '';
+});
+const ecommerceGarmentDropzone = document.getElementById('ecommerce-garment-dropzone');
+if (ecommerceGarmentDropzone) {
+    let garmentClickTimer = null;
+    ecommerceGarmentDropzone.addEventListener('dragenter', event => { event.preventDefault(); ecommerceGarmentDropzone.classList.add('is-dragover'); });
+    ecommerceGarmentDropzone.addEventListener('dragover', event => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'; ecommerceGarmentDropzone.classList.add('is-dragover'); });
+    ecommerceGarmentDropzone.addEventListener('dragleave', event => { if (!ecommerceGarmentDropzone.contains(event.relatedTarget)) ecommerceGarmentDropzone.classList.remove('is-dragover'); });
+    ecommerceGarmentDropzone.addEventListener('drop', async event => {
+        event.preventDefault();
+        ecommerceGarmentDropzone.classList.remove('is-dragover');
+        const summary = document.getElementById('ecommerce-scan-summary');
+        try {
+            if (summary) summary.textContent = '正在递归读取拖入的文件夹…';
+            const records = await collectDroppedEcommerceGarmentFiles(event.dataTransfer);
+            if (!records.length) throw new Error('没有找到可用的JPG、PNG或WEBP图片；若浏览器不支持文件夹拖入，请双击服装区选择文件夹');
+            const directoryDrop = Array.from(event.dataTransfer?.items || []).some(item => item.webkitGetAsEntry?.()?.isDirectory)
+                || records.some(item => String(item.relativePath || '').includes('/'));
+            await loadDroppedEcommerceGarmentFiles(records, { directoryDrop });
+        } catch (error) {
+            ecommerceGarmentDropzone.classList.remove('is-uploading', 'is-dragover');
+            if (summary) summary.textContent = `文件夹加载失败：${error.message}`;
+            showToast(`文件夹加载失败：${error.message}`, 'error');
+        }
+    });
+    ecommerceGarmentDropzone.addEventListener('click', event => {
+        if (event.target === ecommerceGarmentDropzone || event.target.closest('b, strong, span')) {
+            clearTimeout(garmentClickTimer);
+            garmentClickTimer = setTimeout(() => document.getElementById('ecommerce-garment-files')?.click(), 220);
+        }
+    });
+    ecommerceGarmentDropzone.addEventListener('dblclick', event => {
+        event.preventDefault();
+        clearTimeout(garmentClickTimer);
+        document.getElementById('btn-ecommerce-select-root')?.click();
+    });
+    ecommerceGarmentDropzone.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); document.getElementById('ecommerce-garment-files')?.click(); } });
+}
+document.getElementById('btn-ecommerce-save-rh-api')?.addEventListener('click', saveAndVerifyEcommerceRhApi);
+function updateEcommerceImportPlatformUI() {
+    const platform = document.getElementById('ecommerce-import-platform')?.value || 'runninghub';
+    const runningHubModels = document.getElementById('ecommerce-import-rh-model');
+    const hkModels = document.getElementById('ecommerce-import-oaihk-model');
+    const rhApiButton = document.getElementById('btn-ecommerce-open-rh-api');
+    if (runningHubModels) runningHubModels.style.display = platform === 'runninghub' ? '' : 'none';
+    if (hkModels) hkModels.style.display = platform === 'oaihk' ? '' : 'none';
+    if (rhApiButton) rhApiButton.style.display = platform === 'runninghub' ? '' : 'none';
+}
+document.getElementById('ecommerce-import-platform')?.addEventListener('change', updateEcommerceImportPlatformUI);
+document.getElementById('btn-ecommerce-open-rh-api')?.addEventListener('click', () => {
+    const panel = document.getElementById('ecommerce-rh-api-switch');
+    if (!panel) return;
+    panel.open = true;
+    panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    document.getElementById('ecommerce-rh-api-key')?.focus();
+});
+updateEcommerceImportPlatformUI();
+
+// 四段工作台宽度：拖动分隔线时，左栏放大/缩小，右侧所有栏整体右移/左移（不挤压相邻栏）。
+// 当4栏总宽超出视口时，顶部出现自定义水平滚动轨道，可拖动左右浏览。
+(() => {
+    const storageKey = 'ecommerce_workbench_widths_v2';
+    const panels = Object.fromEntries(
+        [...document.querySelectorAll('[data-workbench-panel]')].map(panel => [panel.dataset.workbenchPanel, panel])
+    );
+    const gridScroll = document.getElementById('ecommerce-grid-scroll');
+    const scrollTrack = document.getElementById('ecommerce-scroll-track');
+    const scrollThumb = document.getElementById('ecommerce-scroll-thumb');
+
+    const MIN_W = 180;
+
+    const setPanelWidth = (panel, width) => {
+        if (!panel) return;
+        const value = Math.round(Math.max(MIN_W, width));
+        panel.style.width = `${value}px`;
+        panel.style.flexBasis = `${value}px`;
+    };
+
+    // 恢复保存的宽度
+    try {
+        const saved = JSON.parse(localStorage.getItem(storageKey) || '{}');
+        Object.entries(saved).forEach(([key, width]) => {
+            if (panels[key] && Number(width) >= MIN_W) setPanelWidth(panels[key], Number(width));
+        });
+    } catch (_e) {}
+
+    const persist = () => {
+        try {
+            const widths = Object.fromEntries(Object.entries(panels).map(([key, panel]) => [key, Math.round(panel.getBoundingClientRect().width)]));
+            localStorage.setItem(storageKey, JSON.stringify(widths));
+        } catch (_e) {}
+    };
+
+    // ========== 顶部水平滚动轨道 ==========
+    const updateScrollTrack = () => {
+        if (!gridScroll || !scrollTrack || !scrollThumb) return;
+        const contentW = gridScroll.scrollWidth;
+        const viewportW = gridScroll.clientWidth;
+        const scrollable = contentW > viewportW + 2; // 2px容差
+        scrollTrack.hidden = !scrollable;
+        if (!scrollable) return;
+        const trackW = scrollTrack.clientWidth;
+        if (trackW <= 0) return;
+        // thumb宽 = 视口/内容 × 轨道宽
+        const thumbW = Math.max(30, Math.round(viewportW / contentW * trackW));
+        scrollThumb.style.width = `${thumbW}px`;
+        // thumb位置 = scrollLeft / maxScroll × (trackW - thumbW)
+        const maxScroll = contentW - viewportW;
+        const ratio = maxScroll > 0 ? gridScroll.scrollLeft / maxScroll : 0;
+        scrollThumb.style.left = `${Math.round(ratio * (trackW - thumbW))}px`;
+    };
+
+    // 同步轨道拖动 → gridScroll.scrollLeft
+    if (scrollThumb && scrollTrack && gridScroll) {
+        scrollThumb.addEventListener('pointerdown', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            scrollThumb.setPointerCapture?.(e.pointerId);
+            scrollThumb.classList.add('is-dragging');
+            const startX = e.clientX;
+            const startLeft = parseFloat(scrollThumb.style.left) || 0;
+            const contentW = gridScroll.scrollWidth;
+            const viewportW = gridScroll.clientWidth;
+            const trackW = scrollTrack.clientWidth;
+            const thumbW = scrollThumb.clientWidth;
+            const maxScroll = contentW - viewportW;
+            const maxThumbLeft = trackW - thumbW;
+            const move = me => {
+                const delta = me.clientX - startX;
+                const newThumbLeft = Math.max(0, Math.min(maxThumbLeft, startLeft + delta));
+                scrollThumb.style.left = `${Math.round(newThumbLeft)}px`;
+                gridScroll.scrollLeft = (newThumbLeft / maxThumbLeft) * maxScroll;
+            };
+            const stop = () => {
+                scrollThumb.classList.remove('is-dragging');
+                scrollThumb.removeEventListener('pointermove', move);
+                scrollThumb.removeEventListener('pointerup', stop);
+                scrollThumb.removeEventListener('pointercancel', stop);
+            };
+            scrollThumb.addEventListener('pointermove', move);
+            scrollThumb.addEventListener('pointerup', stop);
+            scrollThumb.addEventListener('pointercancel', stop);
+        });
+        // 点击轨道空白处跳转
+        scrollTrack.addEventListener('click', e => {
+            if (e.target === scrollThumb) return;
+            const rect = scrollTrack.getBoundingClientRect();
+            const clickX = e.clientX - rect.left;
+            const thumbW = scrollThumb.clientWidth;
+            const trackW = scrollTrack.clientWidth;
+            const maxThumbLeft = trackW - thumbW;
+            const newThumbLeft = Math.max(0, Math.min(maxThumbLeft, clickX - thumbW / 2));
+            const contentW = gridScroll.scrollWidth;
+            const viewportW = gridScroll.clientWidth;
+            const maxScroll = contentW - viewportW;
+            scrollThumb.style.left = `${Math.round(newThumbLeft)}px`;
+            gridScroll.scrollLeft = (newThumbLeft / maxThumbLeft) * maxScroll;
+        });
+        // gridScroll原生滚动时同步thumb位置
+        gridScroll.addEventListener('scroll', updateScrollTrack);
+    }
+
+    // ========== 分隔线拖拽：左栏放大 → 右边所有栏右移 ==========
+    document.querySelectorAll('.ecommerce-column-resizer').forEach(handle => {
+        handle.addEventListener('pointerdown', event => {
+            const left = panels[handle.dataset.left];
+            if (!left) return;
+            event.preventDefault();
+            handle.setPointerCapture?.(event.pointerId);
+            const startX = event.clientX;
+            const leftStart = left.getBoundingClientRect().width;
+            const move = moveEvent => {
+                const delta = moveEvent.clientX - startX;
+                let nextLeft = leftStart + delta;
+                // 左栏不能小于MIN_W，但不限制最大值（允许超出视口，用顶部滚动条浏览）
+                nextLeft = Math.max(MIN_W, nextLeft);
+                if (nextLeft !== Math.round(parseFloat(left.style.width))) {
+                    setPanelWidth(left, nextLeft);
+                    // 右边所有栏保持各自当前宽度不变，整体右移
+                    updateScrollTrack();
+                }
+            };
+            const stop = () => {
+                handle.classList.remove('is-dragging');
+                document.body.classList.remove('ecommerce-column-resizing');
+                handle.removeEventListener('pointermove', move);
+                handle.removeEventListener('pointerup', stop);
+                handle.removeEventListener('pointercancel', stop);
+                persist();
+                updateScrollTrack();
+            };
+            handle.classList.add('is-dragging');
+            document.body.classList.add('ecommerce-column-resizing');
+            handle.addEventListener('pointermove', move);
+            handle.addEventListener('pointerup', stop);
+            handle.addEventListener('pointercancel', stop);
+        });
+    });
+
+    // 初始化 & resize时更新滚动轨道
+    updateScrollTrack();
+    const resizeObs = new ResizeObserver(() => updateScrollTrack());
+    if (gridScroll) resizeObs.observe(gridScroll);
+    const mutObs = new MutationObserver(() => updateScrollTrack());
+    if (gridScroll) mutObs.observe(gridScroll, { attributes: true, subtree: true, attributeFilter: ['style'] });
+
+    // ========== 拖动结束后强制彻底 reflow ==========
+    const forceFullReflow = () => {
+        void gridScroll?.offsetWidth;
+        document.querySelectorAll('#ecommerce-mode .ecommerce-card').forEach(card => {
+            void card.offsetHeight;
+        });
+        document.querySelectorAll('#ecommerce-mode select').forEach(sel => {
+            void sel.offsetHeight;
+        });
+        void document.body.offsetHeight;
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                document.querySelectorAll('#ecommerce-mode .ecommerce-card').forEach(card => {
+                    void card.offsetHeight;
+                });
+                void document.body.offsetHeight;
+            });
+        });
+    };
+    const bodyObs = new MutationObserver(() => {
+        if (!document.body.classList.contains('ecommerce-column-resizing')) {
+            forceFullReflow();
+        }
+    });
+    bodyObs.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+})();
+
+// ========== 防御性修复：原生 select 在 flex 布局宽度变化后下拉弹窗定位错乱 ==========
+// Chrome/Safari 中原生 <select> 的下拉弹窗由 OS 渲染，浏览器内部缓存了元素的屏幕坐标。
+// 当 flex 容器宽度通过 JS 改变后，该缓存可能未失效，导致下拉弹窗出现在错误位置。
+// 解决：在用户点击 select 时（弹窗打开前），强制触发一次几何属性重算，
+// 确保浏览器使用最新坐标定位弹窗。使用 transform 临时切换强制合成层重建。
+document.addEventListener('mousedown', e => {
+    const sel = e.target.closest('select');
+    if (!sel) return;
+    if (!sel.closest('#ecommerce-mode')) return;
+    sel.style.transform = 'translateZ(0)';
+    void sel.getBoundingClientRect();
+    sel.style.transform = '';
+    void sel.getBoundingClientRect();
+}, true);
+
+document.querySelector('.ecommerce-results-disclosure')?.addEventListener('toggle', event => {
+    if (!event.currentTarget.open) return;
+    ecommerceState.renderCache.tasks = '';
+    renderEcommerceBatchDetail();
+});
+document.getElementById('btn-ecommerce-select-root')?.addEventListener('click', async () => { if (await chooseEcommerceFolder('ecommerce-clothing-root')) scanEcommerceGarments(); });
+document.getElementById('btn-ecommerce-scan')?.addEventListener('click', scanEcommerceGarments);
+document.getElementById('ecommerce-garment-keyword')?.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && document.getElementById('ecommerce-clothing-root')?.value) scanEcommerceGarments();
+});
+document.getElementById('ecommerce-garment-keyword')?.addEventListener('change', () => {
+    if (document.getElementById('ecommerce-clothing-root')?.value) scanEcommerceGarments();
+});
+document.getElementById('btn-ecommerce-select-final-output')?.addEventListener('click', async () => {
+    if (await chooseEcommerceFolder('ecommerce-final-output-path')) await checkEcommerceFinalOutputPath(true);
+});
+document.getElementById('btn-ecommerce-check-final-output')?.addEventListener('click', () => checkEcommerceFinalOutputPath(true));
+document.getElementById('btn-ecommerce-open-storage-permission')?.addEventListener('click', async () => {
+    if (await chooseEcommerceFolder('ecommerce-final-output-path')) {
+        await checkEcommerceFinalOutputPath(true);
+    }
+});
+document.getElementById('ecommerce-final-output-path')?.addEventListener('change', () => checkEcommerceFinalOutputPath(false));
+document.getElementById('btn-ecommerce-select-output')?.addEventListener('click', () => chooseEcommerceFolder('ecommerce-output-path'));
+document.getElementById('btn-ecommerce-create')?.addEventListener('click', createAndStartEcommerceBatch);
+document.getElementById('btn-ecommerce-start')?.addEventListener('click', () => controlEcommerceBatch('resume'));
+document.getElementById('btn-ecommerce-pause')?.addEventListener('click', () => controlEcommerceBatch('pause'));
+document.getElementById('btn-ecommerce-cancel')?.addEventListener('click', () => { if (confirm('确定取消当前批次？未完成任务不会继续。')) controlEcommerceBatch('cancel'); });
+document.getElementById('btn-ecommerce-refresh')?.addEventListener('click', () => loadEcommerceModeData(true));
+// 自检面板折叠/展开：默认不开启 AI 质检时折叠后4栏变3栏，每栏更宽
+// AI 质检面板不再使用 display:none 折叠（会导致 4 栏变 3 栏，原生 select 下拉框定位全部错乱）。
+// 改为始终可见，初始宽度设为最小值 180px（窄条），用户可随时拖动分隔线放大。
+// 之前缓存的折叠状态已无意义，清理掉。
+localStorage.removeItem('ecommerce_qc_collapsed');
+// 如果 localStorage 中没有保存过宽度，给 QC 面板设置默认最小宽度
+(() => {
+    const qcPanel = document.querySelector('[data-workbench-panel="qc"]');
+    const storageKey = 'ecommerce_workbench_widths_v2';
+    try {
+        const saved = JSON.parse(localStorage.getItem(storageKey) || '{}');
+        if (!saved.qc || Number(saved.qc) < 180) {
+            if (qcPanel) {
+                qcPanel.style.width = '180px';
+                qcPanel.style.flexBasis = '180px';
+            }
+        }
+    } catch (_e) {
+        if (qcPanel) {
+            qcPanel.style.width = '180px';
+            qcPanel.style.flexBasis = '180px';
+        }
+    }
+})();
+// 强制重置：当批次状态卡死（resuming/interrupted/running 但任务不动）时，把状态重置为 paused
+// 不会丢失已生成图片，用户可以再点"开始/继续"恢复
+document.getElementById('btn-ecommerce-force-reset')?.addEventListener('click', async () => {
+    if (!ecommerceState.currentBatchId) return;
+    if (!confirm('确定强制重置批次状态为「已暂停」？\n\n这只会修改批次状态字段，不会删除任何已生成的图片。\n重置后可以点「开始/继续」恢复运行。')) return;
+    try {
+        await ecommerceApi('POST', `/api/ecommerce/batches/${encodeURIComponent(ecommerceState.currentBatchId)}/action`, { action: 'force_pause' });
+        await refreshEcommerceBatch();
+        showToast('已强制重置为已暂停状态，可点「开始/继续」恢复', 'success');
+    } catch (e) {
+        showToast(`强制重置失败：${e.message}`, 'error');
+    }
+});
+document.getElementById('ecommerce-batch-select')?.addEventListener('change', async e => {
+    ecommerceState.currentBatchId = e.target.value;
+    // 反向同步重做批次选择，并清理重做状态
+    const rerunSelect = document.getElementById('ecommerce-rerun-batch-select');
+    if (rerunSelect && rerunSelect.value !== e.target.value) {
+        rerunSelect.value = e.target.value;
+    }
+    ecommerceRerunState.batchId = e.target.value;
+    ecommerceRerunState.items = [];
+    ecommerceRerunState.selectedIds = new Set();
+    ecommerceRerunState.activeIndex = -1;
+    ecommerceRerunState.compareRefIndex = 0;
+    ecommerceRerunState.bulkProgress = { done: 0, total: 0, failed: 0, retrying: 0 };
+    const rerunList = document.getElementById('ecommerce-rerun-list');
+    if (rerunList) rerunList.innerHTML = '<div class="ecommerce-empty">点击「扫描废片」开始</div>';
+    await refreshEcommerceBatch();
+});
+
+const ECOMMERCE_QC_PREF_KEY = 'ecommerce_qc_enabled';
+
+// 质检开关：开→显示质检说明；关→启用抽卡数量并切换提示
+function updateEcommerceQcToggleUi() {
+    const enabled = !!document.getElementById('ecommerce-qc-enabled')?.checked;
+    const offHint = document.getElementById('ecommerce-qc-off-hint');
+    const onHint = document.getElementById('ecommerce-qc-on-hint');
+    const samplesLabel = document.getElementById('ecommerce-samples-label');
+    const samplesSelect = document.getElementById('ecommerce-samples-per-action');
+    if (offHint) offHint.style.display = enabled ? 'none' : '';
+    if (onHint) onHint.style.display = enabled ? '' : 'none';
+    if (samplesLabel) samplesLabel.classList.toggle('ecommerce-disabled', enabled);
+    if (samplesSelect) samplesSelect.disabled = enabled;
+    const samplesValue = Number(samplesSelect?.value || 1);
+    const samplesStrong = document.getElementById('ecommerce-qc-off-samples');
+    if (samplesStrong) samplesStrong.textContent = String(samplesValue);
+    const qcHelp = document.getElementById('ecommerce-qc-help');
+    if (qcHelp) {
+        qcHelp.dataset.tip = enabled
+            ? 'AI质检已开启：按当前模型和通过分数检查服装细节，失败最多重试3张；默认视觉证据缓存不会额外调用一次建档AI。'
+            : `AI质检已关闭：每张目标图生成 ${samplesValue} 张并直接归档，不调用视觉质检；废片可在第4栏人工筛选和重做。`;
+    }
+}
+document.getElementById('ecommerce-qc-enabled')?.addEventListener('change', async e => {
+    const checkbox = e.currentTarget;
+    const enabled = !!checkbox.checked;
+    const batch = ecommerceState.detail;
+    // 已有批次的开关属于批次快照，运行中禁止悄悄改变；暂停后可以安全切换并续跑。
+    if (batch && batch.task_total > 0 && batch.status === 'running' && enabled !== !!batch.settings?.qc_enabled) {
+        checkbox.checked = !!batch.settings?.qc_enabled;
+        updateEcommerceQcToggleUi();
+        return showToast('当前批次正在运行，请先暂停，再切换质检开关', 'error');
+    }
+    try { localStorage.setItem(ECOMMERCE_QC_PREF_KEY, enabled ? '1' : '0'); } catch (_e) {}
+    updateEcommerceQcToggleUi();
+    if (batch && batch.task_total > 0 && batch.status === 'paused' && enabled !== !!batch.settings?.qc_enabled) {
+        checkbox.disabled = true;
+        try {
+            const data = await ecommerceApi('PATCH', `/api/ecommerce/batches/${encodeURIComponent(batch.id)}/settings`, { qc_enabled: enabled });
+            ecommerceState.detail = data.batch;
+            renderEcommerceBatchDetail();
+            showToast(enabled ? '当前批次已开启质检，可继续运行' : `当前批次已关闭质检；已保留${data.recovered_candidates || 0}张已生成图片`, 'success');
+        } catch (error) {
+            checkbox.checked = !!batch.settings?.qc_enabled;
+            updateEcommerceQcToggleUi();
+            showToast(`切换失败：${error.message}`, 'error');
+        } finally {
+            checkbox.disabled = false;
+        }
+    }
+});
+document.getElementById('ecommerce-samples-per-action')?.addEventListener('change', updateEcommerceQcToggleUi);
+try {
+    const savedQcPreference = localStorage.getItem(ECOMMERCE_QC_PREF_KEY);
+    if (savedQcPreference !== null) document.getElementById('ecommerce-qc-enabled').checked = savedQcPreference === '1';
+} catch (_e) {}
+updateEcommerceQcToggleUi();
+
+function updateEcommerceAutoConcurrency(apply = false) {
+    const actionCount = Math.max(1, ecommerceState.importActions?.actions?.length || 1);
+    const input = document.getElementById('ecommerce-concurrency');
+    const presetSelect = document.getElementById('ecommerce-concurrency-presets');
+    if (presetSelect) {
+        const preset = presetSelect.value;
+        const options = ['<option value="">倍数…</option>'];
+        const maxMultiple = Math.floor(100 / actionCount);
+        for (let m = 1; m <= Math.min(maxMultiple, 20); m++) {
+            const val = m * actionCount;
+            options.push(`<option value="${val}">${m}套 (${val}并发)</option>`);
+        }
+        presetSelect.innerHTML = options.join('');
+        presetSelect.value = preset && Number(preset) % actionCount === 0 ? preset : '';
+    }
+    const completeGarments = Math.max(1, Math.floor(100 / actionCount));
+    const recommended = Math.min(100, completeGarments * actionCount);
+    const hint = document.getElementById('ecommerce-concurrency-hint');
+    if (hint) hint.textContent = `${actionCount}张目标图 × 同时N套 = N×${actionCount}并发（滑动窗口：提交完立即补发新任务，不等全部返回）。素材上传4路、结果下载6路独立限速。`;
+    if (apply && input) {
+        input.value = String(recommended);
+        if (presetSelect) presetSelect.value = String(recommended);
+        ecommerceToast(`已设置为${recommended}并发（同时约${completeGarments}套）`);
+    }
+    if (input) {
+        let val = Math.max(1, Math.min(100, Number(input.value) || actionCount));
+        const aligned = Math.round(val / actionCount) * actionCount;
+        if (aligned !== val) {
+            input.value = String(aligned);
+        }
+    }
+    return recommended;
+}
+document.getElementById('btn-ecommerce-auto-concurrency')?.addEventListener('click', () => updateEcommerceAutoConcurrency(true));
+document.getElementById('ecommerce-concurrency-presets')?.addEventListener('change', e => {
+    const val = Number(e.currentTarget.value);
+    const input = document.getElementById('ecommerce-concurrency');
+    if (val && input) input.value = String(val);
+});
+document.getElementById('ecommerce-concurrency')?.addEventListener('change', e => {
+    const actionCount = Math.max(1, ecommerceState.importActions?.actions?.length || 1);
+    let val = Math.max(1, Math.min(100, Number(e.currentTarget.value || actionCount)));
+    const aligned = Math.max(actionCount, Math.round(val / actionCount) * actionCount);
+    e.currentTarget.value = String(aligned);
+    const presetSelect = document.getElementById('ecommerce-concurrency-presets');
+    if (presetSelect) presetSelect.value = String(aligned);
+});
+document.getElementById('ecommerce-concurrency')?.addEventListener('input', e => {
+    const actionCount = Math.max(1, ecommerceState.importActions?.actions?.length || 1);
+    let val = Math.max(1, Math.min(100, Number(e.currentTarget.value || 1)));
+    const remainder = val % actionCount;
+    if (remainder !== 0 && val > actionCount) {
+        const lower = val - remainder;
+        const upper = Math.min(100, lower + actionCount);
+        e.currentTarget.title = `当前值${val}不是${actionCount}的倍数，失焦后自动对齐为 ${Math.abs(val-lower) <= Math.abs(val-upper) ? lower : upper}`;
+    } else {
+        e.currentTarget.title = '';
+    }
+});
+
+function ecommerceFormatBytes(bytes) {
+    const value = Number(bytes || 0);
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+    if (value < 1024 ** 3) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+    return `${(value / 1024 ** 3).toFixed(2)} GB`;
+}
+
+async function refreshEcommerceCacheStatus() {
+    const data = await ecommerceApi('GET', '/api/ecommerce/cache-status');
+    const total = document.getElementById('ecommerce-cache-total');
+    const breakdown = document.getElementById('ecommerce-cache-breakdown');
+    if (total) total.textContent = `当前约 ${ecommerceFormatBytes(data.total_bytes)}`;
+    if (breakdown) breakdown.innerHTML = `
+        <span><strong>${ecommerceFormatBytes(data.candidate_bytes)}</strong><small>完整运行候选 · ${data.candidate_files || 0}个</small></span>
+        <span><strong>${ecommerceFormatBytes(data.backup_bytes)}</strong><small>本地成品备份 · ${data.backup_files || 0}个</small></span>
+        <span><strong>${ecommerceFormatBytes(data.preview_bytes)}</strong><small>轻量废片预览 · ${data.preview_files || 0}个</small></span>
+        <span><strong>${ecommerceFormatBytes(data.qc_bytes)}</strong><small>质检临时素材</small></span>`;
+    return data;
+}
+document.getElementById('ecommerce-cache-manager')?.addEventListener('toggle', e => {
+    if (e.currentTarget.open) refreshEcommerceCacheStatus().catch(error => showToast(`缓存检查失败：${error.message}`, 'error'));
+});
+document.getElementById('btn-ecommerce-cache-refresh')?.addEventListener('click', () => refreshEcommerceCacheStatus().catch(error => showToast(`缓存检查失败：${error.message}`, 'error')));
+document.getElementById('btn-ecommerce-cache-safe')?.addEventListener('click', async e => {
+    if (!confirm('安全清理会为已完成任务保留轻量废片预览，并删除完整候选和质检临时文件。继续吗？')) return;
+    const button = e.currentTarget; button.disabled = true; button.textContent = '正在安全清理…';
+    try {
+        const data = await ecommerceApi('POST', '/api/ecommerce/cache-clean', { mode: 'safe' }, 300000);
+        showToast(`已释放 ${ecommerceFormatBytes(data.freed_bytes)}，废片预览仍可使用`, 'success');
+        await refreshEcommerceCacheStatus();
+    } catch (error) { showToast(`清理失败：${error.message}`, 'error'); }
+    finally { button.disabled = false; button.textContent = '安全清理运行缓存'; }
+});
+document.getElementById('btn-ecommerce-cache-delete-batch')?.addEventListener('click', async e => {
+    const batchId = document.getElementById('ecommerce-rerun-batch-select')?.value || ecommerceState.currentBatchId;
+    const batch = ecommerceState.batches.find(item => item.id === batchId);
+    if (!batchId) return showToast('请先在废片重做区域选择批次', 'error');
+    if (!confirm(`将删除批次“${batch?.name || batchId}”的本地成品备份、候选和废片预览，之后无法废片对比。确定继续吗？`)) return;
+    if (!confirm('这是不可恢复的彻底清理。请再次确认删除该批次全部本地文件。')) return;
+    const button = e.currentTarget; button.disabled = true; button.textContent = '正在彻底删除…';
+    try {
+        const data = await ecommerceApi('POST', '/api/ecommerce/cache-clean', { mode: 'batch_all', batch_id: batchId }, 300000);
+        showToast(`已删除${data.deleted_files || 0}个文件，释放 ${ecommerceFormatBytes(data.freed_bytes)}`, 'success');
+        await refreshEcommerceCacheStatus();
+    } catch (error) { showToast(`删除失败：${error.message}`, 'error'); }
+    finally { button.disabled = false; button.textContent = '删除所选批次全部本地文件'; }
+});
+
+// 打包下载全部成品：把当前批次的所有 AI 成品图打包成 ZIP 下载
+document.getElementById('btn-ecommerce-download-zip')?.addEventListener('click', async e => {
+    const batchId = ecommerceState.currentBatchId;
+    if (!batchId) return showToast('请先选择要下载的批次', 'error');
+    const batch = ecommerceState.batches.find(item => item.id === batchId);
+    const button = e.currentTarget;
+    const originalText = button.textContent;
+    button.disabled = true; button.textContent = '正在打包…';
+    try {
+        const data = await ecommerceApi('POST', `/api/ecommerce/batches/${encodeURIComponent(batchId)}/download-zip`, {}, 300000);
+        if (data.ok && data.zip_filename) {
+            showToast(`打包完成：${data.file_count} 张图，${ecommerceFormatBytes(data.size_bytes)}，开始下载…`, 'success');
+            // 触发浏览器下载
+            const a = document.createElement('a');
+            a.href = `/api/ecommerce/zip-download/${encodeURIComponent(data.zip_filename)}`;
+            a.download = data.zip_filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        } else {
+            showToast(data.error || '打包失败', 'error');
+        }
+    } catch (error) {
+        showToast(`打包失败：${error.message}`, 'error');
+    } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+    }
+});
+
+// 删除批次记录：仅从下拉框清理批次元数据，不删除磁盘文件
+document.getElementById('btn-ecommerce-delete-record')?.addEventListener('click', async e => {
+    const batchId = ecommerceState.currentBatchId;
+    if (!batchId) return showToast('请先选择要删除记录的批次', 'error');
+    const batch = ecommerceState.batches.find(item => item.id === batchId);
+    if (!confirm(`确定删除批次“${batch?.name || batchId}”的记录吗？\n\n这只会从下拉框中移除该批次，不会删除磁盘上的成品图。\n如果之后需要重新查看，可以重新扫描服装目录创建新批次。`)) return;
+    const button = e.currentTarget;
+    const originalText = button.textContent;
+    button.disabled = true; button.textContent = '删除中…';
+    try {
+        await ecommerceApi('DELETE', `/api/ecommerce/batches/${encodeURIComponent(batchId)}/record`);
+        showToast('批次记录已删除', 'success');
+        ecommerceState.currentBatchId = null;
+        ecommerceState.detail = null;
+        await loadEcommerceModeData(true);
+    } catch (error) {
+        showToast(`删除失败：${error.message}`, 'error');
+    } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+    }
+});
+
+// ===== 第5板块：废片重做 =====
+const ecommerceRerunState = {
+    batchId: '', items: [], activeIndex: -1, compareRefIndex: 0,
+    selectedIds: new Set(), bulkPrompt: '', bulkPlatform: '', bulkModelKey: '', bulkRatio: 'auto',
+    bulkConcurrency: 10, bulkProgress: { active: false, total: 0, completed: 0, success: 0, failed: 0 }
+};
+const ecommerceGroupCompareState = { mode: 'rerun', data: null, refIndex: 0, resultIndex: 0 };
+const ecommerceCompareZoomState = { reference: 1, result: 1 };
+const ecommerceComparePanState = {
+    reference: { x: 0, y: 0 },
+    result: { x: 0, y: 0 }
+};
+let ecommerceWasteExpanded = false;
+
+function ecommerceThumbnailUrl(url, maxEdge = 320) {
+    const raw = String(url || '');
+    if (!raw || !raw.startsWith('/api/ecommerce/local-image')) return raw;
+    const separator = raw.includes('?') ? '&' : '?';
+    return `${raw}${separator}thumb=1&max=${Math.max(96, Math.min(Number(maxEdge) || 320, 1200))}`;
+}
+
+async function openEcommerceSystemPreview(paths) {
+    const clean = [...new Set((paths || []).filter(Boolean))];
+    if (!clean.length) return showToast('没有可用的本地原图', 'error');
+    try {
+        const data = await ecommerceApi('POST', '/api/ecommerce/open-preview', { paths: clean });
+        showToast(`已在苹果“预览”中打开 ${data.count || clean.length} 张原图`, 'success');
+    } catch (error) {
+        showToast(`系统预览打开失败：${error.message}`, 'error');
+    }
+}
+
+const ecommerceRefCropState = {
+    itemIndex: -1,
+    refIndex: -1,
+    image: null,
+    x: 0.2,
+    y: 0.2,
+    scale: 0.6,
+    // 图片缩放（滚轮控制）：1=适合画布，>1=放大
+    imageZoom: 1,
+    dragging: false,
+    pointerOffsetX: 0,
+    pointerOffsetY: 0,
+    fit: null
+};
+
+function closeEcommerceReferenceCrop() {
+    const overlay = document.getElementById('ecommerce-ref-crop-overlay');
+    if (!overlay) return;
+    overlay.hidden = true;
+    overlay.setAttribute('aria-hidden', 'true');
+    ecommerceRefCropState.dragging = false;
+    ecommerceRefCropState.image = null;
+    document.getElementById('ecommerce-ref-crop-canvas')?.classList.remove('is-dragging');
+}
+
+function ecommerceClampCropPosition() {
+    const state = ecommerceRefCropState;
+    state.scale = Math.max(0.15, Math.min(1, state.scale));
+    state.x = Math.max(0, Math.min(1 - state.scale, state.x));
+    state.y = Math.max(0, Math.min(1 - state.scale, state.y));
+}
+
+function drawEcommerceReferenceCrop() {
+    const canvas = document.getElementById('ecommerce-ref-crop-canvas');
+    const image = ecommerceRefCropState.image;
+    if (!canvas || !image) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // 基础适配比例
+    const baseRatio = Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
+    // 实际绘制比例 = 基础比例 × 图片缩放（滚轮控制）
+    const ratio = baseRatio * ecommerceRefCropState.imageZoom;
+    const width = image.naturalWidth * ratio;
+    const height = image.naturalHeight * ratio;
+    // 图片位置：居中 + 拖动偏移
+    const left = (canvas.width - width) / 2 + (ecommerceRefCropState.imageOffsetX || 0);
+    const top = (canvas.height - height) / 2 + (ecommerceRefCropState.imageOffsetY || 0);
+    ecommerceRefCropState.fit = { left, top, width, height };
+    ctx.drawImage(image, left, top, width, height);
+    // 裁剪框：固定大小和位置（不随图片缩放变化），固定在画布正中央
+    // 裁剪框尺寸 = 基础适配下图片短边的60%（固定值，不随imageZoom变化）
+    const baseWidth = image.naturalWidth * baseRatio;
+    const baseHeight = image.naturalHeight * baseRatio;
+    const cropBaseSize = Math.min(baseWidth, baseHeight) * 0.6;
+    // 裁剪框按原图比例计算宽高（保持原图比例）
+    const imgRatio = image.naturalWidth / image.naturalHeight;
+    let cropWidthPx, cropHeightPx;
+    if (imgRatio >= 1) {
+        // 横图：宽度为cropBaseSize，高度按比例缩小
+        cropWidthPx = cropBaseSize;
+        cropHeightPx = cropBaseSize / imgRatio;
+    } else {
+        // 竖图：高度为cropBaseSize，宽度按比例缩小
+        cropHeightPx = cropBaseSize;
+        cropWidthPx = cropBaseSize * imgRatio;
+    }
+    const cropLeft = canvas.width / 2 - cropWidthPx / 2;
+    const cropTop = canvas.height / 2 - cropHeightPx / 2;
+    ecommerceRefCropState.cropRect = { left: cropLeft, top: cropTop, width: cropWidthPx, height: cropHeightPx };
+    // 绘制半透明蒙版（裁剪框外区域）
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,.58)';
+    ctx.beginPath();
+    ctx.rect(0, 0, canvas.width, canvas.height);
+    ctx.rect(cropLeft, cropTop, cropWidthPx, cropHeightPx);
+    ctx.fill('evenodd');
+    // 黄色裁剪框边框
+    ctx.strokeStyle = '#fbbf24';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(cropLeft + 1.5, cropTop + 1.5, Math.max(0, cropWidthPx - 3), Math.max(0, cropHeightPx - 3));
+    // 九宫格辅助线
+    ctx.setLineDash([7, 6]);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255,255,255,.85)';
+    ctx.beginPath();
+    ctx.moveTo(cropLeft + cropWidthPx / 3, cropTop);
+    ctx.lineTo(cropLeft + cropWidthPx / 3, cropTop + cropHeightPx);
+    ctx.moveTo(cropLeft + cropWidthPx * 2 / 3, cropTop);
+    ctx.lineTo(cropLeft + cropWidthPx * 2 / 3, cropTop + cropHeightPx);
+    ctx.moveTo(cropLeft, cropTop + cropHeightPx / 3);
+    ctx.lineTo(cropLeft + cropWidthPx, cropTop + cropHeightPx / 3);
+    ctx.moveTo(cropLeft, cropTop + cropHeightPx * 2 / 3);
+    ctx.lineTo(cropLeft + cropWidthPx, cropTop + cropHeightPx * 2 / 3);
+    ctx.stroke();
+    ctx.restore();
+}
+
+function resetEcommerceReferenceCrop() {
+    ecommerceRefCropState.scale = 0.6;
+    ecommerceRefCropState.x = 0.5;
+    ecommerceRefCropState.y = 0.5;
+    ecommerceRefCropState.imageZoom = 1;
+    ecommerceRefCropState.imageOffsetX = 0;
+    ecommerceRefCropState.imageOffsetY = 0;
+    const slider = document.getElementById('ecommerce-ref-crop-scale');
+    if (slider) slider.value = '12';
+    drawEcommerceReferenceCrop();
+}
+
+function openEcommerceReferenceCrop(itemIndex, refIndex) {
+    const item = ecommerceRerunState.items[itemIndex];
+    const reference = item?.references?.[refIndex];
+    const overlay = document.getElementById('ecommerce-ref-crop-overlay');
+    if (!reference || !overlay || !reference.url) return showToast('这张参考图无法裁剪', 'error');
+    ecommerceRefCropState.itemIndex = itemIndex;
+    ecommerceRefCropState.refIndex = refIndex;
+    resetEcommerceReferenceCrop();
+    const image = new Image();
+    image.onload = () => {
+        ecommerceRefCropState.image = image;
+        drawEcommerceReferenceCrop();
+    };
+    image.onerror = () => {
+        closeEcommerceReferenceCrop();
+        showToast('原始参考图加载失败，无法裁剪', 'error');
+    };
+    // 裁剪始终从未裁剪的当前参考图开始，避免连续裁剪损失画质。
+    image.src = reference.url;
+    overlay.hidden = false;
+    overlay.setAttribute('aria-hidden', 'false');
+}
+
+function ecommerceCropPointerCoordinates(event) {
+    const canvas = document.getElementById('ecommerce-ref-crop-canvas');
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    return {
+        x: (event.clientX - rect.left) * canvas.width / rect.width,
+        y: (event.clientY - rect.top) * canvas.height / rect.height
+    };
+}
+
+// 确认裁剪并跳到下一张参考图（回车键触发）
+// 流程：确认裁剪 → 关闭裁剪界面 → 切换到下一张参考图 → 自动打开裁剪界面
+// 如果是最后一张参考图 → 跳到下一组废片的第一张参考图
+// 如果是最后一组的最后一张 → 关闭对比界面
+async function confirmEcommerceReferenceCropAndNext() {
+    const state = ecommerceRefCropState;
+    const item = ecommerceRerunState.items[state.itemIndex];
+    if (!item) return;
+    // 记录裁剪前的状态，用于判断裁剪是否真正成功
+    const refBefore = item.references?.[state.refIndex];
+    const hadOverride = !!refBefore?.override_url;
+    let cropSucceeded = hadOverride; // 已有裁剪图视为成功，跳过本次
+    try {
+        await confirmEcommerceReferenceCrop();
+        const refAfter = item.references?.[state.refIndex];
+        cropSucceeded = !!refAfter?.override_url;
+    } catch (e) {
+        cropSucceeded = false;
+        showToast(`裁剪失败：${e.message}，未跳到下一张`, 'error');
+    }
+    // 仅在裁剪成功（或已有裁剪图）时才前进到下一张
+    if (cropSucceeded) {
+        await advanceEcommerceRerunReference();
+    }
+}
+
+async function advanceEcommerceRerunReference() {
+    const item = ecommerceRerunState.items[ecommerceRerunState.activeIndex];
+    if (!item) return;
+    const refs = item.references || [];
+    const nextCompareIndex = ecommerceRerunState.compareRefIndex + 1;
+    if (nextCompareIndex <= refs.length) {
+        ecommerceRerunState.compareRefIndex = nextCompareIndex;
+        updateEcommerceImageCompare();
+        ecommerceToast(`参考图 ${nextCompareIndex}/${refs.length}（按C裁剪，回车跳过）`);
+        return;
+    }
+    const allGarmentIds = [...new Set(ecommerceRerunState.items.map(i => i.garment_id))];
+    const currentGroupIdx = allGarmentIds.indexOf(item.garment_id);
+    const nextGroupId = allGarmentIds[currentGroupIdx + 1];
+    if (nextGroupId) {
+        const nextIndex = ecommerceRerunState.items.findIndex(i => i.garment_id === nextGroupId);
+        if (nextIndex >= 0) {
+            const sameGroupItems = ecommerceRerunState.items.filter(i => i.garment_id === item.garment_id);
+            sameGroupItems.forEach(i => ecommerceRerunState.selectedIds.add(i.id));
+            ecommerceRerunState.activeIndex = nextIndex;
+            ecommerceRerunState.compareRefIndex = 1;
+            const scrollY = window.scrollY;
+            renderEcommerceRerunCompare(nextIndex);
+            window.scrollTo(0, scrollY);
+            const nextItem = ecommerceRerunState.items[nextIndex];
+            ecommerceToast(`下一组：${nextItem?.garment_name || ''}（参考图1/${nextItem?.references?.length || 0}）`);
+        }
+    } else {
+        const compareOverlay = document.getElementById('ecommerce-compare-overlay');
+        if (compareOverlay && !compareOverlay.hidden) closeEcommerceImageCompare();
+        ecommerceToast('所有参考图都处理完了，可以批量重做了');
+    }
+}
+
+async function confirmEcommerceReferenceCrop() {
+    const state = ecommerceRefCropState;
+    const item = ecommerceRerunState.items[state.itemIndex];
+    const reference = item?.references?.[state.refIndex];
+    const button = document.getElementById('ecommerce-ref-crop-confirm');
+    if (!reference || !state.image) return showToast('裁剪图片尚未加载完成', 'error');
+    if (button) { button.disabled = true; button.textContent = '正在保存…'; }
+    try {
+        // 计算裁剪框在图片上的归一化坐标
+        // 裁剪框是固定的，图片可以缩放和移动
+        const fit = state.fit;
+        const cropRect = state.cropRect;
+        if (!fit || fit.width <= 0 || fit.height <= 0 || !cropRect) throw new Error('图片尺寸异常');
+        // 裁剪框在图片归一化坐标中的位置和尺寸
+        const cropXInImage = (cropRect.left - fit.left) / fit.width;
+        const cropYInImage = (cropRect.top - fit.top) / fit.height;
+        const cropWNorm = cropRect.width / fit.width;
+        const cropHNorm = cropRect.height / fit.height;
+        // 边界约束：确保裁剪框完全在图片内
+        const clampedX = Math.max(0, Math.min(Math.max(0, 1 - cropWNorm), cropXInImage));
+        const clampedY = Math.max(0, Math.min(Math.max(0, 1 - cropHNorm), cropYInImage));
+        const data = await ecommerceApi('POST', '/api/ecommerce/crop-reference', {
+            batch_id: ecommerceRerunState.batchId,
+            source: reference.path || reference.url,
+            x: clampedX,
+            y: clampedY,
+            width: cropWNorm,
+            height: cropHNorm
+        });
+        // 同一套服装的多张废片共享这一组服装参考证据；裁剪一次后，
+        // 本组所有已选动作都必须使用同一张裁剪图，不能只改当前行。
+        ecommerceRerunState.items
+            .filter(entry => entry.garment_id === item.garment_id)
+            .forEach(entry => {
+                const relatedReference = entry.references?.[state.refIndex];
+                if (!relatedReference) return;
+                relatedReference.override_url = data.url;
+                relatedReference.override_path = data.path;
+            });
+        closeEcommerceReferenceCrop();
+        renderEcommerceRerunCompare(state.itemIndex);
+        const compareOverlay = document.getElementById('ecommerce-compare-overlay');
+        if (compareOverlay && !compareOverlay.hidden) updateEcommerceImageCompare();
+        showToast('已保存本次重做裁剪；原图未修改', 'success');
+    } catch (error) {
+        showToast(`裁剪失败：${error.message}`, 'error');
+    } finally {
+        if (button) { button.disabled = false; button.textContent = '使用本次裁剪'; }
+    }
+}
+
+function ecommerceCompactWasteModel(model) {
+    const raw = String(model?.model_key || model?.model_id || '').toLowerCase();
+    const platform = String(model?.platform || '').toLowerCase() === 'runninghub' ? 'RH' : String(model?.platform || '').toLowerCase() === 'oaihk' ? 'HK' : String(model?.platform || 'API').slice(0, 3).toUpperCase();
+    let name = 'MODEL';
+    if (raw.includes('n-pro') || (raw.includes('banana') && raw.includes('pro'))) name = 'NBP';
+    else if (raw.includes('g31') || raw.includes('banana/v2')) name = 'NB2';
+    else if (raw.includes('gpt') || raw.includes('g-2')) name = 'GPT2';
+    else name = raw.replace(/[^a-z0-9]+/g, '').slice(0, 7).toUpperCase() || 'MODEL';
+    const channel = ['low-cost','cheap','channel'].includes(String(model?.channel || '').toLowerCase()) ? 'LC' : ['official','flagship'].includes(String(model?.channel || '').toLowerCase()) ? 'OFF' : 'STD';
+    return `${platform}-${name}-${channel}-${String(model?.resolution || '2K').toUpperCase()}`;
+}
+
+function ecommerceCompactWasteTime(value) {
+    const text = String(value || '').replace('T', ' ');
+    return text.length >= 16 ? text.slice(5, 16) : text;
+}
+
+async function loadEcommerceWasteStats() {
+    const data = await ecommerceApi('GET', '/api/ecommerce/waste-stats?limit=20');
+    const records = data.records || [];
+    const latest = document.getElementById('ecommerce-waste-latest');
+    if (latest) latest.textContent = records.length ? `最近 ${Number(records[0].waste_rate || 0).toFixed(1)}%` : '暂无记录';
+    const list = document.getElementById('ecommerce-waste-list');
+    if (!list) return;
+    const visible = records.slice(0, ecommerceWasteExpanded ? 20 : 5);
+    if (!visible.length) {
+        list.innerHTML = '<div class="ecommerce-empty">扫描一次废片后开始记录模型表现。</div>';
+        return;
+    }
+    list.innerHTML = `<div class="ecommerce-waste-row is-head"><span>时间 / 批次</span><span>模型</span><span>生成</span><span>删除</span><span>废片率</span><span>费用</span></div>` + visible.map(record => {
+        const modelDetails = (record.model_breakdown || []).map(model => `${model.platform} · ${model.model_key || model.model_id} · ${model.resolution} · ${model.channel}`).join(' / ') || '未记录模型';
+        const models = [...new Set((record.model_breakdown || []).map(ecommerceCompactWasteModel))].join(' / ') || (record.run_code || '旧批次');
+        const rateClass = Number(record.waste_rate || 0) >= 30 ? 'is-high' : Number(record.waste_rate || 0) >= 15 ? 'is-mid' : 'is-low';
+        const batchShort = String(record.batch_name || record.batch_id || '').replace(/^电商批次\s*/, '');
+        return `<div class="ecommerce-waste-row">
+            <span><strong>${ecommerceEscape(ecommerceCompactWasteTime(record.last_scan_at))}</strong><small>批次 ${ecommerceEscape(batchShort)}｜${ecommerceEscape(record.scope_label || '整批')}｜扫${record.scan_count || 1}次</small></span>
+            <span title="${ecommerceEscape(modelDetails)}">${ecommerceEscape(models)}</span>
+            <span>${record.generated || 0}</span><span>${record.current_deleted || 0}</span>
+            <span class="ecommerce-waste-rate ${rateClass}">${Number(record.waste_rate || 0).toFixed(1)}%</span>
+            <span>¥${Number(record.billed_cny || 0).toFixed(2)}</span>
+        </div>`;
+    }).join('');
+    const toggle = document.getElementById('btn-ecommerce-waste-toggle');
+    if (toggle) {
+        toggle.style.display = records.length > 5 ? '' : 'none';
+        toggle.textContent = ecommerceWasteExpanded ? '收起到近5次' : '展开近20次';
+    }
+}
+document.getElementById('btn-ecommerce-waste-toggle')?.addEventListener('click', () => {
+    ecommerceWasteExpanded = !ecommerceWasteExpanded;
+    loadEcommerceWasteStats().catch(e => showToast(`统计加载失败：${e.message}`, 'error'));
+});
+document.getElementById('ecommerce-waste-disclosure')?.addEventListener('toggle', event => {
+    const label = document.getElementById('ecommerce-waste-disclosure-label');
+    if (label) label.textContent = event.currentTarget.open ? '收起' : '展开';
+});
+
+function closeEcommerceImageCompare() {
+    const overlay = document.getElementById('ecommerce-compare-overlay');
+    if (!overlay) return;
+    overlay.hidden = true;
+    overlay.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('ecommerce-compare-open');
+}
+
+function resetEcommerceComparePan(side) {
+    const safeSide = side === 'result' ? 'result' : 'reference';
+    ecommerceComparePanState[safeSide].x = 0;
+    ecommerceComparePanState[safeSide].y = 0;
+}
+
+function applyEcommerceComparePan(side) {
+    const safeSide = side === 'result' ? 'result' : 'reference';
+    const imageId = safeSide === 'result' ? 'ecommerce-compare-bad-image' : 'ecommerce-compare-reference-image';
+    const image = document.getElementById(imageId);
+    if (!image) return;
+    const pan = ecommerceComparePanState[safeSide];
+    image.style.transform = `translate3d(${pan.x}px, ${pan.y}px, 0)`;
+}
+
+function applyEcommerceCompareZoom(side, center = false) {
+    const safeSide = side === 'result' ? 'result' : 'reference';
+    const imageId = safeSide === 'result' ? 'ecommerce-compare-bad-image' : 'ecommerce-compare-reference-image';
+    const image = document.getElementById(imageId);
+    const scroller = document.querySelector(`.ecommerce-compare-image-scroll[data-zoom-side="${safeSide}"]`);
+    if (!image || !scroller || !image.naturalWidth || !image.naturalHeight) return;
+    const zoom = Math.max(0.5, Math.min(4, Number(ecommerceCompareZoomState[safeSide]) || 1));
+    ecommerceCompareZoomState[safeSide] = zoom;
+    if (center) resetEcommerceComparePan(safeSide);
+    const fitWidth = Math.max(1, scroller.clientWidth - 8);
+    const fitHeight = Math.max(1, scroller.clientHeight - 8);
+    const fitScale = Math.min(fitWidth / image.naturalWidth, fitHeight / image.naturalHeight);
+    image.style.width = `${Math.max(1, Math.round(image.naturalWidth * fitScale * zoom))}px`;
+    image.style.height = `${Math.max(1, Math.round(image.naturalHeight * fitScale * zoom))}px`;
+    applyEcommerceComparePan(safeSide);
+    scroller.classList.toggle('is-zoomed', zoom > 1.01);
+    scroller.classList.add('is-grabbable');
+    const value = document.querySelector(`.ecommerce-compare-zoom-controls[data-zoom-side="${safeSide}"] .ecommerce-compare-zoom-value`);
+    if (value) value.textContent = `${Math.round(zoom * 100)}%`;
+    document.querySelectorAll(`.ecommerce-compare-zoom-controls[data-zoom-side="${safeSide}"] button[data-zoom-action]`).forEach(btn => {
+        const action = btn.dataset.zoomAction;
+        let isActive = false;
+        if (action === 'fit' || action === 'reset') isActive = Math.abs(zoom - 1) < 0.02;
+        else if (action === '1') isActive = Math.abs(zoom - 1) < 0.05;
+        else if (action === '2') isActive = Math.abs(zoom - 2) < 0.1;
+        else if (action === '4') isActive = Math.abs(zoom - 4) < 0.15;
+        btn.classList.toggle('is-active', isActive);
+    });
+}
+
+function setEcommerceCompareZoom(side, zoom, center = true) {
+    const safeSide = side === 'result' ? 'result' : 'reference';
+    ecommerceCompareZoomState[safeSide] = Math.max(0.5, Math.min(4, Number(zoom) || 1));
+    applyEcommerceCompareZoom(safeSide, center);
+}
+
+function resetEcommerceCompareZoom() {
+    ecommerceCompareZoomState.reference = 1;
+    ecommerceCompareZoomState.result = 1;
+    resetEcommerceComparePan('reference');
+    resetEcommerceComparePan('result');
+    applyEcommerceCompareZoom('reference', true);
+    applyEcommerceCompareZoom('result', true);
+}
+
+function setEcommerceCompareImage(side, url, alt = '') {
+    const safeSide = side === 'result' ? 'result' : 'reference';
+    const imageId = safeSide === 'result' ? 'ecommerce-compare-bad-image' : 'ecommerce-compare-reference-image';
+    const image = document.getElementById(imageId);
+    if (!image) return;
+    const nextUrl = String(url || '');
+    const sourceChanged = image.dataset.sourceUrl !== nextUrl;
+    if (alt) image.alt = alt;
+    if (!sourceChanged) {
+        if (image.complete && image.naturalWidth) applyEcommerceCompareZoom(safeSide);
+        return;
+    }
+    if (image.dataset.pendingSourceUrl === nextUrl) return;
+    image.dataset.pendingSourceUrl = nextUrl;
+    const loader = new Image();
+    loader.onload = () => {
+        if (image.dataset.pendingSourceUrl !== nextUrl) return;
+        image.dataset.pendingSourceUrl = '';
+        image.dataset.sourceUrl = nextUrl;
+        resetEcommerceComparePan(safeSide);
+        image.onload = () => {
+            if (image.dataset.sourceUrl === nextUrl) applyEcommerceCompareZoom(safeSide);
+        };
+        image.src = nextUrl;
+        if (image.complete && image.naturalWidth) applyEcommerceCompareZoom(safeSide);
+    };
+    loader.onerror = () => {
+        if (image.dataset.pendingSourceUrl === nextUrl) image.dataset.pendingSourceUrl = '';
+    };
+    loader.src = nextUrl;
+}
+
+function updateEcommerceImageCompare() {
+    const groupMode = ecommerceGroupCompareState.mode === 'group';
+    const item = groupMode ? null : ecommerceRerunState.items[ecommerceRerunState.activeIndex];
+    const group = groupMode ? ecommerceGroupCompareState.data : null;
+    if ((!groupMode && !item) || (groupMode && !group)) return;
+    let refs = groupMode ? (group.references || []) : (item.references || []);
+    if (!groupMode && item) {
+        refs = [
+            { url: item.bad_photo_url || '', name: '废片', _isBadPhoto: true },
+            ...refs
+        ];
+    }
+    const groupResults = groupMode ? (group.results || []) : [];
+    if (groupMode && ['target_only', 'garment_prompt'].includes(group.generation_mode) && groupResults.length) {
+        const currentResult = groupResults[Math.max(0, Math.min(ecommerceGroupCompareState.resultIndex, groupResults.length - 1))];
+        const matchingIndex = refs.findIndex(entry => Number(entry.action_order) === Number(currentResult?.action_order));
+        if (matchingIndex >= 0) ecommerceGroupCompareState.refIndex = matchingIndex;
+    }
+    const requestedRefIndex = groupMode ? ecommerceGroupCompareState.refIndex : ecommerceRerunState.compareRefIndex;
+    const index = Math.max(0, Math.min(requestedRefIndex, refs.length - 1));
+    if (groupMode) ecommerceGroupCompareState.refIndex = index;
+    else ecommerceRerunState.compareRefIndex = index;
+    const ref = refs[index] || {};
+    const results = groupMode ? groupResults : [{
+        url: item.bad_photo_url || '', deleted: true, action_order: item.action_order,
+        action_name: item.action_name || ''
+    }];
+    const resultIndex = Math.max(0, Math.min(groupMode ? ecommerceGroupCompareState.resultIndex : 0, results.length - 1));
+    if (groupMode) ecommerceGroupCompareState.resultIndex = resultIndex;
+    const result = results[resultIndex] || {};
+    const refImage = document.getElementById('ecommerce-compare-reference-image');
+    const badImage = document.getElementById('ecommerce-compare-bad-image');
+    const isBadPhotoRef = !groupMode && ref._isBadPhoto;
+    if (refImage) setEcommerceCompareImage('reference', ecommerceThumbnailUrl(ref.override_url || ref.url || '', 1200), '服装实拍参考大图');
+    if (badImage) setEcommerceCompareImage(
+        'result',
+        ecommerceThumbnailUrl(result.url || '', 1200),
+        result.deleted ? '已删废片备份' : `生成图·动作${result.action_order || resultIndex + 1}`
+    );
+    const refLabel = document.getElementById('ecommerce-compare-ref-label');
+    if (refLabel) {
+        if (isBadPhotoRef) {
+            refLabel.innerHTML = `⚠ 废片（已删除） · 动作${item.action_order} · ${ecommerceEscape(item.action_name || '')}`;
+            refLabel.style.color = '#f04438';
+        } else {
+            const refNum = groupMode ? (index + 1) : index;
+            const compareMode = groupMode ? group.generation_mode : item?.generation_mode;
+            const referenceName = compareMode === 'target_only'
+                ? '原始目标图'
+                : (compareMode === 'garment_prompt' ? '原始服装图' : '服装参考图');
+            refLabel.innerHTML = `${referenceName} ${refNum}/${refs.length - (groupMode ? 0 : 1)}${ref.override_url ? ' · 已裁剪' : ''}${ref.temporary_url ? ' · 临时图' : ''}${ref.is_detail ? ' · 细节图' : ''}`;
+            refLabel.style.color = '';
+        }
+    }
+    const counter = document.getElementById('ecommerce-compare-counter');
+    if (counter) {
+        if (groupMode) counter.textContent = `${index + 1} / ${refs.length || 0}`;
+        else counter.textContent = index === 0 ? '废片' : `${index} / ${refs.length - 1}`;
+    }
+    const resultCounter = document.getElementById('ecommerce-compare-result-counter');
+    if (resultCounter) resultCounter.textContent = `${resultIndex + 1} / ${results.length || 0}`;
+    const resultLabel = document.getElementById('ecommerce-compare-result-label');
+    if (resultLabel) {
+        const markedBadge = result.marked_redo ? ' ⚑ 已标记重做 ' : '';
+        const deletedBadge = result.deleted ? ' ⚠ 已删除 ' : '';
+        if (result.deleted) {
+            resultLabel.innerHTML = `⚠ 已删除 · 动作${result.action_order || resultIndex + 1} · ${ecommerceEscape(result.action_name || '')}`;
+            resultLabel.style.color = '#f04438';
+        } else if (result.marked_redo) {
+            resultLabel.innerHTML = `⚑ 已标记重做 · 动作${result.action_order || resultIndex + 1} · ${ecommerceEscape(result.action_name || '')}`;
+            resultLabel.style.color = '#2563eb';
+        } else {
+            resultLabel.innerHTML = `AI生成图 · 动作${result.action_order || resultIndex + 1} · ${ecommerceEscape(result.action_name || '')}`;
+            resultLabel.style.color = '';
+        }
+    }
+    const restoreButton = document.getElementById('ecommerce-compare-restore-ref');
+    const cropBtn = document.getElementById('ecommerce-compare-crop-ref');
+    const replaceBtn = document.getElementById('ecommerce-compare-replace-ref');
+    const targetOnlyCompare = ['target_only', 'garment_prompt'].includes(groupMode ? group.generation_mode : item?.generation_mode);
+    if (restoreButton) restoreButton.hidden = isBadPhotoRef || !(ref.override_url || ref.temporary_url || ref.original_url);
+    if (cropBtn) cropBtn.hidden = isBadPhotoRef || groupMode || targetOnlyCompare;
+    if (replaceBtn) replaceBtn.hidden = isBadPhotoRef || targetOnlyCompare;
+    const refActions = document.querySelector('.ecommerce-compare-ref-actions');
+    if (refActions) refActions.hidden = groupMode || isBadPhotoRef || targetOnlyCompare;
+    ['ecommerce-compare-result-prev', 'ecommerce-compare-result-next'].forEach(id => {
+        const button = document.getElementById(id);
+        if (!button) return;
+        button.hidden = !groupMode;
+        button.disabled = groupMode && results.length < 2;
+        button.style.visibility = groupMode && results.length < 2 ? 'hidden' : '';
+    });
+    const garmentIndicator = document.getElementById('ecommerce-compare-garment-indicator');
+    const prevGarmentBtn = document.getElementById('ecommerce-compare-prev-garment');
+    const nextGarmentBtn = document.getElementById('ecommerce-compare-next-garment');
+    if (garmentIndicator && groupMode && ecommerceState.detail) {
+        const garments = ecommerceState.detail.garments || [];
+        const currentGid = ecommerceGroupCompareState.data?.garment_id;
+        const gIdx = garments.findIndex(g => g.id === currentGid);
+        if (gIdx >= 0 && garments.length > 1) {
+            garmentIndicator.textContent = `${gIdx + 1}/${garments.length} · ${ecommerceGroupCompareState.data?.garment_name || ''}`;
+            garmentIndicator.hidden = false;
+            if (prevGarmentBtn) prevGarmentBtn.hidden = false;
+            if (nextGarmentBtn) nextGarmentBtn.hidden = false;
+        } else {
+            garmentIndicator.hidden = true;
+            if (prevGarmentBtn) prevGarmentBtn.hidden = true;
+            if (nextGarmentBtn) nextGarmentBtn.hidden = true;
+        }
+    } else {
+        if (garmentIndicator) garmentIndicator.hidden = true;
+        if (prevGarmentBtn) prevGarmentBtn.hidden = true;
+        if (nextGarmentBtn) nextGarmentBtn.hidden = true;
+    }
+    // "删除此图"按钮：只在 group 模式且当前图未删除时显示
+    const deleteBtn = document.getElementById('ecommerce-compare-delete');
+    if (deleteBtn) {
+        const currentResult = results[resultIndex];
+        deleteBtn.hidden = !groupMode || !currentResult || currentResult.deleted;
+        deleteBtn.textContent = currentResult?.deleted ? '已删除' : '删除此图';
+    }
+    // "标记重做"按钮：只在 group 模式且当前图未删除时显示
+    const markBtn = document.getElementById('ecommerce-compare-mark-redo');
+    if (markBtn) {
+        const currentResult = results[resultIndex];
+        markBtn.hidden = !groupMode || !currentResult || currentResult.deleted;
+        if (currentResult?.marked_redo) {
+            markBtn.textContent = '✓ 已标记重做（点击取消）';
+            markBtn.style.background = '#2563eb';
+            markBtn.style.color = '#fff';
+            markBtn.style.borderColor = '#2563eb';
+            markBtn.style.fontWeight = '600';
+        } else {
+            markBtn.textContent = '⚑ 标记重做';
+            markBtn.style.background = '';
+            markBtn.style.color = '#2563eb';
+            markBtn.style.borderColor = '#93c5fd';
+            markBtn.style.fontWeight = '';
+        }
+    }
+    const thumbs = document.getElementById('ecommerce-compare-thumbnails');
+    if (thumbs) {
+        thumbs.innerHTML = refs.map((entry, i) => {
+            const isBad = !groupMode && entry._isBadPhoto;
+            const thumbUrl = entry.override_url || entry.url || '';
+            const label = isBad ? '废' : (groupMode ? `${i + 1}` : `${i}`);
+            return `<button type="button" data-ref-index="${i}" class="${i === index ? 'is-active' : ''} ${isBad ? 'is-bad-photo' : ''}" title="${isBad ? '废片（已删除的AI图）' : `参考图${label}`}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(thumbUrl, 180))}" alt="${isBad ? '废片' : `参考${label}`}"><span>${label}</span></button>`;
+        }).join('');
+        thumbs.querySelectorAll('button').forEach(btn => btn.addEventListener('click', e => {
+            e.stopPropagation();
+            if (groupMode) ecommerceGroupCompareState.refIndex = Number(btn.dataset.refIndex);
+            else ecommerceRerunState.compareRefIndex = Number(btn.dataset.refIndex);
+            updateEcommerceImageCompare();
+        }));
+    }
+    const resultThumbs = document.getElementById('ecommerce-compare-result-thumbnails');
+    if (resultThumbs) {
+        resultThumbs.hidden = !groupMode;
+        resultThumbs.innerHTML = groupMode ? results.map((entry, i) => {
+            const classes = [];
+            if (i === resultIndex) classes.push('is-active');
+            if (entry.deleted) classes.push('is-deleted');
+            if (entry.marked_redo) classes.push('is-marked-redo');
+            const label = entry.deleted ? `废${entry.action_order || i + 1}` : (entry.marked_redo ? `标${entry.action_order || i + 1}` : `${entry.action_order || i + 1}`);
+            const title = entry.deleted ? '已删废片·本地备份' : (entry.marked_redo ? '已标记为待重做（原图保留）' : '生成图');
+            return `<button type="button" data-result-index="${i}" class="${classes.join(' ')}" title="${ecommerceEscape(title)}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(entry.url || '', 180))}" alt="动作${entry.action_order || i + 1}"><span>${label}</span></button>`;
+        }).join('') : '';
+        resultThumbs.querySelectorAll('button').forEach(button => button.addEventListener('click', event => {
+            event.stopPropagation();
+            ecommerceGroupCompareState.resultIndex = Number(button.dataset.resultIndex);
+            updateEcommerceImageCompare();
+        }));
+    }
+}
+
+async function openEcommerceGroupCompare(garmentId) {
+    const batchId = ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    if (!batchId || !garmentId) throw new Error('请先选择批次和服装');
+    const data = await ecommerceApi('GET', `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(garmentId)}/compare`);
+    ecommerceGroupCompareState.mode = 'group';
+    ecommerceGroupCompareState.data = data;
+    ecommerceGroupCompareState.refIndex = 0;
+    ecommerceGroupCompareState.resultIndex = 0;
+    ecommerceCompareZoomState.reference = 1;
+    ecommerceCompareZoomState.result = 1;
+    resetEcommerceComparePan('reference');
+    resetEcommerceComparePan('result');
+    // 保存当前批次的所有服装列表，用于"下一套"导航
+    const batch = ecommerceState.detail;
+    if (batch && Array.isArray(batch.garments)) {
+        ecommerceGroupCompareState.garmentList = batch.garments.map(g => ({ id: g.id, name: g.name }));
+        ecommerceGroupCompareState.currentGarmentIndex = batch.garments.findIndex(g => g.id === garmentId);
+    } else {
+        ecommerceGroupCompareState.garmentList = [{ id: garmentId, name: data.garment_name }];
+        ecommerceGroupCompareState.currentGarmentIndex = 0;
+    }
+    updateEcommerceCompareHeading(data, data.garment_name);
+    updateEcommerceImageCompare();
+    updateEcommerceCompareGarmentNav();
+    const overlay = document.getElementById('ecommerce-compare-overlay');
+    if (overlay) {
+        overlay.hidden = false;
+        overlay.setAttribute('aria-hidden', 'false');
+        document.body.classList.add('ecommerce-compare-open');
+    }
+}
+
+// 更新"上一套/下一套"按钮状态
+function updateEcommerceCompareGarmentNav() {
+    const list = ecommerceGroupCompareState.garmentList || [];
+    const idx = ecommerceGroupCompareState.currentGarmentIndex ?? -1;
+    const prevBtn = document.getElementById('ecommerce-compare-prev-garment');
+    const nextBtn = document.getElementById('ecommerce-compare-next-garment');
+    if (prevBtn) prevBtn.disabled = idx <= 0;
+    if (nextBtn) nextBtn.disabled = idx < 0 || idx >= list.length - 1;
+}
+
+function updateEcommerceCompareHeading(data, fallbackName = '') {
+    const title = document.getElementById('ecommerce-compare-title');
+    if (title) title.textContent = data?.generation_mode === 'target_only'
+        ? '原始目标图 · 生成结果对比'
+        : (data?.generation_mode === 'garment_prompt'
+            ? '原始服装图 · 生成结果对比'
+            : `${data?.garment_name || fallbackName || '服装'} · 实拍与生成结果对比`);
+    const help = document.getElementById('ecommerce-compare-help');
+    if (help) help.textContent = data?.generation_mode === 'target_only'
+        ? '左侧为原始目标图，右侧为生成结果；按Delete可删除当前AI图'
+        : (data?.generation_mode === 'garment_prompt'
+            ? '左侧为当前原始服装图，右侧为对应生成结果；按Delete可删除当前AI图'
+            : '左右两侧都可切换；按Delete删除当前AI图；点击"下一套"切换服装');
+}
+
+// 切换到指定索引的服装
+async function switchEcommerceCompareGarment(direction) {
+    if (ecommerceGroupCompareState.switching) return false;
+    const list = ecommerceGroupCompareState.garmentList || [];
+    let idx = ecommerceGroupCompareState.currentGarmentIndex ?? -1;
+    idx += direction;
+    if (idx < 0 || idx >= list.length) return false;
+    const target = list[idx];
+    if (!target) return false;
+    const batchId = ecommerceGroupCompareState.data?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    if (!batchId) return false;
+    ecommerceGroupCompareState.switching = true;
+    try {
+        const data = await ecommerceApi('GET', `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(target.id)}/compare`);
+        ecommerceGroupCompareState.data = data;
+        ecommerceGroupCompareState.refIndex = 0;
+        ecommerceGroupCompareState.resultIndex = 0;
+        ecommerceGroupCompareState.currentGarmentIndex = idx;
+        updateEcommerceCompareHeading(data, target.name);
+        updateEcommerceImageCompare();
+        updateEcommerceCompareGarmentNav();
+        if (!(data?.results || []).length) ecommerceToast('该套暂无可查看的AI图', 'warning');
+        return true;
+    } catch (e) {
+        showToast(`切换服装失败：${e.message}`, 'error');
+        return false;
+    } finally {
+        ecommerceGroupCompareState.switching = false;
+    }
+}
+
+// 删除当前显示的AI生成图
+async function deleteEcommerceCurrentResult() {
+    const groupMode = ecommerceGroupCompareState.mode === 'group';
+    const group = groupMode ? ecommerceGroupCompareState.data : null;
+    const results = groupMode ? (group?.results || []) : [];
+    const resultIndex = groupMode ? ecommerceGroupCompareState.resultIndex : 0;
+    const result = results[resultIndex];
+    if (!result) return showToast('没有可删除的AI图', 'error');
+    if (result.deleted) return showToast('此图已删除（当前显示的是废片备份）', 'warning');
+    if (!result.path) return showToast('找不到文件路径', 'error');
+    const batchId = group?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group?.garment_id || '';
+    if (!batchId || !garmentId) return showToast('缺少批次或服装信息', 'error');
+    const basename = result.path.split('/').pop();
+    const deletedResult = { ...result };
+    const deletedIndex = resultIndex;
+    let undone = false;
+    try {
+        const resp = await ecommerceApi('POST', '/api/ecommerce/delete-sample', {
+            batch_id: batchId, garment_id: garmentId, path: result.path, permanent: false
+        });
+        if (!resp.ok && resp.error) throw new Error(resp.error);
+        results.splice(resultIndex, 1);
+        if (ecommerceGroupCompareState.resultIndex >= results.length && results.length > 0) {
+            ecommerceGroupCompareState.resultIndex = results.length - 1;
+        }
+        if (results.length === 0) {
+            // 该服装所有AI图都已删除：关闭对比界面，避免空白残留
+            closeEcommerceImageCompare();
+            showToast('这套服装的所有AI图已删除，已关闭对比界面', 'info');
+        } else {
+            updateEcommerceImageCompare();
+        }
+        ecommerceUndoToast(`已删除 ${basename}`, async () => {
+            undone = true;
+            try {
+                await ecommerceApi('POST', '/api/ecommerce/undo-delete', {
+                    batch_id: batchId, garment_id: garmentId, path: deletedResult.path
+                });
+                const restored = await ecommerceApi('GET', `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(garmentId)}/compare`);
+                if (restored && restored.results) {
+                    ecommerceGroupCompareState.data = restored;
+                    const restoredIdx = restored.results.findIndex(r => r.path === deletedResult.path);
+                    ecommerceGroupCompareState.resultIndex = restoredIdx >= 0 ? restoredIdx : Math.min(deletedIndex, restored.results.length - 1);
+                    updateEcommerceImageCompare();
+                    ecommerceToast('已恢复');
+                }
+            } catch (e) {
+                showToast(`恢复失败：${e.message}`, 'error');
+            }
+        }, 5000);
+        setTimeout(async () => {
+            if (undone) return;
+            try {
+                await ecommerceApi('POST', '/api/ecommerce/delete-sample', {
+                    batch_id: batchId, garment_id: garmentId, path: deletedResult.path, permanent: true
+                });
+            } catch(e) { /* silent */ }
+        }, 5500);
+    } catch (e) {
+        showToast(`删除失败：${e.message}`, 'error');
+    }
+}
+
+// 标记当前显示的AI图为"待重做"（不删除原图，重做后新旧图共存对比）
+async function markEcommerceCurrentRedo() {
+    const groupMode = ecommerceGroupCompareState.mode === 'group';
+    const group = groupMode ? ecommerceGroupCompareState.data : null;
+    const results = groupMode ? (group?.results || []) : [];
+    const resultIndex = groupMode ? ecommerceGroupCompareState.resultIndex : 0;
+    const result = results[resultIndex];
+    if (!result) return showToast('没有可标记的AI图', 'error');
+    if (!result.action_order) return showToast('缺少动作信息', 'error');
+    const batchId = group?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group?.garment_id || '';
+    if (!batchId || !garmentId) return showToast('缺少批次或服装信息', 'error');
+    // 如果当前图已被删除（废片），提示用户直接扫描废片即可
+    if (result.deleted) {
+        return showToast('该图已被删除（废片），无需标记重做。直接到废片重做扫描即可重做', 'warning');
+    }
+    // 如果已标记，则取消标记
+    if (result.marked_redo) {
+        try {
+            const resp = await ecommerceApi('POST', '/api/ecommerce/unmark-redo', {
+                batch_id: batchId,
+                garment_id: garmentId,
+                action_order: result.action_order,
+                mark_id: result.mark_id || '',
+                result_path: result.path || ''
+            });
+            if (!resp.ok && resp.error) throw new Error(resp.error);
+            result.marked_redo = false;
+            showToast(`已取消标记动作${result.action_order}`, 'info');
+            updateEcommerceImageCompare();
+        } catch (e) {
+            showToast(`取消标记失败：${e.message}`, 'error');
+        }
+        return;
+    }
+    // 标记为待重做
+    try {
+        const resp = await ecommerceApi('POST', '/api/ecommerce/mark-redo', {
+            batch_id: batchId,
+            garment_id: garmentId,
+            action_order: result.action_order,
+            result_path: result.path || ''
+        });
+        if (!resp.ok && resp.error) throw new Error(resp.error);
+        result.marked_redo = true;
+        result.mark_id = resp.mark_id || result.mark_id || '';
+        showToast(`✓ 已标记动作${result.action_order}为待重做（原图保留，重做时直接替换）`, 'success');
+        updateEcommerceImageCompare();
+    } catch (e) {
+        showToast(`标记失败：${e.message}`, 'error');
+    }
+}
+
+async function replaceEcommerceCompareReference(file) {
+    if (ecommerceGroupCompareState.mode === 'group') return showToast('请先扫描废片并进入单张重做，再临时换图或裁剪', 'warning');
+    const itemIndex = ecommerceRerunState.activeIndex;
+    const refIndex = ecommerceRerunState.compareRefIndex - 1;
+    if (refIndex < 0) return;
+    const item = ecommerceRerunState.items[itemIndex];
+    const reference = item?.references?.[refIndex];
+    if (!file || !reference) return;
+    if (!String(file.type || '').startsWith('image/')) return showToast('请拖入图片文件', 'error');
+    try {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('batch_id', ecommerceRerunState.batchId);
+        const response = await fetch('/api/ecommerce/upload-temp-image', { method: 'POST', body: formData });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.url) throw new Error(data.error || '上传失败');
+        ecommerceRerunState.items
+            .filter(entry => entry.garment_id === item.garment_id)
+            .forEach(entry => {
+                const relatedReference = entry.references?.[refIndex];
+                if (!relatedReference) return;
+                if (!relatedReference.original_url) {
+                    relatedReference.original_url = relatedReference.url;
+                    relatedReference.original_path = relatedReference.path;
+                }
+                relatedReference.url = data.url;
+                relatedReference.path = data.path;
+                relatedReference.temporary_url = data.url;
+                relatedReference.temporary_path = data.path;
+                relatedReference.override_url = '';
+                relatedReference.override_path = '';
+            });
+        renderEcommerceRerunCompare(itemIndex);
+        updateEcommerceImageCompare();
+        showToast('已临时替换当前服装参考图；原文件未修改，仅本次重做使用', 'success');
+    } catch (error) {
+        showToast(`临时换图失败：${error.message}`, 'error');
+    }
+}
+
+function restoreEcommerceCompareReference() {
+    const itemIndex = ecommerceRerunState.activeIndex;
+    const refIndex = ecommerceRerunState.compareRefIndex - 1;
+    if (refIndex < 0) return;
+    const item = ecommerceRerunState.items[itemIndex];
+    const reference = item?.references?.[refIndex];
+    if (!reference) return;
+    ecommerceRerunState.items
+        .filter(entry => entry.garment_id === item.garment_id)
+        .forEach(entry => {
+            const relatedReference = entry.references?.[refIndex];
+            if (!relatedReference) return;
+            if (relatedReference.original_url) {
+                relatedReference.url = relatedReference.original_url;
+                relatedReference.path = relatedReference.original_path;
+            }
+            relatedReference.override_url = '';
+            relatedReference.override_path = '';
+            delete relatedReference.temporary_url;
+            delete relatedReference.temporary_path;
+            delete relatedReference.original_url;
+            delete relatedReference.original_path;
+        });
+    renderEcommerceRerunCompare(itemIndex);
+    updateEcommerceImageCompare();
+    showToast('已恢复服装原始参考图', 'success');
+}
+
+function openEcommerceImageCompare(itemIndex, refIndex = 1) {
+    const item = ecommerceRerunState.items[itemIndex];
+    const overlay = document.getElementById('ecommerce-compare-overlay');
+    if (!item || !overlay) return showToast('无法打开对比', 'error');
+    ecommerceRerunState.activeIndex = itemIndex;
+    ecommerceRerunState.compareRefIndex = Math.max(1, refIndex);
+    ecommerceGroupCompareState.mode = 'rerun';
+    ecommerceGroupCompareState.data = null;
+    ecommerceCompareZoomState.reference = 1;
+    ecommerceCompareZoomState.result = 1;
+    resetEcommerceComparePan('reference');
+    resetEcommerceComparePan('result');
+    const title = document.getElementById('ecommerce-compare-title');
+    if (title) title.textContent = `${item.garment_name} · 动作${item.action_order} · 废片对比`;
+    const help = document.getElementById('ecommerce-compare-help');
+    if (help) help.textContent = item.generation_mode === 'target_only'
+        ? '左侧默认为原始目标图，右侧为已删废片备份；两侧都可缩放和拖动对比'
+        : (item.generation_mode === 'garment_prompt'
+            ? '左侧为本次生成所用的原始服装图，右侧为已删废片备份；两侧都可缩放和拖动对比'
+            : '左侧：废片+参考图（第1张是废片，2-N是参考图），右侧：废片备份；滚轮无极缩放，拖拽平移；C键裁剪，回车跳到下一张');
+    updateEcommerceImageCompare();
+    overlay.hidden = false;
+    overlay.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('ecommerce-compare-open');
+}
+
+function renderEcommerceRerunBatchOptions() {
+    const select = document.getElementById('ecommerce-rerun-batch-select');
+    if (!select) return;
+    const selectedBatchId = select.value || ecommerceRerunState.batchId || '';
+    const batches = ecommerceState.batches || [];
+    const opts = ['<option value="">选择批次</option>'].concat(
+        batches.map(b => `<option value="${ecommerceEscape(b.id)}">${ecommerceEscape(b.name || '未命名')}（${(b.garment_total || b.garments?.length || 0)}套${b.run_code ? `｜${ecommerceEscape(b.run_code)}` : ''}）</option>`)
+    );
+    select.innerHTML = opts.join('');
+    if (selectedBatchId && batches.some(batch => batch.id === selectedBatchId)) {
+        select.value = selectedBatchId;
+    }
+}
+
+async function scanEcommerceRerun() {
+    const batchId = document.getElementById('ecommerce-rerun-batch-select')?.value;
+    if (!batchId) return showToast('请先选择批次', 'error');
+    const summary = document.getElementById('ecommerce-rerun-summary');
+    const list = document.getElementById('ecommerce-rerun-list');
+    if (summary) summary.textContent = '扫描中…';
+    if (list) list.innerHTML = '<div class="ecommerce-empty">扫描中…</div>';
+    try {
+        const resultPath = document.getElementById('ecommerce-rerun-result-path')?.value.trim() || '';
+        const data = await ecommerceApi('POST', '/api/ecommerce/scan-deleted', { batch_id: batchId, result_path: resultPath });
+        ecommerceRerunState.batchId = batchId;
+        ecommerceRerunState.items = data.items || [];
+        ecommerceRerunState.activeIndex = -1;
+        ecommerceRerunState.selectedIds = new Set(ecommerceRerunState.items.map(item => item.id));
+        ecommerceRerunState.bulkPrompt = '';
+        const firstModel = ecommerceRerunState.items[0]?.original_model || {};
+        ecommerceRerunState.bulkPlatform = firstModel.platform || 'runninghub';
+        const bulkKeys = ecommerceRerunState.bulkPlatform === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : ECOMMERCE_RERUN_HK_MODEL_KEYS;
+        ecommerceRerunState.bulkModelKey = bulkKeys.includes(firstModel.model_key) ? firstModel.model_key : bulkKeys[0];
+        ecommerceRerunState.bulkRatio = firstModel.aspect_ratio || 'auto';
+        const total = ecommerceRerunState.items.length;
+        if (summary) summary.textContent = total ? `${resultPath ? '所选单组' : '整批'}共扫描到 ${total} 张废片待重做` : `${resultPath ? '所选单组' : '整批'}没有废片`;
+        renderEcommerceRerunList();
+        await loadEcommerceWasteStats();
+    } catch (e) {
+        if (summary) summary.textContent = `扫描失败：${e.message}`;
+        if (list) list.innerHTML = `<div class="ecommerce-empty">扫描失败：${ecommerceEscape(e.message)}</div>`;
+    }
+}
+
+function renderEcommerceRerunList() {
+    const list = document.getElementById('ecommerce-rerun-list');
+    if (!list) return;
+    const items = ecommerceRerunState.items;
+    if (!items.length) {
+        const last = ecommerceRerunState.bulkProgress || {};
+        list.innerHTML = `<div class="ecommerce-empty">没有废片，所有动作图都已补齐${last.total ? `<br><small>上次重做：成功${last.success || 0}张，失败${last.failed || 0}张</small>` : ''}</div>`;
+        return;
+    }
+    const grouped = new Map();
+    items.forEach((item, index) => {
+        if (!grouped.has(item.garment_id)) grouped.set(item.garment_id, []);
+        grouped.get(item.garment_id).push({ item, index });
+    });
+    const selectedCount = items.filter(item => ecommerceRerunState.selectedIds.has(item.id)).length;
+    const progress = ecommerceRerunState.bulkProgress || {};
+    const bulkModels = ecommerceRerunModelOptions(ecommerceRerunState.bulkPlatform || 'runninghub', ecommerceRerunState.bulkModelKey);
+    const groupsHtml = [...grouped.entries()].map(([garmentId, entries]) => {
+        const groupChecked = entries.every(({ item }) => ecommerceRerunState.selectedIds.has(item.id));
+        const markedCount = entries.filter(({ item }) => item.marked_redo).length;
+        const deletedCount = entries.length - markedCount;
+        const groupLabel = markedCount > 0 && deletedCount > 0
+            ? `${deletedCount}张废片 + ${markedCount}张标记重做｜本组全选`
+            : markedCount > 0
+                ? `${markedCount}张标记重做｜本组全选`
+                : `${entries.length}张废片｜本组全选`;
+        const rows = entries.map(({ item, index }) => {
+            const thumb = item.bad_photo_url
+                ? `<img class="ecommerce-rerun-thumb ecommerce-rerun-open-compare" src="${ecommerceEscape(ecommerceThumbnailUrl(item.bad_photo_url, 120))}" alt="${item.marked_redo ? '标记重做' : '废片'}" title="点击放大对比" loading="lazy" decoding="async">`
+                : '<span class="ecommerce-rerun-thumb" style="display:grid;place-items:center;color:#98a2b3;">无备份</span>';
+            const typeBadge = item.marked_redo
+                ? '<span class="ecommerce-rerun-type-badge is-marked" title="标记重做：原图保留，重做后替换">⚑ 标记</span>'
+                : item.also_marked_redo
+                    ? '<span class="ecommerce-rerun-type-badge is-waste" title="这张图同时被删除和手动标记，已合并为一个重做任务">✕废片 + ⚑标记</span>'
+                : '<span class="ecommerce-rerun-type-badge is-waste" title="废片：原图已删除">✕ 废片</span>';
+            // 抽卡模式：显示缺几张需要重做（samples_per_action > 1 时）
+            const samplesPerAction = parseInt(item.samples_per_action, 10) || 1;
+            const actualCount = parseInt(item.actual_count, 10) || 0;
+            const missingCount = parseInt(item.missing_count, 10) || 1;
+            const countBadge = samplesPerAction > 1
+                ? `<span class="ecommerce-rerun-count-badge" title="抽卡${samplesPerAction}张/动作 · 现存${actualCount}张 · 需补${missingCount}张">抽卡 ${actualCount}/${samplesPerAction} → 补${missingCount}</span>`
+                : '';
+            return `<div class="ecommerce-rerun-item ${index === ecommerceRerunState.activeIndex ? 'is-active' : ''} ${item.marked_redo ? 'is-marked-redo' : ''}" data-index="${index}">
+                <input type="checkbox" class="ecommerce-rerun-item-select" aria-label="选择这张${item.marked_redo ? '标记重做' : '废片'}" ${ecommerceRerunState.selectedIds.has(item.id) ? 'checked' : ''}>
+                <span class="ecommerce-rerun-index">${index + 1}</span>
+                <span class="ecommerce-rerun-name" title="${ecommerceEscape(item.garment_path || '')}">动作${item.action_order}</span>
+                <span class="ecommerce-rerun-action">${ecommerceEscape(item.action_name || '')}</span>
+                ${typeBadge}
+                ${countBadge}
+                ${thumb}
+                <button class="btn btn-outline btn-compact ecommerce-rerun-pick" type="button">调整参考图</button>
+            </div>`;
+        }).join('');
+        const firstItem = entries[0].item;
+        const groupResultPath = firstItem?.result_path || '';
+        const groupGarmentPath = firstItem?.garment_path || '';
+        return `<section class="ecommerce-rerun-group" data-garment-id="${ecommerceEscape(garmentId)}" data-result-path="${ecommerceEscape(groupResultPath)}" data-garment-path="${ecommerceEscape(groupGarmentPath)}">
+            <label class="ecommerce-rerun-group-head"><input type="checkbox" class="ecommerce-rerun-group-select" ${groupChecked ? 'checked' : ''}><strong>${ecommerceEscape(firstItem?.garment_name || '')}</strong><span>${groupLabel}</span></label>
+            <button class="btn btn-outline btn-compact ecommerce-rerun-folder-open" type="button" title="在访达中打开 ${ecommerceEscape(groupResultPath || groupGarmentPath)}">📁 打开文件夹</button>
+            ${rows}
+        </section>`;
+    }).join('');
+    list.innerHTML = `<div class="ecommerce-rerun-bulk-bar">
+        <div class="ecommerce-rerun-bulk-select"><label><input type="checkbox" id="ecommerce-rerun-select-all" ${selectedCount === items.length ? 'checked' : ''}> 全选</label><strong id="ecommerce-rerun-selected-count">已选 ${selectedCount}/${items.length}</strong></div>
+        <div class="ecommerce-rerun-bulk-model">
+            <select id="ecommerce-rerun-bulk-platform"><option value="runninghub" ${ecommerceRerunState.bulkPlatform === 'runninghub' ? 'selected' : ''}>RH</option><option value="oaihk" ${ecommerceRerunState.bulkPlatform === 'oaihk' ? 'selected' : ''}>HK</option></select>
+            <select id="ecommerce-rerun-bulk-model">${bulkModels}</select>
+            <select id="ecommerce-rerun-bulk-ratio">${ECOMMERCE_RERUN_RATIOS.map(ratio => `<option value="${ratio}" ${ratio === ecommerceRerunState.bulkRatio ? 'selected' : ''}>${ratio === 'auto' ? '自动' : ratio}</option>`).join('')}</select>
+        </div>
+        <div class="ecommerce-rerun-bulk-execution">
+            <label>并发 <input id="ecommerce-rerun-concurrency" type="number" min="1" max="99" value="${Math.max(1, Math.min(99, Number(ecommerceRerunState.bulkConcurrency) || 10))}"></label>
+            <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-auto-concurrency">按已选自动</button>
+            <small id="ecommerce-rerun-concurrency-hint">实际并发 = min(设定值, 已选${selectedCount}张)；每张独立重做，超过自动截断</small>
+        </div>
+        <textarea id="ecommerce-rerun-bulk-prompt" placeholder="批量补充提示词；留空时每张复用原提示词">${ecommerceEscape(ecommerceRerunState.bulkPrompt || '')}</textarea>
+        <button type="button" class="btn btn-primary btn-compact" id="btn-ecommerce-rerun-bulk" ${selectedCount ? '' : 'disabled'}>批量重做已选 ${selectedCount} 张</button>
+        <div class="ecommerce-rerun-progress" id="ecommerce-rerun-progress" ${progress.active || progress.total ? '' : 'hidden'}>
+            <div><span id="ecommerce-rerun-progress-label">${progress.active ? '正在重做' : '上次重做'} ${progress.completed || 0}/${progress.total || 0}</span><span id="ecommerce-rerun-progress-counts">成功${progress.success || 0} · 失败${progress.failed || 0}</span></div>
+            <div class="ecommerce-rerun-progress-track"><i id="ecommerce-rerun-progress-fill" style="width:${progress.total ? Math.round((progress.completed || 0) / progress.total * 100) : 0}%"></i></div>
+        </div>
+    </div>${groupsHtml}`;
+    list.querySelector('#ecommerce-rerun-select-all')?.addEventListener('change', event => {
+        ecommerceRerunState.selectedIds = event.target.checked ? new Set(items.map(item => item.id)) : new Set();
+        renderEcommerceRerunList();
+    });
+    list.querySelectorAll('.ecommerce-rerun-folder-open').forEach(button => {
+        button.addEventListener('click', async event => {
+            event.stopPropagation();
+            const section = button.closest('.ecommerce-rerun-group');
+            const path = section?.dataset.resultPath || '';
+            const garmentPath = section?.dataset.garmentPath || '';
+            const batch = (ecommerceState.batches || []).find(b => b.id === ecommerceRerunState.batchId);
+            const outputPath = batch?.output_path || '';
+            const originalText = button.textContent;
+            button.disabled = true;
+            button.textContent = '打开中…';
+            try {
+                const resp = await ecommerceApi('POST', '/api/ecommerce/open-folder', {
+                    path, garment_path: garmentPath, output_path: outputPath
+                });
+                if (resp.ok) showToast(`已打开: ${resp.path}`, 'success');
+                else showToast(resp.error || '打开文件夹失败', 'error');
+            } catch (e) {
+                showToast('打开文件夹失败: ' + e.message, 'error');
+            } finally {
+                button.disabled = false;
+                button.textContent = originalText;
+            }
+        });
+    });
+    list.querySelectorAll('.ecommerce-rerun-group-select').forEach(input => input.addEventListener('change', event => {
+        event.stopPropagation();
+        const groupId = event.currentTarget.closest('.ecommerce-rerun-group').dataset.garmentId;
+        items.filter(item => item.garment_id === groupId).forEach(item => {
+            if (event.currentTarget.checked) ecommerceRerunState.selectedIds.add(item.id);
+            else ecommerceRerunState.selectedIds.delete(item.id);
+        });
+        renderEcommerceRerunList();
+    }));
+    list.querySelectorAll('.ecommerce-rerun-item-select').forEach(input => input.addEventListener('change', event => {
+        event.stopPropagation();
+        const item = items[Number(event.currentTarget.closest('.ecommerce-rerun-item').dataset.index)];
+        if (event.currentTarget.checked) ecommerceRerunState.selectedIds.add(item.id);
+        else ecommerceRerunState.selectedIds.delete(item.id);
+        renderEcommerceRerunList();
+    }));
+    list.querySelector('#ecommerce-rerun-bulk-prompt')?.addEventListener('input', event => { ecommerceRerunState.bulkPrompt = event.target.value; });
+    list.querySelector('#ecommerce-rerun-bulk-platform')?.addEventListener('change', event => {
+        ecommerceRerunState.bulkPrompt = list.querySelector('#ecommerce-rerun-bulk-prompt')?.value || '';
+        ecommerceRerunState.bulkPlatform = event.target.value;
+        ecommerceRerunState.bulkModelKey = (event.target.value === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : ECOMMERCE_RERUN_HK_MODEL_KEYS)[0];
+        renderEcommerceRerunList();
+    });
+    list.querySelector('#ecommerce-rerun-bulk-model')?.addEventListener('change', event => { ecommerceRerunState.bulkModelKey = event.target.value; });
+    list.querySelector('#ecommerce-rerun-bulk-ratio')?.addEventListener('change', event => { ecommerceRerunState.bulkRatio = event.target.value; });
+    const updateRerunConcurrencyHint = () => {
+        const currentSelected = ecommerceRerunState.items.filter(item => ecommerceRerunState.selectedIds.has(item.id)).length;
+        const inputVal = Math.max(1, Math.min(99, Number(list.querySelector('#ecommerce-rerun-concurrency')?.value) || 1));
+        const effective = Math.min(inputVal, Math.max(1, currentSelected));
+        const hint = list.querySelector('#ecommerce-rerun-concurrency-hint');
+        if (hint) hint.textContent = currentSelected
+            ? `实际并发 = min(${inputVal}, 已选${currentSelected}张) = ${effective}；每张独立重做，超过自动截断`
+            : '请先勾选要重做的废片';
+    };
+    list.querySelector('#ecommerce-rerun-concurrency')?.addEventListener('change', event => {
+        ecommerceRerunState.bulkConcurrency = Math.max(1, Math.min(99, Number(event.target.value) || 1));
+        event.target.value = String(ecommerceRerunState.bulkConcurrency);
+        updateRerunConcurrencyHint();
+    });
+    list.querySelector('#ecommerce-rerun-concurrency')?.addEventListener('input', updateRerunConcurrencyHint);
+    list.querySelector('#btn-ecommerce-rerun-auto-concurrency')?.addEventListener('click', () => {
+        ecommerceRerunState.bulkConcurrency = Math.max(1, Math.min(99, selectedCount || 1));
+        const input = list.querySelector('#ecommerce-rerun-concurrency');
+        if (input) input.value = String(ecommerceRerunState.bulkConcurrency);
+        updateRerunConcurrencyHint();
+        showToast(`已按待重做数量设为 ${ecommerceRerunState.bulkConcurrency} 并发`, 'success');
+    });
+    updateRerunConcurrencyHint();
+    list.querySelector('#btn-ecommerce-rerun-bulk')?.addEventListener('click', bulkRegenerateEcommerceSelected);
+    list.querySelectorAll('.ecommerce-rerun-item').forEach(row => {
+        row.addEventListener('click', event => {
+            if (event.target.closest('input')) return;
+            const idx = Number(row.dataset.index);
+            ecommerceRerunState.activeIndex = idx;
+            list.querySelector('.ecommerce-rerun-item.is-active')?.classList.remove('is-active');
+            row.classList.add('is-active');
+            renderEcommerceRerunCompare(idx);
+        });
+    });
+    list.querySelectorAll('.ecommerce-rerun-open-compare').forEach(img => img.addEventListener('click', e => {
+        e.stopPropagation();
+        openEcommerceImageCompare(Number(e.currentTarget.closest('.ecommerce-rerun-item').dataset.index), 1);
+    }));
+}
+
+const ECOMMERCE_RERUN_RH_MODEL_KEYS = [
+    'rhart-image-n-g31-flash/image-to-image-2k', 'rhart-image-n-g31-flash/image-to-image-4k',
+    'rhart-image-n-g31-flash-official/image-to-image-2k', 'rhart-image-n-g31-flash-official/image-to-image-4k',
+    'rhart-image-n-pro/edit-2k', 'rhart-image-n-pro/edit-4k',
+    'rhart-image-g-2/image-to-image-2k', 'rhart-image-g-2/image-to-image-4k',
+    'rhart-image-g-2-official/image-to-image-2k', 'rhart-image-g-2-official/image-to-image-4k'
+];
+const ECOMMERCE_RERUN_HK_MODEL_KEYS = [
+    'fal-ai/banana/v3.1/flash', 'fal-ai/banana/v3.1/flash/2k', 'fal-ai/banana/v3.1/flash/4k',
+    'fal-ai/banana/v2', 'fal-ai/banana/v2/2k', 'fal-ai/banana/v2/4k',
+    'gpt-image-2', 'gpt-image-2/2k', 'gpt-image-2/4k'
+];
+const ECOMMERCE_RERUN_RATIOS = ['auto','3:4','4:3','2:3','3:2','1:1','9:16','16:9','4:5','5:4','21:9'];
+
+function ecommerceRerunModelOptions(platform, selected) {
+    const catalog = platform === 'runninghub' ? RH_MODELS : OAIHK_MODELS;
+    const keys = platform === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : ECOMMERCE_RERUN_HK_MODEL_KEYS;
+    return keys.filter(key => catalog[key]).map(key => {
+        const model = catalog[key];
+        const label = `${model.shortName || model.name || key}${model.price ? `｜${model.price}` : ''}`;
+        return `<option value="${ecommerceEscape(key)}" ${key === selected ? 'selected' : ''}>${ecommerceEscape(label)}</option>`;
+    }).join('');
+}
+
+function updateEcommerceRerunProgress() {
+    const progress = ecommerceRerunState.bulkProgress || {};
+    const root = document.getElementById('ecommerce-rerun-progress');
+    if (root) root.hidden = !(progress.active || progress.total);
+    const label = document.getElementById('ecommerce-rerun-progress-label');
+    if (label) label.textContent = `${progress.active ? '正在重做' : '重做完成'} ${progress.completed || 0}/${progress.total || 0}`;
+    const counts = document.getElementById('ecommerce-rerun-progress-counts');
+    if (counts) {
+        const retryText = progress.retrying ? ` · 重试${progress.retrying}` : '';
+        counts.textContent = `成功${progress.success || 0} · 失败${progress.failed || 0}${retryText}`;
+    }
+    const fill = document.getElementById('ecommerce-rerun-progress-fill');
+    if (fill) fill.style.width = `${progress.total ? Math.round((progress.completed || 0) / progress.total * 100) : 0}%`;
+}
+
+async function bulkRegenerateEcommerceSelected() {
+    const selectedItems = ecommerceRerunState.items.filter(item => ecommerceRerunState.selectedIds.has(item.id));
+    if (!selectedItems.length) return showToast('请至少勾选一张废片', 'error');
+    const prompt = document.getElementById('ecommerce-rerun-bulk-prompt')?.value.trim() || '';
+    ecommerceRerunState.bulkPrompt = prompt;
+    const platform = ecommerceRerunState.bulkPlatform || 'runninghub';
+    const modelKey = ecommerceRerunState.bulkModelKey;
+    const ratio = ecommerceRerunState.bulkRatio || 'auto';
+    const modelSelect = document.getElementById('ecommerce-rerun-bulk-model');
+    const modelLabel = modelSelect?.selectedOptions?.[0]?.textContent || modelKey;
+    const concurrency = Math.max(1, Math.min(99, Number(document.getElementById('ecommerce-rerun-concurrency')?.value) || ecommerceRerunState.bulkConcurrency || 10));
+    // 流程级保证：并发永远不超过待重做数量，且每张独立重做无需倍数对齐
+    const effectiveConcurrency = Math.min(concurrency, selectedItems.length);
+    ecommerceRerunState.bulkConcurrency = concurrency;
+    if (!modelKey) return showToast('请选择批量重做模型', 'error');
+    const concurrencyNote = effectiveConcurrency < concurrency ? `（实际${effectiveConcurrency}，超过待重做数量自动截断）` : '';
+    if (!confirm(`确定批量重做 ${selectedItems.length} 张废片？\n\n平台/模型：${platform === 'runninghub' ? 'RH' : 'HK'} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${concurrency}${concurrencyNote}\n\n这会产生 ${selectedItems.length} 次生图费用。`)) return;
+    const button = document.getElementById('btn-ecommerce-rerun-bulk');
+    if (button) button.disabled = true;
+    const list = document.getElementById('ecommerce-rerun-list');
+    if (list) {
+        list.classList.add('is-running');
+        list.querySelectorAll('input, select, textarea, button').forEach(control => { if (control !== button) control.disabled = true; });
+    }
+    let cursor = 0;
+    const failures = [];
+    ecommerceRerunState.bulkProgress = { active: true, total: selectedItems.length, completed: 0, success: 0, failed: 0, retrying: 0 };
+    updateEcommerceRerunProgress();
+    // 前端再包一层重试：后端内部已有3次重试，这里对整个请求再重试1次，
+    // 处理偶发的网络断开或服务端进程重启等极端情况。
+    const callRegenerateWithRetry = async (item, referenceImages, prompt) => {
+        const maxFrontRetries = 2;
+        // 抽卡模式：按缺失张数生成（item.missing_count 来自 scan-deleted）
+        const rerunCount = Math.max(1, Math.min(parseInt(item.missing_count, 10) || 1, 5));
+        let lastError = '';
+        for (let attempt = 1; attempt <= maxFrontRetries; attempt++) {
+            try {
+                return await ecommerceApi('POST', '/api/ecommerce/regenerate', {
+                    batch_id: ecommerceRerunState.batchId,
+                    item_id: item.id,
+                    result_path: item.result_path || '',
+                    mark_id: item.mark_id || '',
+                    marked_result_path: item.marked_result_path || '',
+                    mode: 'full',
+                    prompt: prompt,
+                    reference_images: referenceImages,
+                    count: rerunCount,
+                    model_override: { platform, model_key: modelKey, aspect_ratio: ratio }
+                }, 600000);
+            } catch (error) {
+                lastError = error.message || String(error);
+                if (attempt < maxFrontRetries) {
+                    ecommerceRerunState.bulkProgress.retrying = (ecommerceRerunState.bulkProgress.retrying || 0) + 1;
+                    updateEcommerceRerunProgress();
+                    ecommerceToast(`${item.garment_name}·动作${item.action_order} 第${attempt}次失败，5秒后整体重试…`);
+                    await new Promise(r => setTimeout(r, 5000));
+                }
+            }
+        }
+        throw new Error(lastError);
+    };
+    const runOne = async () => {
+        while (cursor < selectedItems.length) {
+            const item = selectedItems[cursor++];
+            const singleSource = ['target_only', 'garment_prompt'].includes(item.generation_mode);
+            const referenceImages = singleSource ? [] : (item.references || [])
+                .filter(reference => reference.selected !== false)
+                .map(reference => reference.override_url || reference.url)
+                .filter(Boolean);
+            if (!singleSource && !referenceImages.length) {
+                failures.push(`${item.garment_name}·动作${item.action_order}：没有可用服装参考图`);
+                ecommerceRerunState.bulkProgress.failed += 1;
+                ecommerceRerunState.bulkProgress.completed += 1;
+                updateEcommerceRerunProgress();
+                continue;
+            }
+            try {
+                await callRegenerateWithRetry(item, referenceImages, String(item.rerun_prompt || '').trim() || prompt);
+                ecommerceRerunState.bulkProgress.success += 1;
+            } catch (error) {
+                failures.push(`${item.garment_name}·动作${item.action_order}：${error.message}`);
+                ecommerceRerunState.bulkProgress.failed += 1;
+            }
+            ecommerceRerunState.bulkProgress.completed += 1;
+            updateEcommerceRerunProgress();
+            if (button) button.textContent = `批量重做 ${ecommerceRerunState.bulkProgress.completed}/${selectedItems.length}`;
+        }
+    };
+    try {
+        await Promise.all(Array.from({ length: effectiveConcurrency }, () => runOne()));
+        const totalRetries = ecommerceRerunState.bulkProgress.retrying || 0;
+        if (failures.length) {
+            const retryNote = totalRetries ? `（自动重试${totalRetries}次后仍失败）` : '';
+            showToast(`批量重做完成：成功${selectedItems.length - failures.length}张，失败${failures.length}张${retryNote}；失败项仍保留在列表`, 'warning');
+            console.warn('[ecommerce-rerun-bulk] failures', failures);
+        } else {
+            const retryNote = totalRetries ? `（其中自动重试成功${totalRetries}次）` : '';
+            showToast(`已完成${selectedItems.length}张废片批量重做${retryNote}`, 'success');
+        }
+        await scanEcommerceRerun();
+        // 重做完成后刷新主结果列表，确保新生成的图片立即可见
+        try { await refreshEcommerceBatch(); } catch (e) { console.warn('[rerun-bulk] refresh batch failed', e); }
+    } finally {
+        ecommerceRerunState.bulkProgress.active = false;
+        updateEcommerceRerunProgress();
+        if (list) list.classList.remove('is-running');
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = `批量重做已选 ${selectedItems.length} 张`;
+        }
+    }
+}
+
+function renderEcommerceRerunCompare(index) {
+    const list = document.getElementById('ecommerce-rerun-list');
+    const item = ecommerceRerunState.items[index];
+    if (!item || !list) return;
+    const existing = list.querySelector('.ecommerce-rerun-compare');
+    const targetOnly = ['target_only', 'garment_prompt'].includes(item.generation_mode);
+    const sourceReferenceLabel = item.generation_mode === 'garment_prompt' ? '原始服装图' : '原始目标图';
+    const refs = (item.references || []).map((ref, i) => {
+        const url = ref.override_url || ref.url;
+        return `<div class="ecommerce-rerun-ref ${ref.is_detail ? 'is-detail' : ''} ${ref.override_url ? 'is-cropped' : ''} ${ref.temporary_url ? 'is-temporary' : ''}" data-ref-index="${i}">
+            <img class="ecommerce-rerun-open-ref" src="${ecommerceEscape(ecommerceThumbnailUrl(url || '', 220))}" alt="参考${i + 1}" title="${targetOnly ? '点击放大，与AI生成图对比' : '点击放大，与AI生成图对比；放大后可裁剪或临时换图'}" loading="lazy" decoding="async">
+            ${targetOnly ? `<span class="ecommerce-rerun-ref-state">${sourceReferenceLabel}</span>` : `<label class="ecommerce-rerun-ref-check"><input type="checkbox" class="ecommerce-rerun-ref-use" ${ref.selected === false ? '' : 'checked'}>使用${ref.is_detail ? '·细节' : ''}</label>`}
+            ${ref.override_url ? '<span class="ecommerce-rerun-ref-state">已裁剪</span>' : ref.temporary_url ? '<span class="ecommerce-rerun-ref-state">临时图</span>' : ''}
+        </div>`;
+    }).join('');
+    const compare = document.createElement('div');
+    compare.className = 'ecommerce-rerun-compare';
+    compare.innerHTML = `
+        <div class="ecommerce-rerun-compare-head">
+            <strong>重新调整参考图重做 · ${ecommerceEscape(item.garment_name)} · 动作${item.action_order}</strong>
+            <div class="ecommerce-rerun-system-actions"><button type="button" class="btn btn-outline btn-compact ecommerce-preview-bad">系统预览废片</button><button type="button" class="btn btn-outline btn-compact ecommerce-preview-refs">系统预览参考组</button></div>
+        </div>
+        <p class="ecommerce-rerun-adjust-hint">${targetOnly ? `重做仍使用${sourceReferenceLabel}+提示词；只有点击批量重做后才会生图扣费。` : '这里只调整本次重做的参考图和单张补充提示词，不会立即生图或扣费。同套服装的裁剪、临时换图和参考图勾选会同步给本组所有废片。'}</p>
+        <div class="ecommerce-rerun-compare-grid">
+            <div class="ecommerce-rerun-compare-col">
+                <h4>AI生成图（废片缓存）</h4>
+                ${item.bad_photo_url ? `<img class="ecommerce-rerun-compare-img" src="${ecommerceEscape(ecommerceThumbnailUrl(item.bad_photo_url, 720))}" alt="废片">` : '<div class="ecommerce-empty" style="padding:14px;">无备份（可能未走批量生成）</div>'}
+            </div>
+            <div class="ecommerce-rerun-compare-col">
+                <h4>${targetOnly ? `${sourceReferenceLabel}（点击放大对比）` : '服装参考图（点击任意一张进入大图对比、裁剪或临时换图）'}</h4>
+                <div class="ecommerce-rerun-refs">${refs}</div>
+                ${targetOnly ? '' : `<button type="button" class="btn btn-outline btn-compact ecommerce-rerun-add-detail" ${item.references.length >= 9 ? 'disabled' : ''}>＋ 添加局部细节图</button>`}
+            </div>
+        </div>
+        <textarea class="ecommerce-rerun-prompt" placeholder="可选：这一张的单独纠错要求；留空时使用上方批量提示词，上方也留空则复用原提示词">${ecommerceEscape(item.rerun_prompt || '')}</textarea>
+        <div class="ecommerce-rerun-actions">
+            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-adjustments">保存调整并勾选这一张</button>
+            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-next-group" style="background:#16a34a;border-color:#16a34a;">保存整组并跳到下一组 →</button>
+            <button class="btn btn-outline btn-compact" type="button" id="btn-ecommerce-rerun-cancel">取消调整</button>
+        </div>`;
+    // 如果已有对比面板，替换它（保持位置不变）；否则追加到列表末尾
+    if (existing) {
+        existing.replaceWith(compare);
+    } else {
+        list.appendChild(compare);
+    }
+    // 显示当前是第几组/共几组
+    const allGarmentIds = [...new Set(ecommerceRerunState.items.map(i => i.garment_id))];
+    const currentGroupIdx = allGarmentIds.indexOf(item.garment_id);
+    const groupInfo = compare.querySelector('.ecommerce-rerun-compare-head strong');
+    if (groupInfo && allGarmentIds.length > 1) {
+        groupInfo.textContent = `重新调整参考图重做 · ${item.garment_name} · 动作${item.action_order} · 第${currentGroupIdx + 1}/${allGarmentIds.length} 组`;
+    }
+    compare.querySelector('.ecommerce-preview-bad')?.addEventListener('click', () => openEcommerceSystemPreview([item.bad_photo_path]));
+    compare.querySelector('.ecommerce-preview-refs')?.addEventListener('click', () => openEcommerceSystemPreview(
+        (item.references || []).filter(ref => ref.selected !== false).map(ref => ref.override_path || ref.path)
+    ));
+    compare.querySelector('.ecommerce-rerun-compare-img[alt="废片"]')?.addEventListener('click', () => openEcommerceImageCompare(index, 0));
+    compare.querySelectorAll('.ecommerce-rerun-open-ref').forEach(img => img.addEventListener('click', e => {
+        openEcommerceImageCompare(index, Number(e.currentTarget.closest('.ecommerce-rerun-ref').dataset.refIndex) + 1);
+    }));
+    compare.querySelector('.ecommerce-rerun-prompt')?.addEventListener('input', event => { item.rerun_prompt = event.target.value; });
+    compare.querySelectorAll('.ecommerce-rerun-ref-use').forEach(input => input.addEventListener('change', () => {
+        const refIndex = Number(input.closest('.ecommerce-rerun-ref').dataset.refIndex);
+        ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id).forEach(entry => {
+            if (entry.references?.[refIndex]) entry.references[refIndex].selected = input.checked;
+        });
+    }));
+    compare.querySelector('#btn-ecommerce-rerun-cancel')?.addEventListener('click', () => { compare.remove(); ecommerceRerunState.activeIndex = -1; renderEcommerceRerunList(); });
+    compare.querySelector('.ecommerce-rerun-add-detail')?.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.multiple = true;
+        input.onchange = async () => {
+            const files = [...(input.files || [])].slice(0, Math.max(0, 9 - item.references.length));
+            for (const file of files) {
+                try {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    formData.append('batch_id', ecommerceRerunState.batchId);
+                    const res = await fetch('/api/ecommerce/upload-temp-image', { method: 'POST', body: formData });
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok || !data.url) throw new Error(data.error || '上传失败');
+                    const relatedItems = ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id);
+                    relatedItems.forEach(entry => {
+                        entry.references = entry.references || [];
+                        if (entry.references.length < 9 && !entry.references.some(ref => (ref.override_url || ref.url) === data.url)) {
+                            entry.references.push({ url: data.url, path: data.path, override_url: '', override_path: '', selected: true, is_detail: true });
+                        }
+                    });
+                } catch (error) {
+                    showToast(`细节图上传失败：${error.message}`, 'error');
+                }
+            }
+            renderEcommerceRerunCompare(index);
+        };
+        input.click();
+    });
+    compare.querySelector('#btn-ecommerce-rerun-save-adjustments')?.addEventListener('click', () => {
+        const referenceImages = (item.references || []).filter(reference => reference.selected !== false);
+        if (!targetOnly && !referenceImages.length) return showToast('请至少保留一张服装参考图', 'error');
+        item.rerun_prompt = compare.querySelector('.ecommerce-rerun-prompt')?.value.trim() || '';
+        ecommerceRerunState.selectedIds.add(item.id);
+        compare.remove();
+        ecommerceRerunState.activeIndex = -1;
+        renderEcommerceRerunList();
+        showToast('已保存本次参考图调整并勾选该废片；点击上方批量重做才会扣费', 'success');
+    });
+    // 保存整组并跳到下一组：勾选当前组的所有废片，自动展开下一组
+    compare.querySelector('#btn-ecommerce-rerun-save-next-group')?.addEventListener('click', () => {
+        const referenceImages = (item.references || []).filter(reference => reference.selected !== false);
+        if (!targetOnly && !referenceImages.length) return showToast('请至少保留一张服装参考图', 'error');
+        const promptValue = compare.querySelector('.ecommerce-rerun-prompt')?.value.trim() || '';
+        // 1. 保存调整：把提示词同步给同组所有废片
+        const sameGroupItems = ecommerceRerunState.items.filter(i => i.garment_id === item.garment_id);
+        sameGroupItems.forEach(i => {
+            i.rerun_prompt = promptValue;
+            // 参考图已经自动同步过了，这里只勾选
+            ecommerceRerunState.selectedIds.add(i.id);
+        });
+        // 2. 找到下一组的第一张废片
+        const allGarmentIds = [...new Set(ecommerceRerunState.items.map(i => i.garment_id))];
+        const currentGroupIdx = allGarmentIds.indexOf(item.garment_id);
+        const nextGroupId = allGarmentIds[currentGroupIdx + 1];
+        // 3. 如果有下一组，保留对比面板位置不动，只更新内容为下一组的数据
+        if (nextGroupId) {
+            const nextIndex = ecommerceRerunState.items.findIndex(i => i.garment_id === nextGroupId);
+            if (nextIndex >= 0) {
+                // 记录当前滚动位置，防止页面跳动
+                const scrollY = window.scrollY;
+                // 更新activeIndex为下一组，然后重新渲染对比面板（会原地替换）
+                ecommerceRerunState.activeIndex = nextIndex;
+                renderEcommerceRerunCompare(nextIndex);
+                // 恢复滚动位置，保持界面不动
+                window.scrollTo(0, scrollY);
+                showToast(`已勾选整组 ${item.garment_name}（${sameGroupItems.length}张），已切换到下一组`, 'success');
+            }
+        } else {
+            // 没有下一组了，移除对比面板，提示用户可以批量重做
+            compare.remove();
+            ecommerceRerunState.activeIndex = -1;
+            renderEcommerceRerunList();
+            showToast(`已勾选整组 ${item.garment_name}（${sameGroupItems.length}张），所有组已处理完，可以批量重做了`, 'success');
+        }
+    });
+}
+
+document.getElementById('btn-ecommerce-rerun-scan')?.addEventListener('click', () => {
+    const input = document.getElementById('ecommerce-rerun-result-path');
+    if (input) input.value = '';
+    scanEcommerceRerun();
+});
+document.getElementById('btn-ecommerce-rerun-scan-single')?.addEventListener('click', () => {
+    if (!document.getElementById('ecommerce-rerun-result-path')?.value.trim()) return showToast('请先从上方打开一组结果，或选择单组结果文件夹', 'error');
+    scanEcommerceRerun();
+});
+document.getElementById('btn-ecommerce-rerun-select-folder')?.addEventListener('click', () => chooseEcommerceFolder('ecommerce-rerun-result-path'));
+document.getElementById('btn-ecommerce-rerun-refresh')?.addEventListener('click', async event => {
+    const button = event.currentTarget;
+    const select = document.getElementById('ecommerce-rerun-batch-select');
+    const selectedBatchId = select?.value || ecommerceRerunState.batchId || '';
+    if (!selectedBatchId) return showToast('请先选择要重新扫描的批次', 'error');
+    const oldText = button.textContent;
+    button.disabled = true;
+    button.textContent = '刷新并扫描中…';
+    try {
+        ecommerceRerunState.batchId = selectedBatchId;
+        await loadEcommerceModeData(true);
+        renderEcommerceRerunBatchOptions();
+        if (select) select.value = selectedBatchId;
+        await scanEcommerceRerun();
+    } finally {
+        button.disabled = false;
+        button.textContent = oldText;
+    }
+});
+document.getElementById('btn-ecommerce-rerun-expand')?.addEventListener('click', event => {
+    const card = document.querySelector('.ecommerce-card-rerun');
+    if (!card) return;
+    const expanded = card.classList.toggle('is-expanded');
+    document.body.classList.toggle('ecommerce-rerun-expanded', expanded);
+    event.currentTarget.textContent = expanded ? '退出放大' : '放大验片';
+});
+document.getElementById('ecommerce-rerun-batch-select')?.addEventListener('change', async e => {
+    if (!e.target.value) return;
+    ecommerceState.currentBatchId = e.target.value;
+    // 同步主批次选择器（避免两个下拉框不一致）
+    const mainSelect = document.getElementById('ecommerce-batch-select');
+    if (mainSelect && mainSelect.value !== e.target.value) {
+        mainSelect.value = e.target.value;
+    }
+    // 清理废片重做状态，避免上一批次的 items/selectedIds 残留
+    ecommerceRerunState.batchId = e.target.value;
+    ecommerceRerunState.items = [];
+    ecommerceRerunState.selectedIds = new Set();
+    ecommerceRerunState.activeIndex = -1;
+    ecommerceRerunState.compareRefIndex = 0;
+    ecommerceRerunState.bulkProgress = { done: 0, total: 0, failed: 0, retrying: 0 };
+    // 清空列表 UI
+    const rerunList = document.getElementById('ecommerce-rerun-list');
+    if (rerunList) rerunList.innerHTML = '<div class="ecommerce-empty">点击「扫描废片」开始</div>';
+    const rerunSummary = document.getElementById('ecommerce-rerun-summary');
+    if (rerunSummary) rerunSummary.textContent = '';
+    await refreshEcommerceBatch();
+});
+document.getElementById('ecommerce-reference-close')?.addEventListener('click', closeEcommerceReferenceReview);
+document.getElementById('ecommerce-reference-overlay')?.addEventListener('click', e => {
+    if (e.target === e.currentTarget) closeEcommerceReferenceReview();
+});
+document.getElementById('ecommerce-reference-prev')?.addEventListener('click', e => { e.stopPropagation(); ecommerceReferenceReview.index -= 1; updateEcommerceReferenceReview(); });
+document.getElementById('ecommerce-reference-next')?.addEventListener('click', e => { e.stopPropagation(); ecommerceReferenceReview.index += 1; updateEcommerceReferenceReview(); });
+document.getElementById('ecommerce-compare-close')?.addEventListener('click', closeEcommerceImageCompare);
+document.getElementById('ecommerce-compare-prev-garment')?.addEventListener('click', e => { e.stopPropagation(); switchEcommerceCompareGarment(-1); });
+document.getElementById('ecommerce-compare-next-garment')?.addEventListener('click', e => { e.stopPropagation(); switchEcommerceCompareGarment(1); });
+document.getElementById('ecommerce-compare-delete')?.addEventListener('click', e => { e.stopPropagation(); deleteEcommerceCurrentResult(); });
+document.getElementById('ecommerce-compare-mark-redo')?.addEventListener('click', e => { e.stopPropagation(); markEcommerceCurrentRedo(); });
+document.getElementById('ecommerce-compare-overlay')?.addEventListener('click', e => {
+    // 不再因为点击背景而自动关闭——只能通过 ESC 键或 × 按钮关闭
+    // 避免用户整理图片时不小心点到空白区域导致退出，需要重新打开
+    e.stopPropagation();
+});
+document.querySelectorAll('.ecommerce-compare-zoom-controls').forEach(control => {
+    control.addEventListener('click', event => {
+        event.stopPropagation();
+        const side = control.dataset.zoomSide;
+        const action = event.target.closest('[data-zoom-action]')?.dataset.zoomAction;
+        if (!action) return;
+        if (action === 'fit' || action === 'reset') {
+            setEcommerceCompareZoom(side, 1);
+        } else if (action === 'in') {
+            setEcommerceCompareZoom(side, ecommerceCompareZoomState[side] + 0.5);
+        } else if (action === 'out') {
+            setEcommerceCompareZoom(side, ecommerceCompareZoomState[side] - 0.5);
+        } else {
+            const targetZoom = Number(action);
+            if (targetZoom > 0) setEcommerceCompareZoom(side, targetZoom);
+        }
+    });
+});
+['reference', 'result'].forEach(side => {
+    const imageId = side === 'result' ? 'ecommerce-compare-bad-image' : 'ecommerce-compare-reference-image';
+    const scroller = document.querySelector(`.ecommerce-compare-image-scroll[data-zoom-side="${side}"]`);
+    const image = document.getElementById(imageId);
+    if (!image || !scroller) return;
+    const dragState = { dragging: false, startX: 0, startY: 0, panX: 0, panY: 0, moved: false, pointerId: -1, lastClick: 0 };
+    scroller.addEventListener('wheel', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        const step = event.shiftKey ? 0.25 : 0.1;
+        const delta = event.deltaY < 0 ? step : -step;
+        const newZoom = Math.max(0.5, Math.min(4, ecommerceCompareZoomState[side] + delta));
+        if (Math.abs(newZoom - ecommerceCompareZoomState[side]) > 0.001) {
+            const rect = scroller.getBoundingClientRect();
+            const cursorX = event.clientX - rect.left;
+            const cursorY = event.clientY - rect.top;
+            const centerX = rect.width / 2;
+            const centerY = rect.height / 2;
+            const pan = ecommerceComparePanState[side];
+            const oldZoom = ecommerceCompareZoomState[side];
+            const scale = newZoom / oldZoom;
+            pan.x = cursorX - centerX - (cursorX - centerX - pan.x) * scale;
+            pan.y = cursorY - centerY - (cursorY - centerY - pan.y) * scale;
+            ecommerceCompareZoomState[side] = newZoom;
+            applyEcommerceCompareZoom(side, false);
+        }
+    }, { passive: false, capture: true });
+    scroller.addEventListener('pointerdown', event => {
+        if (event.button !== 0) return;
+        dragState.dragging = true;
+        dragState.startX = event.clientX;
+        dragState.startY = event.clientY;
+        dragState.panX = ecommerceComparePanState[side].x;
+        dragState.panY = ecommerceComparePanState[side].y;
+        dragState.moved = false;
+        dragState.pointerId = event.pointerId;
+        scroller.classList.add('is-grabbing');
+        try { scroller.setPointerCapture(event.pointerId); } catch(e) {}
+    });
+    scroller.addEventListener('pointermove', event => {
+        if (!dragState.dragging) return;
+        const dx = event.clientX - dragState.startX;
+        const dy = event.clientY - dragState.startY;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragState.moved = true;
+        ecommerceComparePanState[side].x = dragState.panX + dx;
+        ecommerceComparePanState[side].y = dragState.panY + dy;
+        applyEcommerceComparePan(side);
+    });
+    const endDrag = event => {
+        if (!dragState.dragging) return;
+        dragState.dragging = false;
+        scroller.classList.remove('is-grabbing');
+        try { if (scroller.hasPointerCapture(event.pointerId)) scroller.releasePointerCapture(event.pointerId); } catch(e) {}
+    };
+    scroller.addEventListener('pointerup', endDrag);
+    scroller.addEventListener('pointercancel', endDrag);
+    scroller.addEventListener('click', event => {
+        if (dragState.moved) { dragState.moved = false; event.preventDefault(); event.stopPropagation(); return; }
+        event.stopPropagation();
+        const now = Date.now();
+        if (now - dragState.lastClick < 350) {
+            setEcommerceCompareZoom(side, 1);
+            dragState.lastClick = 0;
+            return;
+        }
+        dragState.lastClick = now;
+        const cur = ecommerceCompareZoomState[side];
+        if (cur > 1.8) setEcommerceCompareZoom(side, 1);
+        else setEcommerceCompareZoom(side, 2);
+    });
+});
+document.getElementById('ecommerce-compare-prev')?.addEventListener('click', e => {
+    e.stopPropagation();
+    const groupMode = ecommerceGroupCompareState.mode === 'group';
+    const item = !groupMode ? ecommerceRerunState.items[ecommerceRerunState.activeIndex] : null;
+    const refCount = groupMode ? (ecommerceGroupCompareState.data?.references?.length || 1) : ((item?.references?.length || 0) + 1);
+    if (groupMode) ecommerceGroupCompareState.refIndex = (ecommerceGroupCompareState.refIndex - 1 + refCount) % refCount;
+    else ecommerceRerunState.compareRefIndex = (ecommerceRerunState.compareRefIndex - 1 + refCount) % refCount;
+    updateEcommerceImageCompare();
+});
+document.getElementById('ecommerce-compare-next')?.addEventListener('click', e => {
+    e.stopPropagation();
+    const groupMode = ecommerceGroupCompareState.mode === 'group';
+    const item = !groupMode ? ecommerceRerunState.items[ecommerceRerunState.activeIndex] : null;
+    const refCount = groupMode ? (ecommerceGroupCompareState.data?.references?.length || 1) : ((item?.references?.length || 0) + 1);
+    if (groupMode) ecommerceGroupCompareState.refIndex = (ecommerceGroupCompareState.refIndex + 1) % refCount;
+    else ecommerceRerunState.compareRefIndex = (ecommerceRerunState.compareRefIndex + 1) % refCount;
+    updateEcommerceImageCompare();
+});
+document.getElementById('ecommerce-compare-result-prev')?.addEventListener('click', event => {
+    event.stopPropagation();
+    navigateEcommerceResult(-1);
+});
+document.getElementById('ecommerce-compare-result-next')?.addEventListener('click', event => {
+    event.stopPropagation();
+    navigateEcommerceResult(1);
+});
+
+async function navigateEcommerceResult(delta) {
+    const results = ecommerceGroupCompareState.data?.results || [];
+    const count = results.length || 1;
+    const nextIdx = ecommerceGroupCompareState.resultIndex + delta;
+    if (nextIdx >= 0 && nextIdx < results.length) {
+        ecommerceGroupCompareState.resultIndex = nextIdx;
+        updateEcommerceImageCompare();
+        return;
+    }
+    if (delta < 0 && nextIdx < 0) {
+        ecommerceGroupCompareState.resultIndex = count - 1;
+        updateEcommerceImageCompare();
+        return;
+    }
+    if (delta > 0 && nextIdx >= results.length) {
+        const garments = ecommerceGroupCompareState.garmentList || [];
+        const gIdx = ecommerceGroupCompareState.currentGarmentIndex ?? -1;
+        if (gIdx < 0 || gIdx >= garments.length - 1) {
+            ecommerceToast('已经是最后一套了');
+            return;
+        }
+        const nextGarment = garments[gIdx + 1];
+        const ok = await ecommerceConfirm(`当前是"${ecommerceGroupCompareState.data?.garment_name || '本套'}"的最后一张。\n\n切换到下一套"${nextGarment.name || '下一套'}"？`);
+        if (!ok) return;
+        const switched = await switchEcommerceCompareGarment(1);
+        if (switched) ecommerceToast(`已切换到"${nextGarment.name || '下一套'}"`);
+    }
+}
+document.getElementById('ecommerce-compare-crop-ref')?.addEventListener('click', event => {
+    event.stopPropagation();
+    if (ecommerceGroupCompareState.mode === 'group') return;
+    const refIdx = ecommerceRerunState.compareRefIndex - 1;
+    if (refIdx < 0) return;
+    openEcommerceReferenceCrop(ecommerceRerunState.activeIndex, refIdx);
+});
+document.getElementById('ecommerce-compare-replace-ref')?.addEventListener('click', event => {
+    event.stopPropagation();
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.onchange = () => replaceEcommerceCompareReference(input.files?.[0]);
+    input.click();
+});
+document.getElementById('ecommerce-compare-restore-ref')?.addEventListener('click', event => {
+    event.stopPropagation();
+    restoreEcommerceCompareReference();
+});
+const ecommerceCompareReferenceImage = document.getElementById('ecommerce-compare-reference-image');
+ecommerceCompareReferenceImage?.addEventListener('dragover', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = 'copy';
+    event.currentTarget.closest('.ecommerce-compare-pane')?.classList.add('is-dragover');
+});
+ecommerceCompareReferenceImage?.addEventListener('dragleave', event => {
+    event.stopPropagation();
+    event.currentTarget.closest('.ecommerce-compare-pane')?.classList.remove('is-dragover');
+});
+ecommerceCompareReferenceImage?.addEventListener('drop', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.closest('.ecommerce-compare-pane')?.classList.remove('is-dragover');
+    replaceEcommerceCompareReference(event.dataTransfer?.files?.[0]);
+});
+document.getElementById('ecommerce-ref-crop-close')?.addEventListener('click', closeEcommerceReferenceCrop);
+document.getElementById('ecommerce-ref-crop-overlay')?.addEventListener('click', event => {
+    if (event.target === event.currentTarget) closeEcommerceReferenceCrop();
+});
+document.getElementById('ecommerce-ref-crop-reset')?.addEventListener('click', resetEcommerceReferenceCrop);
+document.getElementById('ecommerce-ref-crop-confirm')?.addEventListener('click', confirmEcommerceReferenceCrop);
+document.getElementById('ecommerce-ref-crop-scale')?.addEventListener('input', event => {
+    // 滑杆也保留，作为备用控制方式——控制图片缩放
+    // 滑杆值15-100映射到0.1-8.0
+    ecommerceRefCropState.imageZoom = Math.max(0.1, Number(event.target.value) / 12.5);
+    drawEcommerceReferenceCrop();
+});
+// 滚轮控制图片缩放（裁剪框固定）
+document.getElementById('ecommerce-ref-crop-canvas')?.addEventListener('wheel', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    // 每次滚轮变化0.15，范围0.1-12.0（可以缩小到比裁剪框还小，也可以放大到很大）
+    const delta = event.deltaY < 0 ? 0.15 : -0.15;
+    const newZoom = Math.max(0.1, Math.min(12, ecommerceRefCropState.imageZoom + delta));
+    if (newZoom !== ecommerceRefCropState.imageZoom) {
+        ecommerceRefCropState.imageZoom = newZoom;
+        // 同步滑杆值
+        const slider = document.getElementById('ecommerce-ref-crop-scale');
+        if (slider) slider.value = String(Math.round(newZoom * 12.5));
+        drawEcommerceReferenceCrop();
+    }
+}, { passive: false, capture: true });
+// 拖动图片（而非裁剪框）——图片移动，裁剪框固定在中央
+document.getElementById('ecommerce-ref-crop-canvas')?.addEventListener('pointerdown', event => {
+    const state = ecommerceRefCropState;
+    if (!state.image) return;
+    state.dragging = true;
+    state.pointerOffsetX = event.clientX;
+    state.pointerOffsetY = event.clientY;
+    state.dragStartOffsetX = state.imageOffsetX || 0;
+    state.dragStartOffsetY = state.imageOffsetY || 0;
+    try { event.currentTarget.setPointerCapture(event.pointerId); } catch(e) {}
+    event.currentTarget.classList.add('is-dragging');
+});
+document.getElementById('ecommerce-ref-crop-canvas')?.addEventListener('pointermove', event => {
+    const state = ecommerceRefCropState;
+    if (!state.dragging) return;
+    const dx = event.clientX - state.pointerOffsetX;
+    const dy = event.clientY - state.pointerOffsetY;
+    state.imageOffsetX = state.dragStartOffsetX + dx;
+    state.imageOffsetY = state.dragStartOffsetY + dy;
+    drawEcommerceReferenceCrop();
+});
+['pointerup', 'pointercancel'].forEach(name => document.getElementById('ecommerce-ref-crop-canvas')?.addEventListener(name, event => {
+    ecommerceRefCropState.dragging = false;
+    event.currentTarget.classList.remove('is-dragging');
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+}));
+document.addEventListener('keydown', e => {
+    const cropOverlay = document.getElementById('ecommerce-ref-crop-overlay');
+    if (cropOverlay && !cropOverlay.hidden) {
+        if (e.key === 'Escape') closeEcommerceReferenceCrop();
+        else if (e.key === 'Enter') {
+            e.preventDefault();
+            e.stopPropagation();
+            // 回车：确认裁剪并跳到下一张参考图
+            confirmEcommerceReferenceCropAndNext();
+        }
+        return;
+    }
+    const referenceOverlay = document.getElementById('ecommerce-reference-overlay');
+    if (referenceOverlay && !referenceOverlay.hidden) {
+        if (e.key === 'Escape') closeEcommerceReferenceReview();
+        if (e.key === 'ArrowLeft') document.getElementById('ecommerce-reference-prev')?.click();
+        if (e.key === 'ArrowRight') document.getElementById('ecommerce-reference-next')?.click();
+        return;
+    }
+    const overlay = document.getElementById('ecommerce-compare-overlay');
+    if (!overlay || overlay.hidden) {
+        const rerunCard = document.querySelector('.ecommerce-card-rerun.is-expanded');
+        if (rerunCard && e.key === 'Escape') document.getElementById('btn-ecommerce-rerun-expand')?.click();
+        return;
+    }
+    if (e.key === 'Escape') closeEcommerceImageCompare();
+    if (e.key === 'ArrowLeft') document.getElementById('ecommerce-compare-prev')?.click();
+    if (e.key === 'ArrowRight') document.getElementById('ecommerce-compare-next')?.click();
+    if (e.key === 'ArrowUp') { e.preventDefault(); navigateEcommerceResult(-1); }
+    if (e.key === 'ArrowDown') { e.preventDefault(); navigateEcommerceResult(1); }
+    if (e.key === 'Enter' && ecommerceGroupCompareState.mode === 'rerun') {
+        const tag = e.target?.tagName;
+        if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable) return;
+        e.preventDefault();
+        advanceEcommerceRerunReference();
+        return;
+    }
+    if (e.key === 'c' || e.key === 'C') {
+        const tag = e.target?.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable) return;
+        e.preventDefault();
+        const cropBtn = document.getElementById('ecommerce-compare-crop-ref');
+        if (cropBtn && !cropBtn.hidden) cropBtn.click();
+    }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+        const tag = e.target?.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable) return;
+        e.preventDefault();
+        deleteEcommerceCurrentResult();
+    }
+    if (e.key === 'PageUp') { e.preventDefault(); switchEcommerceCompareGarment(-1); }
+    if (e.key === 'PageDown') { e.preventDefault(); switchEcommerceCompareGarment(1); }
+});
+
+// ===== 换装提示词模板管理 =====
+const ecommercePromptTemplates = { templates: [], snippets: [] };
+let ecommerceTemplateDragIndex = null;
+
+async function loadEcommercePromptTemplates() {
+    try {
+        const res = await fetch('/api/ecommerce/prompt-templates');
+        const data = await res.json();
+        ecommercePromptTemplates.templates = data.templates || [];
+        ecommercePromptTemplates.snippets = (data.snippets || []).map(s => {
+            // 兼容旧数据：没有 name 字段的用 text 前缀补上
+            if (!s.name) s.name = (s.text || '').slice(0, 12);
+            return s;
+        });
+        renderEcommercePromptTemplates();
+        renderEcommerceInsertSnippets();
+    } catch (e) {
+        console.error('加载提示词模板失败', e);
+    }
+}
+
+function genEcommerceTemplateId() {
+    return 'tpl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+async function saveEcommercePromptTemplates() {
+    try {
+        await fetch('/api/ecommerce/prompt-templates', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                templates: ecommercePromptTemplates.templates,
+                snippets: ecommercePromptTemplates.snippets
+            })
+        });
+    } catch (e) {
+        console.error('保存提示词模板失败', e);
+    }
+}
+
+function renderEcommercePromptTemplates() {
+    const list = document.getElementById('ecommerce-prompt-templates-list');
+    const moreSelect = document.getElementById('ecommerce-prompt-templates-more');
+    if (!list) return;
+    const templates = ecommercePromptTemplates.templates;
+    const visible = templates.slice(0, 10);
+    const hidden = templates.slice(10);
+    list.innerHTML = visible.map(t => `
+        <span class="ecommerce-prompt-template-chip" draggable="true" data-id="${ecommerceEscape(t.id)}" title="${ecommerceEscape(t.prompt).slice(0, 80)}…">
+            <span class="chip-name">${ecommerceEscape(t.name)}</span>
+            <span class="chip-delete" data-action="delete" data-id="${ecommerceEscape(t.id)}" title="删除">×</span>
+        </span>`).join('') || '<span style="font-size:10px;color:#98a2b3;">暂无模板，点下方"存储模板"保存当前提示词</span>';
+    if (moreSelect) {
+        if (hidden.length) {
+            moreSelect.style.display = '';
+            moreSelect.innerHTML = '<option value="">更多模板…</option>' + hidden.map(t => `<option value="${ecommerceEscape(t.id)}">${ecommerceEscape(t.name)}</option>`).join('');
+        } else {
+            moreSelect.style.display = 'none';
+        }
+    }
+    // 点击芯片：替换提示词
+    list.querySelectorAll('.ecommerce-prompt-template-chip').forEach(chip => {
+        chip.addEventListener('click', e => {
+            if (e.target.classList.contains('chip-delete')) return;
+            const id = chip.dataset.id;
+            const t = ecommercePromptTemplates.templates.find(x => x.id === id);
+            if (t) {
+                const ta = document.getElementById('ecommerce-standard-prompt');
+                if (ta) ta.value = t.prompt;
+                showToast(`已加载模板「${t.name}」`, 'success');
+            }
+        });
+        chip.querySelector('.chip-delete')?.addEventListener('click', e => {
+            e.stopPropagation();
+            const id = e.target.dataset.id;
+            ecommercePromptTemplates.templates = ecommercePromptTemplates.templates.filter(x => x.id !== id);
+            saveEcommercePromptTemplates();
+            renderEcommercePromptTemplates();
+        });
+        // 拖拽排序
+        chip.addEventListener('dragstart', e => {
+            ecommerceTemplateDragIndex = ecommercePromptTemplates.templates.findIndex(x => x.id === chip.dataset.id);
+            chip.classList.add('is-dragging');
+            e.dataTransfer.effectAllowed = 'move';
+        });
+        chip.addEventListener('dragend', () => {
+            chip.classList.remove('is-dragging');
+            list.querySelectorAll('.is-dragover').forEach(c => c.classList.remove('is-dragover'));
+            ecommerceTemplateDragIndex = null;
+        });
+        chip.addEventListener('dragover', e => { e.preventDefault(); chip.classList.add('is-dragover'); });
+        chip.addEventListener('dragleave', () => chip.classList.remove('is-dragover'));
+        chip.addEventListener('drop', e => {
+            e.preventDefault();
+            chip.classList.remove('is-dragover');
+            const targetIndex = ecommercePromptTemplates.templates.findIndex(x => x.id === chip.dataset.id);
+            if (ecommerceTemplateDragIndex === null || ecommerceTemplateDragIndex === targetIndex) return;
+            const [moved] = ecommercePromptTemplates.templates.splice(ecommerceTemplateDragIndex, 1);
+            ecommercePromptTemplates.templates.splice(targetIndex, 0, moved);
+            saveEcommercePromptTemplates();
+            renderEcommercePromptTemplates();
+        });
+    });
+    if (moreSelect) {
+        moreSelect.onchange = () => {
+            const id = moreSelect.value;
+            if (!id) return;
+            const t = ecommercePromptTemplates.templates.find(x => x.id === id);
+            if (t) {
+                const ta = document.getElementById('ecommerce-standard-prompt');
+                if (ta) ta.value = t.prompt;
+                showToast(`已加载模板「${t.name}」`, 'success');
+            }
+            moreSelect.value = '';
+        };
+    }
+}
+
+function renderEcommerceInsertSnippets() {
+    const list = document.getElementById('ecommerce-insert-snippets-list');
+    if (!list) return;
+    const snippets = ecommercePromptTemplates.snippets;
+    const chips = snippets.map(s => `
+        <span class="ecommerce-insert-snippet" data-id="${ecommerceEscape(s.id)}" title="${ecommerceEscape(s.text)}">
+            <span class="snippet-name">${ecommerceEscape(s.name || s.text.slice(0, 12))}</span>
+            <span class="snippet-delete" data-id="${ecommerceEscape(s.id)}" title="删除">×</span>
+        </span>`).join('');
+    list.innerHTML = chips + `<span class="ecommerce-insert-snippet-add" id="ecommerce-add-snippet-inline" title="把当前选中的提示词保存为插入片段">＋</span>`;
+    list.querySelectorAll('.ecommerce-insert-snippet').forEach(snippet => {
+        snippet.addEventListener('click', e => {
+            if (e.target.classList.contains('snippet-delete')) return;
+            const id = snippet.dataset.id;
+            const s = ecommercePromptTemplates.snippets.find(x => x.id === id);
+            if (!s) return;
+            const ta = document.getElementById('ecommerce-standard-prompt');
+            if (!ta) return;
+            if (s.position === 'suffix') {
+                const separator = ta.value.trim() ? '\n\n' : '';
+                ta.value = `${ta.value.trimEnd()}${separator}${s.text}`;
+                ta.selectionStart = ta.selectionEnd = ta.value.length;
+                ta.focus();
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                showToast(`已追加后缀「${s.name}」`, 'success');
+                return;
+            }
+            const start = ta.selectionStart;
+            const end = ta.selectionEnd;
+            const insertText = s.text;
+            const needSpace = start > 0 && !/[\s，。、；]/.test(ta.value[start - 1]);
+            const prefix = needSpace ? '，' : '';
+            ta.value = ta.value.slice(0, start) + prefix + insertText + ta.value.slice(end);
+            const newPos = start + prefix.length + insertText.length;
+            ta.selectionStart = ta.selectionEnd = newPos;
+            ta.focus();
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        snippet.querySelector('.snippet-delete')?.addEventListener('click', e => {
+            e.stopPropagation();
+            const id = e.target.dataset.id;
+            ecommercePromptTemplates.snippets = ecommercePromptTemplates.snippets.filter(x => x.id !== id);
+            saveEcommercePromptTemplates();
+            renderEcommerceInsertSnippets();
+        });
+    });
+    // 内联“＋”按钮：把当前选中的文字保存为插入片段
+    document.getElementById('ecommerce-add-snippet-inline')?.addEventListener('click', () => {
+        const ta = document.getElementById('ecommerce-standard-prompt');
+        let snippetText = '';
+        if (ta) {
+            const sel = ta.value.substring(ta.selectionStart, ta.selectionEnd).trim();
+            if (sel) {
+                snippetText = sel;
+            }
+        }
+        // 如果没有选中文本，提示用户输入
+        const inputText = snippetText || window.prompt('请输入要插入的提示词文字：');
+        if (inputText === null) return;
+        const finalText = inputText.trim();
+        if (!finalText) return showToast('提示词文字为空，未保存', 'error');
+        const inputName = window.prompt('请给这个插入片段起个名字（标题）：');
+        if (inputName === null) return;
+        const snippetName = inputName.trim() || finalText.slice(0, 10);
+        ecommercePromptTemplates.snippets.push({ id: genEcommerceTemplateId(), name: snippetName, text: finalText });
+        saveEcommercePromptTemplates();
+        renderEcommerceInsertSnippets();
+        showToast(`已添加插入片段「${snippetName}」`, 'success');
+    });
+}
+
+document.getElementById('btn-ecommerce-save-prompt-template')?.addEventListener('click', () => {
+    const ta = document.getElementById('ecommerce-standard-prompt');
+    const promptText = ta?.value?.trim();
+    if (!promptText) return showToast('提示词为空，无法存储', 'error');
+    const name = window.prompt('请为这个模板起个名字：');
+    if (name === null) return;
+    const templateName = name.trim() || `模板${ecommercePromptTemplates.templates.length + 1}`;
+    ecommercePromptTemplates.templates.unshift({ id: genEcommerceTemplateId(), name: templateName, prompt: promptText });
+    saveEcommercePromptTemplates();
+    renderEcommercePromptTemplates();
+    showToast(`已存储模板「${templateName}」`, 'success');
+});
+
+document.getElementById('btn-ecommerce-add-snippet')?.addEventListener('click', () => {
+    const ta = document.getElementById('ecommerce-standard-prompt');
+    let snippetText = '';
+    if (ta) {
+        const sel = ta.value.substring(ta.selectionStart, ta.selectionEnd).trim();
+        if (sel) snippetText = sel;
+    }
+    const inputText = snippetText || window.prompt('请输入要插入的提示词文字：');
+    if (inputText === null) return;
+    const snippetTextFinal = inputText.trim();
+    if (!snippetTextFinal) return showToast('提示词文字为空，未保存', 'error');
+    const inputName = window.prompt('请给这个插入片段起个名字（标题）：');
+    if (inputName === null) return;
+    const snippetName = inputName.trim() || snippetTextFinal.slice(0, 10);
+    ecommercePromptTemplates.snippets.push({ id: genEcommerceTemplateId(), name: snippetName, text: snippetTextFinal });
+    saveEcommercePromptTemplates();
+    renderEcommerceInsertSnippets();
+    showToast(`已添加插入片段「${snippetName}」`, 'success');
+});
+
+loadEcommercePromptTemplates();
+
+function applyRhAspectRatioToPayload(payload, model, aspectRatio) {
+    if (!payload || !aspectRatio) return payload;
+    // RH 的可选比例模型选择“自动”时省略字段，让上游从参考图推断；必填模型显式传 auto。
+    if (aspectRatio !== 'auto' || model?.aspectRatioRequired) payload.aspectRatio = aspectRatio;
+    return payload;
+}
+
+function applyOaihkAspectRatioToPayload(payload, aspectRatio) {
+    if (!payload || !aspectRatio) return payload;
+    // HK 的 fal 异步文档没有声明 "auto" 枚举；省略字段才能让 Google 按参考图比例推断。
+    if (aspectRatio !== 'auto') payload.aspect_ratio = aspectRatio;
+    return payload;
+}
+
 function getOaihkGptQuality(model) {
-    return (model?.shortEdge || 1024) >= 1536 ? 'high' : 'low';
+    const configured = String(state.modelConfig?.oaihk_gpt_quality || 'medium').toLowerCase();
+    if (['low', 'medium', 'high', 'auto'].includes(configured)) return configured;
+    return (model?.shortEdge || 1024) >= 1536 ? 'medium' : 'low';
 }
 
 function announceOaihkSubmit(source, payload) {
@@ -9312,6 +14589,40 @@ function announceOaihkSubmit(source, payload) {
     if (quality) parts.push(`质量:${quality}`);
     if (endpoint) parts.push(`端点:${endpoint}`);
     showToast(`本次提交 -> ${parts.join(' | ')}`, 'info');
+}
+
+function warnOnOaihkSizeMismatch(response, source = 'HK GPT') {
+    if (!response?.sample_factory_size_mismatch) return;
+    const checks = Array.isArray(response.sample_factory_size_check)
+        ? response.sample_factory_size_check.filter(check => check?.matches_request === false)
+        : [];
+    const summary = checks.map(check => `${check.requested_size}→实返${check.actual_size}`).join('，');
+    logAction('api', 'OAIHK返回尺寸不匹配', { source, checks });
+    showToast(`${source} 未返回请求分辨率：${summary || '请查看运行日志'}；已保留上游原图，未本地拉伸`, 'warning');
+}
+
+function verifyOaihkDownloadedImage(downloadData, model, aspectRatio, source = 'HK Nano') {
+    const width = Number(downloadData?.width);
+    const height = Number(downloadData?.height);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+
+    const actualSize = `${width}x${height}`;
+    const expectedSize = aspectRatio === 'auto' ? null : model?.sizes?.[aspectRatio] || null;
+    let ratioMatches = true;
+    const parsedRatio = parseAspectRatio(aspectRatio);
+    if (parsedRatio) {
+        const expectedRatio = parsedRatio.w / parsedRatio.h;
+        ratioMatches = Math.abs((width / height) - expectedRatio) / expectedRatio <= 0.015;
+    }
+    const sizeMatches = !expectedSize || actualSize === expectedSize;
+    const valid = ratioMatches && sizeMatches;
+    const check = { source, aspectRatio, actualSize, expectedSize, ratioMatches, sizeMatches, valid };
+    logAction('api', valid ? 'OAIHK结果尺寸校验通过' : 'OAIHK结果尺寸校验失败', check);
+    if (!valid) {
+        const expectedText = expectedSize || `比例 ${aspectRatio}`;
+        showToast(`${source} 返回规格不符：选择 ${aspectRatio} / ${expectedText}，实返 ${actualSize}；已保留原图，未本地拉伸`, 'warning');
+    }
+    return check;
 }
 
 // ---------- 图片命名系统 ----------
@@ -9365,22 +14676,26 @@ function togglePlatformUI(platform) {
     if (hkPriceTag) hkPriceTag.style.display = isRH ? 'none' : '';
     if (hkAspectRatioGroup) hkAspectRatioGroup.style.display = isRH ? 'none' : 'flex';
 
-    // 更新HK价格
-    if (!isRH) updateOaihkModelParamsInline();
+    // 更新当前平台价格与固定分辨率状态
+    if (isRH) updateRhModelParamsInline();
+    else updateOaihkModelParamsInline();
 }
 
 // HK 模型切换时更新价格
 function updateOaihkModelParamsInline() {
     const modelSelect = document.getElementById('cfg-oaihk-model-inline');
     const priceTag = document.getElementById('oaihk-price-tag');
+    const aspectRatioSelect = document.getElementById('cfg-oaihk-aspect-ratio-inline');
     if (!modelSelect) return;
     const model = OAIHK_MODELS[modelSelect.value];
     if (model && priceTag) priceTag.textContent = model.price;
-    // GPT-Image 模型隐藏比例选择器（比例已内嵌在模型 sizes 映射中）
     const hkAspectRatioGroup = document.getElementById('oaihk-aspect-ratio-group');
     if (hkAspectRatioGroup) {
-        hkAspectRatioGroup.style.display = model?.isGptImage ? 'none' : 'flex';
+        hkAspectRatioGroup.style.display = document.getElementById('cfg-api-platform')?.value === 'oaihk' ? 'flex' : 'none';
     }
+    const preferred = aspectRatioSelect?.value || state.modelConfig?.oaihk_aspect_ratio || '3:4';
+    const picked = fillAspectRatioSelect(aspectRatioSelect, model?.aspectRatios, preferred);
+    state.modelConfig.oaihk_aspect_ratio = picked;
     updateDefaultModelBadge();
 }
 
@@ -9515,6 +14830,7 @@ document.getElementById('btn-split-settings')?.addEventListener('click', () => {
 });
 document.getElementById('split-cfg-oaihk-model')?.addEventListener('change', () => {
     readSplitApiConfigToQueue(activeSplitQueue);
+    syncSplitOaihkAspectRatioSelectForQueue(splitQueueData[activeSplitQueue]);
     applySplitAutoAspectRatioFromCrop(activeSplitQueue);
     updateSplitApiPlatformUI();
     saveSplitQueueData();
@@ -9531,6 +14847,11 @@ document.getElementById('split-cfg-rh-aspect-ratio')?.addEventListener('change',
     const qdM = splitQueueData[activeSplitQueue];
     if (qdM) qdM.splitAspectRatioManualOverride = true;
     readSplitApiConfigToQueue(activeSplitQueue);
+    saveSplitQueueData();
+});
+document.getElementById('split-cfg-rh-resolution')?.addEventListener('change', () => {
+    readSplitApiConfigToQueue(activeSplitQueue);
+    updateSplitApiPlatformUI();
     saveSplitQueueData();
 });
 document.getElementById('split-cfg-oaihk-aspect-ratio')?.addEventListener('change', () => {
@@ -9567,25 +14888,27 @@ function updateRhModelParamsInline() {
     if (!model) return;
 
     // 价格标签
-    if (priceTag) priceTag.textContent = model.price;
+    if (priceTag) priceTag.textContent = getRhPriceLabel(model, document.getElementById('cfg-rh-resolution-inline')?.value || '1k');
 
-    // 显示/隐藏分辨率
+    // 显示/隐藏分辨率；固定 2K/4K 模型自动锁定对应分辨率
+    const resolutionSelect = document.getElementById('cfg-rh-resolution-inline');
     if (resolutionGroup) {
         resolutionGroup.style.display = model.hasResolution ? 'flex' : 'none';
+    }
+    if (resolutionSelect) {
+        if (model.fixedResolution) {
+            resolutionSelect.value = model.fixedResolution;
+            resolutionSelect.disabled = true;
+        } else {
+            resolutionSelect.disabled = false;
+        }
     }
 
     // 更新宽高比选项
     if (aspectRatioSelect) {
-        aspectRatioSelect.innerHTML = '';
-        for (const ratio of model.aspectRatios) {
-            const opt = document.createElement('option');
-            opt.value = ratio;
-            opt.textContent = ratio === 'auto' ? '自适应' : ratio;
-            aspectRatioSelect.appendChild(opt);
-        }
-        if (model.aspectRatios.includes('3:4')) {
-            aspectRatioSelect.value = '3:4';
-        }
+        const preferred = aspectRatioSelect.value || state.modelConfig?.rh_aspect_ratio || '3:4';
+        const picked = fillAspectRatioSelect(aspectRatioSelect, model.aspectRatios, preferred);
+        state.modelConfig.rh_aspect_ratio = picked;
     }
 
     // 同步到配置弹窗
@@ -9614,14 +14937,17 @@ document.getElementById('cfg-rh-aspect-ratio-inline')?.addEventListener('change'
 document.getElementById('cfg-rh-resolution-inline')?.addEventListener('change', (e) => {
     api('PUT', '/api/model-config', { rh_resolution: e.target.value }).catch(() => {});
     state.modelConfig.rh_resolution = e.target.value;
+    updateRhModelParamsInline();
     if (queueMode === 'multi') saveCurrentQueueData();
 });
 
 // 持久化内联HK模型选择
 document.getElementById('cfg-oaihk-model-inline')?.addEventListener('change', () => {
     const modelId = document.getElementById('cfg-oaihk-model-inline')?.value;
-    api('PUT', '/api/model-config', { oaihk_model: modelId }).catch(() => {});
+    const aspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
+    api('PUT', '/api/model-config', { oaihk_model: modelId, oaihk_aspect_ratio: aspectRatio }).catch(() => {});
     state.modelConfig.oaihk_model = modelId;
+    state.modelConfig.oaihk_aspect_ratio = aspectRatio;
     if (queueMode === 'multi') saveCurrentQueueData();
 });
 
@@ -9637,6 +14963,9 @@ document.getElementById('cfg-rh-seed-mode-inline')?.addEventListener('change', (
 
 // 多图列队模式下，其他配置变更也自动保存到当前队列
 document.getElementById('cfg-oaihk-aspect-ratio-inline')?.addEventListener('change', () => {
+    const aspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
+    api('PUT', '/api/model-config', { oaihk_aspect_ratio: aspectRatio }).catch(() => {});
+    state.modelConfig.oaihk_aspect_ratio = aspectRatio;
     if (queueMode === 'multi') saveCurrentQueueData();
 });
 document.getElementById('cfg-rh-count-inline')?.addEventListener('change', () => {
@@ -9781,26 +15110,21 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
     }
 
     // 构建请求参数
-    const imageUrls = slotsWithImages.map(s => {
-        // 如果是相对路径，转为完整URL
-        if (s.image.startsWith('/')) return window.location.origin + s.image;
-        return s.image;
-    });
+    const refPayload = buildGenerationReferencePayload(slotsWithImages, prompt, apiPromptLang, true);
+    const imageUrls = refPayload.imageUrls;
 
-    const payload = { prompt };
+    const payload = { prompt: refPayload.prompt };
     if (model.type === 'image-to-image') {
         payload.imageUrls = imageUrls;
     }
     if (model.hasResolution) {
-        payload.resolution = document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
+        payload.resolution = model.fixedResolution || document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
     }
     // 宽高比
     const aspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value;
-    if (aspectRatio) {
-        payload.aspectRatio = aspectRatio;
-    }
+    applyRhAspectRatioToPayload(payload, model, aspectRatio);
 
-    const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || 'https://www.runninghub.cn/openapi/v2';
+    const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || 'https://www.runninghub.ai/openapi/v2';
 
     apiGenerateState.running = true;
     apiGenerateState.cancelled = false;
@@ -9818,12 +15142,15 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
             action: 'submit',
             api_key: rhApiKey,
             base_url: rhBaseUrl,
-            model_id: modelId,
+            model_id: model.endpoint || modelId,
             params: payload
         });
 
         if (data.status === 'FAILED') {
             throw new Error(data.errorMessage || '任务提交失败');
+        }
+        if (!data.taskId) {
+            throw new Error(data.errorMessage || 'RunningHub 提交成功但没有返回 taskId，请检查模型接口或账户权限');
         }
 
         apiGenerateState.taskId = data.taskId;
@@ -9836,11 +15163,8 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
     } catch (e) {
         if (apiGenerateState.cancelled) return; // 已取消，不弹错误
         showToast('API调用失败: ' + e.message, 'error');
-        apiGenerateState.running = false;
-        apiGenerateState.abortController = null;
-        btn.disabled = false;
-        btn.textContent = '生成';
-        cancelBtn.style.display = 'none';
+        resetApiGlobalGenerateState({ cancelled: false });
+        syncApiGenerateUiAfterState();
         showApiRegenerateBtn();
     }
 });
@@ -9860,16 +15184,8 @@ async function pollApiResult(apiKey, baseUrl) {
 
         if (data.status === 'SUCCESS') {
             // 停止轮询
-            clearTimeout(apiGenerateState.pollTimer);
-            apiGenerateState.running = false;
-            apiGenerateState.taskId = null;
-            apiGenerateState.abortController = null;
-
-            const btn = document.getElementById('btn-api-generate');
-            const cancelBtn = document.getElementById('btn-api-cancel');
-            btn.disabled = false;
-            btn.textContent = '生成';
-            cancelBtn.style.display = 'none';
+            resetApiGlobalGenerateState({ cancelled: false });
+            syncApiGenerateUiAfterState();
             showApiRegenerateBtn();
 
             // 显示结果
@@ -9880,16 +15196,8 @@ async function pollApiResult(apiKey, baseUrl) {
             await autoBackupResults(data.results || []);
 
         } else if (data.status === 'FAILED') {
-            clearTimeout(apiGenerateState.pollTimer);
-            apiGenerateState.running = false;
-            apiGenerateState.taskId = null;
-            apiGenerateState.abortController = null;
-
-            const btn = document.getElementById('btn-api-generate');
-            const cancelBtn = document.getElementById('btn-api-cancel');
-            btn.disabled = false;
-            btn.textContent = '生成';
-            cancelBtn.style.display = 'none';
+            resetApiGlobalGenerateState({ cancelled: false });
+            syncApiGenerateUiAfterState();
             showApiRegenerateBtn();
 
             showToast('生成失败: ' + (data.errorMessage || '未知错误'), 'error');
@@ -10025,51 +15333,25 @@ async function runDiagHealthCheck() {
 
 async function downloadImage(url, filename, downloadPath) {
     try {
-        // 先备份到本地，再触发浏览器下载
-        const localUrl = await backupImageToLocal(url, filename, downloadPath);
-        const downloadUrl = localUrl || url;
-
         const namePart = filename.replace(/\.\w+$/, '');
         const jpgFilename = namePart + '.jpg';
-
-        // 通过后端转JPG后下载
-        const resp = await fetch('/api/convert-download', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: downloadUrl, filename: jpgFilename })
-        });
-        if (!resp.ok) {
-            const fallbackResp = await fetch(downloadUrl);
-            const blob = await fallbackResp.blob();
-            const blobUrl = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = blobUrl;
-            a.download = jpgFilename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-        } else {
-            const blob = await resp.blob();
-            const blobUrl = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = blobUrl;
-            a.download = jpgFilename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
-        }
+        const resp = await api('POST', '/api/save-image-to-path', {
+            url,
+            path: downloadPath || getGlobalDownloadPath(),
+            filename: jpgFilename,
+            use_date_folder: false
+        }, 180000, null, true);
+        if (!resp.ok && !resp.success) throw new Error(resp.error || '保存失败');
         showToast(`已下载: ${jpgFilename}`, 'success');
     } catch (e) {
         window.open(url, '_blank');
-        showToast('下载失败，已在新窗口打开', 'info');
+        showToast(`下载失败：${e.message || e}，已在新窗口打开`, 'info');
     }
 }
 
 // 自动备份结果图片到本地，替换results中的URL为本地路径
 async function autoBackupResults(results, qi) {
-    const imagesToBackup = results.filter(r => r.url && !r.url.startsWith('/static/') && !r.url.startsWith('/api/gallery-image'));
+    const imagesToBackup = results.filter(r => r.url && !r.url.startsWith('/api/gallery-image'));
     if (imagesToBackup.length === 0) return;
 
     // 获取当前队列的下载路径
@@ -10092,7 +15374,7 @@ async function autoBackupResults(results, qi) {
     for (let i = 0; i < results.length; i++) {
         const r = results[i];
         if (!r.url) continue;
-        if (r.url.startsWith('/static/') || r.url.startsWith('/api/gallery-image')) continue;
+        if (r.url.startsWith('/api/gallery-image')) continue;
 
         const num = formatImageNumber(counterStart + counterIdx);
         const filename = `${prefix}-${num}.jpg`;
@@ -10128,9 +15410,12 @@ document.getElementById('btn-download-all')?.addEventListener('click', async () 
     } catch (e) { console.error('获取图片计数器失败:', e); }
 
     const prefix = getEffectiveImagePrefix();
-    const currentDownloadPath = queueMode === 'multi'
+    const defaultDownloadPath = queueMode === 'multi'
         ? getEffectiveQueueDownloadPath(activeQueue)
         : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
+    const picked = await api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath }, 120000, null, true);
+    if (!picked?.ok || !picked.path) { showToast('已取消下载', 'info'); return; }
+    const currentDownloadPath = picked.path;
     let count = 0;
     for (const img of cards) {
         const url = img.src;
@@ -10171,9 +15456,12 @@ document.getElementById('btn-download-checked')?.addEventListener('click', async
     } catch (e) { console.error('获取图片计数器失败:', e); }
 
     const prefix = getEffectiveImagePrefix();
-    const currentDownloadPath = queueMode === 'multi'
+    const defaultDownloadPath = queueMode === 'multi'
         ? getEffectiveQueueDownloadPath(activeQueue)
         : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
+    const picked = await api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath }, 120000, null, true);
+    if (!picked?.ok || !picked.path) { showToast('已取消下载', 'info'); return; }
+    const currentDownloadPath = picked.path;
     let count = 0;
     for (const card of checkedCards) {
         const img = card.querySelector('img');
@@ -10187,27 +15475,109 @@ document.getElementById('btn-download-checked')?.addEventListener('click', async
     showToast(`${count}张勾选图片已下载`, 'success');
 });
 
-document.getElementById('btn-download-to-folder')?.addEventListener('click', async () => {
-    // 浏览器无法选择文件夹，提示用户设置下载路径
-    const path = await showPrompt('指定下载文件夹路径', document.getElementById('cfg-rh-download-path')?.value || DEFAULT_DOWNLOAD_PATH, '路径');
-    if (path && path.trim()) {
-        const cleanPath = path.trim();
-        const el = document.getElementById('cfg-rh-download-path');
-        if (queueMode === 'multi' && queueData[activeQueue]) {
-            markDownloadPathInputAsOwn('cfg-rh-download-path', cleanPath);
-            queueData[activeQueue].downloadPath = cleanPath;
-            saveQueueData();
-        } else {
-            if (el) {
-                el.value = cleanPath;
-                el.dataset.downloadPathInherited = '1';
-            }
-            state.modelConfig.rh_download_path = cleanPath;
-            api('PUT', '/api/model-config', { rh_download_path: cleanPath }).catch(e => console.error('保存下载路径失败:', e));
+function syncVisibleResultChecksToData() {
+    if (queueMode !== 'multi' || !queueData[activeQueue]) return;
+    const cards = document.querySelectorAll('#api-result-grid .api-result-card');
+    cards.forEach((card, idx) => {
+        const item = card._resultItem || queueData[activeQueue].results?.[idx];
+        const cb = card.querySelector('.result-checkbox');
+        if (item && cb) item.checked = cb.checked;
+    });
+    saveQueueData();
+}
+
+function collectCheckedResultsForSave(includeAllQueues) {
+    syncVisibleResultChecksToData();
+    const selected = [];
+    if (queueMode === 'multi') {
+        const queueIndexes = includeAllQueues
+            ? Array.from({ length: multiQueueCount }, (_, i) => i)
+            : [activeQueue];
+        queueIndexes.forEach(qi => {
+            (queueData[qi]?.results || []).forEach((item, resultIndex) => {
+                if (item?.checked && item?.url) selected.push({ item, queueIndex: qi, resultIndex });
+            });
+        });
+        return selected;
+    }
+
+    document.querySelectorAll('#api-result-grid .api-result-card').forEach((card, resultIndex) => {
+        const cb = card.querySelector('.result-checkbox');
+        const img = card.querySelector('img');
+        if (cb?.checked && img?.src) {
+            selected.push({
+                item: card._resultItem || { url: img.src, filename: `AI生图_${resultIndex + 1}.jpg` },
+                queueIndex: 0,
+                resultIndex
+            });
         }
-        showToast('下载路径已更新，后续图片将下载到浏览器默认目录\n如需更改浏览器下载目录，请在浏览器设置中修改', 'info');
-        // 触发全部下载
-        document.getElementById('btn-download-all')?.click();
+    });
+    return selected;
+}
+
+function buildCheckedResultSaveFilename(entry) {
+    const rawName = String(entry.item?.filename || `结果${entry.resultIndex + 1}`)
+        .replace(/\.[^.]+$/, '')
+        .replace(/[\\/:*?"<>|]+/g, '_')
+        .trim() || `结果${entry.resultIndex + 1}`;
+    const queuePrefix = queueMode === 'multi'
+        ? `队列${String(entry.queueIndex + 1).padStart(2, '0')}-`
+        : '';
+    return `${queuePrefix}${rawName}.jpg`;
+}
+
+document.getElementById('btn-download-to-folder')?.addEventListener('click', async () => {
+    const button = document.getElementById('btn-download-to-folder');
+    try {
+        const includeAllQueues = queueMode === 'multi' && !!document.getElementById('save-all-queues')?.checked;
+        const selected = collectCheckedResultsForSave(includeAllQueues);
+        if (selected.length === 0) {
+            showToast(includeAllQueues ? '全部队列都没有勾选结果' : '当前队列没有勾选结果', 'error');
+            return;
+        }
+        const initialDir = queueMode === 'multi'
+            ? getEffectiveQueueDownloadPath(activeQueue)
+            : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
+        const resp = await api('POST', '/api/select-folder', { initial_dir: initialDir }, 120000, null, true);
+        if (!resp?.ok || !resp.path) {
+            showToast('已取消另存', 'info');
+            return;
+        }
+
+        if (button) {
+            button.disabled = true;
+            button.textContent = `另存中 0/${selected.length}`;
+        }
+        let okCount = 0;
+        const failures = [];
+        for (let i = 0; i < selected.length; i++) {
+            const entry = selected[i];
+            const filename = buildCheckedResultSaveFilename(entry);
+            const saved = await downloadImageAsJpg(entry.item.url, `队列${entry.queueIndex + 1}`, resp.path, filename);
+            if (saved.ok) okCount++;
+            else if (failures.length < 3) failures.push(`队列${entry.queueIndex + 1}: ${saved.error || '保存失败'}`);
+            if (button) button.textContent = `另存中 ${i + 1}/${selected.length}`;
+        }
+
+        logAction('download', includeAllQueues ? '另存全部队列勾选结果' : '另存当前队列勾选结果', {
+            selected: selected.length,
+            saved: okCount,
+            path: resp.path
+        });
+        if (okCount > 0) {
+            const scopeText = includeAllQueues ? '全部队列' : (queueMode === 'multi' ? `队列${activeQueue + 1}` : '当前结果');
+            showToast(`${scopeText}已另存 ${okCount}/${selected.length} 张到所选文件夹`, okCount === selected.length ? 'success' : 'warning');
+        }
+        if (failures.length > 0) {
+            showToast(`另存失败：${failures.join('；')}`, 'error');
+        }
+    } catch (e) {
+        showToast('另存图片失败: ' + (e?.message || e), 'error');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '另存指定文件夹';
+        }
     }
 });
 
@@ -10249,7 +15619,9 @@ function openImageViewer(images, startIndex = 0) {
     viewerState.images = images.map((img, i) => ({
         url: img.url || img,
         checked: img.checked || false,
-        filename: img.filename || `AI生图_${i+1}.jpg`
+        filename: img.filename || `AI生图_${i+1}.jpg`,
+        sourceItem: img.sourceItem || null,
+        sourceCheckbox: img.sourceCheckbox || null
     }));
     viewerState.currentIndex = startIndex || 0;
     viewerState.scale = 1;
@@ -10414,8 +15786,12 @@ function drawViewerCanvas() {
 
     // 勾选
     document.getElementById('viewer-check')?.addEventListener('change', (e) => {
-        if (viewerState.images[viewerState.currentIndex]) {
-            viewerState.images[viewerState.currentIndex].checked = e.target.checked;
+        const viewerItem = viewerState.images[viewerState.currentIndex];
+        if (viewerItem) {
+            viewerItem.checked = e.target.checked;
+            if (viewerItem.sourceItem) viewerItem.sourceItem.checked = e.target.checked;
+            if (viewerItem.sourceCheckbox) viewerItem.sourceCheckbox.checked = e.target.checked;
+            if (queueMode === 'multi') saveQueueData();
         }
     });
 
@@ -10531,6 +15907,7 @@ async function generateSingleTask(qi, task, platform, qd, signal, uiRoundIndex) 
                     n: 1,
                     image_base64_list: publicUrls
                 }, gptTm, signal);
+                warnOnOaihkSizeMismatch(gptResp, `${task.queueLabel} HK GPT`);
                 publicUrls.length = 0;
                 if (qs.cancelled) return results;
 
@@ -10548,8 +15925,11 @@ async function generateSingleTask(qi, task, platform, qd, signal, uiRoundIndex) 
                     showToast(`${task.queueLabel}生成失败: ${friendlyMsg}`, 'error');
                 }
             } else {
-                const hkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 600000);
-                const payload = { prompt: task.prompt, image_urls: publicUrls, num_images: 1, aspect_ratio: aspectRatio };
+                const hkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 1200000);
+                const payload = applyOaihkAspectRatioToPayload(
+                    { prompt: task.prompt, image_urls: publicUrls, num_images: 1 },
+                    aspectRatio
+                );
                 if (model.modelId) payload.model = model.modelId;
 
                 const submitData = await api('POST', '/api/oaihk-proxy', {
@@ -10571,6 +15951,7 @@ async function generateSingleTask(qi, task, platform, qd, signal, uiRoundIndex) 
                             try {
                                 const dlResp = await api('POST', '/api/download-image', { url: img.url }, hkTm, signal);
                                 if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                                verifyOaihkDownloadedImage(dlResp.data, model, aspectRatio, `${task.queueLabel} HK Nano`);
                             } catch (dlErr) {
                                 console.warn('[多图队列-OAIHK] 图片下载失败:', dlErr);
                                 showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL`, 'warning');
@@ -10585,24 +15966,28 @@ async function generateSingleTask(qi, task, platform, qd, signal, uiRoundIndex) 
             const modelId = qd.rhModelId;
             const model = RH_MODELS[modelId];
             const rhApiKey = document.getElementById('cfg-rh-api-key')?.value || state.modelConfig.rh_api_key || '';
-            const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
+            const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || state.modelConfig.rh_base_url || 'https://www.runninghub.ai/openapi/v2';
 
             const payload = { prompt: task.prompt };
             if (model.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
-            if (model.hasResolution) payload.resolution = qd.rhResolution || '1k';
+            if (model.hasResolution) payload.resolution = model.fixedResolution || qd.rhResolution || '1k';
             const aspectRatio = qd.rhAspectRatio;
-            if (aspectRatio) payload.aspectRatio = aspectRatio;
+            applyRhAspectRatioToPayload(payload, model, aspectRatio);
 
             const data = await api('POST', '/api/rh-proxy', {
-                action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
+                action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: model.endpoint || modelId, params: payload
             }, undefined, signal);
 
             if (data.status === 'FAILED') {
                 showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
                 return results;
             }
+            if (!data.taskId) {
+                showToast(`${task.queueLabel} RH 提交未返回 taskId: ${data.errorMessage || '请检查模型接口或账户权限'}`, 'error');
+                return results;
+            }
 
-                const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, Date.now(), qi, signal, uiRoundIndex);
+            const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, Date.now(), qi, signal, uiRoundIndex);
             if (qs.cancelled) return results;
 
             if (result && result.results) {
@@ -10627,6 +16012,7 @@ async function runSingleQueueGenerate() {
     if (qs.running) return;
 
     saveCurrentQueueData(qi); // 传入捕获的索引，确保数据存到正确的队列
+    applyPinnedSlotsToAllQueues();
     const qd = queueData[qi];
     const platform = qd.apiPlatform || 'runninghub';
     logAction('api', '单队列生图开始', { platform, queue: qi + 1 });
@@ -10645,9 +16031,10 @@ async function runSingleQueueGenerate() {
         if (!prompt || images.length === 0) {
             showToast(`队列${qi+1}没有有效的Prompt或图片`, 'error'); return;
         }
-        const imageUrls = images.map(s => s.image);
+        const refPayload = buildGenerationReferencePayload(images, prompt, promptLang, false);
+        const imageUrls = refPayload.imageUrls;
         for (let i = 0; i < count; i++) {
-            tasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${qi+1} 第${i+1}张` : `队列${qi+1}` });
+            tasks.push({ prompt: refPayload.prompt, imageUrls, queueLabel: count > 1 ? `队列${qi+1} 第${i+1}张` : `队列${qi+1}` });
         }
     } else {
         const modelId = qd.rhModelId;
@@ -10659,12 +16046,10 @@ async function runSingleQueueGenerate() {
         if (!prompt || (model.type === 'image-to-image' && images.length === 0)) {
             showToast(`队列${qi+1}没有有效的Prompt或图片`, 'error'); return;
         }
-        const imageUrls = images.map(s => {
-            if (s.image.startsWith('/')) return window.location.origin + s.image;
-            return s.image;
-        });
+        const refPayload = buildGenerationReferencePayload(images, prompt, promptLang, true);
+        const imageUrls = refPayload.imageUrls;
         for (let i = 0; i < count; i++) {
-            tasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${qi+1} 第${i+1}张` : `队列${qi+1}` });
+            tasks.push({ prompt: refPayload.prompt, imageUrls, queueLabel: count > 1 ? `队列${qi+1} 第${i+1}张` : `队列${qi+1}` });
         }
     }
 
@@ -10692,36 +16077,53 @@ async function runSingleQueueGenerate() {
     }
 
     const prevResultLen = (queueData[qi].results || []).length;
+    let queueUiReleased = false;
+    const releaseQueueGenerateUi = () => {
+        if (queueUiReleased) return;
+        queueUiReleased = true;
+        const wasCancelled = qs.cancelled;
+        resetQueueGenerateState(qi, { cancelled: wasCancelled });
+        apiGenerateState.running = isAnyQueueGenerating();
+        if (activeQueue === qi) {
+            syncApiGenerateUiAfterState();
+            clearRemainingApiResultPendingSlots(document.getElementById('api-result-grid'));
+            if (allResults.length === 0) restoreApiResultEmptyPlaceholderIfNeeded();
+        }
+        if (!queueGenerateStates.some(s => s.running)) {
+            syncApiGenerateUiAfterState();
+        }
+    };
 
     const buckets = Array.from({ length: tasks.length }, () => []);
-    await Promise.allSettled(tasks.map((task, round) => (async () => {
-        if (qs.cancelled) return;
-        buckets[round] = await generateSingleTask(qi, task, platform, qd, queueSignal, round);
-        if (activeQueue === qi) {
-            btn.innerHTML = `<span class="loading"></span> 队列${qi + 1}（并行 ${tasks.length} 张）`;
-            setApiProgress(Math.min(92, Math.round(((round + 1) / tasks.length) * 40)));
-        }
-    })()));
-
-    for (let round = 0; round < tasks.length; round++) {
-        if (qs.cancelled) break;
-        const taskResults = buckets[round] || [];
-        let imgIdx = 0;
-        for (const tr of taskResults) {
-            allResults.push(tr);
+    try {
+        await Promise.allSettled(tasks.map((task, round) => (async () => {
+            if (qs.cancelled) return;
+            buckets[round] = await generateSingleTask(qi, task, platform, qd, queueSignal, round);
             if (activeQueue === qi) {
-                const idx = prevResultLen + allResults.length - 1;
-                appendResultCard(tr, idx, imgIdx === 0 ? { slotIndex: round } : {});
+                btn.innerHTML = `<span class="loading"></span> 队列${qi + 1}（并行 ${tasks.length} 张）`;
+                setApiProgress(Math.min(92, Math.round(((round + 1) / tasks.length) * 40)));
             }
-            imgIdx++;
+        })()));
+
+        for (let round = 0; round < tasks.length; round++) {
+            if (qs.cancelled) break;
+            const taskResults = buckets[round] || [];
+            let imgIdx = 0;
+            for (const tr of taskResults) {
+                allResults.push(tr);
+                if (activeQueue === qi) {
+                    const idx = prevResultLen + allResults.length - 1;
+                    appendResultCard(tr, idx, imgIdx === 0 ? { slotIndex: round } : {});
+                }
+                imgIdx++;
+            }
         }
+    } finally {
+        releaseQueueGenerateUi();
     }
 
-    // 重置状态
-    qs.running = false;
-    qs.cancelled = false;
-    qs.abortController = null;
-    apiGenerateState.running = isAnyQueueGenerating();
+    // 重置状态：先解除“生成中”UI，再做入库等收尾，避免生成已完成但界面一直转圈
+    releaseQueueGenerateUi();
 
     // 存储结果到队列（追加模式：新生成的图片排在已有结果后面）
     if (allResults.length > 0) {
@@ -10736,23 +16138,8 @@ async function runSingleQueueGenerate() {
         await autoBackupResults(allResults, queueMode === 'multi' ? qi : undefined);
     }
 
-    // 更新UI
-    if (activeQueue === qi) {
-        btn.disabled = false;
-        updateGenerateBtnText();
-        hideApiProgress();
-    }
-    // 如果没有其他队列在生成，隐藏取消按钮和进度条
-    if (!queueGenerateStates.some(s => s.running)) {
-        cancelBtn.style.display = 'none';
-        hideApiProgress();
-    }
-    clearRemainingApiResultPendingSlots(document.getElementById('api-result-grid'));
-    if (activeQueue === qi && allResults.length === 0) {
-        restoreApiResultEmptyPlaceholderIfNeeded();
-    }
     // 刷新队列按钮状态（移除生成指示器）
-    renderQueueNumberBars();
+    syncApiGenerateUiAfterState();
 }
 
 document.getElementById('btn-api-generate')?.addEventListener('click', async () => {
@@ -10782,7 +16169,7 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
     const model = RH_MODELS[modelId];
     if (!model) { showToast('请选择模型', 'error'); return; }
 
-    const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
+    const rhBaseUrl = document.getElementById('cfg-rh-base-url')?.value?.trim() || state.modelConfig.rh_base_url || 'https://www.runninghub.ai/openapi/v2';
     const count = parseInt(document.getElementById('cfg-rh-count-inline')?.value, 10) || 1;
 
     // 构建生成任务列表
@@ -10790,6 +16177,7 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
 
     if (queueMode === 'multi') {
         saveCurrentQueueData();
+        applyPinnedSlotsToAllQueues();
         // 单组生成：只生成当前选中队列，张数随便填
         const qd = queueData[activeQueue];
         const prompt = qd?.promptEn?.trim();
@@ -10798,12 +16186,10 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
             showToast(`队列${activeQueue+1}没有有效的英文Prompt或图片`, 'error');
             return;
         }
-        const imageUrls = images.map(s => {
-            if (s.image.startsWith('/')) return window.location.origin + s.image;
-            return s.image;
-        });
+        const refPayload = buildGenerationReferencePayload(images, prompt, 'en', true);
+        const imageUrls = refPayload.imageUrls;
         for (let i = 0; i < count; i++) {
-            tasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${activeQueue+1} 第${i+1}张` : `队列${activeQueue+1}` });
+            tasks.push({ prompt: refPayload.prompt, imageUrls, queueLabel: count > 1 ? `队列${activeQueue+1} 第${i+1}张` : `队列${activeQueue+1}` });
         }
     } else {
         // 同图抽卡模式：同一组数据生成N张
@@ -10814,12 +16200,10 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
             showToast('图生图模型需要至少一张参考图片', 'error');
             return;
         }
-        const imageUrls = slotsWithImages.map(s => {
-            if (s.image.startsWith('/')) return window.location.origin + s.image;
-            return s.image;
-        });
+        const refPayload = buildGenerationReferencePayload(slotsWithImages, promptEn, 'en', true);
+        const imageUrls = refPayload.imageUrls;
         for (let i = 0; i < count; i++) {
-            tasks.push({ prompt: promptEn, imageUrls, queueLabel: `第${i+1}张` });
+            tasks.push({ prompt: refPayload.prompt, imageUrls, queueLabel: `第${i+1}张` });
         }
     }
 
@@ -10839,75 +16223,86 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
     setApiProgress(5);
 
     const rhStartTime = Date.now();
+    let apiUiReleased = false;
+    const releaseApiGenerateUi = () => {
+        if (apiUiReleased) return;
+        apiUiReleased = true;
+        resetApiGlobalGenerateState({ cancelled: false });
+        syncApiGenerateUiAfterState();
+        showApiRegenerateBtn();
+        clearRemainingApiResultPendingSlots(resultGrid);
+        if (allResults.length === 0) restoreApiResultEmptyPlaceholderIfNeeded();
+    };
 
-    for (let round = 0; round < tasks.length; round++) {
-        if (apiGenerateState.cancelled) {
-            showToast(`已取消，已完成${round}张`, 'info');
-            break;
-        }
-        const task = tasks[round];
-        btn.innerHTML = `<span class="loading"></span> ${round+1}/${tasks.length}`;
-
-        const payload = { prompt: task.prompt };
-        if (model.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
-        if (model.hasResolution) payload.resolution = document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
-        const aspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value;
-        if (aspectRatio) payload.aspectRatio = aspectRatio;
-
-        try {
-            const data = await api('POST', '/api/rh-proxy', {
-                action: 'submit',
-                api_key: rhApiKey,
-                base_url: rhBaseUrl,
-                model_id: modelId,
-                params: payload
-            });
-
-            if (data.status === 'FAILED') {
-                showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
-                markApiResultPendingSlotFailed(resultGrid, round, '提交失败');
-                continue;
+    try {
+        for (let round = 0; round < tasks.length; round++) {
+            if (apiGenerateState.cancelled) {
+                showToast(`已取消，已完成${round}张`, 'info');
+                break;
             }
+            const task = tasks[round];
+            btn.innerHTML = `<span class="loading"></span> ${round+1}/${tasks.length}`;
 
-            // 提交成功，开始轮询
-            setApiProgress(10);
-            setApiResultPendingSlotStatus(resultGrid, round, '<span class="loading" style="display:inline-block;"></span> 已提交，等待绘制…');
+            const payload = { prompt: task.prompt };
+            if (model.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
+            if (model.hasResolution) payload.resolution = model.fixedResolution || document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
+            const aspectRatio = document.getElementById('cfg-rh-aspect-ratio-inline')?.value;
+            applyRhAspectRatioToPayload(payload, model, aspectRatio);
 
-            // 轮询等待结果
-            const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, rhStartTime, undefined, undefined, round);
-            if (apiGenerateState.cancelled) break;
-            let rhImgIdx = 0;
-            if (result && result.results) {
-                setApiProgress(100);
-                for (const r of result.results) {
-                    if (r.url) {
-                        const item = { url: r.url, checked: false, filename: `AI生图_${allResults.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' };
-                        allResults.push(item);
-                        appendResultCard(item, allResults.length - 1, rhImgIdx === 0 ? { slotIndex: round } : {});
-                        rhImgIdx++;
+            try {
+                const data = await api('POST', '/api/rh-proxy', {
+                    action: 'submit',
+                    api_key: rhApiKey,
+                    base_url: rhBaseUrl,
+                    model_id: model.endpoint || modelId,
+                    params: payload
+                });
+
+                if (data.status === 'FAILED') {
+                    showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
+                    markApiResultPendingSlotFailed(resultGrid, round, '提交失败');
+                    continue;
+                }
+                if (!data.taskId) {
+                    const msg = data.errorMessage || 'RH 提交未返回 taskId';
+                    showToast(`${task.queueLabel}提交失败: ${msg}`, 'error');
+                    markApiResultPendingSlotFailed(resultGrid, round, msg);
+                    continue;
+                }
+
+                // 提交成功，开始轮询
+                setApiProgress(10);
+                setApiResultPendingSlotStatus(resultGrid, round, '<span class="loading" style="display:inline-block;"></span> 已提交，等待绘制…');
+
+                // 轮询等待结果
+                const result = await pollUntilDone(rhApiKey, rhBaseUrl, data.taskId, rhStartTime, undefined, undefined, round);
+                if (apiGenerateState.cancelled) break;
+                let rhImgIdx = 0;
+                if (result && result.results) {
+                    setApiProgress(100);
+                    for (const r of result.results) {
+                        if (r.url) {
+                            const item = { url: r.url, checked: false, filename: `AI生图_${allResults.length+1}.${r.outputType || 'png'}`, outputType: r.outputType || 'png' };
+                            allResults.push(item);
+                            appendResultCard(item, allResults.length - 1, rhImgIdx === 0 ? { slotIndex: round } : {});
+                            rhImgIdx++;
+                        }
                     }
                 }
+                if (rhImgIdx === 0 && !apiGenerateState.cancelled) {
+                    markApiResultPendingSlotFailed(resultGrid, round, '未返图');
+                }
+            } catch (e) {
+                if (apiGenerateState.cancelled) break;
+                showToast(`${task.queueLabel}生成失败: ${e.message}`, 'error');
+                markApiResultPendingSlotFailed(resultGrid, round, e.message.length > 120 ? `${e.message.slice(0, 118)}…` : e.message);
             }
-            if (rhImgIdx === 0 && !apiGenerateState.cancelled) {
-                markApiResultPendingSlotFailed(resultGrid, round, '未返图');
-            }
-        } catch (e) {
-            if (apiGenerateState.cancelled) break;
-            showToast(`${task.queueLabel}生成失败: ${e.message}`, 'error');
-            markApiResultPendingSlotFailed(resultGrid, round, e.message.length > 120 ? `${e.message.slice(0, 118)}…` : e.message);
         }
+    } finally {
+        releaseApiGenerateUi();
     }
 
-    apiGenerateState.running = false;
-    apiGenerateState.cancelled = false;
-    apiGenerateState.abortController = null;
-    btn.disabled = false;
-    btn.textContent = '生成';
-    cancelBtn.style.display = 'none';
-    showApiRegenerateBtn();
-    hideApiProgress();
-
-    clearRemainingApiResultPendingSlots(resultGrid);
+    releaseApiGenerateUi();
     if (allResults.length > 0) {
         logAction('api', 'RH生图完成', { count: allResults.length });
         showToast(`生成完成！共${allResults.length}张`, 'success');
@@ -10919,8 +16314,6 @@ document.getElementById('btn-api-generate')?.addEventListener('click', async () 
         }
         // 统一入图库
         await autoBackupResults(allResults, queueMode === 'multi' ? activeQueue : undefined);
-    } else {
-        restoreApiResultEmptyPlaceholderIfNeeded();
     }
 });
 
@@ -10977,29 +16370,27 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
             apiGenerateState.abortController?.abort();
         }
         // 取消所有正在生成的队列
-        for (let qi = 0; qi < QUEUE_COUNT; qi++) {
+        for (let qi = 0; qi < multiQueueCount; qi++) {
             const qs = queueGenerateStates[qi];
             if (qs.running) {
                 qs.cancelled = true;
                 if (qs.abortController) {
                     qs.abortController.abort();
                 }
+                resetQueueGenerateState(qi, { cancelled: true });
             }
         }
+        resetApiGlobalGenerateState({ cancelled: true });
         // 更新UI
-        const btn = document.getElementById('btn-api-generate');
-        if (btn) { btn.disabled = false; updateGenerateBtnText(); }
-        const cancelBtn = document.getElementById('btn-api-cancel');
-        if (cancelBtn) cancelBtn.style.display = 'none';
+        syncApiGenerateUiAfterState();
         // 移除所有队列的生成中占位
-        for (let qi2 = 0; qi2 < QUEUE_COUNT; qi2++) {
+        for (let qi2 = 0; qi2 < multiQueueCount; qi2++) {
             const placeholder = document.getElementById(`api-generating-placeholder-queue${qi2}`);
             if (placeholder) placeholder.remove();
         }
         const batchPlaceholder = document.getElementById('api-generating-placeholder');
         if (batchPlaceholder) batchPlaceholder.remove();
         clearRemainingApiResultPendingSlots(document.getElementById('api-result-grid'));
-        hideApiProgress();
         renderQueueNumberBars();
         if (queueMode === 'multi') renderQueueResults(activeQueue);
         showToast('已取消所有正在生成的队列', 'info');
@@ -11015,14 +16406,10 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
                 clearTimeout(apiGenerateState.pollTimer);
                 apiGenerateState.pollTimer = null;
             }
-            apiGenerateState.running = false;
-            apiGenerateState.taskId = null;
+            resetApiGlobalGenerateState({ cancelled: true });
         }
         // 重置UI
-        const btn = document.getElementById('btn-api-generate');
-        const cancelBtn = document.getElementById('btn-api-cancel');
-        if (btn) { btn.disabled = false; updateGenerateBtnText(); }
-        if (cancelBtn) cancelBtn.style.display = 'none';
+        syncApiGenerateUiAfterState();
         showApiRegenerateBtn();
         // 移除生成中占位
         const placeholder = document.getElementById('api-generating-placeholder');
@@ -11036,7 +16423,6 @@ document.getElementById('btn-api-cancel')?.addEventListener('click', () => {
                     <div>选择模型后点击「API生成」开始</div>
                 </div>`;
         }
-        hideApiProgress();
         showToast('已取消生成', 'info');
     }
 });
@@ -11181,9 +16567,10 @@ async function generateViaOpenAIHK() {
             showToast(`队列${activeQueue+1}没有有效的${apiPromptLang === 'cn' ? '中文' : '英文'}Prompt或图片`, 'error');
             return;
         }
-        const imageUrls = images.map(s => s.image);
+        const refPayload = buildGenerationReferencePayload(images, prompt, apiPromptLang, false);
+        const imageUrls = refPayload.imageUrls;
         for (let i = 0; i < count; i++) {
-            tasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${activeQueue+1} 第${i+1}张` : `队列${activeQueue+1}` });
+            tasks.push({ prompt: refPayload.prompt, imageUrls, queueLabel: count > 1 ? `队列${activeQueue+1} 第${i+1}张` : `队列${activeQueue+1}` });
         }
     } else {
         // 根据语言切换选择中文或英文提示词
@@ -11199,9 +16586,10 @@ async function generateViaOpenAIHK() {
             showToast('OpenAI-HK 通道需要至少一张参考图片', 'error');
             return;
         }
-        const imageUrls = slotsWithImages.map(s => s.image);
+        const refPayload = buildGenerationReferencePayload(slotsWithImages, prompt, apiPromptLang, false);
+        const imageUrls = refPayload.imageUrls;
         for (let i = 0; i < count; i++) {
-            tasks.push({ prompt, imageUrls, queueLabel: `第${i+1}张` });
+            tasks.push({ prompt: refPayload.prompt, imageUrls, queueLabel: `第${i+1}张` });
         }
     }
 
@@ -11221,7 +16609,7 @@ async function generateViaOpenAIHK() {
     const aspectRatio = document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || '3:4';
     const shortEdge = model.shortEdge || 1536;
     const gptTimeoutMs = getOaihkGptClientTimeoutMs();
-    const hkSubmitTimeoutMs = Math.min(Math.max(gptTimeoutMs, 120000), 600000);
+    const hkSubmitTimeoutMs = Math.min(Math.max(gptTimeoutMs, 120000), 1200000);
     _hkParallelUiTail = Promise.resolve();
     let hkParallelFinished = 0;
 
@@ -11273,6 +16661,8 @@ async function generateViaOpenAIHK() {
                     image_base64_list: publicUrls
                 }, gptTimeoutMs, apiGenerateState.abortController?.signal);
 
+                warnOnOaihkSizeMismatch(gptResp, 'HK GPT');
+
                 publicUrls.length = 0;
 
                 if (apiGenerateState.cancelled) return;
@@ -11300,12 +16690,11 @@ async function generateViaOpenAIHK() {
             } else {
                 setApiResultPendingSlotStatus(resultGrid, round, '<span class="loading" style="display:inline-block;"></span> 加密传输（Base64）…');
 
-                const payload = {
+                const payload = applyOaihkAspectRatioToPayload({
                     prompt: task.prompt,
                     image_urls: publicUrls,
-                    num_images: 1,
-                    aspect_ratio: aspectRatio
-                };
+                    num_images: 1
+                }, aspectRatio);
                 if (model.modelId) {
                     payload.model = model.modelId;
                 }
@@ -11352,6 +16741,7 @@ async function generateViaOpenAIHK() {
                                 if (dlResp.data?.data_uri) {
                                     displayUrl = dlResp.data.data_uri;
                                 }
+                                verifyOaihkDownloadedImage(dlResp.data, model, aspectRatio, 'HK Nano');
                             } catch (dlErr) {
                                 console.warn('代理下载失败，使用原始URL:', dlErr);
                             }
@@ -11392,14 +16782,9 @@ async function generateViaOpenAIHK() {
     }
 
     // 无论成功/失败/取消，都重置UI状态
-    apiGenerateState.running = false;
-    apiGenerateState.cancelled = false;
-    apiGenerateState.abortController = null;
-    btn.disabled = false;
-    btn.textContent = '生成';
-    cancelBtn.style.display = 'none';
+    resetApiGlobalGenerateState({ cancelled: false });
+    syncApiGenerateUiAfterState();
     showApiRegenerateBtn();
-    hideApiProgress();
     clearRemainingApiResultPendingSlots(resultGrid);
 
     if (allResults.length > 0) {
@@ -11425,10 +16810,11 @@ async function batchGenerateAll() {
 
     // 收集所有有效队列的任务（每个队列用自己的平台/模型/配置）
     saveCurrentQueueData();
+    applyPinnedSlotsToAllQueues();
     const baseTasks = [];
 
     // 收集有效队列（跳过正在生成的队列，包括拆图生成中的）
-    for (let q = 0; q < QUEUE_COUNT; q++) {
+    for (let q = 0; q < multiQueueCount; q++) {
         const qd = queueData[q];
         if (!qd) continue;
         // 跳过正在生成的队列（拆图或单队列生成中）
@@ -11455,12 +16841,10 @@ async function batchGenerateAll() {
             if (!model) continue;
             if (model.type === 'image-to-image' && images.length === 0) continue;
         }
-        const imageUrls = images.map(s => {
-            if (s.image.startsWith('/')) return window.location.origin + s.image;
-            return s.image;
-        });
+        const refPayload = buildGenerationReferencePayload(images, prompt, platform !== 'oaihk' ? 'en' : (qd.promptLang || 'en'), platform !== 'oaihk');
+        const imageUrls = refPayload.imageUrls;
         for (let i = 0; i < count; i++) {
-            baseTasks.push({ prompt, imageUrls, queueLabel: count > 1 ? `队列${q+1} 第${i+1}张` : `队列${q+1}`, queueIndex: q, platform, rhModelId: qd.rhModelId, oaihkModelId: qd.oaihkModelId, rhAspectRatio: qd.rhAspectRatio, oaihkAspectRatio: qd.oaihkAspectRatio, rhResolution: qd.rhResolution });
+            baseTasks.push({ prompt: refPayload.prompt, imageUrls, queueLabel: count > 1 ? `队列${q+1} 第${i+1}张` : `队列${q+1}`, queueIndex: q, platform, rhModelId: qd.rhModelId, oaihkModelId: qd.oaihkModelId, rhAspectRatio: qd.rhAspectRatio, oaihkAspectRatio: qd.oaihkAspectRatio, rhResolution: qd.rhResolution });
         }
     }
 
@@ -11524,7 +16908,7 @@ async function batchGenerateAll() {
                 }
                 if (apiGenerateState.cancelled || qs.cancelled) return localResults;
 
-                const hkBatchTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 600000);
+                const hkBatchTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 1200000);
                 if (model.isGptImage) {
                     announceOaihkSubmit('多图队列-批量-GPT', {
                         model: model.modelId || 'gpt-image-2',
@@ -11540,6 +16924,7 @@ async function batchGenerateAll() {
                         n: 1,
                         image_base64_list: publicUrls
                     }, hkBatchTm);
+                    warnOnOaihkSizeMismatch(gptResp, `${task.queueLabel} HK GPT`);
                     publicUrls.length = 0;
 
                     if (gptResp.data && Array.isArray(gptResp.data)) {
@@ -11553,12 +16938,11 @@ async function batchGenerateAll() {
                         }
                     }
                 } else {
-                    const payload = {
+                    const payload = applyOaihkAspectRatioToPayload({
                         prompt: task.prompt,
                         image_urls: publicUrls,
-                        num_images: 1,
-                        aspect_ratio: aspectRatio
-                    };
+                        num_images: 1
+                    }, aspectRatio);
                     if (model.modelId) payload.model = model.modelId;
 
                     const submitData = await api('POST', '/api/oaihk-proxy', {
@@ -11587,6 +16971,7 @@ async function batchGenerateAll() {
                                 try {
                                     const dlResp = await api('POST', '/api/download-image', { url: img.url }, hkBatchTm);
                                     if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                                    verifyOaihkDownloadedImage(dlResp.data, model, aspectRatio, `${task.queueLabel} HK Nano`);
                                 } catch (dlErr) {
                                     console.warn('[批量生图-OAIHK] 图片下载失败:', dlErr);
                                     showToast('图片下载到本地失败，已使用外网URL', 'warning');
@@ -11602,20 +16987,24 @@ async function batchGenerateAll() {
 
                 const payload = { prompt: task.prompt };
                 if (model.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
-                if (model.hasResolution) payload.resolution = task.rhResolution || document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
+                if (model.hasResolution) payload.resolution = model.fixedResolution || task.rhResolution || document.getElementById('cfg-rh-resolution-inline')?.value || '1k';
                 const aspectRatio = task.rhAspectRatio || document.getElementById('cfg-rh-aspect-ratio-inline')?.value;
-                if (aspectRatio) payload.aspectRatio = aspectRatio;
+                applyRhAspectRatioToPayload(payload, model, aspectRatio);
 
                 const data = await api('POST', '/api/rh-proxy', {
                     action: 'submit',
                     api_key: '',
                     base_url: '',
-                    model_id: task.rhModelId || modelId,
+                    model_id: model.endpoint || task.rhModelId || modelId,
                     params: payload
                 });
 
                 if (data.status === 'FAILED') {
                     showToast(`${task.queueLabel}提交失败: ${data.errorMessage || '未知错误'}`, 'error');
+                    return localResults;
+                }
+                if (!data.taskId) {
+                    showToast(`${task.queueLabel} RH 提交未返回 taskId: ${data.errorMessage || '请检查模型接口或账户权限'}`, 'error');
                     return localResults;
                 }
 
@@ -11672,32 +17061,23 @@ async function batchGenerateAll() {
 
     // 重置涉及的队列生成状态
     for (const q of involvedQueues) {
-        const qs = queueGenerateStates[q];
-        qs.running = false;
-        qs.cancelled = false;
-        qs.abortController = null;
+        resetQueueGenerateState(q, { cancelled: false });
     }
 
     // 重置UI
-    apiGenerateState.running = false;
-    apiGenerateState.cancelled = false;
-    apiGenerateState.abortController = null;
+    resetApiGlobalGenerateState({ cancelled: false });
     batchBtn.disabled = false;
     batchBtn.textContent = '批量生成';
-    if (!isAnyQueueGenerating()) {
-        cancelBtn.style.display = 'none';
-        hideApiProgress();
-    }
+    syncApiGenerateUiAfterState();
     showApiRegenerateBtn();
     clearRemainingApiResultPendingSlots(resultGrid);
-    renderQueueNumberBars();
 
     if (allResults.length > 0) {
         const platform = involvedQueues.length > 0 ? (queueData[involvedQueues[0]]?.apiPlatform || 'runninghub') : 'runninghub';
         logAction('api', platform === 'oaihk' ? 'HK批量生图完成' : 'RH批量生图完成', { count: allResults.length, tasks: totalTasks });
         showToast(`批量生成完成！共${allResults.length}张（${completedCount}组）`, 'success');
         // 按队列追加结果
-        for (let q = 0; q < QUEUE_COUNT; q++) {
+        for (let q = 0; q < multiQueueCount; q++) {
             const qResults = allResults.filter(r => r.queueIndex === q);
             if (qResults.length > 0) {
                 queueData[q].results = (queueData[q].results || []).concat(qResults);
@@ -11787,6 +17167,7 @@ function buildApiResultCardElement(item, index) {
     const card = document.createElement('div');
     card.className = 'api-result-card';
     card.dataset.index = String(index);
+    card._resultItem = item;
     const imgEl = document.createElement('img');
     imgEl.alt = '生成结果';
     imgEl.style.cssText = 'width:100%;aspect-ratio:3/4;object-fit:cover;display:block;cursor:pointer;';
@@ -11804,6 +17185,14 @@ function buildApiResultCardElement(item, index) {
     const checkDiv = document.createElement('div');
     checkDiv.style.cssText = 'position:absolute;top:4px;left:4px;';
     checkDiv.innerHTML = '<input type="checkbox" class="result-checkbox" style="width:14px;height:14px;cursor:pointer;" title="勾选下载">';
+    const resultCheckbox = checkDiv.querySelector('.result-checkbox');
+    if (resultCheckbox) {
+        resultCheckbox.checked = !!item.checked;
+        resultCheckbox.addEventListener('change', () => {
+            item.checked = resultCheckbox.checked;
+            if (queueMode === 'multi') saveQueueData();
+        });
+    }
     card.appendChild(imgEl);
     card.appendChild(actionsDiv);
     card.appendChild(checkDiv);
@@ -11815,16 +17204,27 @@ function buildApiResultCardElement(item, index) {
         allCards.forEach(c => {
             const img = c.querySelector('img');
             const cb = c.querySelector('.result-checkbox');
-            images.push({ url: img?.src || '', checked: cb?.checked || false, filename: `AI生图_${images.length + 1}.jpg` });
+            images.push({
+                url: img?.src || '',
+                checked: cb?.checked || false,
+                filename: c._resultItem?.filename || `AI生图_${images.length + 1}.jpg`,
+                sourceItem: c._resultItem || null,
+                sourceCheckbox: cb || null
+            });
         });
         openImageViewer(images, index);
     });
     card.querySelector('.download-single').addEventListener('click', (e) => {
         e.stopPropagation();
-        const currentDownloadPath = queueMode === 'multi'
+        const defaultDownloadPath = queueMode === 'multi'
             ? getEffectiveQueueDownloadPath(activeQueue)
             : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
-        downloadImage(item.url, item.filename, currentDownloadPath);
+        api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath }, 120000, null, true)
+            .then(resp => {
+                if (!resp?.ok || !resp.path) { showToast('已取消下载', 'info'); return; }
+                return downloadImage(item.url, item.filename, resp.path);
+            })
+            .catch(err => showToast('选择下载位置失败: ' + (err?.message || err), 'error'));
     });
     card.querySelector('.delete-single').addEventListener('click', (e) => {
         e.stopPropagation();
@@ -12116,10 +17516,12 @@ renderImageSlots = function renderImageSlotsDynamic() {
     for (let i = 0; i < renderCount; i++) {
         const slot = imageState.slots[i];
         const isActive = imageState.activeSlotIndex === i;
+        const isPinned = queueMode === 'multi' && pinnedSlotIndices.has(i);
 
         const slotEl = document.createElement('div');
-        slotEl.className = `image-slot-compact ${isActive ? 'active' : ''}`;
+        slotEl.className = `image-slot-compact ${isActive ? 'active' : ''} ${isPinned ? 'pinned-slot' : ''}`;
         slotEl.dataset.slotIndex = i;
+        slotEl.draggable = !!slot.image;
 
         const imgHtml = slot.image
             ? `<img src="${escHtml(slot.image)}" class="slot-compact-img" alt="Image ${i+1}" style="width:${imgSize}px;height:${imgSize}px;">`
@@ -12128,12 +17530,15 @@ renderImageSlots = function renderImageSlotsDynamic() {
         const prefix = slot.prefixTemplate || '请参考';
         const semantic = slot.label || '';
 
-        const pinBtn = (queueMode === 'multi' && slot.image) ? `<button class="slot-pin-btn ${pinnedSlotIndices.has(i) ? 'pinned' : ''}" title="${pinnedSlotIndices.has(i) ? '取消全列队' : '应用全列队'}">${pinnedSlotIndices.has(i) ? '📌' : '📍'}</button>` : '';
+        const pinBtn = (queueMode === 'multi' && slot.image) ? `<button class="slot-pin-btn ${isPinned ? 'pinned' : ''}" title="${isPinned ? '取消固定槽（保留当前图片）' : '固定到全队列'}">${isPinned ? '📌' : '📍'}</button>` : '';
         const dwBtn = slot.image
-            ? `<button class="slot-dw-btn ${slot.dwEnabled ? 'active' : ''}" title="DWPose 姿态提取">${slot._dwLoading ? '<span class="dw-spinner"></span>' : 'DW'}</button>`
+            ? `<button class="slot-dw-btn ${slot.dwEnabled ? 'active' : ''}" title="DWPose 姿态提取" ${slot._dwLoading ? 'disabled' : ''}>${slot._dwLoading ? '<span class="dw-spinner"></span>' : 'DW'}</button>`
+            : '';
+        const dwProgress = slot._dwLoading
+            ? `<div class="slot-dw-progress" aria-live="polite"><span class="slot-dw-progress-text">DW姿态图生成中...</span><span class="slot-dw-progress-bar"><span></span></span></div>`
             : '';
         slotEl.innerHTML = `
-            <div class="slot-compact-image-area ${slot.dwEnabled ? 'dw-active' : ''}">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}${dwBtn}</div>
+            <div class="slot-compact-image-area ${slot.dwEnabled ? 'dw-active' : ''} ${slot._dwLoading ? 'dw-loading' : ''}">${imgHtml}${slot.image ? '<button class="slot-change-btn" title="更换图片">✎</button>' : ''}${pinBtn}${dwBtn}${dwProgress}</div>
             <div class="slot-compact-label">
                 <span class="slot-prefix" title="点击编辑前缀">${escHtml(prefix)}</span><span class="slot-auto-text">图${i+1}${semantic ? '的' + escHtml(semantic) : ''}</span>
             </div>
@@ -12163,6 +17568,7 @@ renderImageSlots = function renderImageSlotsDynamic() {
             const newPrefix = await showPrompt('修改前缀模板', slot.prefixTemplate || '请参考', '前缀模板');
             if (newPrefix !== null && newPrefix.trim()) {
                 imageState.slots[i].prefixTemplate = newPrefix.trim();
+                syncPinnedSlotFromCurrent(i);
                 renderImageSlots();
                 updateLocalPrompt();
                 // 持久化前缀设置：多图列队模式需同步到当前队列
@@ -12185,7 +17591,7 @@ renderImageSlots = function renderImageSlotsDynamic() {
         let clickTimer = null;
         imgArea.addEventListener('click', (e) => {
             e.stopPropagation();
-            if (e.target.closest('.slot-change-btn') || e.target.closest('.slot-pin-btn')) return;
+            if (e.target.closest('.slot-change-btn') || e.target.closest('.slot-pin-btn') || slotEl.classList.contains('slot-dragging')) return;
             // 仅切换active状态，不重新渲染DOM（避免dblclick事件丢失）
             if (imageState.activeSlotIndex !== i) {
                 imageState.activeSlotIndex = i;
@@ -12210,11 +17616,30 @@ renderImageSlots = function renderImageSlotsDynamic() {
             openSelectMaterialModal();
         });
 
+        slotEl.addEventListener('dragstart', (e) => {
+            if (!slot.image) { e.preventDefault(); return; }
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('application/x-image-slot-index', String(i));
+            e.dataTransfer.setData('text/plain', String(i));
+            slotEl.classList.add('slot-dragging');
+        });
+        slotEl.addEventListener('dragend', () => {
+            slotEl.classList.remove('slot-dragging');
+            document.querySelectorAll('.image-slot-compact.drag-over').forEach(el => el.classList.remove('drag-over'));
+        });
         slotEl.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); slotEl.classList.add('drag-over'); });
         slotEl.addEventListener('dragleave', () => { slotEl.classList.remove('drag-over'); });
         slotEl.addEventListener('drop', async (e) => {
             e.preventDefault(); e.stopPropagation();
             slotEl.classList.remove('drag-over');
+            const fromSlotRaw = e.dataTransfer.getData('application/x-image-slot-index');
+            if (fromSlotRaw !== '') {
+                const fromSlot = parseInt(fromSlotRaw, 10);
+                if (Number.isInteger(fromSlot) && fromSlot !== i) {
+                    swapImageSlots(fromSlot, i);
+                }
+                return;
+            }
             const libPayload2 = parseLibMaterialDragPayload(e.dataTransfer);
             if (libPayload2?.url) {
                 imageState.activeSlotIndex = i;
@@ -12222,71 +17647,14 @@ renderImageSlots = function renderImageSlotsDynamic() {
                 imageState.slots[i].dwEnabled = false;
                 imageState.slots[i].dwOriginalImage = '';
                 imageState.slots[i].label = libPayload2.name || '素材库';
+                syncPinnedSlotFromCurrent(i);
                 renderImageSlots();
                 updateLocalPrompt();
                 showToast(`已从素材库拖拽填入 Image ${i + 1}`, 'success');
                 logAction('slot', '素材库拖拽到槽', { slotIndex: i });
                 return;
             }
-            const imageFiles = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith('image/'));
-            if (!imageFiles.length) return;
-            if (imageFiles.length === 1) {
-                // 单张：裁剪 → 分配素材 → 加载到槽位
-                const reader = new FileReader();
-                reader.onload = () => {
-                    showCropModal(reader.result, async (croppedBlob) => {
-                        const formData = new FormData();
-                        formData.append('file', croppedBlob, 'cropped.jpg');
-                        try {
-                            const url = await uploadImage(formData);
-                            // 弹出分配素材弹窗（命名+分类）
-                            const assignResult = await showAssignMaterial(url, imageFiles[0].name);
-                            imageState.slots[i].image = url;
-                            imageState.slots[i].dwEnabled = false;
-                            imageState.slots[i].dwOriginalImage = '';
-                            if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
-                                imageState.slots[i].label = assignResult.labels.join('、');
-                            }
-                            renderImageSlots();
-                            updateLocalPrompt();
-                            if (assignResult && assignResult.savedToLib) {
-                                showToast('图片已存入素材库并加载到槽位', 'success');
-                            } else {
-                                showToast('图片已加载到槽位', 'success');
-                            }
-                            logAction('slot', '拖拽上传图片到槽', { slotIndex: i });
-                        } catch (err) { showToast(err.message, 'error'); }
-                    });
-                };
-                reader.readAsDataURL(imageFiles[0]);
-            } else {
-                // 多张：批量裁剪队列，每张裁剪后弹出分配弹窗
-                startBatchCrop(imageFiles, i, (targetSlot, idx, total) => {
-                    return async (croppedBlob) => {
-                        const formData = new FormData();
-                        formData.append('file', croppedBlob, 'cropped.jpg');
-                        try {
-                            const url = await uploadImage(formData);
-                            // 弹出分配素材弹窗（命名+分类）
-                            const assignResult = await showAssignMaterial(url, imageFiles[idx].name);
-                            if (targetSlot < SLOT_COUNT) {
-                                imageState.slots[targetSlot].image = url;
-                                imageState.slots[targetSlot].dwEnabled = false;
-                                imageState.slots[targetSlot].dwOriginalImage = '';
-                                if (assignResult && assignResult.labels && assignResult.labels.length > 0) {
-                                    imageState.slots[targetSlot].label = assignResult.labels.join('、');
-                                }
-                                renderImageSlots();
-                                updateLocalPrompt();
-                                logAction('slot', '拖拽批量上传图片到槽', { slotIndex: targetSlot });
-                            }
-                            if (idx === total - 1) {
-                                showToast('批量上传完成：' + total + '张', 'success');
-                            }
-                        } catch (err) { showToast('第' + (idx+1) + '张上传失败：' + err.message, 'error'); }
-                    };
-                });
-            }
+            uploadFilesToImageSlots(e.dataTransfer.files, i, '拖拽上传图片到槽');
         });
 
         slotEl.addEventListener('contextmenu', (e) => {
@@ -12296,6 +17664,11 @@ renderImageSlots = function renderImageSlotsDynamic() {
             if (choice) {
                 pushUndoSnapshot();
                 imageState.slots[i] = { image: '', label: '', prefixTemplate: '请参考', dwEnabled: false, dwOriginalImage: '' };
+                if (queueMode === 'multi' && pinnedSlotIndices.has(i)) {
+                    pinnedSlotIndices.delete(i);
+                    delete pinnedSlotMasters[String(i)];
+                    applyPinnedSlotsToAllQueues();
+                }
                 compactAndRenumber();
                 renderImageSlots();
                 updateLocalPrompt();
@@ -12320,6 +17693,45 @@ renderImageSlots = function renderImageSlotsDynamic() {
         container.appendChild(addBtn);
     }
 };
+
+function bindImageSlotsContainerDrop() {
+    const container = document.getElementById('image-slots');
+    if (!container || container.dataset.multiDropBound) return;
+    container.dataset.multiDropBound = '1';
+    container.addEventListener('dragover', (e) => {
+        const hasFiles = dataTransferHasImageFiles(e.dataTransfer);
+        if (!hasFiles && !parseLibMaterialDragPayload(e.dataTransfer)?.url) return;
+        e.preventDefault();
+        container.classList.add('drag-over');
+    });
+    container.addEventListener('dragleave', (e) => {
+        if (container.contains(e.relatedTarget)) return;
+        container.classList.remove('drag-over');
+    });
+    container.addEventListener('drop', (e) => {
+        if (e.target.closest('.image-slot-compact')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        container.classList.remove('drag-over');
+        const startSlot = getFirstEmptyImageSlotIndex();
+        const libPayload = parseLibMaterialDragPayload(e.dataTransfer);
+        if (libPayload?.url) {
+            imageState.activeSlotIndex = startSlot;
+            imageState.slots[startSlot].image = libPayload.url;
+            imageState.slots[startSlot].dwEnabled = false;
+            imageState.slots[startSlot].dwOriginalImage = '';
+            imageState.slots[startSlot].label = libPayload.name || '素材库';
+            syncPinnedSlotFromCurrent(startSlot);
+            renderImageSlots();
+            updateLocalPrompt();
+            showToast(`已从素材库拖拽填入 Image ${startSlot + 1}`, 'success');
+            return;
+        }
+        uploadFilesToImageSlots(e.dataTransfer.files, startSlot, '拖拽批量上传到参考图区');
+    });
+}
+
+bindImageSlotsContainerDrop();
 
 function compactSlots() {
     // 旧版：仅移除尾部空槽
@@ -12383,12 +17795,19 @@ function compactAndRenumber() {
 
     // 更新 pinnedSlotIndices
     const newPinnedIndices = new Set();
+    const newPinnedMasters = {};
     for (const old of pinnedSlotIndices) {
         const newIdx = oldToNew[old + 1];
-        if (newIdx !== undefined) newPinnedIndices.add(newIdx - 1);
+        if (newIdx !== undefined) {
+            const nextIndex = newIdx - 1;
+            newPinnedIndices.add(nextIndex);
+            const master = pinnedSlotMasters[String(old)] || imageState.slots[nextIndex];
+            if (isFilledSlot(master)) newPinnedMasters[String(nextIndex)] = deepClone(master);
+        }
     }
     pinnedSlotIndices = newPinnedIndices;
-    try { localStorage.setItem('pinnedSlotIndices', JSON.stringify(Array.from(pinnedSlotIndices))); } catch(e) {}
+    pinnedSlotMasters = newPinnedMasters;
+    applyPinnedSlotsToAllQueues();
 
     // 同步到当前队列数据
     const q = queueData[activeQueue];
@@ -12519,18 +17938,23 @@ const POLL_DELAYS = [500, 1000, 2000, 3000];
 
 // Replace pollUntilDone with exponential backoff version
 const _origPollUntilDone = pollUntilDone;
-pollUntilDone = async function pollUntilDoneBackoff(apiKey, baseUrl, taskId, startTime = Date.now(), qi, signal) {
-    const maxPolls = 120;
+pollUntilDone = async function pollUntilDoneBackoff(apiKey, baseUrl, taskId, startTime = Date.now(), qi, signal, statusSlotIndex) {
+    const maxPollMs = 30 * 60 * 1000;
+    const startedAt = Date.now();
     const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
-    for (let i = 0; i < maxPolls; i++) {
+    let i = 0;
+    let queueCount = 0;
+    while (Date.now() - startedAt < maxPollMs) {
         if (isCancelled()) return null;
-        const delay = POLL_DELAYS[Math.min(i, POLL_DELAYS.length - 1)];
+        const waitedMs = Date.now() - startedAt;
+        const delay = waitedMs < 2 * 60 * 1000 ? POLL_DELAYS[Math.min(i, POLL_DELAYS.length - 1)] : 8000;
         await new Promise(r => setTimeout(r, delay));
         if (isCancelled()) return null;
         const elapsed = Math.round((Date.now() - startTime) / 1000);
         const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
-        if (ph) ph.innerHTML = `<span class="loading" style="display:inline-block;"></span> 正在绘制中... (${elapsed}秒，第${i+1}次查询)`;
-        if (activeQueue === qi) setApiProgress(10 + 80 * ((i + 1) / maxPolls));
+        const pendingStatusEl = statusSlotIndex !== undefined && statusSlotIndex !== null
+            ? document.getElementById('api-result-grid')?.querySelector(`.api-result-pending-card[data-slot-index="${statusSlotIndex}"] .api-result-pending-status`)
+            : null;
         try {
             const data = await api('POST', '/api/rh-proxy', {
                 action: 'query',
@@ -12543,28 +17967,44 @@ pollUntilDone = async function pollUntilDoneBackoff(apiKey, baseUrl, taskId, sta
                 showToast('生成失败: ' + (data.errorMessage || '未知错误'), 'error');
                 return null;
             }
+            if (data.status === 'IN_QUEUE' || data.status === 'PENDING' || data.status === 'QUEUED') {
+                queueCount++;
+                const extra = queueCount > 10 ? '<br><span style="font-size:10px;color:#e67e22;">4K任务排队较久，请保持窗口打开，软件会继续等待</span>' : '';
+                const html = `<span class="loading" style="display:inline-block;"></span> 排队等待中...（已等${elapsed}秒，第${i+1}次查询）${extra}`;
+                if (pendingStatusEl) pendingStatusEl.innerHTML = html;
+                else if (ph) ph.innerHTML = html;
+            } else {
+                const html = `<span class="loading" style="display:inline-block;"></span> 正在绘制中...（已等${elapsed}秒，第${i+1}次查询）`;
+                if (pendingStatusEl) pendingStatusEl.innerHTML = html;
+                else if (ph) ph.innerHTML = html;
+            }
+            if (activeQueue === qi) setApiProgress(40 + Math.min(55, 30 * Math.log10(i + 1)));
         } catch (e) {
             if (isCancelled()) return null;
             console.warn('轮询出错:', e);
         }
+        i++;
     }
-    if (!isCancelled()) showToast('生成超时', 'error');
+    if (!isCancelled()) showToast('RunningHub 生成等待超过30分钟，远端任务可能仍在排队，请稍后检查或重试', 'error');
     return null;
 };
 
 // Replace pollOAIHK with exponential backoff version
 const _origPollOAIHK = pollOAIHK;
 pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, requestId, qi, signal, statusSlotIndex) {
-    const maxPolls = 120;
+    const maxPollMs = 30 * 60 * 1000;
+    const startedAt = Date.now();
     const isCancelled = () => qi !== undefined ? queueGenerateStates[qi]?.cancelled : apiGenerateState.cancelled;
     let queueCount = 0;
-    for (let i = 0; i < maxPolls; i++) {
+    let i = 0;
+    while (Date.now() - startedAt < maxPollMs) {
         if (isCancelled()) return null;
-        const delay = POLL_DELAYS[Math.min(i, POLL_DELAYS.length - 1)];
+        const waitedMs = Date.now() - startedAt;
+        const delay = waitedMs < 2 * 60 * 1000 ? POLL_DELAYS[Math.min(i, POLL_DELAYS.length - 1)] : 8000;
         await new Promise(r => setTimeout(r, delay));
         if (isCancelled()) return null;
         const ph = document.getElementById(`api-generating-placeholder-queue${qi}`) || document.getElementById('api-generating-placeholder');
-        const elapsed = Math.round((i + 1) * 3);
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
         const pendingStatusEl = statusSlotIndex !== undefined && statusSlotIndex !== null
             ? document.getElementById('api-result-grid')?.querySelector(`.api-result-pending-card[data-slot-index="${statusSlotIndex}"] .api-result-pending-status`)
             : null;
@@ -12602,8 +18042,9 @@ pollOAIHK = async function pollOAIHKBackoff(apiKey, baseUrl, pollEndpoint, reque
             if (isCancelled()) return null;
             console.warn('OpenAI-HK 轮询出错:', e);
         }
+        i++;
     }
-    if (!isCancelled()) showToast('OpenAI-HK 生成超时（排队过久），建议稍后重试', 'error');
+    if (!isCancelled()) showToast('OpenAI-HK 生成超时（已等待30分钟），可能仍在远端排队，建议稍后刷新图库或重试', 'error');
     return null;
 };
 
@@ -12767,7 +18208,54 @@ function _startPollWithBackoff(apiKey, baseUrl, attempt) {
 // ========== 拆图模式（独立模块） ==========
 
 // 非裁剪模式固定前缀（不可删除/修改，{N}自动替换为编号）
-const SPLIT_NOCROP_FIXED_PREFIX = '为我生成图片的第{N}张 ';
+const SPLIT_NOCROP_FIXED_PREFIX = '为我生成图片第{N}张的单独图片 ';
+const SPLIT_CROP_DEFAULT_TEMPLATES = [
+    {
+        name: '高清放大',
+        content: '使用我这张照片做高清放大增加画面细节 要保持画面不变，超写实人像，原相机直出，高清8K，自然原生肤质，真实皮肤肌理，真实光影，层次渐变光影，真人实拍，高级写真质感，色彩自然真实，无 AI 畸形，无假脸，无塑料皮肤 耳边和额前有自然的胎毛和碎发，真实有层次'
+    },
+    {
+        name: '质感皮肤',
+        content: '保持画面不变，超写实人像，原相机直出，高清 8K，自然原生肤质，真实皮肤肌理，不磨皮过度，真实光影，室内柔光，层次渐变光影，真人实拍，高级写真质感，景深虚化，构图专业，色彩自然真实，无 AI 畸形，无假脸，无塑料皮肤 耳边胎毛碎发，轻微自然凌乱微风吹动发丝轻轻飘动，发丝透气不结块，自然蓬松，真实头皮衔接，不僵硬不假发 发质真实有层次，发丝根根分明'
+    }
+];
+const SPLIT_NOCROP_DEFAULT_TEMPLATES = [
+    {
+        name: '默认',
+        content: '要保持画面不变，超写实人像，原相机直出，高清 8K，超细腻皮肤，自然原生肤质，轻微皮肤肌理，不磨皮过度，真实光影，室内柔光，层次渐变光影，胶片质感，真人实拍，高级写真质感，景深虚化，构图专业，色彩自然真实，无 AI 畸形，无假脸，无塑料皮肤 耳边胎毛碎发，轻微自然凌乱微风吹动发丝轻轻飘动，发丝透气不结块，自然蓬松，真实头皮衔接，不僵硬不假发 发质真实有层次，发丝根根分明，脸颊两侧鬓角各垂两缕轻薄碎发 表情要灵动自然纹理'
+    }
+];
+
+function _looksLikeNumberedSplitTemplate(text) {
+    return /第\s*(\{N\}|\d+)\s*张/.test(text || '') || /为我生成图片/.test(text || '');
+}
+
+function _normalizeSplitTemplates(all) {
+    const templates = all && typeof all === 'object' ? all : {};
+    if (!Array.isArray(templates.crop)) templates.crop = [];
+    if (!Array.isArray(templates.nocrop)) templates.nocrop = [];
+
+    const cropNeedsRestore = templates.crop.length === 0
+        || templates.crop.every(t => _looksLikeNumberedSplitTemplate(t?.content || ''));
+    if (cropNeedsRestore) {
+        templates.crop = SPLIT_CROP_DEFAULT_TEMPLATES.map(t => ({ ...t }));
+    }
+
+    if (templates.nocrop.length === 0) {
+        templates.nocrop = SPLIT_NOCROP_DEFAULT_TEMPLATES.map(t => ({ ...t }));
+    }
+
+    templates.crop = templates.crop.map((t, i) => ({
+        name: t?.name || `模板${i + 1}`,
+        content: (t?.content || '').trim()
+    })).filter(t => t.content);
+    templates.nocrop = templates.nocrop.map((t, i) => ({
+        name: t?.name || `模板${i + 1}`,
+        content: (t?.content || '').replace(SPLIT_NOCROP_FIXED_PREFIX, '').trim()
+    })).filter(t => t.content);
+
+    return templates;
+}
 
 // ========== 拆图模板管理系统 ==========
 const SPLIT_TEMPLATE_MAX = 10;
@@ -12776,17 +18264,17 @@ const SPLIT_TEMPLATE_STORAGE_KEY = 'gridSplitTemplates_v2';
 function _getSplitTemplates() {
     try {
         const raw = localStorage.getItem(SPLIT_TEMPLATE_STORAGE_KEY);
-        if (raw) return JSON.parse(raw);
+        if (raw) {
+            const normalized = _normalizeSplitTemplates(JSON.parse(raw));
+            _saveSplitTemplates(normalized);
+            return normalized;
+        }
     } catch (e) {}
     // 默认模板
-    return {
-        crop: [
-            { name: '默认', content: '为我生成图片第{N}张的单独图片 要保持画面不变，超写实人像，原相机直出，高清 8K，超细腻皮肤，自然原生肤质，轻微皮肤肌理，不磨皮过度，真实光影，室内柔光，层次渐变光影，胶片质感，真人实拍，高级写真质感，景深虚化，构图专业，色彩自然真实，无 AI 畸形，无假脸，无塑料皮肤 耳边胎毛碎发，轻微自然凌乱微风吹动发丝轻轻飘动，发丝透气不结块，自然蓬松，真实头皮衔接，不僵硬不假发 发质真实有层次，发丝根根分明，脸颊两侧鬓角各垂两缕轻薄碎发 表情要灵动自然纹理' }
-        ],
-        nocrop: [
-            { name: '默认', content: ' 要保持画面不变，超写实人像，原相机直出，高清 8K，超细腻皮肤，自然原生肤质，轻微皮肤肌理，不磨皮过度，真实光影，室内柔光，层次渐变光影，胶片质感，真人实拍，高级写真质感，景深虚化，构图专业，色彩自然真实，无 AI 畸形，无假脸，无塑料皮肤 耳边胎毛碎发，轻微自然凌乱微风吹动发丝轻轻飘动，发丝透气不结块，自然蓬松，真实头皮衔接，不僵硬不假发 发质真实有层次，发丝根根分明，脸颊两侧鬓角各垂两缕轻薄碎发 表情要灵动自然纹理' }
-        ]
-    };
+    return _normalizeSplitTemplates({
+        crop: SPLIT_CROP_DEFAULT_TEMPLATES.map(t => ({ ...t })),
+        nocrop: SPLIT_NOCROP_DEFAULT_TEMPLATES.map(t => ({ ...t }))
+    });
 }
 
 function _saveSplitTemplates(templates) {
@@ -13253,6 +18741,9 @@ function resetSplitPreview() {
         qd.gridImageUrl = '';
         qd.sourceFilename = '';
         qd.learnedGridLayout = null;
+        qd.workItems = [];
+        qd.activeItemIndex = 0;
+        qd.selectedNums = [];
         qd.materials = [];
         qd.activeMaterialIndex = 0;
         normalizeSplitQueueMaterials(qd);
@@ -13266,6 +18757,75 @@ function resetSplitPreview() {
     renderSplitMaterialTabs(activeSplitQueue);
     renderSplitWorkItemTabs(activeSplitQueue);
     updateSplitGenerateBtnState();
+}
+
+function updateSplitResultSourcesAfterMaterialDelete(qd, deletedIndex) {
+    if (!qd || !Array.isArray(qd.results)) return;
+    qd.results.forEach(result => {
+        if (!result || !Number.isFinite(result._materialIndex)) return;
+        if (result._materialIndex === deletedIndex) {
+            result._sourceDeleted = true;
+            result._sourceDeletedAt = Date.now();
+            return;
+        }
+        if (result._materialIndex > deletedIndex) {
+            result._materialIndex -= 1;
+        }
+    });
+    if (Array.isArray(qd.failedItems)) {
+        qd.failedItems = qd.failedItems
+            .filter(item => item.materialIndex !== deletedIndex)
+            .map(item => {
+                if (item.materialIndex > deletedIndex) item.materialIndex -= 1;
+                return item;
+            });
+    }
+}
+
+function deleteActiveSplitMaterialPreview() {
+    const qi = activeSplitQueue;
+    const qd = splitQueueData[qi];
+    if (!qd) return;
+    normalizeSplitQueueMaterials(qd);
+    persistActiveSplitMaterial(qd);
+    const idx = Math.max(0, Math.min(qd.activeMaterialIndex || 0, qd.materials.length - 1));
+    if (isSplitMaterialBusy(qi, idx)) {
+        showToast(`图片${idx + 1}正在生成中，请完成或取消后再删除`, 'warning');
+        return;
+    }
+    const label = `队列${qi + 1} 的图片${idx + 1}`;
+
+    if (qd.materials.length <= 1) {
+        updateSplitResultSourcesAfterMaterialDelete(qd, 0);
+        resetSplitPreview();
+        qd.results = qd.results || [];
+        saveSplitQueueData();
+        renderSplitQueueResults(qi);
+        showToast(`已删除${label}`, 'success');
+        return;
+    }
+
+    qd.materials.splice(idx, 1);
+    updateSplitResultSourcesAfterMaterialDelete(qd, idx);
+    const nextIdx = Math.min(idx, qd.materials.length - 1);
+    loadActiveSplitMaterialIntoQueue(qd, nextIdx);
+    splitImageUrl = qd.gridImageUrl || '';
+    splitGridImageUrl = splitImageUrl;
+    const imgEl = document.getElementById('split-img');
+    if (imgEl) imgEl.src = splitImageUrl || '';
+    const previewEl = document.getElementById('split-preview');
+    const dropZoneEl = document.getElementById('split-drop-zone');
+    if (previewEl) previewEl.style.display = splitImageUrl ? '' : 'none';
+    if (dropZoneEl) dropZoneEl.style.display = splitImageUrl ? 'none' : '';
+    renderSplitMaterialTabs(qi);
+    renderSplitNumSelectionForQueue(qi);
+    renderSplitWorkItemTabs(qi);
+    loadSplitQueueToUI(qi);
+    renderSplitQueueResults(qi);
+    renderSplitQueueNumberBar();
+    updateSplitGenerateBtnState();
+    saveSplitQueueData();
+    showToast(`已删除${label}，剩余 ${qd.materials.length} 张`, 'success');
 }
 
 function loadSplitTemplate(mode) {
@@ -13686,17 +19246,20 @@ async function runSplitGenerate(qi) {
         showToast('该队列没有拆图数据', 'warning');
         return { cancelled: false, skipped: true };
     }
-    const qs = splitGenerateStates[qi];
-    if (qs.running) {
-        showToast(`拆图队列${qi+1}正在生成中`, 'error');
-        return { cancelled: false, skipped: true };
-    }
+    const qs = ensureSplitRuntimeState(qi);
 
     // 保存当前数据
     saveCurrentSplitQueueData();
 
     // 只生成当前活跃项（用户正在查看/编辑的那一张）
     const activeIdx = qd.activeItemIndex || 0;
+    const materialIndex = qd.activeMaterialIndex || 0;
+    const jobKey = splitJobKey(materialIndex, activeIdx, 'single');
+    const pendingKey = `q${qi}:${jobKey}:${Date.now()}`;
+    if (isSplitJobRunning(qi, jobKey)) {
+        showToast(`队列${qi + 1} 图片${materialIndex + 1} 的格子${qd.workItems[activeIdx]?.number || activeIdx + 1}正在生成中`, 'warning');
+        return { cancelled: false, skipped: true };
+    }
     const item = qd.workItems[activeIdx];
     if (!item) {
         showToast('当前没有选中的拆图项', 'warning');
@@ -13717,10 +19280,9 @@ async function runSplitGenerate(qi) {
         if (!RH_MODELS[qd.rhModelId]) { showToast('请选择模型', 'error'); return { cancelled: false, skipped: true }; }
     }
 
-    qs.running = true;
-    qs.cancelled = false;
-    qs.abortController = new AbortController();
-    const signal = qs.abortController.signal;
+    const controller = new AbortController();
+    beginSplitJob(qi, jobKey, controller);
+    const signal = controller.signal;
     qs.batchVisualTotal = 1;
     qs.batchVisualFilled = 0;
     updateSplitGenerateBtnState();
@@ -13728,15 +19290,19 @@ async function runSplitGenerate(qi) {
     const progressWrap = document.getElementById('split-progress-bar-wrap');
     const progressBar = document.getElementById('split-progress-bar');
     const progressText = document.getElementById('split-progress-text');
-    if (qi === activeSplitQueue) {
-        if (progressWrap) progressWrap.style.display = '';
-        if (progressText) progressText.style.display = '';
-        if (progressBar) progressBar.style.width = '0%';
-        if (progressText) progressText.textContent = `队列${qi+1} 正在生成第${activeIdx+1}张...`;
-        const splitGrid = document.getElementById('split-result-grid');
+    if (progressWrap) progressWrap.style.display = '';
+    if (progressText) progressText.style.display = '';
+    if (progressBar) progressBar.style.width = '0%';
+    if (progressText) progressText.textContent = `队列${qi+1} 正在生成第${activeIdx+1}张...`;
+    const splitGridForPending = document.getElementById('split-result-grid');
+    if (splitGridForPending && !splitGridForPending.querySelector('.split-result-pending-card')) {
         renderSplitQueueResults(qi);
-        appendSplitResultPendingSlots(splitGrid, 1);
     }
+    appendSplitResultPendingSlots(splitGridForPending, 1, {
+        key: pendingKey,
+        startIndex: activeIdx,
+        labelPrefix: `队列${qi + 1} · 图片${materialIndex + 1} · ${item.number || activeIdx + 1}号`
+    });
 
     const allResults = [];
     try {
@@ -13764,12 +19330,13 @@ async function runSplitGenerate(qi) {
         if (!sourceUrl) {
             sourceUrl = item.croppedImageUrl || item.imageUrl;
         }
-        if (!sourceUrl) {
-            showToast('没有可用的图片源', 'warning');
-            if (qi === activeSplitQueue) {
-                fillNextSplitPendingCard(document.getElementById('split-result-grid'), splitPendingStubCard('skip', '无可用图源'));
-            }
-        } else {
+            if (!sourceUrl) {
+                showToast('没有可用的图片源', 'warning');
+                const failPrompt = buildSplitFullPrompt(item);
+                const failedItem = recordSplitFailure(qi, { materialIndex, itemIndex: activeIdx, gridNum: item.number || (activeIdx + 1), reason: '无可用图源', prompt: failPrompt, sourceUrl: '', imageUrls: [] });
+                const failedIdx = splitQueueData[qi]?.failedItems?.indexOf(failedItem) ?? 0;
+                fillNextSplitPendingCard(document.getElementById('split-result-grid'), createSplitFailureCardElement(qi, failedItem, Math.max(0, failedIdx)), pendingKey);
+            } else {
             let imageUrls = [sourceUrl];
             if (item.materials) {
                 item.materials.forEach(m => { if (m) imageUrls.push(m); });
@@ -13778,30 +19345,30 @@ async function runSplitGenerate(qi) {
                 imageUrls = imageUrls.map(u => u.startsWith('/') ? window.location.origin + u : u);
             }
             const fullPrompt = buildSplitFullPrompt(item);
-            const task = { prompt: fullPrompt, imageUrls, queueLabel: `拆图${item.number || (activeIdx + 1)}` };
+            const task = { prompt: fullPrompt, imageUrls, queueLabel: `拆图${item.number || (activeIdx + 1)}`, pendingKey };
             const taskResults = await generateSingleTaskForSplit(qi, task, platform, qd, signal);
             if (taskResults.length > 0) {
                 const mid = qd.activeMaterialIndex || 0;
+                const meta = getSplitResultSourceMeta(qi, mid, activeIdx, item.number || (activeIdx + 1));
                 for (const r of taskResults) {
                     r._regenPrompt = fullPrompt;
                     r._regenImageUrl = sourceUrl;
                     r.prompt = fullPrompt;
-                    r._materialIndex = mid;
+                    attachSplitResultSourceMeta(r, meta);
                 }
                 allResults.push(...taskResults);
                 qd.results = (qd.results || []).concat(taskResults);
                 saveSplitQueueData();
-                if (qi === activeSplitQueue) {
-                    const grid = document.getElementById('split-result-grid');
-                    const results = qd.results || [];
-                    const idx = results.length - 1;
-                    fillNextSplitPendingCard(grid, createSplitResultCardElement(qi, results[idx], idx, results));
-                }
+                const grid = document.getElementById('split-result-grid');
+                const results = qd.results || [];
+                const idx = results.length - 1;
+                fillNextSplitPendingCard(grid, createSplitResultCardElement(qi, results[idx], idx, results), pendingKey);
             } else {
-                showToast(`第${activeIdx+1}张未返回图片`, 'warning');
-                if (qi === activeSplitQueue) {
-                    fillNextSplitPendingCard(document.getElementById('split-result-grid'), splitPendingStubCard('fail', '未返图'));
-                }
+                const failReason = task._lastError || '未返图';
+                const failedItem = recordSplitFailure(qi, { materialIndex, itemIndex: activeIdx, gridNum: item.number || (activeIdx + 1), reason: failReason, prompt: fullPrompt, sourceUrl, imageUrls });
+                showToast(`第${activeIdx+1}张生成失败: ${failReason}`, 'warning');
+                const failedIdx = splitQueueData[qi]?.failedItems?.indexOf(failedItem) ?? 0;
+                fillNextSplitPendingCard(document.getElementById('split-result-grid'), createSplitFailureCardElement(qi, failedItem, Math.max(0, failedIdx)), pendingKey);
             }
         }
         } finally {
@@ -13812,30 +19379,30 @@ async function runSplitGenerate(qi) {
         }
     } catch (e) {
         if (!qs.cancelled) showToast(`拆图队列${qi+1}生成失败: ${e.message}`, 'error');
-        if (qi === activeSplitQueue && document.getElementById('split-result-grid')?.querySelector('.split-result-pending-card')) {
-            fillNextSplitPendingCard(document.getElementById('split-result-grid'), splitPendingStubCard('fail', '异常'));
+        if (!qs.cancelled && item) {
+            const fallbackSource = item.croppedImageUrl || item.imageUrl || '';
+            const fallbackImages = fallbackSource ? [fallbackSource, ...(Array.isArray(item.materials) ? item.materials.filter(Boolean) : [])] : [];
+            recordSplitFailure(qi, {
+                materialIndex,
+                itemIndex: activeIdx,
+                gridNum: item.number || (activeIdx + 1),
+                reason: e?.message || '生成异常',
+                prompt: buildSplitFullPrompt(item),
+                sourceUrl: fallbackSource,
+                imageUrls: fallbackImages
+            });
+        }
+        if (document.getElementById('split-result-grid')?.querySelector(`.split-result-pending-card[data-pending-key="${CSS.escape(pendingKey)}"]`)) {
+            fillNextSplitPendingCard(document.getElementById('split-result-grid'), splitPendingStubCard('fail', '异常'), pendingKey);
         }
     }
 
-    // 统一入图库
-    if (allResults.length > 0 && qd.autoBackup !== false) {
-        await autoBackupSplitResults(allResults, qi);
-    }
-
-    if (qi === activeSplitQueue) {
-        clearRemainingSplitResultPendingSlots(document.getElementById('split-result-grid'));
-        renderSplitQueueResults(qi);
-    }
+    clearRemainingSplitResultPendingSlots(document.getElementById('split-result-grid'), pendingKey);
 
     persistActiveSplitMaterial(qd);
 
-    qs.running = false;
-    qs.cancelled = false;
-    qs.abortController = null;
-    qs.progressPercent = 0;
-    qs.progressText = '';
-    qs.batchVisualTotal = 0;
-    qs.batchVisualFilled = 0;
+    const wasCancelled = qs.cancelled;
+    finishSplitJob(qi, jobKey);
     if (progressWrap) progressWrap.style.display = 'none';
     if (progressText) progressText.style.display = 'none';
     renderSplitQueueNumberBar();
@@ -13843,22 +19410,30 @@ async function runSplitGenerate(qi) {
     syncSplitProgressUI();
     saveSplitQueueData();
 
+    // 统一入图库放在运行状态收尾之后，避免“已出图但按钮还显示生成中”
+    if (allResults.length > 0 && qd.autoBackup !== false) {
+        await autoBackupSplitResults(allResults, qi);
+    }
+
     if (allResults.length > 0) {
         showToast(`拆图队列 ${qi + 1} 格子编号 ${item.number || activeIdx + 1} 生成完成`, 'success');
-    } else if (!qs.cancelled) {
+    } else if (!wasCancelled) {
         showToast('生成未产出结果', 'warning');
     }
-    return { cancelled: qs.cancelled, skipped: false };
+    return { cancelled: wasCancelled, skipped: false };
 }
 
 async function pollUntilDoneForSplit(apiKey, baseUrl, taskId, splitQueueIndex, signal, startTime = Date.now()) {
-    const maxPolls = 120;
+    const maxPollMs = 30 * 60 * 1000;
+    const startedAt = Date.now();
     const qsRh = splitGenerateStates[splitQueueIndex];
-    for (let i = 0; i < maxPolls; i++) {
+    let i = 0;
+    while (Date.now() - startedAt < maxPollMs) {
         if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
-        await waitForSplitPollTick(signal, 3000);
+        const waitedMs = Date.now() - startedAt;
+        await waitForSplitPollTick(signal, waitedMs < 2 * 60 * 1000 ? POLL_DELAYS[Math.min(i, POLL_DELAYS.length - 1)] : 8000);
         if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
-        const elapsedSec = (i + 1) * 3;
+        const elapsedSec = Math.round((Date.now() - startTime) / 1000);
         if (qsRh?.running) {
             qsRh.progressText = `队列${splitQueueIndex + 1}: RH 任务查询中…（约 ${elapsedSec}s）`;
             syncSplitProgressUI();
@@ -13876,24 +19451,28 @@ async function pollUntilDoneForSplit(apiKey, baseUrl, taskId, splitQueueIndex, s
             if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
             console.warn('[拆图-RH轮询]', e);
         }
+        i++;
     }
     if (!splitGenerateStates[splitQueueIndex]?.cancelled) {
-        showToast(`RunningHub 拆图任务轮询超时（约 ${maxPolls * 3}s），请检查任务状态或稍后重试`, 'warning');
+        showToast('RunningHub 拆图任务等待超过30分钟，远端任务可能仍在排队，请稍后检查或重试', 'warning');
     }
     return null;
 }
 
 async function pollOAIHKForSplit(pollEndpoint, requestId, splitQueueIndex, signal, taskLabel = '') {
-    const maxPolls = 120;
+    const maxPollMs = 30 * 60 * 1000;
+    const startedAt = Date.now();
     const qsPoll = splitGenerateStates[splitQueueIndex];
     const label = (taskLabel || '拆图').slice(0, 40);
-    for (let i = 0; i < maxPolls; i++) {
+    let i = 0;
+    while (Date.now() - startedAt < maxPollMs) {
         if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
-        await waitForSplitPollTick(signal, 3000);
+        const waitedMs = Date.now() - startedAt;
+        await waitForSplitPollTick(signal, waitedMs < 2 * 60 * 1000 ? 3000 : 8000);
         if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
-        const elapsedSec = (i + 1) * 3;
+        const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
         if (qsPoll?.running) {
-            qsPoll.progressText = `队列${splitQueueIndex + 1}: ${label} 等待出图…（约 ${elapsedSec}s，第 ${i + 1}/${maxPolls} 次查询）`;
+            qsPoll.progressText = `队列${splitQueueIndex + 1}: ${label} 等待出图…（约 ${elapsedSec}s，第 ${i + 1} 次查询）`;
             syncSplitProgressUI();
         }
         try {
@@ -13910,9 +19489,10 @@ async function pollOAIHKForSplit(pollEndpoint, requestId, splitQueueIndex, signa
             if (splitGenerateStates[splitQueueIndex]?.cancelled) return null;
             console.warn('[拆图-HK轮询]', label, e);
         }
+        i++;
     }
     if (!splitGenerateStates[splitQueueIndex]?.cancelled) {
-        showToast(`「${label}」OpenAI-HK 轮询超时（约 ${maxPolls * 3}s），可能仍在远端排队，可稍后单独对该格子「再生」`, 'warning');
+        showToast(`「${label}」OpenAI-HK 轮询超时（已等待30分钟），可能仍在远端排队，可稍后单独对该格子「再生」`, 'warning');
     }
     return null;
 }
@@ -13950,14 +19530,128 @@ async function generateSingleTaskForSplit(qi, task, platform, qd, signal, opts =
     if (opts?.bypassDispatchChain) {
         return generateSingleTaskForSplitCore(qi, task, platform, qd, signal);
     }
-    return enqueueSplitApiGeneration(qi, task.queueLabel || '任务提交', () =>
+    return runWithSplitGlobalConcurrency(() =>
         generateSingleTaskForSplitCore(qi, task, platform, qd, signal)
-    );
+    , signal);
+}
+
+async function pollOaihkGptImageJobForSplit(jobId, qi, signal, taskLabel = '') {
+    const startedAt = Date.now();
+    const maxPollMs = getOaihkGptClientTimeoutMs();
+    const label = (taskLabel || '拆图').slice(0, 40);
+    let i = 0;
+    while (Date.now() - startedAt < maxPollMs) {
+        if (signal?.aborted || splitGenerateStates[qi]?.cancelled) return null;
+        await waitForSplitPollTick(signal, i < 20 ? 2000 : 5000);
+        if (signal?.aborted || splitGenerateStates[qi]?.cancelled) return null;
+        const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+        const qsJob = splitGenerateStates[qi];
+        if (qsJob?.running) {
+            qsJob.progressText = `队列${qi + 1}: ${label} GPT后台生成中…（约 ${elapsedSec}s）`;
+            syncSplitProgressUI();
+        }
+        const data = await api('GET', `/api/oaihk-gpt-image-job/${encodeURIComponent(jobId)}`, null, 30000, signal);
+        if (data.status === 'success') return data.data || {};
+        if (data.status === 'failed') {
+            const err = new Error(data.error || 'GPT后台任务失败');
+            err.code = data.code || data.data?.code || '';
+            err.data = data.data || data;
+            throw err;
+        }
+        i++;
+    }
+    throw new Error(`OpenAI-HK GPT后台任务超时（已等待 ${Math.round(maxPollMs / 1000)}s）`);
+}
+
+async function submitGptImageTaskForSplitAsync(qi, task, qd, signal, opts = {}) {
+    const qs = splitGenerateStates[qi];
+    const modelId = qd.oaihkModelId;
+    const model = OAIHK_MODELS[modelId];
+    const aspectRatio = qd.oaihkAspectRatio || '3:4';
+    const shortEdge = model?.shortEdge || 1536;
+    let releaseSlot = null;
+    if (opts.acquireSlot !== false) {
+        releaseSlot = await acquireSplitGlobalJobSlot(signal);
+    }
+    let released = false;
+    const releaseOnce = () => {
+        if (released) return;
+        released = true;
+        if (releaseSlot) releaseSlot();
+    };
+    try {
+        const publicUrls = [];
+        const imgs = task.imageUrls || [];
+        for (let ii = 0; ii < imgs.length; ii++) {
+            if (qs.cancelled || signal?.aborted) throw createSplitAbortError();
+            if (qs.running) {
+                qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 预处理参考图 ${ii + 1}/${imgs.length}…`;
+                syncSplitProgressUI();
+            }
+            if (task.pendingKey) {
+                setSplitPendingCardStatus(document.getElementById('split-result-grid'), task.pendingKey, `<span class="loading" style="display:inline-block;"></span> 预处理参考图 ${ii + 1}/${imgs.length}…`);
+            }
+            publicUrls.push(await uploadToTmpfiles(imgs[ii], aspectRatio, shortEdge));
+        }
+        if (qs.cancelled || signal?.aborted) throw createSplitAbortError();
+        const payload = {
+            action: publicUrls.length > 0 ? 'edits' : 'generations',
+            model: model?.modelId || 'gpt-image-2',
+            prompt: task.prompt,
+            size: getOaihkImageSize(model, aspectRatio),
+            quality: getOaihkGptQuality(model),
+            n: 1,
+            image_base64_list: publicUrls
+        };
+        announceOaihkSubmit('拆图-GPT后台', payload);
+        if (qs.running) {
+            qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} GPT已交给后台，继续下一张…`;
+            syncSplitProgressUI();
+        }
+        if (task.pendingKey) {
+            setSplitPendingCardStatus(document.getElementById('split-result-grid'), task.pendingKey, '<span class="loading" style="display:inline-block;"></span> GPT后台生成中…');
+        }
+        const jobResp = await api('POST', '/api/oaihk-gpt-image-job', payload, 60000, signal);
+        if (!jobResp.job_id) throw new Error('GPT后台任务未返回 job_id');
+        return {
+            jobId: jobResp.job_id,
+            waitForResults: async () => {
+                try {
+                    const gptResp = await pollOaihkGptImageJobForSplit(jobResp.job_id, qi, signal, task.queueLabel || '');
+                    const results = [];
+                    warnOnOaihkSizeMismatch(gptResp, `${task.queueLabel || '拆图'} HK GPT`);
+                    if (gptResp?.data && Array.isArray(gptResp.data)) {
+                        for (const item of gptResp.data) {
+                            const displayUrl = await displayUrlFromOaihkGptItem(item, signal);
+                            if (!displayUrl) continue;
+                            if (!item.b64_json && item.url && displayUrl === item.url) {
+                                showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL（入图库可能失败）`, 'warning');
+                            }
+                            results.push({ url: displayUrl, checked: false, filename: `拆图_${task.queueLabel}_${results.length + 1}.jpg`, outputType: 'png' });
+                        }
+                    }
+                    return results;
+                } finally {
+                    releaseOnce();
+                }
+            }
+        };
+    } catch (e) {
+        releaseOnce();
+        throw e;
+    }
 }
 
 async function generateSingleTaskForSplitCore(qi, task, platform, qd, signal) {
     const qs = splitGenerateStates[qi];
     const results = [];
+    const setTaskProgress = (text) => {
+        if (!text) return;
+        task._lastStatus = text;
+        if (task.pendingKey) {
+            setSplitPendingCardStatus(document.getElementById('split-result-grid'), task.pendingKey, `<span class="loading" style="display:inline-block;"></span> ${text}`);
+        }
+    };
     try {
         if (platform === 'oaihk') {
             const modelId = qd.oaihkModelId;
@@ -13966,54 +19660,35 @@ async function generateSingleTaskForSplitCore(qi, task, platform, qd, signal) {
             const shortEdge = model?.shortEdge || 1536;
             const publicUrls = [];
             const imgs = task.imageUrls || [];
-            for (let ii = 0; ii < imgs.length; ii++) {
-                if (qs.cancelled) break;
-                if (qs.running) {
-                    qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 预处理参考图 ${ii + 1}/${imgs.length}…`;
-                    syncSplitProgressUI();
+            if (!model?.isGptImage) {
+                for (let ii = 0; ii < imgs.length; ii++) {
+                    if (qs.cancelled) break;
+                    if (qs.running) {
+                        qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 预处理参考图 ${ii + 1}/${imgs.length}…`;
+                        syncSplitProgressUI();
+                    }
+                    setTaskProgress(`预处理参考图 ${ii + 1}/${imgs.length}…`);
+                    publicUrls.push(await uploadToTmpfiles(imgs[ii], aspectRatio, shortEdge));
                 }
-                publicUrls.push(await uploadToTmpfiles(imgs[ii], aspectRatio, shortEdge));
             }
             if (qs.cancelled) return results;
 
-            const splitHkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 600000);
+            const splitHkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 1200000);
             if (model?.isGptImage) {
-                if (qs.running) {
-                    qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 已提交 GPT，同步生成中（较慢）…`;
-                    syncSplitProgressUI();
-                }
-                announceOaihkSubmit('拆图-GPT', {
-                    model: model.modelId || 'gpt-image-2',
-                    size: getOaihkImageSize(model, aspectRatio),
-                    quality: getOaihkGptQuality(model)
-                });
-                const gptResp = await api('POST', '/api/oaihk-gpt-image', {
-                    action: publicUrls.length > 0 ? 'edits' : 'generations',
-                    model: model.modelId || 'gpt-image-2',
-                    prompt: task.prompt,
-                    size: getOaihkImageSize(model, aspectRatio),
-                    quality: getOaihkGptQuality(model),
-                    n: 1,
-                    image_base64_list: publicUrls
-                }, splitHkTm, signal);
-                if (qs.cancelled) return results;
-                if (gptResp.data && Array.isArray(gptResp.data)) {
-                    for (const item of gptResp.data) {
-                        const displayUrl = await displayUrlFromOaihkGptItem(item, signal);
-                        if (!displayUrl) continue;
-                        if (!item.b64_json && item.url && displayUrl === item.url) {
-                            showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL（入图库可能失败）`, 'warning');
-                        }
-                        results.push({ url: displayUrl, checked: false, filename: `拆图_${task.queueLabel}_${results.length + 1}.jpg`, outputType: 'png' });
-                    }
-                }
+                const submitted = await submitGptImageTaskForSplitAsync(qi, task, qd, signal, { acquireSlot: false });
+                const taskResults = await submitted.waitForResults();
+                results.push(...taskResults);
             } else {
-                const payload = { prompt: task.prompt, image_urls: publicUrls, num_images: 1, aspect_ratio: aspectRatio };
+                const payload = applyOaihkAspectRatioToPayload(
+                    { prompt: task.prompt, image_urls: publicUrls, num_images: 1 },
+                    aspectRatio
+                );
                 if (model?.modelId) payload.model = model.modelId;
                 if (qs.running) {
                     qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 已提交，等待排队/出图…`;
                     syncSplitProgressUI();
                 }
+                setTaskProgress('已提交，等待排队/出图…');
                 const submitData = await api('POST', '/api/oaihk-proxy', {
                     action: 'submit', api_key: '', base_url: '', endpoint: model.endpoint, model_id: modelId, params: payload
                 }, splitHkTm, signal);
@@ -14033,6 +19708,7 @@ async function generateSingleTaskForSplitCore(qi, task, platform, qd, signal) {
                             try {
                                 const dlResp = await api('POST', '/api/download-image', { url: img.url }, splitHkTm, signal);
                                 if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                                verifyOaihkDownloadedImage(dlResp.data, model, aspectRatio, `${task.queueLabel} HK Nano`);
                             } catch (e) {
                                 console.warn(`[拆图-OAIHK] 图片下载失败，使用原始URL: ${e.message}`);
                                 showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL（入图库可能失败）`, 'warning');
@@ -14046,18 +19722,19 @@ async function generateSingleTaskForSplitCore(qi, task, platform, qd, signal) {
             const modelId = qd.rhModelId;
             const model = RH_MODELS[modelId];
             const rhApiKey = state.modelConfig.rh_api_key || '';
-            const rhBaseUrl = state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
+            const rhBaseUrl = state.modelConfig.rh_base_url || 'https://www.runninghub.ai/openapi/v2';
             const payload = { prompt: task.prompt };
             if (model?.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
-            if (model?.hasResolution) payload.resolution = qd.rhResolution || '1k';
-            if (qd.rhAspectRatio) payload.aspectRatio = qd.rhAspectRatio;
+            if (model?.hasResolution) payload.resolution = model.fixedResolution || qd.rhResolution || '1k';
+            applyRhAspectRatioToPayload(payload, model, qd.rhAspectRatio);
 
             if (qs.running) {
                 qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} RH 提交中…`;
                 syncSplitProgressUI();
             }
+            setTaskProgress('RH 提交中…');
             const data = await api('POST', '/api/rh-proxy', {
-                action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
+                action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: model.endpoint || modelId, params: payload
             }, 180000, signal);
             if (data.status === 'FAILED') return results;
             if (!data.taskId) {
@@ -14074,7 +19751,9 @@ async function generateSingleTaskForSplitCore(qi, task, platform, qd, signal) {
             }
         }
     } catch (e) {
-        if (!qs.cancelled) showToast(`${task.queueLabel}生成失败: ${e.message}`, 'error');
+        const codeSuffix = e?.code ? ` (${e.code})` : '';
+        task._lastError = `${e?.message || String(e || '未知错误')}${codeSuffix}`;
+        if (!qs.cancelled) showToast(`${task.queueLabel}生成失败: ${task._lastError}`, 'error');
     }
     return results;
 }
@@ -14085,8 +19764,7 @@ async function submitSingleTaskForSplitAsync(qi, task, platform, qd, signal) {
         const modelId = qd.oaihkModelId;
         const model = OAIHK_MODELS[modelId];
         if (model?.isGptImage) {
-            const taskResults = await generateSingleTaskForSplitCore(qi, task, platform, qd, signal);
-            return { waitForResults: async () => taskResults };
+            return submitGptImageTaskForSplitAsync(qi, task, qd, signal, { acquireSlot: true });
         }
         const aspectRatio = qd.oaihkAspectRatio || '3:4';
         const shortEdge = model?.shortEdge || 1536;
@@ -14101,12 +19779,18 @@ async function submitSingleTaskForSplitAsync(qi, task, platform, qd, signal) {
             publicUrls.push(await uploadToTmpfiles(imgs[ii], aspectRatio, shortEdge));
         }
         if (qs.cancelled || signal?.aborted) throw createSplitAbortError();
-        const payload = { prompt: task.prompt, image_urls: publicUrls, num_images: 1, aspect_ratio: aspectRatio };
+        const payload = applyOaihkAspectRatioToPayload(
+            { prompt: task.prompt, image_urls: publicUrls, num_images: 1 },
+            aspectRatio
+        );
         if (model?.modelId) payload.model = model.modelId;
-        const splitHkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 600000);
+        const splitHkTm = Math.min(Math.max(getOaihkGptClientTimeoutMs(), 120000), 1200000);
         if (qs.running) {
             qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} 已提交，继续下一张…`;
             syncSplitProgressUI();
+        }
+        if (task.pendingKey) {
+            setSplitPendingCardStatus(document.getElementById('split-result-grid'), task.pendingKey, '<span class="loading" style="display:inline-block;"></span> 已提交，等待出图…');
         }
         const submitData = await api('POST', '/api/oaihk-proxy', {
             action: 'submit', api_key: '', base_url: '', endpoint: model.endpoint, model_id: modelId, params: payload
@@ -14129,6 +19813,7 @@ async function submitSingleTaskForSplitAsync(qi, task, platform, qd, signal) {
                         try {
                             const dlResp = await api('POST', '/api/download-image', { url: img.url }, splitHkTm, signal);
                             if (dlResp.data?.data_uri) displayUrl = dlResp.data.data_uri;
+                            verifyOaihkDownloadedImage(dlResp.data, model, aspectRatio, `${task.queueLabel} HK Nano`);
                         } catch (e) {
                             console.warn(`[拆图-OAIHK] 图片下载失败，使用原始URL: ${e.message}`);
                             showToast(`${task.queueLabel}图片下载到本地失败，已使用外网URL（入图库可能失败）`, 'warning');
@@ -14144,17 +19829,17 @@ async function submitSingleTaskForSplitAsync(qi, task, platform, qd, signal) {
     const modelId = qd.rhModelId;
     const model = RH_MODELS[modelId];
     const rhApiKey = state.modelConfig.rh_api_key || '';
-    const rhBaseUrl = state.modelConfig.rh_base_url || 'https://www.runninghub.cn/openapi/v2';
+    const rhBaseUrl = state.modelConfig.rh_base_url || 'https://www.runninghub.ai/openapi/v2';
     const payload = { prompt: task.prompt };
     if (model?.type === 'image-to-image' && task.imageUrls.length > 0) payload.imageUrls = task.imageUrls;
-    if (model?.hasResolution) payload.resolution = qd.rhResolution || '1k';
-    if (qd.rhAspectRatio) payload.aspectRatio = qd.rhAspectRatio;
+    if (model?.hasResolution) payload.resolution = model.fixedResolution || qd.rhResolution || '1k';
+    applyRhAspectRatioToPayload(payload, model, qd.rhAspectRatio);
     if (qs.running) {
         qs.progressText = `队列${qi + 1}: ${task.queueLabel || '拆图'} RH 已提交，继续下一张…`;
         syncSplitProgressUI();
     }
     const data = await api('POST', '/api/rh-proxy', {
-        action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: modelId, params: payload
+        action: 'submit', api_key: rhApiKey, base_url: rhBaseUrl, model_id: model.endpoint || modelId, params: payload
     }, 180000, signal);
     if (data.status === 'FAILED') throw new Error(`${task.queueLabel || '拆图'} RH 提交失败`);
     if (!data.taskId) throw new Error(`${task.queueLabel || '拆图'} RH 提交未返回 taskId`);
@@ -14181,9 +19866,11 @@ async function runSplitBatchGenerate() {
         showToast('当前队列没有拆图数据', 'warning');
         return { cancelled: false, skipped: true };
     }
-    const qs = splitGenerateStates[qi];
-    if (qs.running) {
-        showToast(`队列${qi+1}正在生成中`, 'error');
+    const qs = ensureSplitRuntimeState(qi);
+    const materialIndexForBatch = qd.activeMaterialIndex || 0;
+    const jobKey = splitJobKey(materialIndexForBatch, null, 'material');
+    if (isSplitMaterialBusy(qi, materialIndexForBatch)) {
+        showToast(`队列${qi + 1} 图片${materialIndexForBatch + 1}已有格子正在生成中`, 'warning');
         return { cancelled: false, skipped: true };
     }
 
@@ -14202,10 +19889,9 @@ async function runSplitBatchGenerate() {
         if (!RH_MODELS[qd.rhModelId]) { showToast('请选择模型', 'error'); return { cancelled: false, skipped: true }; }
     }
 
-    qs.running = true;
-    qs.cancelled = false;
-    qs.abortController = new AbortController();
-    const signal = qs.abortController.signal;
+    const controller = new AbortController();
+    beginSplitJob(qi, jobKey, controller);
+    const signal = controller.signal;
     const batchSlotCount = Math.max(1, qd.workItems.length);
     qs.batchVisualTotal = batchSlotCount;
     qs.batchVisualFilled = 0;
@@ -14225,13 +19911,14 @@ async function runSplitBatchGenerate() {
     qd.progressDone = 0;
     qd.failedItems = [];
     updateSplitFailedUI(qi);
-    saveSplitQueueData();
+    saveSplitQueueData({ clearFailuresQueues: [qi] });
     renderSplitQueueNumberBar();
 
+    const batchPendingPrefix = `q${qi}:batch:${Date.now()}`;
     if (qi === activeSplitQueue) {
         const grid = document.getElementById('split-result-grid');
         renderSplitQueueResults(qi);
-        appendSplitResultPendingSlots(grid, batchSlotCount);
+        appendSplitResultPendingSlots(grid, batchSlotCount, { keyPrefix: batchPendingPrefix });
     }
 
     const allResults = [];
@@ -14267,7 +19954,7 @@ async function runSplitBatchGenerate() {
                         showToast(`格子编号 ${item.number} 裁剪失败，跳过`, 'warning');
                         recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum: item.number || (itemIdx + 1), reason: '裁剪失败' });
                         processedItems++;
-                        if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '裁剪失败'));
+                        if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '裁剪失败'), `${batchPendingPrefix}:${itemIdx}`);
                         bumpSplitBatchVisualFilled();
                         continue;
                     }
@@ -14275,7 +19962,7 @@ async function runSplitBatchGenerate() {
                     showToast(`格子编号 ${item.number} 裁剪请求失败: ${e.message}`, 'error');
                     recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum: item.number || (itemIdx + 1), reason: '裁剪异常' });
                     processedItems++;
-                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '裁剪异常'));
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '裁剪异常'), `${batchPendingPrefix}:${itemIdx}`);
                     bumpSplitBatchVisualFilled();
                     continue;
                 }
@@ -14286,7 +19973,7 @@ async function runSplitBatchGenerate() {
             if (!sourceUrl) {
                 recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum: item.number || (itemIdx + 1), reason: '无图源' });
                 processedItems++;
-                if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '无图源'));
+                if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('skip', '无图源'), `${batchPendingPrefix}:${itemIdx}`);
                 bumpSplitBatchVisualFilled();
                 continue;
             }
@@ -14301,8 +19988,8 @@ async function runSplitBatchGenerate() {
             const prompt = buildSplitFullPrompt(item);
             const task = { prompt, imageUrls, queueLabel: `拆图${item.number || (itemIdx + 1)}` };
             const gridNum = item.number || (itemIdx + 1);
-            const materialIndex = qd.activeMaterialIndex || 0;
-            const job = { itemIdx, materialIndex, gridNum, task, prompt, sourceUrl };
+            const materialIndex = materialIndexForBatch;
+                    const job = { itemIdx, materialIndex, gridNum, task, prompt, sourceUrl, imageUrls };
             processedItems++;
             if (progressText) {
                 progressText.textContent = `队列${qi + 1} 正在提交 ${processedItems}/${totalItems}：格子 ${gridNum}`;
@@ -14322,9 +20009,10 @@ async function runSplitBatchGenerate() {
                         taskResults = ent.taskResults || [];
                 } else {
                     console.warn('[拆图批量] 任务异常', ent.reason);
-                        recordSplitFailure(qi, { materialIndex, itemIndex: itemIdx, gridNum, reason: '请求异常' });
+                        const reason = compactSplitFailureReason(ent.reason, '请求异常');
+                        recordSplitFailure(qi, { materialIndex, itemIndex: itemIdx, gridNum, reason, prompt, sourceUrl, imageUrls: ent.job.task?.imageUrls || [] });
                     if (!qs.cancelled) showToast(`格子编号 ${gridNum} 请求失败`, 'error');
-                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '请求异常'));
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '请求异常'), `${batchPendingPrefix}:${itemIdx}`);
                     bumpSplitBatchVisualFilled();
                     finishedJobs.n++;
                     if (progressText) progressText.textContent = `队列${qi + 1} 已处理 ${finishedJobs.n}/${totalJobs}（成功出图 ${completedItems}）`;
@@ -14336,11 +20024,12 @@ async function runSplitBatchGenerate() {
                 }
 
                 if (taskResults.length > 0) {
+                    const meta = getSplitResultSourceMeta(qi, materialIndex, itemIdx, gridNum);
                     for (const r of taskResults) {
                         r._regenPrompt = prompt;
                         r._regenImageUrl = sourceUrl;
                         r.prompt = prompt;
-                            r._materialIndex = materialIndex;
+                        attachSplitResultSourceMeta(r, meta);
                     }
                     allResults.push(...taskResults);
                     qd.results = (qd.results || []).concat(taskResults);
@@ -14350,7 +20039,7 @@ async function runSplitBatchGenerate() {
                         const start = results.length - taskResults.length;
                         for (let k = start; k < results.length; k++) {
                             const el = createSplitResultCardElement(qi, results[k], k, results);
-                            if (k === start) fillSplitPendingSlotAt(splitGrid, itemIdx, el);
+                            if (k === start) fillSplitPendingSlotAt(splitGrid, itemIdx, el, `${batchPendingPrefix}:${itemIdx}`);
                             else splitGrid.appendChild(el);
                         }
                     }
@@ -14360,9 +20049,10 @@ async function runSplitBatchGenerate() {
                     saveSplitQueueData();
                     renderSplitQueueNumberBar();
                 } else {
-                    recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum, reason: '未返图' });
-                    if (!qs.cancelled) showToast(`格子编号 ${gridNum} 未返回图片`, 'warning');
-                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '未返图'));
+                    const failReason = task._lastError || '未返图';
+                    recordSplitFailure(qi, { materialIndex: qd.activeMaterialIndex || 0, itemIndex: itemIdx, gridNum, reason: failReason, prompt, sourceUrl, imageUrls });
+                    if (!qs.cancelled) showToast(`格子编号 ${gridNum} 生成失败: ${failReason}`, 'warning');
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', failReason), `${batchPendingPrefix}:${itemIdx}`);
                 }
                 bumpSplitBatchVisualFilled();
                 finishedJobs.n++;
@@ -14375,10 +20065,10 @@ async function runSplitBatchGenerate() {
             } catch (e) {
                 if (!qs.cancelled) {
                     console.warn('[拆图批量] 提交异常', e);
-                    recordSplitFailure(qi, { materialIndex, itemIndex: itemIdx, gridNum, reason: '提交异常' });
+                    recordSplitFailure(qi, { materialIndex, itemIndex: itemIdx, gridNum, reason: e?.message || '提交异常', prompt, sourceUrl, imageUrls });
                     showToast(`格子编号 ${gridNum} 提交失败`, 'error');
                 }
-                if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '提交异常'));
+                if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '提交异常'), `${batchPendingPrefix}:${itemIdx}`);
                 bumpSplitBatchVisualFilled();
                 finishedJobs.n++;
             }
@@ -14391,28 +20081,22 @@ async function runSplitBatchGenerate() {
 
     persistActiveSplitMaterial(qd);
 
-    if (allResults.length > 0 && qd.autoBackup !== false) {
-        await autoBackupSplitResults(allResults, qi);
-    }
-
     const wasCancelled = qs.cancelled;
-    qs.running = false;
-    qs.cancelled = false;
-    qs.abortController = null;
-    qs.progressPercent = 0;
-    qs.progressText = '';
-    qs.batchVisualTotal = 0;
-    qs.batchVisualFilled = 0;
+    finishSplitJob(qi, jobKey);
     if (progressWrap) progressWrap.style.display = 'none';
     if (progressText) progressText.style.display = 'none';
     if (qi === activeSplitQueue) {
-        clearRemainingSplitResultPendingSlots(document.getElementById('split-result-grid'));
+        clearSplitPendingCardsByPrefix(document.getElementById('split-result-grid'), batchPendingPrefix);
         renderSplitQueueResults(qi);
     }
     renderSplitQueueNumberBar();
     updateSplitGenerateBtnState();
     syncSplitProgressUI();
     saveSplitQueueData();
+
+    if (allResults.length > 0 && qd.autoBackup !== false) {
+        await autoBackupSplitResults(allResults, qi);
+    }
 
     const failedCount = qd.failedItems?.length || 0;
     if (allResults.length > 0) {
@@ -14458,9 +20142,10 @@ async function runSplitBatchGenerateAllMaterials() {
         return { cancelled: false, skipped: true };
     }
 
-    const qs = splitGenerateStates[qi];
-    if (qs.running) {
-        showToast(`队列${qi + 1}正在生成中`, 'error');
+    const qs = ensureSplitRuntimeState(qi);
+    const jobKey = splitJobKey(0, null, 'all');
+    if (isSplitJobRunning(qi)) {
+        showToast(`队列${qi + 1}已有拆图任务在生成，请等当前任务完成后再跑全部素材`, 'warning');
         return { cancelled: false, skipped: true };
     }
 
@@ -14475,10 +20160,9 @@ async function runSplitBatchGenerateAllMaterials() {
 
     const savedActiveMat = Math.max(0, Math.min(qd.activeMaterialIndex || 0, Math.max(0, qd.materials.length - 1)));
 
-    qs.running = true;
-    qs.cancelled = false;
-    qs.abortController = new AbortController();
-    const signal = qs.abortController.signal;
+    const controller = new AbortController();
+    beginSplitJob(qi, jobKey, controller);
+    const signal = controller.signal;
     const batchSlotCount = Math.max(1, totalWorkSlots);
     qs.batchVisualTotal = batchSlotCount;
     qs.batchVisualFilled = 0;
@@ -14497,13 +20181,14 @@ async function runSplitBatchGenerateAllMaterials() {
     qd.progressDone = 0;
     qd.failedItems = [];
     updateSplitFailedUI(qi);
-    saveSplitQueueData();
+    saveSplitQueueData({ clearFailuresQueues: [qi] });
     renderSplitQueueNumberBar();
 
+    const allPendingPrefix = `q${qi}:all:${Date.now()}`;
     if (qi === activeSplitQueue) {
         const grid = document.getElementById('split-result-grid');
         renderSplitQueueResults(qi);
-        appendSplitResultPendingSlots(grid, batchSlotCount);
+        appendSplitResultPendingSlots(grid, batchSlotCount, { keyPrefix: allPendingPrefix });
     }
 
     const allResults = [];
@@ -14553,14 +20238,14 @@ async function runSplitBatchGenerateAllMaterials() {
                         } else {
                             showToast(`素材 ${mi + 1} · 格子编号 ${item.number} 裁剪失败，跳过`, 'warning');
                             recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '裁剪失败' });
-                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '裁剪失败'));
+                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '裁剪失败'), `${allPendingPrefix}:${slotIdx}`);
                             bumpSplitBatchVisualFilled();
                             continue;
                         }
                     } catch (e) {
                         showToast(`素材 ${mi + 1} · 格子编号 ${item.number} 裁剪异常: ${e.message}`, 'error');
                         recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '裁剪异常' });
-                        if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '裁剪异常'));
+                        if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '裁剪异常'), `${allPendingPrefix}:${slotIdx}`);
                         bumpSplitBatchVisualFilled();
                         continue;
                     }
@@ -14570,7 +20255,7 @@ async function runSplitBatchGenerateAllMaterials() {
                 }
                 if (!sourceUrl) {
                     recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || (wi + 1), reason: '无图源' });
-                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '无图源'));
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('skip', '无图源'), `${allPendingPrefix}:${slotIdx}`);
                     bumpSplitBatchVisualFilled();
                     continue;
                 }
@@ -14585,7 +20270,7 @@ async function runSplitBatchGenerateAllMaterials() {
                 const prompt = buildSplitFullPrompt(item);
                 const task = { prompt, imageUrls, queueLabel: `拆图M${mi + 1}-${item.number || (wi + 1)}` };
                 const gridNum = item.number || (wi + 1);
-                const job = { itemIdx: slotIdx, itemIndexInMaterial: wi, materialIndex: mi, gridNum, task, prompt, sourceUrl };
+                const job = { itemIdx: slotIdx, itemIndexInMaterial: wi, materialIndex: mi, gridNum, task, prompt, sourceUrl, imageUrls };
                 if (progressText) {
                     progressText.textContent = `队列${qi + 1} 正在提交素材 ${mi + 1} · 格子 ${gridNum}`;
                 }
@@ -14595,15 +20280,16 @@ async function runSplitBatchGenerateAllMaterials() {
                     syncSplitProgressUI();
                     pendingResultPromises.push(submitted.waitForResults().then(taskResults => ({ status: 'fulfilled', taskResults, job }), reason => ({ status: 'rejected', reason, job })).then(ent => {
                         if (splitGenerateStates[qi]?.cancelled) return;
-                        const { itemIdx, itemIndexInMaterial, prompt, sourceUrl, materialIndex, gridNum } = ent.job;
+                        const { itemIdx, itemIndexInMaterial, prompt, sourceUrl, materialIndex, gridNum, imageUrls } = ent.job;
                         let taskResults = [];
                         if (ent.status === 'fulfilled') {
                             taskResults = ent.taskResults || [];
                         } else {
                             console.warn('[拆图全部素材] 任务异常', ent.reason);
-                            recordSplitFailure(qi, { materialIndex, itemIndex: itemIndexInMaterial, gridNum, reason: '请求异常' });
+                            const reason = compactSplitFailureReason(ent.reason, '请求异常');
+                            recordSplitFailure(qi, { materialIndex, itemIndex: itemIndexInMaterial, gridNum, reason, prompt, sourceUrl, imageUrls });
                             if (!qs.cancelled) showToast(`素材 ${materialIndex + 1} · 格子编号 ${gridNum} 请求失败`, 'error');
-                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '请求异常'));
+                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '请求异常'), `${allPendingPrefix}:${itemIdx}`);
                             bumpSplitBatchVisualFilled();
                             finishedJobsAll.n++;
                             if (progressText) progressText.textContent = `队列${qi + 1} 全部素材 已返回 ${finishedJobsAll.n}/${totalJobsAll}（成功 ${completedItems}）`;
@@ -14615,11 +20301,12 @@ async function runSplitBatchGenerateAllMaterials() {
                         }
 
                         if (taskResults.length > 0) {
+                            const meta = getSplitResultSourceMeta(qi, materialIndex, itemIndexInMaterial, gridNum);
                             for (const r of taskResults) {
                                 r._regenPrompt = prompt;
                                 r._regenImageUrl = sourceUrl;
                                 r.prompt = prompt;
-                                r._materialIndex = materialIndex;
+                                attachSplitResultSourceMeta(r, meta);
                             }
                             allResults.push(...taskResults);
                             qd.results = (qd.results || []).concat(taskResults);
@@ -14629,7 +20316,7 @@ async function runSplitBatchGenerateAllMaterials() {
                                 const start = results.length - taskResults.length;
                                 for (let k = start; k < results.length; k++) {
                                     const el = createSplitResultCardElement(qi, results[k], k, results);
-                                    if (k === start) fillSplitPendingSlotAt(splitGrid, itemIdx, el);
+                                    if (k === start) fillSplitPendingSlotAt(splitGrid, itemIdx, el, `${allPendingPrefix}:${itemIdx}`);
                                     else splitGrid.appendChild(el);
                                 }
                             }
@@ -14639,9 +20326,10 @@ async function runSplitBatchGenerateAllMaterials() {
                             saveSplitQueueData();
                             renderSplitQueueNumberBar();
                         } else {
-                            recordSplitFailure(qi, { materialIndex, itemIndex: itemIndexInMaterial, gridNum, reason: '未返图' });
-                            if (!qs.cancelled) showToast(`素材 ${materialIndex + 1} · 格子编号 ${gridNum} 未返回图片`, 'warning');
-                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', '未返图'));
+                            const failReason = task._lastError || '未返图';
+                            recordSplitFailure(qi, { materialIndex, itemIndex: itemIndexInMaterial, gridNum, reason: failReason, prompt, sourceUrl, imageUrls });
+                            if (!qs.cancelled) showToast(`素材 ${materialIndex + 1} · 格子编号 ${gridNum} 生成失败: ${failReason}`, 'warning');
+                            if (splitGrid) fillSplitPendingSlotAt(splitGrid, itemIdx, splitPendingStubCard('fail', failReason), `${allPendingPrefix}:${itemIdx}`);
                         }
                         bumpSplitBatchVisualFilled();
                         finishedJobsAll.n++;
@@ -14654,10 +20342,10 @@ async function runSplitBatchGenerateAllMaterials() {
                 } catch (e) {
                     if (!qs.cancelled) {
                         console.warn('[拆图全部素材] 提交异常', e);
-                        recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum, reason: '提交异常' });
+                        recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum, reason: e?.message || '提交异常', prompt, sourceUrl, imageUrls });
                         showToast(`素材 ${mi + 1} · 格子编号 ${gridNum} 提交失败`, 'error');
                     }
-                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('fail', '提交异常'));
+                    if (splitGrid) fillSplitPendingSlotAt(splitGrid, slotIdx, splitPendingStubCard('fail', '提交异常'), `${allPendingPrefix}:${slotIdx}`);
                     bumpSplitBatchVisualFilled();
                     finishedJobsAll.n++;
                 }
@@ -14674,22 +20362,12 @@ async function runSplitBatchGenerateAllMaterials() {
     splitImageUrl = qd.gridImageUrl || '';
     splitGridImageUrl = splitImageUrl;
 
-    if (allResults.length > 0 && qd.autoBackup !== false) {
-        await autoBackupSplitResults(allResults, qi);
-    }
-
     const wasCancelled = qs.cancelled;
-    qs.running = false;
-    qs.cancelled = false;
-    qs.abortController = null;
-    qs.progressPercent = 0;
-    qs.progressText = '';
-    qs.batchVisualTotal = 0;
-    qs.batchVisualFilled = 0;
+    finishSplitJob(qi, jobKey);
     if (progressWrap) progressWrap.style.display = 'none';
     if (progressText) progressText.style.display = 'none';
     if (qi === activeSplitQueue) {
-        clearRemainingSplitResultPendingSlots(document.getElementById('split-result-grid'));
+        clearSplitPendingCardsByPrefix(document.getElementById('split-result-grid'), allPendingPrefix);
         renderSplitQueueResults(qi);
         loadSplitQueueToUI(qi);
         renderSplitMaterialTabs(qi);
@@ -14697,6 +20375,10 @@ async function runSplitBatchGenerateAllMaterials() {
     renderSplitQueueNumberBar();
     updateSplitGenerateBtnState();
     syncSplitProgressUI();
+
+    if (allResults.length > 0 && qd.autoBackup !== false) {
+        await autoBackupSplitResults(allResults, qi);
+    }
 
     const failedCount = qd.failedItems?.length || 0;
     if (allResults.length > 0) {
@@ -14719,27 +20401,22 @@ async function runSplitRetryFailed() {
         return;
     }
     const qs = splitGenerateStates[qi];
-    if (qs.running) {
+    const jobKey = 'retry';
+    if (isSplitJobRunning(qi)) {
         showToast(`队列${qi + 1}正在生成中`, 'error');
         return;
     }
     saveCurrentSplitQueueData();
-    const platform = qd.apiPlatform || 'oaihk';
-    if (platform === 'oaihk') {
-        if (!OAIHK_MODELS[qd.oaihkModelId]) { showToast('请选择 OpenAI-HK 模型', 'error'); return; }
-    } else if (!RH_MODELS[qd.rhModelId]) {
-        showToast('请选择模型', 'error');
-        return;
-    }
+    const defaultPlatform = qd.apiPlatform || 'oaihk';
 
-    qs.running = true;
-    qs.cancelled = false;
-    qs.abortController = new AbortController();
-    const signal = qs.abortController.signal;
+    const controller = new AbortController();
+    beginSplitJob(qi, jobKey, controller);
+    const signal = controller.signal;
     qs.batchVisualTotal = failed.length;
     qs.batchVisualFilled = 0;
     qd.failedItems = [];
-    updateSplitFailedUI(qi);
+    updateSplitFailedUI(qi, { skipInfer: true });
+    saveSplitQueueData({ clearFailuresQueues: [qi] });
     updateSplitGenerateBtnState();
 
     const progressWrap = document.getElementById('split-progress-bar-wrap');
@@ -14751,8 +20428,9 @@ async function runSplitRetryFailed() {
     if (progressText) progressText.textContent = `队列${qi + 1} 重试失败项 0/${failed.length}（顺序逐张提交）`;
 
     const grid = document.getElementById('split-result-grid');
+    const retryPendingPrefix = `q${qi}:retry:${Date.now()}`;
     renderSplitQueueResults(qi);
-    appendSplitResultPendingSlots(grid, failed.length);
+    appendSplitResultPendingSlots(grid, failed.length, { keyPrefix: retryPendingPrefix });
 
     const apiJobs = [];
     let slotIdx = 0;
@@ -14761,14 +20439,15 @@ async function runSplitRetryFailed() {
         const wi = Number.isFinite(f.itemIndex) ? f.itemIndex : 0;
         const material = qd.materials?.[mi];
         const item = material?.workItems?.[wi] || qd.workItems?.[wi];
-        if (!item) {
-            recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: f.gridNum, reason: '工作项不存在' });
-            continue;
-        }
+        const pendingKey = `${retryPendingPrefix}:${slotIdx}`;
+        const failureSnapshot = buildSplitFailureSnapshot(qi, f);
+        const gridNum = item?.number || f.gridNum || (wi + 1);
         const qdCtx = Object.assign({}, qd, { gridImageUrl: material?.gridImageUrl || qd.gridImageUrl || '' });
-        let sourceUrl = '';
+        let sourceUrl = failureSnapshot.sourceUrl || '';
+        let imageUrls = normalizeSplitFailureImages(failureSnapshot.imageUrls);
+        const prompt = failureSnapshot.prompt || (item ? buildSplitFullPrompt(item) : '');
         const cropSourceUrl = getSplitCropSourceUrl(item, qdCtx);
-        if (item.cropRect && cropSourceUrl) {
+        if (!sourceUrl && item?.cropRect && cropSourceUrl) {
             try {
                 const cropResult = await api('POST', '/api/free-crop-image', {
                     image_url: cropSourceUrl,
@@ -14780,40 +20459,67 @@ async function runSplitRetryFailed() {
                     item.croppedImageUrl = cropResult.url;
                 }
             } catch (e) {
-                recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || f.gridNum, reason: '裁剪异常' });
-                fillSplitPendingSlotAt(grid, slotIdx++, splitPendingStubCard('fail', '裁剪异常'));
+                recordSplitFailure(qi, { ...failureSnapshot, materialIndex: mi, itemIndex: wi, gridNum, reason: e?.message || '裁剪异常', prompt, sourceUrl, imageUrls });
+                fillSplitPendingSlotAt(grid, slotIdx, splitPendingStubCard('fail', '裁剪异常'), pendingKey);
+                slotIdx++;
                 continue;
             }
         }
-        if (!sourceUrl) sourceUrl = item.croppedImageUrl || item.imageUrl;
+        if (!sourceUrl) sourceUrl = item?.croppedImageUrl || item?.imageUrl || '';
         if (!sourceUrl) {
-            recordSplitFailure(qi, { materialIndex: mi, itemIndex: wi, gridNum: item.number || f.gridNum, reason: '无图源' });
-            fillSplitPendingSlotAt(grid, slotIdx++, splitPendingStubCard('fail', '无图源'));
+            recordSplitFailure(qi, { ...failureSnapshot, materialIndex: mi, itemIndex: wi, gridNum, reason: item ? '无图源' : '工作项不存在且失败快照无图源', prompt });
+            fillSplitPendingSlotAt(grid, slotIdx, splitPendingStubCard('fail', item ? '无图源' : '工作项不存在'), pendingKey);
+            slotIdx++;
             continue;
         }
-        let imageUrls = [sourceUrl];
-        if (item.materials) item.materials.forEach(mat => { if (mat) imageUrls.push(mat); });
-        if (platform !== 'oaihk') imageUrls = imageUrls.map(u => u.startsWith('/') ? window.location.origin + u : u);
-        const prompt = buildSplitFullPrompt(item);
-        apiJobs.push({ slotIndex: slotIdx++, materialIndex: mi, itemIndex: wi, gridNum: item.number || f.gridNum || (wi + 1), prompt, sourceUrl, task: { prompt, imageUrls, queueLabel: `重试M${mi + 1}-${item.number || (wi + 1)}` } });
+        if (imageUrls.length === 0) {
+            imageUrls = [sourceUrl];
+            if (item?.materials) item.materials.forEach(mat => { if (mat) imageUrls.push(mat); });
+            imageUrls = normalizeSplitFailureImages(imageUrls);
+        }
+        if (!prompt) {
+            recordSplitFailure(qi, { ...failureSnapshot, materialIndex: mi, itemIndex: wi, gridNum, reason: '缺少提示词', sourceUrl, imageUrls });
+            fillSplitPendingSlotAt(grid, slotIdx, splitPendingStubCard('fail', '缺少提示词'), pendingKey);
+            slotIdx++;
+            continue;
+        }
+        const jobPlatform = failureSnapshot.apiPlatform || defaultPlatform;
+        const qdForJob = Object.assign({}, qd, failureSnapshot);
+        if (jobPlatform === 'oaihk' && !OAIHK_MODELS[qdForJob.oaihkModelId]) {
+            recordSplitFailure(qi, { ...failureSnapshot, materialIndex: mi, itemIndex: wi, gridNum, reason: 'OpenAI-HK 模型配置缺失', prompt, sourceUrl, imageUrls });
+            fillSplitPendingSlotAt(grid, slotIdx, splitPendingStubCard('fail', '模型配置缺失'), pendingKey);
+            slotIdx++;
+            continue;
+        }
+        if (jobPlatform !== 'oaihk' && !RH_MODELS[qdForJob.rhModelId]) {
+            recordSplitFailure(qi, { ...failureSnapshot, materialIndex: mi, itemIndex: wi, gridNum, reason: 'RunningHub 模型配置缺失', prompt, sourceUrl, imageUrls });
+            fillSplitPendingSlotAt(grid, slotIdx, splitPendingStubCard('fail', '模型配置缺失'), pendingKey);
+            slotIdx++;
+            continue;
+        }
+        if (jobPlatform !== 'oaihk') imageUrls = imageUrls.map(u => u.startsWith('/') ? window.location.origin + u : u);
+        const snapshot = buildSplitFailureSnapshot(qi, { ...f, ...failureSnapshot, materialIndex: mi, itemIndex: wi, gridNum, prompt, sourceUrl, imageUrls, apiPlatform: jobPlatform });
+        const task = { prompt, imageUrls, queueLabel: `重试M${mi + 1}-${gridNum}`, pendingKey };
+        apiJobs.push({ slotIndex: slotIdx++, pendingKey, materialIndex: mi, itemIndex: wi, gridNum, prompt, sourceUrl, imageUrls, platform: jobPlatform, qdForJob, failureSnapshot: snapshot, task });
     }
 
     let successCount = 0;
     const allResults = [];
     await mapWithConcurrency(apiJobs, SPLIT_GEN_CONCURRENCY, job =>
         runWithSplitGlobalConcurrency(() =>
-            generateSingleTaskForSplit(qi, job.task, platform, qd, signal, { bypassDispatchChain: true }).then(taskResults => ({ job, taskResults }))
+            generateSingleTaskForSplit(qi, job.task, job.platform, job.qdForJob, signal, { bypassDispatchChain: true }).then(taskResults => ({ job, taskResults }))
         , signal),
         (_idx, ent) => {
             const job = apiJobs[_idx];
             if (!job || qs.cancelled) return;
             let taskResults = ent.status === 'fulfilled' ? (ent.value.taskResults || []) : [];
             if (taskResults.length > 0) {
+                const meta = getSplitResultSourceMeta(qi, job.materialIndex, job.itemIndexInMaterial ?? job.itemIndex, job.gridNum);
                 for (const r of taskResults) {
                     r._regenPrompt = job.prompt;
                     r._regenImageUrl = job.sourceUrl;
                     r.prompt = job.prompt;
-                    r._materialIndex = job.materialIndex;
+                    attachSplitResultSourceMeta(r, meta);
                 }
                 allResults.push(...taskResults);
                 qd.results = (qd.results || []).concat(taskResults);
@@ -14823,40 +20529,38 @@ async function runSplitRetryFailed() {
                 const start = results.length - taskResults.length;
                 for (let k = start; k < results.length; k++) {
                     const el = createSplitResultCardElement(qi, results[k], k, results);
-                    if (k === start) fillSplitPendingSlotAt(grid, job.slotIndex, el);
+                    if (k === start) fillSplitPendingSlotAt(grid, job.slotIndex, el, job.pendingKey);
                     else grid.appendChild(el);
                 }
                 saveSplitQueueData();
             } else {
-                const reason = ent.status === 'rejected' ? '请求异常' : '未返图';
-                recordSplitFailure(qi, { materialIndex: job.materialIndex, itemIndex: job.itemIndex, gridNum: job.gridNum, reason });
-                fillSplitPendingSlotAt(grid, job.slotIndex, splitPendingStubCard('fail', reason));
+                const reason = ent.status === 'rejected' ? compactSplitFailureReason(ent.reason, '请求异常') : (job.task?._lastError || '未返图');
+                recordSplitFailure(qi, { ...job.failureSnapshot, materialIndex: job.materialIndex, itemIndex: job.itemIndex, gridNum: job.gridNum, reason, prompt: job.prompt, sourceUrl: job.sourceUrl, imageUrls: job.imageUrls });
+                fillSplitPendingSlotAt(grid, job.slotIndex, splitPendingStubCard('fail', reason), job.pendingKey);
             }
             const done = successCount + (qd.failedItems?.length || 0);
             if (progressText) progressText.textContent = `队列${qi + 1} 重试失败项 ${Math.min(done, failed.length)}/${failed.length}（成功 ${successCount}）`;
             if (progressBar) progressBar.style.width = `${Math.round((Math.min(done, failed.length) / failed.length) * 100)}%`;
             qs.batchVisualFilled = Math.min(failed.length, (qs.batchVisualFilled || 0) + 1);
-            updateSplitFailedUI(qi);
+            updateSplitFailedUI(qi, { skipInfer: true });
             renderSplitQueueNumberBar();
         }
     );
 
-    if (allResults.length > 0 && qd.autoBackup !== false) await autoBackupSplitResults(allResults, qi);
     const remaining = qd.failedItems?.length || 0;
-    qs.running = false;
-    qs.cancelled = false;
-    qs.abortController = null;
-    qs.batchVisualTotal = 0;
-    qs.batchVisualFilled = 0;
+    const wasCancelled = qs.cancelled;
+    finishSplitJob(qi, jobKey);
     if (progressWrap) progressWrap.style.display = 'none';
     if (progressText) progressText.style.display = 'none';
-    clearRemainingSplitResultPendingSlots(grid);
+    clearSplitPendingCardsByPrefix(grid, retryPendingPrefix);
     renderSplitQueueResults(qi);
     renderSplitQueueNumberBar();
     updateSplitGenerateBtnState();
-    updateSplitFailedUI(qi);
+    updateSplitFailedUI(qi, { skipInfer: true });
     saveSplitQueueData();
-    showToast(remaining > 0 ? `重试完成：成功 ${successCount} 张，仍失败 ${remaining} 张` : `失败项已全部重试成功，共 ${successCount} 张`, remaining > 0 ? 'warning' : 'success');
+    if (allResults.length > 0 && qd.autoBackup !== false) await autoBackupSplitResults(allResults, qi);
+    if (wasCancelled) showToast(`队列${qi + 1}重试已取消`, 'info');
+    else showToast(remaining > 0 ? `重试完成：成功 ${successCount} 张，仍失败 ${remaining} 张` : `失败项已全部重试成功，共 ${successCount} 张`, remaining > 0 ? 'warning' : 'success');
 }
 
 // 取消拆图生成
@@ -14867,12 +20571,16 @@ function cancelSplitGenerate(targetQueue = activeSplitQueue) {
     }
     targetQueue = Number.isInteger(targetQueue) ? targetQueue : activeSplitQueue;
     const cancelByQueue = (q) => {
-        const state = splitGenerateStates[q];
+        const state = ensureSplitRuntimeState(q);
         if (!state?.running) return false;
         state.cancelled = true;
-        state.abortController?.abort();
+        forceStopSplitQueue(q, { cancelled: true });
         state.progressText = `队列${q + 1}取消中...`;
         showToast(`已取消拆图队列${q + 1}生成`, 'info');
+        clearSplitPendingCardsByPrefix(document.getElementById('split-result-grid'), `q${q}:`);
+        renderSplitQueueResults(activeSplitQueue);
+        renderSplitQueueNumberBar();
+        updateSplitGenerateBtnState();
         syncSplitProgressUI();
         return true;
     };
@@ -14902,7 +20610,7 @@ async function autoBackupSplitResults(results, qi) {
     let failCount = 0;
     const failReasons = [];
     for (const item of results) {
-        if (!item?.url || item.url.startsWith('/api/gallery-image') || item.url.startsWith('/static/')) continue;
+        if (!item?.url || item.url.startsWith('/api/gallery-image')) continue;
         const num = formatImageNumber(counterStart + idx);
         const filename = `${(imagePrefix || 'split').trim() || 'split'}-${num}.jpg`;
         idx++;
@@ -14933,18 +20641,89 @@ async function autoBackupSplitResults(results, qi) {
     }
 }
 
-// JPG下载函数（复用已有逻辑）
-async function downloadImageAsJpg(url, prefix, downloadPath) {
+function buildManualDownloadFilename(item, prefix, idx = 0) {
+    const rawName = (item?.filename || '').trim();
+    if (rawName) {
+        const base = rawName.replace(/\.[^.]+$/, '');
+        return `${base}.jpg`;
+    }
+    const ts = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const defaultPrefix = (prefix || 'split').trim() || 'split';
+    const suffix = idx > 0 ? `_${idx + 1}` : '';
+    return `${defaultPrefix}_${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}${suffix}.jpg`;
+}
+
+async function pickManualDownloadFolder(qi) {
+    const initialDir = getEffectiveSplitDownloadPath(qi) || '~/Downloads/AI生图/';
+    const resp = await api('POST', '/api/select-folder', { initial_dir: initialDir }, 120000, null, true);
+    if (!resp?.ok || !resp.path) return null;
+    return resp.path;
+}
+
+function summarizeDownloadError(err) {
+    const text = String(err || '未知错误');
+    if (text.includes('图库源文件不存在')) return '有图片的本地文件已被移动或删除';
+    if (text.includes('下载图片超时') || text.includes('timed out') || text.includes('Read timed out')) return '远程图片下载超时';
+    if (text.includes('pro.filesystem.site')) return `${text}（远程临时图床连接不稳定）`;
+    return text;
+}
+
+async function manualDownloadSplitResults(items, qi, actionLabel = '下载') {
+    const qd = splitQueueData[qi];
+    const validItems = (items || []).filter(item => item?.url);
+    if (validItems.length === 0) {
+        showToast('没有可下载的结果', 'warning');
+        return;
+    }
+    let folder = null;
     try {
-        const ts = new Date();
-        const pad = (n) => String(n).padStart(2, '0');
-        const defaultPrefix = (prefix || 'split').trim() || 'split';
-        const filename = `${defaultPrefix}_${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.jpg`;
+        folder = await pickManualDownloadFolder(qi);
+    } catch (e) {
+        showToast('选择下载位置失败: ' + (e?.message || e), 'error');
+        return;
+    }
+    if (!folder) {
+        showToast('已取消下载', 'info');
+        return;
+    }
+
+    let okCount = 0;
+    let failCount = 0;
+    const failReasons = [];
+    showToast(`开始${actionLabel} ${validItems.length} 张...`, 'info');
+    for (let i = 0; i < validItems.length; i++) {
+        const item = validItems[i];
+        const filename = buildManualDownloadFilename(item, qd?.imagePrefix || 'split', i);
+        const resp = await downloadImageAsJpg(item.url, qd?.imagePrefix || 'split', folder, filename);
+        if (resp.ok) {
+            okCount++;
+        } else {
+            failCount++;
+            const reason = summarizeDownloadError(resp.error);
+            if (reason && failReasons.length < 3) failReasons.push(reason);
+        }
+        if (validItems.length > 1) {
+            showToast(`${actionLabel}进度 ${i + 1}/${validItems.length}`, 'info');
+        }
+    }
+    if (okCount > 0) showToast(`已${actionLabel} ${okCount} 张到所选文件夹`, 'success');
+    if (failCount > 0) {
+        const detail = failReasons.join('；') || '未知错误';
+        showToast(`${failCount}张${actionLabel}失败：${detail}`, 'error');
+    }
+}
+
+// JPG保存函数：生成时用于自动入库，手动下载时用于另存
+async function downloadImageAsJpg(url, prefix, downloadPath, filenameOverride = '') {
+    try {
+        const filename = filenameOverride || buildManualDownloadFilename(null, prefix);
         const resp = await api('POST', '/api/save-image-to-path', {
             url: url,
             path: downloadPath || '~/Downloads/AI生图/',
-            filename
-        });
+            filename,
+            use_date_folder: !filenameOverride
+        }, 180000, null, true);
         if (resp.ok || resp.success) {
             logAction('download', '自动下载图片(JPG)', { url, path: downloadPath });
             return { ok: true, path: resp.path || '' };
@@ -15452,7 +21231,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // 预览图删除
     document.getElementById('split-delete-preview')?.addEventListener('click', (e) => {
         e.stopPropagation();
-        resetSplitPreview();
+        deleteActiveSplitMaterialPreview();
     });
 
     // 拆图生成按钮
@@ -15566,7 +21345,7 @@ document.addEventListener('DOMContentLoaded', () => {
             qd.rhResolution = qd.rhResolution || '1k';
             qd.rhAspectRatio = '3:4';
         }
-        saveSplitQueueData();
+        saveSplitQueueDataNow({ clearResultsQueues: [activeSplitQueue], clearFailuresQueues: [activeSplitQueue] });
         writeSplitApiConfigFromQueue(activeSplitQueue);
         applySplitSourcePreview(activeSplitQueue);
         renderSplitMaterialTabs(activeSplitQueue);
@@ -15583,26 +21362,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const splitDownloadAllHandler = async () => {
         const qd = splitQueueData[activeSplitQueue];
         if (!qd || !qd.results || qd.results.length === 0) { showToast('没有可下载的结果', 'warning'); return; }
-        let okCount = 0;
-        let failCount = 0;
-        const failReasons = [];
-        for (const item of qd.results) {
-            const resp = await downloadImageAsJpg(item.url, qd.imagePrefix || 'split', getEffectiveSplitDownloadPath(activeSplitQueue));
-            if (resp.ok) okCount++;
-            else {
-                failCount++;
-                if (resp.error && failReasons.length < 3) failReasons.push(resp.error);
-            }
-        }
-        if (okCount > 0) showToast(`已下载 ${okCount} 张`, 'success');
-        if (failCount > 0) {
-            const detail = failReasons.join('；') || '未知错误';
-            if (detail.includes('pro.filesystem.site')) {
-                showToast(`${failCount}张下载失败：${detail}（请重启后端使白名单生效）`, 'error');
-            } else {
-                showToast(`${failCount}张下载失败：${detail}`, 'error');
-            }
-        }
+        await manualDownloadSplitResults([...qd.results], activeSplitQueue, '下载');
     };
     document.getElementById('btn-split-download-all-btn')?.addEventListener('click', splitDownloadAllHandler);
     // 兼容旧按钮ID
@@ -15612,26 +21372,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!qd || !qd.results || qd.results.length === 0) { showToast('没有可下载的结果', 'warning'); return; }
         const selected = qd.results.filter(r => r.checked);
         if (selected.length === 0) { showToast('请先勾选要下载的图片', 'warning'); return; }
-        let okCount = 0;
-        let failCount = 0;
-        const failReasons = [];
-        for (const item of selected) {
-            const resp = await downloadImageAsJpg(item.url, qd.imagePrefix || 'split', getEffectiveSplitDownloadPath(activeSplitQueue));
-            if (resp.ok) okCount++;
-            else {
-                failCount++;
-                if (resp.error && failReasons.length < 3) failReasons.push(resp.error);
-            }
-        }
-        if (okCount > 0) showToast(`已下载勾选 ${okCount} 张`, 'success');
-        if (failCount > 0) {
-            const detail = failReasons.join('；') || '未知错误';
-            if (detail.includes('pro.filesystem.site')) {
-                showToast(`${failCount}张下载失败：${detail}（请重启后端使白名单生效）`, 'error');
-            } else {
-                showToast(`${failCount}张下载失败：${detail}`, 'error');
-            }
-        }
+        await manualDownloadSplitResults(selected, activeSplitQueue, '下载勾选');
     });
     document.getElementById('btn-split-retry-failed')?.addEventListener('click', runSplitRetryFailed);
 
