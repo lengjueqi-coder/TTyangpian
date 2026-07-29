@@ -1,9 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
+import json
 import os
 import sys
 from PyInstaller.utils.hooks import collect_all
 
 project = os.path.dirname(os.path.abspath(SPECPATH))
+with open(os.path.join(project, 'version.json'), encoding='utf-8') as version_file:
+    app_version = json.load(version_file)['version']
 
 dwpose_datas, dwpose_binaries, dwpose_hidden = collect_all('dwpose')
 
@@ -79,8 +82,8 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleName': '样片工厂',
             'CFBundleDisplayName': '样片工厂',
-            'CFBundleVersion': '1.5.0',
-            'CFBundleShortVersionString': '1.5.0',
+            'CFBundleVersion': app_version,
+            'CFBundleShortVersionString': app_version,
             'LSMinimumSystemVersion': '11.0',
             'NSHighResolutionCapable': True,
             'NSAppTransportSecurity': {'NSAllowsArbitraryLoads': True},

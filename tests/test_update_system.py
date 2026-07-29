@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import app as app_module
 
@@ -31,6 +33,41 @@ class UpdateSystemTest(unittest.TestCase):
     def test_wrong_platform_assets_are_rejected(self):
         release = {'assets': [self.RELEASE['assets'][1]]}
         self.assertIsNone(app_module._select_release_asset(release, frozen=True, system='Windows'))
+
+    def test_check_update_reports_local_ahead_of_release(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            'tag_name': 'v1.4.0', 'assets': [], 'body': '', 'html_url': 'https://github.com/release'
+        }
+        with patch.object(app_module.requests, 'get', return_value=response):
+            payload = app_module.app.test_client().get('/api/check-update').get_json()
+        self.assertFalse(payload['has_update'])
+        self.assertEqual(payload['release_status'], 'local_ahead')
+        self.assertEqual(payload['local_version'], '1.5.0')
+        self.assertEqual(payload['remote_version'], '1.4.0')
+
+    def test_check_update_rejects_release_without_compatible_asset(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            'tag_name': 'v1.6.0', 'assets': [], 'body': '', 'html_url': 'https://github.com/release'
+        }
+        with patch.object(app_module.requests, 'get', return_value=response):
+            payload = app_module.app.test_client().get('/api/check-update').get_json()
+        self.assertFalse(payload['has_update'])
+        self.assertEqual(payload['release_status'], 'missing_asset')
+        self.assertIn('缺少适用于本机', payload['error'])
+
+    def test_packaging_does_not_hardcode_current_release_asset_version(self):
+        root = Path(app_module.__file__).resolve().parent
+        workflow_path = root / '.github/workflows/release.yml'
+        installer = (root / 'packaging/windows/installer.iss').read_text(encoding='utf-8')
+        spec = (root / 'packaging/sample_factory.spec').read_text(encoding='utf-8')
+        self.assertNotIn('#define MyAppVersion "1.5.0"', installer)
+        self.assertIn("json.load(version_file)['version']", spec)
+        if workflow_path.exists():
+            workflow = workflow_path.read_text(encoding='utf-8')
+            self.assertNotIn('sample-factory-v1.5.0', workflow)
+            self.assertIn('/DMyAppVersion=$env:APP_VERSION', workflow)
 
 
 if __name__ == '__main__':

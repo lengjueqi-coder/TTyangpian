@@ -1,5 +1,7 @@
 #define MyAppName "样片工厂"
-#define MyAppVersion "1.5.0"
+#ifndef MyAppVersion
+  #error MyAppVersion must be provided from version.json
+#endif
 #define MyAppPublisher "lengjueqi-coder"
 #define MyAppExeName "样片工厂.exe"
 
@@ -14,7 +16,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\..\release-assets
-OutputBaseFilename=sample-factory-v1.5.0-windows-x64-setup
+OutputBaseFilename=sample-factory-v{#MyAppVersion}-windows-x64-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

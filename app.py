@@ -5437,12 +5437,32 @@ def check_update():
         if not remote_ver:
             return jsonify({"has_update": False, "error": "无法获取远程版本号"})
 
-        has_update = _version_tuple(remote_ver) > _version_tuple(local_ver)
+        remote_tuple = _version_tuple(remote_ver)
+        local_tuple = _version_tuple(local_ver)
+        version_available = remote_tuple > local_tuple
         asset = _select_release_asset(release)
         download_url = asset.get('browser_download_url') if asset else None
 
+        if version_available and not asset:
+            runtime_name = '源码包'
+            if getattr(sys, 'frozen', False):
+                runtime_name = 'Windows 安装包' if platform.system() == 'Windows' else 'macOS 安装包'
+            return jsonify({
+                "has_update": False,
+                "release_status": "missing_asset",
+                "local_version": local_ver,
+                "remote_version": remote_ver,
+                "error": f"发现新版本 {remote_ver}，但 Release 缺少适用于本机的{runtime_name}",
+                "html_url": release.get('html_url', ''),
+            })
+
+        release_status = 'update_available' if version_available else (
+            'local_ahead' if local_tuple > remote_tuple else 'current'
+        )
+
         return jsonify({
-            "has_update": has_update,
+            "has_update": version_available,
+            "release_status": release_status,
             "local_version": local_ver,
             "remote_version": remote_ver,
             "download_url": download_url,
