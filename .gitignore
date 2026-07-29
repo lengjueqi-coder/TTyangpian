@@ -55,6 +55,9 @@ desktop.ini
 .agents/
 .codex/
 
+# Local AI/release helper state
+.sync-*/
+
 # Local exports and scratch documents
 情人节爱自己摄影创意方案.html
 样片工厂.html

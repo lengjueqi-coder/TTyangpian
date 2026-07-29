@@ -12043,8 +12043,7 @@ document.getElementById('btn-ecommerce-open-rh-api')?.addEventListener('click', 
 });
 updateEcommerceImportPlatformUI();
 
-// 四段工作台宽度：拖动分隔线时，左栏放大/缩小，右侧所有栏整体右移/左移（不挤压相邻栏）。
-// 当4栏总宽超出视口时，顶部出现自定义水平滚动轨道，可拖动左右浏览。
+// 可调宽工作台：第5栏只在调整参考图时展开，总宽超出视口时使用顶部轨道浏览。
 (() => {
     const storageKey = 'ecommerce_workbench_widths_v2';
     const panels = Object.fromEntries(
@@ -12311,7 +12310,9 @@ document.getElementById('ecommerce-batch-select')?.addEventListener('change', as
     ecommerceRerunState.selectedIds = new Set();
     ecommerceRerunState.activeIndex = -1;
     ecommerceRerunState.compareRefIndex = 0;
+    ecommerceRerunState.groupSyncByGarment = new Map();
     ecommerceRerunState.bulkProgress = { done: 0, total: 0, failed: 0, retrying: 0 };
+    closeEcommerceRerunAdjustPanel(false);
     const rerunList = document.getElementById('ecommerce-rerun-list');
     if (rerunList) rerunList.innerHTML = '<div class="ecommerce-empty">点击「扫描废片」开始</div>';
     await refreshEcommerceBatch();
@@ -12541,7 +12542,9 @@ document.getElementById('btn-ecommerce-delete-record')?.addEventListener('click'
 const ecommerceRerunState = {
     batchId: '', items: [], activeIndex: -1, compareRefIndex: 0,
     selectedIds: new Set(), bulkPrompt: '', bulkPlatform: '', bulkModelKey: '', bulkRatio: 'auto',
-    bulkConcurrency: 10, bulkProgress: { active: false, total: 0, completed: 0, success: 0, failed: 0 }
+    bulkConcurrency: 10, bulkDrawCount: 1,
+    groupSyncByGarment: new Map(),
+    bulkProgress: { active: false, total: 0, completed: 0, success: 0, failed: 0 }
 };
 const ecommerceGroupCompareState = { mode: 'rerun', data: null, refIndex: 0, resultIndex: 0 };
 const ecommerceCompareZoomState = { reference: 1, result: 1 };
@@ -12550,6 +12553,68 @@ const ecommerceComparePanState = {
     result: { x: 0, y: 0 }
 };
 let ecommerceWasteExpanded = false;
+
+function ecommerceRerunGroupSyncEnabled(item) {
+    return !!(item && ecommerceRerunState.groupSyncByGarment.get(item.garment_id));
+}
+
+function ecommerceRerunAdjustmentTargets(item) {
+    if (!item) return [];
+    return ecommerceRerunGroupSyncEnabled(item)
+        ? ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id)
+        : [item];
+}
+
+function ecommerceCloneRerunReferences(references) {
+    return (references || []).map(reference => ({ ...reference }));
+}
+
+function setEcommerceRerunAdjustPanelVisible(visible, scrollIntoView = false) {
+    const panel = document.getElementById('ecommerce-rerun-adjust-panel');
+    const resizer = document.getElementById('ecommerce-rerun-adjust-resizer');
+    if (!panel) return;
+    panel.hidden = !visible;
+    if (resizer) resizer.hidden = !visible;
+    if (visible && scrollIntoView) {
+        requestAnimationFrame(() => panel.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' }));
+    }
+}
+
+function closeEcommerceRerunAdjustPanel(renderList = true) {
+    const host = document.getElementById('ecommerce-rerun-adjust-host');
+    if (host) host.innerHTML = '<div class="ecommerce-empty">从废片列表选择一张后，这里会显示独立调整工作台。</div>';
+    setEcommerceRerunAdjustPanelVisible(false);
+    ecommerceRerunState.activeIndex = -1;
+    if (renderList) renderEcommerceRerunList();
+}
+
+function advanceEcommerceRerunWorkflow(currentIndex, syncWholeGarment) {
+    const current = ecommerceRerunState.items[currentIndex];
+    if (!current) return false;
+    const items = ecommerceRerunState.items;
+    let nextIndex = -1;
+    if (!syncWholeGarment) {
+        nextIndex = items.findIndex((entry, index) => index > currentIndex && entry.garment_id === current.garment_id);
+    }
+    if (nextIndex < 0) {
+        nextIndex = items.findIndex((entry, index) => index > currentIndex && entry.garment_id !== current.garment_id);
+    }
+    if (nextIndex < 0) {
+        closeEcommerceRerunAdjustPanel(true);
+        ecommerceToast('所有待重做图片都调整完了，可以批量重做了');
+        return false;
+    }
+    const scrollY = window.scrollY;
+    ecommerceRerunState.activeIndex = nextIndex;
+    ecommerceRerunState.compareRefIndex = 1;
+    renderEcommerceRerunCompare(nextIndex);
+    window.scrollTo(0, scrollY);
+    const next = items[nextIndex];
+    ecommerceToast(next.garment_id === current.garment_id
+        ? `本套下一张：${next.action_name || `动作${next.action_order}`}`
+        : `下一套：${next.garment_name || ''}`);
+    return true;
+}
 
 function ecommerceThumbnailUrl(url, maxEdge = 320) {
     const raw = String(url || '');
@@ -12748,27 +12813,12 @@ async function advanceEcommerceRerunReference() {
         ecommerceToast(`参考图 ${nextCompareIndex}/${refs.length}（按C裁剪，回车跳过）`);
         return;
     }
-    const allGarmentIds = [...new Set(ecommerceRerunState.items.map(i => i.garment_id))];
-    const currentGroupIdx = allGarmentIds.indexOf(item.garment_id);
-    const nextGroupId = allGarmentIds[currentGroupIdx + 1];
-    if (nextGroupId) {
-        const nextIndex = ecommerceRerunState.items.findIndex(i => i.garment_id === nextGroupId);
-        if (nextIndex >= 0) {
-            const sameGroupItems = ecommerceRerunState.items.filter(i => i.garment_id === item.garment_id);
-            sameGroupItems.forEach(i => ecommerceRerunState.selectedIds.add(i.id));
-            ecommerceRerunState.activeIndex = nextIndex;
-            ecommerceRerunState.compareRefIndex = 1;
-            const scrollY = window.scrollY;
-            renderEcommerceRerunCompare(nextIndex);
-            window.scrollTo(0, scrollY);
-            const nextItem = ecommerceRerunState.items[nextIndex];
-            ecommerceToast(`下一组：${nextItem?.garment_name || ''}（参考图1/${nextItem?.references?.length || 0}）`);
-        }
-    } else {
-        const compareOverlay = document.getElementById('ecommerce-compare-overlay');
-        if (compareOverlay && !compareOverlay.hidden) closeEcommerceImageCompare();
-        ecommerceToast('所有参考图都处理完了，可以批量重做了');
-    }
+    const syncWholeGarment = ecommerceRerunGroupSyncEnabled(item);
+    const targets = ecommerceRerunAdjustmentTargets(item);
+    targets.forEach(entry => ecommerceRerunState.selectedIds.add(entry.id));
+    const compareOverlay = document.getElementById('ecommerce-compare-overlay');
+    if (compareOverlay && !compareOverlay.hidden) closeEcommerceImageCompare();
+    advanceEcommerceRerunWorkflow(ecommerceRerunState.activeIndex, syncWholeGarment);
 }
 
 async function confirmEcommerceReferenceCrop() {
@@ -12800,16 +12850,12 @@ async function confirmEcommerceReferenceCrop() {
             width: cropWNorm,
             height: cropHNorm
         });
-        // 同一套服装的多张废片共享这一组服装参考证据；裁剪一次后，
-        // 本组所有已选动作都必须使用同一张裁剪图，不能只改当前行。
-        ecommerceRerunState.items
-            .filter(entry => entry.garment_id === item.garment_id)
-            .forEach(entry => {
-                const relatedReference = entry.references?.[state.refIndex];
-                if (!relatedReference) return;
-                relatedReference.override_url = data.url;
-                relatedReference.override_path = data.path;
-            });
+        ecommerceRerunAdjustmentTargets(item).forEach(entry => {
+            const relatedReference = entry.references?.[state.refIndex];
+            if (!relatedReference) return;
+            relatedReference.override_url = data.url;
+            relatedReference.override_path = data.path;
+        });
         closeEcommerceReferenceCrop();
         renderEcommerceRerunCompare(state.itemIndex);
         const compareOverlay = document.getElementById('ecommerce-compare-overlay');
@@ -13375,22 +13421,20 @@ async function replaceEcommerceCompareReference(file) {
         const response = await fetch('/api/ecommerce/upload-temp-image', { method: 'POST', body: formData });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data.url) throw new Error(data.error || '上传失败');
-        ecommerceRerunState.items
-            .filter(entry => entry.garment_id === item.garment_id)
-            .forEach(entry => {
-                const relatedReference = entry.references?.[refIndex];
-                if (!relatedReference) return;
-                if (!relatedReference.original_url) {
-                    relatedReference.original_url = relatedReference.url;
-                    relatedReference.original_path = relatedReference.path;
-                }
-                relatedReference.url = data.url;
-                relatedReference.path = data.path;
-                relatedReference.temporary_url = data.url;
-                relatedReference.temporary_path = data.path;
-                relatedReference.override_url = '';
-                relatedReference.override_path = '';
-            });
+        ecommerceRerunAdjustmentTargets(item).forEach(entry => {
+            const relatedReference = entry.references?.[refIndex];
+            if (!relatedReference) return;
+            if (!relatedReference.original_url) {
+                relatedReference.original_url = relatedReference.url;
+                relatedReference.original_path = relatedReference.path;
+            }
+            relatedReference.url = data.url;
+            relatedReference.path = data.path;
+            relatedReference.temporary_url = data.url;
+            relatedReference.temporary_path = data.path;
+            relatedReference.override_url = '';
+            relatedReference.override_path = '';
+        });
         renderEcommerceRerunCompare(itemIndex);
         updateEcommerceImageCompare();
         showToast('已临时替换当前服装参考图；原文件未修改，仅本次重做使用', 'success');
@@ -13406,22 +13450,20 @@ function restoreEcommerceCompareReference() {
     const item = ecommerceRerunState.items[itemIndex];
     const reference = item?.references?.[refIndex];
     if (!reference) return;
-    ecommerceRerunState.items
-        .filter(entry => entry.garment_id === item.garment_id)
-        .forEach(entry => {
-            const relatedReference = entry.references?.[refIndex];
-            if (!relatedReference) return;
-            if (relatedReference.original_url) {
-                relatedReference.url = relatedReference.original_url;
-                relatedReference.path = relatedReference.original_path;
-            }
-            relatedReference.override_url = '';
-            relatedReference.override_path = '';
-            delete relatedReference.temporary_url;
-            delete relatedReference.temporary_path;
-            delete relatedReference.original_url;
-            delete relatedReference.original_path;
-        });
+    ecommerceRerunAdjustmentTargets(item).forEach(entry => {
+        const relatedReference = entry.references?.[refIndex];
+        if (!relatedReference) return;
+        if (relatedReference.original_url) {
+            relatedReference.url = relatedReference.original_url;
+            relatedReference.path = relatedReference.original_path;
+        }
+        relatedReference.override_url = '';
+        relatedReference.override_path = '';
+        delete relatedReference.temporary_url;
+        delete relatedReference.temporary_path;
+        delete relatedReference.original_url;
+        delete relatedReference.original_path;
+    });
     renderEcommerceRerunCompare(itemIndex);
     updateEcommerceImageCompare();
     showToast('已恢复服装原始参考图', 'success');
@@ -13472,6 +13514,7 @@ async function scanEcommerceRerun() {
     if (!batchId) return showToast('请先选择批次', 'error');
     const summary = document.getElementById('ecommerce-rerun-summary');
     const list = document.getElementById('ecommerce-rerun-list');
+    closeEcommerceRerunAdjustPanel(false);
     if (summary) summary.textContent = '扫描中…';
     if (list) list.innerHTML = '<div class="ecommerce-empty">扫描中…</div>';
     try {
@@ -13481,6 +13524,7 @@ async function scanEcommerceRerun() {
         ecommerceRerunState.items = data.items || [];
         ecommerceRerunState.activeIndex = -1;
         ecommerceRerunState.selectedIds = new Set(ecommerceRerunState.items.map(item => item.id));
+        ecommerceRerunState.groupSyncByGarment = new Map();
         ecommerceRerunState.bulkPrompt = '';
         const firstModel = ecommerceRerunState.items[0]?.original_model || {};
         ecommerceRerunState.bulkPlatform = firstModel.platform || 'runninghub';
@@ -13567,11 +13611,12 @@ function renderEcommerceRerunList() {
             <select id="ecommerce-rerun-bulk-ratio">${ECOMMERCE_RERUN_RATIOS.map(ratio => `<option value="${ratio}" ${ratio === ecommerceRerunState.bulkRatio ? 'selected' : ''}>${ratio === 'auto' ? '自动' : ratio}</option>`).join('')}</select>
         </div>
         <div class="ecommerce-rerun-bulk-execution">
-            <label>并发 <input id="ecommerce-rerun-concurrency" type="number" min="1" max="99" value="${Math.max(1, Math.min(99, Number(ecommerceRerunState.bulkConcurrency) || 10))}"></label>
+            <label>并发 <input id="ecommerce-rerun-concurrency" type="number" min="1" max="100" value="${Math.max(1, Math.min(100, Number(ecommerceRerunState.bulkConcurrency) || 10))}"></label>
+            <label>每项生成 <select id="ecommerce-rerun-draw-count">${[1, 2, 3, 4, 5].map(count => `<option value="${count}" ${count === (Number(ecommerceRerunState.bulkDrawCount) || 1) ? 'selected' : ''}>${count}张</option>`).join('')}</select></label>
             <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-auto-concurrency">按已选自动</button>
-            <small id="ecommerce-rerun-concurrency-hint">实际并发 = min(设定值, 已选${selectedCount}张)；每张独立重做，超过自动截断</small>
+            <small id="ecommerce-rerun-concurrency-hint">1–100；每张按批次/服装/动作身份归档，不按返回顺序归属</small>
         </div>
-        <textarea id="ecommerce-rerun-bulk-prompt" placeholder="批量补充提示词；留空时每张复用原提示词">${ecommerceEscape(ecommerceRerunState.bulkPrompt || '')}</textarea>
+        <textarea id="ecommerce-rerun-bulk-prompt" placeholder="批量新提示词；留空时复用原提示词，填写后完整替换原提示词">${ecommerceEscape(ecommerceRerunState.bulkPrompt || '')}</textarea>
         <button type="button" class="btn btn-primary btn-compact" id="btn-ecommerce-rerun-bulk" ${selectedCount ? '' : 'disabled'}>批量重做已选 ${selectedCount} 张</button>
         <div class="ecommerce-rerun-progress" id="ecommerce-rerun-progress" ${progress.active || progress.total ? '' : 'hidden'}>
             <div><span id="ecommerce-rerun-progress-label">${progress.active ? '正在重做' : '上次重做'} ${progress.completed || 0}/${progress.total || 0}</span><span id="ecommerce-rerun-progress-counts">成功${progress.success || 0} · 失败${progress.failed || 0}</span></div>
@@ -13632,23 +13677,30 @@ function renderEcommerceRerunList() {
     });
     list.querySelector('#ecommerce-rerun-bulk-model')?.addEventListener('change', event => { ecommerceRerunState.bulkModelKey = event.target.value; });
     list.querySelector('#ecommerce-rerun-bulk-ratio')?.addEventListener('change', event => { ecommerceRerunState.bulkRatio = event.target.value; });
+    list.querySelector('#ecommerce-rerun-draw-count')?.addEventListener('change', event => {
+        ecommerceRerunState.bulkDrawCount = Math.max(1, Math.min(5, Number(event.target.value) || 1));
+        updateRerunConcurrencyHint();
+    });
     const updateRerunConcurrencyHint = () => {
-        const currentSelected = ecommerceRerunState.items.filter(item => ecommerceRerunState.selectedIds.has(item.id)).length;
-        const inputVal = Math.max(1, Math.min(99, Number(list.querySelector('#ecommerce-rerun-concurrency')?.value) || 1));
+        const selectedEntries = ecommerceRerunState.items.filter(item => ecommerceRerunState.selectedIds.has(item.id));
+        const currentSelected = selectedEntries.length;
+        const inputVal = Math.max(1, Math.min(100, Number(list.querySelector('#ecommerce-rerun-concurrency')?.value) || 1));
         const effective = Math.min(inputVal, Math.max(1, currentSelected));
+        const drawCount = Math.max(1, Math.min(5, Number(list.querySelector('#ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
+        const paidCount = selectedEntries.reduce((sum, item) => sum + Math.max(drawCount, Math.min(5, parseInt(item.missing_count, 10) || 1)), 0);
         const hint = list.querySelector('#ecommerce-rerun-concurrency-hint');
         if (hint) hint.textContent = currentSelected
-            ? `实际并发 = min(${inputVal}, 已选${currentSelected}张) = ${effective}；每张独立重做，超过自动截断`
+            ? `实际并发${effective}；已选${currentSelected}项 × 每项${drawCount}张，预计付费${paidCount}张；${ecommerceRerunState.bulkPlatform === 'runninghub' ? 'RH企业线路官方上限100' : 'HK未公布固定上限，限流时自动重试'}`
             : '请先勾选要重做的废片';
     };
     list.querySelector('#ecommerce-rerun-concurrency')?.addEventListener('change', event => {
-        ecommerceRerunState.bulkConcurrency = Math.max(1, Math.min(99, Number(event.target.value) || 1));
+        ecommerceRerunState.bulkConcurrency = Math.max(1, Math.min(100, Number(event.target.value) || 1));
         event.target.value = String(ecommerceRerunState.bulkConcurrency);
         updateRerunConcurrencyHint();
     });
     list.querySelector('#ecommerce-rerun-concurrency')?.addEventListener('input', updateRerunConcurrencyHint);
     list.querySelector('#btn-ecommerce-rerun-auto-concurrency')?.addEventListener('click', () => {
-        ecommerceRerunState.bulkConcurrency = Math.max(1, Math.min(99, selectedCount || 1));
+        ecommerceRerunState.bulkConcurrency = Math.max(1, Math.min(100, selectedCount || 1));
         const input = list.querySelector('#ecommerce-rerun-concurrency');
         if (input) input.value = String(ecommerceRerunState.bulkConcurrency);
         updateRerunConcurrencyHint();
@@ -13721,13 +13773,22 @@ async function bulkRegenerateEcommerceSelected() {
     const ratio = ecommerceRerunState.bulkRatio || 'auto';
     const modelSelect = document.getElementById('ecommerce-rerun-bulk-model');
     const modelLabel = modelSelect?.selectedOptions?.[0]?.textContent || modelKey;
-    const concurrency = Math.max(1, Math.min(99, Number(document.getElementById('ecommerce-rerun-concurrency')?.value) || ecommerceRerunState.bulkConcurrency || 10));
+    const concurrency = Math.max(1, Math.min(100, Number(document.getElementById('ecommerce-rerun-concurrency')?.value) || ecommerceRerunState.bulkConcurrency || 10));
+    const drawCount = Math.max(1, Math.min(5, Number(document.getElementById('ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
+    ecommerceRerunState.bulkDrawCount = drawCount;
+    const paidCallTotal = selectedItems.reduce(
+        (sum, item) => sum + Math.max(drawCount, Math.min(5, parseInt(item.missing_count, 10) || 1)), 0
+    );
+    const individualPromptCount = selectedItems.filter(item => String(item.rerun_prompt || '').trim()).length;
     // 流程级保证：并发永远不超过待重做数量，且每张独立重做无需倍数对齐
     const effectiveConcurrency = Math.min(concurrency, selectedItems.length);
     ecommerceRerunState.bulkConcurrency = concurrency;
     if (!modelKey) return showToast('请选择批量重做模型', 'error');
     const concurrencyNote = effectiveConcurrency < concurrency ? `（实际${effectiveConcurrency}，超过待重做数量自动截断）` : '';
-    if (!confirm(`确定批量重做 ${selectedItems.length} 张废片？\n\n平台/模型：${platform === 'runninghub' ? 'RH' : 'HK'} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${concurrency}${concurrencyNote}\n\n这会产生 ${selectedItems.length} 次生图费用。`)) return;
+    const promptNote = individualPromptCount
+        ? `提示词：${individualPromptCount}项使用单项新提示词，其余${prompt ? '使用批量新提示词' : '复用原提示词'}`
+        : `提示词：${prompt ? '全部使用批量新提示词' : '全部复用原提示词'}`;
+    if (!confirm(`确定批量重做 ${selectedItems.length} 项？\n\n平台/模型：${platform === 'runninghub' ? 'RH' : 'HK'} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${concurrency}${concurrencyNote}\n每项生成：${drawCount}张（原本缺失更多时自动补齐）\n${promptNote}\n\n预计付费生图 ${paidCallTotal} 张。`)) return;
     const button = document.getElementById('btn-ecommerce-rerun-bulk');
     if (button) button.disabled = true;
     const list = document.getElementById('ecommerce-rerun-list');
@@ -13743,8 +13804,8 @@ async function bulkRegenerateEcommerceSelected() {
     // 处理偶发的网络断开或服务端进程重启等极端情况。
     const callRegenerateWithRetry = async (item, referenceImages, prompt) => {
         const maxFrontRetries = 2;
-        // 抽卡模式：按缺失张数生成（item.missing_count 来自 scan-deleted）
-        const rerunCount = Math.max(1, Math.min(parseInt(item.missing_count, 10) || 1, 5));
+        // 每条待处理项至少补齐缺失数，用户设置更大时用于抽卡。
+        const rerunCount = Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5));
         let lastError = '';
         for (let attempt = 1; attempt <= maxFrontRetries; attempt++) {
             try {
@@ -13826,10 +13887,17 @@ async function bulkRegenerateEcommerceSelected() {
 
 function renderEcommerceRerunCompare(index) {
     const list = document.getElementById('ecommerce-rerun-list');
+    const host = document.getElementById('ecommerce-rerun-adjust-host');
     const item = ecommerceRerunState.items[index];
-    if (!item || !list) return;
-    const existing = list.querySelector('.ecommerce-rerun-compare');
+    if (!item || !list || !host) return;
+    setEcommerceRerunAdjustPanelVisible(true, true);
+    const existing = host.querySelector('.ecommerce-rerun-compare');
     const targetOnly = ['target_only', 'garment_prompt'].includes(item.generation_mode);
+    const syncWholeGarment = ecommerceRerunGroupSyncEnabled(item);
+    const hasNextInGarment = ecommerceRerunState.items.some((entry, itemIndex) => itemIndex > index && entry.garment_id === item.garment_id);
+    const workflowButtonLabel = syncWholeGarment
+        ? '应用本套并下一套 →'
+        : (hasNextInGarment ? '保存当前并下一张 →' : '保存当前并下一套 →');
     const sourceReferenceLabel = item.generation_mode === 'garment_prompt' ? '原始服装图' : '原始目标图';
     const refs = (item.references || []).map((ref, i) => {
         const url = ref.override_url || ref.url;
@@ -13844,9 +13912,9 @@ function renderEcommerceRerunCompare(index) {
     compare.innerHTML = `
         <div class="ecommerce-rerun-compare-head">
             <strong>重新调整参考图重做 · ${ecommerceEscape(item.garment_name)} · 动作${item.action_order}</strong>
-            <div class="ecommerce-rerun-system-actions"><button type="button" class="btn btn-outline btn-compact ecommerce-preview-bad">系统预览废片</button><button type="button" class="btn btn-outline btn-compact ecommerce-preview-refs">系统预览参考组</button></div>
+            <div class="ecommerce-rerun-system-actions"><label class="ecommerce-rerun-sync-choice">同步本套 <select class="ecommerce-rerun-sync-select"><option value="no" ${syncWholeGarment ? '' : 'selected'}>否（逐张调整）</option><option value="yes" ${syncWholeGarment ? 'selected' : ''}>是（整套共用）</option></select></label><button type="button" class="btn btn-outline btn-compact ecommerce-preview-bad">系统预览废片</button><button type="button" class="btn btn-outline btn-compact ecommerce-preview-refs">系统预览参考组</button></div>
         </div>
-        <p class="ecommerce-rerun-adjust-hint">${targetOnly ? `重做仍使用${sourceReferenceLabel}+提示词；只有点击批量重做后才会生图扣费。` : '这里只调整本次重做的参考图和单张补充提示词，不会立即生图或扣费。同套服装的裁剪、临时换图和参考图勾选会同步给本组所有废片。'}</p>
+        <p class="ecommerce-rerun-adjust-hint">${syncWholeGarment ? '已选择“同步本套”：参考图勾选、裁剪、换图、细节图和提示词会同步给本套全部废片。' : `已选择“逐张调整”：参考图支持1～9张，所有修改只影响当前图片；保存后继续本套下一张。`}</p>
         <div class="ecommerce-rerun-compare-grid">
             <div class="ecommerce-rerun-compare-col">
                 <h4>AI生成图（废片缓存）</h4>
@@ -13858,25 +13926,47 @@ function renderEcommerceRerunCompare(index) {
                 ${targetOnly ? '' : `<button type="button" class="btn btn-outline btn-compact ecommerce-rerun-add-detail" ${item.references.length >= 9 ? 'disabled' : ''}>＋ 添加局部细节图</button>`}
             </div>
         </div>
-        <textarea class="ecommerce-rerun-prompt" placeholder="可选：这一张的单独纠错要求；留空时使用上方批量提示词，上方也留空则复用原提示词">${ecommerceEscape(item.rerun_prompt || '')}</textarea>
+        <textarea class="ecommerce-rerun-prompt" placeholder="可选：这一张的新提示词；优先于批量提示词并完整替换原提示词，都留空则复用原提示词">${ecommerceEscape(item.rerun_prompt || '')}</textarea>
         <div class="ecommerce-rerun-actions">
             <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-adjustments">保存调整并勾选这一张</button>
-            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-next-group" style="background:#16a34a;border-color:#16a34a;">保存整组并跳到下一组 →</button>
+            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-next-group" style="background:#16a34a;border-color:#16a34a;">${workflowButtonLabel}</button>
             <button class="btn btn-outline btn-compact" type="button" id="btn-ecommerce-rerun-cancel">取消调整</button>
         </div>`;
     // 如果已有对比面板，替换它（保持位置不变）；否则追加到列表末尾
     if (existing) {
         existing.replaceWith(compare);
     } else {
-        list.appendChild(compare);
+        host.innerHTML = '';
+        host.appendChild(compare);
     }
     // 显示当前是第几组/共几组
     const allGarmentIds = [...new Set(ecommerceRerunState.items.map(i => i.garment_id))];
     const currentGroupIdx = allGarmentIds.indexOf(item.garment_id);
+    const sameGarmentItems = ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id);
+    const currentItemInGarment = sameGarmentItems.findIndex(entry => entry.id === item.id);
+    const groupProgress = document.getElementById('ecommerce-rerun-adjust-group-progress');
+    const itemProgress = document.getElementById('ecommerce-rerun-adjust-item-progress');
+    if (groupProgress) groupProgress.textContent = `第 ${currentGroupIdx + 1}/${allGarmentIds.length} 套 · ${item.garment_name}`;
+    if (itemProgress) itemProgress.textContent = `本套第 ${currentItemInGarment + 1}/${sameGarmentItems.length} 张 · ${item.action_name || `动作${item.action_order}`}`;
     const groupInfo = compare.querySelector('.ecommerce-rerun-compare-head strong');
     if (groupInfo && allGarmentIds.length > 1) {
         groupInfo.textContent = `重新调整参考图重做 · ${item.garment_name} · 动作${item.action_order} · 第${currentGroupIdx + 1}/${allGarmentIds.length} 组`;
     }
+    compare.querySelector('.ecommerce-rerun-sync-select')?.addEventListener('change', event => {
+        const enabled = event.target.value === 'yes';
+        ecommerceRerunState.groupSyncByGarment.set(item.garment_id, enabled);
+        if (enabled) {
+            ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id).forEach(entry => {
+                if (entry === item) return;
+                entry.references = ecommerceCloneRerunReferences(item.references);
+                entry.rerun_prompt = item.rerun_prompt || '';
+            });
+            showToast('已开启同步：当前设置已应用到本套其他废片', 'success');
+        } else {
+            showToast('已关闭同步：之后的调整只影响当前图片', 'info');
+        }
+        renderEcommerceRerunCompare(index);
+    });
     compare.querySelector('.ecommerce-preview-bad')?.addEventListener('click', () => openEcommerceSystemPreview([item.bad_photo_path]));
     compare.querySelector('.ecommerce-preview-refs')?.addEventListener('click', () => openEcommerceSystemPreview(
         (item.references || []).filter(ref => ref.selected !== false).map(ref => ref.override_path || ref.path)
@@ -13885,14 +13975,16 @@ function renderEcommerceRerunCompare(index) {
     compare.querySelectorAll('.ecommerce-rerun-open-ref').forEach(img => img.addEventListener('click', e => {
         openEcommerceImageCompare(index, Number(e.currentTarget.closest('.ecommerce-rerun-ref').dataset.refIndex) + 1);
     }));
-    compare.querySelector('.ecommerce-rerun-prompt')?.addEventListener('input', event => { item.rerun_prompt = event.target.value; });
+    compare.querySelector('.ecommerce-rerun-prompt')?.addEventListener('input', event => {
+        ecommerceRerunAdjustmentTargets(item).forEach(entry => { entry.rerun_prompt = event.target.value; });
+    });
     compare.querySelectorAll('.ecommerce-rerun-ref-use').forEach(input => input.addEventListener('change', () => {
         const refIndex = Number(input.closest('.ecommerce-rerun-ref').dataset.refIndex);
-        ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id).forEach(entry => {
+        ecommerceRerunAdjustmentTargets(item).forEach(entry => {
             if (entry.references?.[refIndex]) entry.references[refIndex].selected = input.checked;
         });
     }));
-    compare.querySelector('#btn-ecommerce-rerun-cancel')?.addEventListener('click', () => { compare.remove(); ecommerceRerunState.activeIndex = -1; renderEcommerceRerunList(); });
+    compare.querySelector('#btn-ecommerce-rerun-cancel')?.addEventListener('click', () => closeEcommerceRerunAdjustPanel(true));
     compare.querySelector('.ecommerce-rerun-add-detail')?.addEventListener('click', () => {
         const input = document.createElement('input');
         input.type = 'file';
@@ -13908,8 +14000,7 @@ function renderEcommerceRerunCompare(index) {
                     const res = await fetch('/api/ecommerce/upload-temp-image', { method: 'POST', body: formData });
                     const data = await res.json().catch(() => ({}));
                     if (!res.ok || !data.url) throw new Error(data.error || '上传失败');
-                    const relatedItems = ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id);
-                    relatedItems.forEach(entry => {
+                    ecommerceRerunAdjustmentTargets(item).forEach(entry => {
                         entry.references = entry.references || [];
                         if (entry.references.length < 9 && !entry.references.some(ref => (ref.override_url || ref.url) === data.url)) {
                             entry.references.push({ url: data.url, path: data.path, override_url: '', override_path: '', selected: true, is_detail: true });
@@ -13928,47 +14019,28 @@ function renderEcommerceRerunCompare(index) {
         if (!targetOnly && !referenceImages.length) return showToast('请至少保留一张服装参考图', 'error');
         item.rerun_prompt = compare.querySelector('.ecommerce-rerun-prompt')?.value.trim() || '';
         ecommerceRerunState.selectedIds.add(item.id);
-        compare.remove();
-        ecommerceRerunState.activeIndex = -1;
-        renderEcommerceRerunList();
+        closeEcommerceRerunAdjustPanel(true);
         showToast('已保存本次参考图调整并勾选该废片；点击上方批量重做才会扣费', 'success');
     });
-    // 保存整组并跳到下一组：勾选当前组的所有废片，自动展开下一组
+    // 根据“同步本套”选择，跳到本套下一张或下一套。
     compare.querySelector('#btn-ecommerce-rerun-save-next-group')?.addEventListener('click', () => {
         const referenceImages = (item.references || []).filter(reference => reference.selected !== false);
         if (!targetOnly && !referenceImages.length) return showToast('请至少保留一张服装参考图', 'error');
         const promptValue = compare.querySelector('.ecommerce-rerun-prompt')?.value.trim() || '';
-        // 1. 保存调整：把提示词同步给同组所有废片
+        const syncEnabled = ecommerceRerunGroupSyncEnabled(item);
         const sameGroupItems = ecommerceRerunState.items.filter(i => i.garment_id === item.garment_id);
-        sameGroupItems.forEach(i => {
-            i.rerun_prompt = promptValue;
-            // 参考图已经自动同步过了，这里只勾选
-            ecommerceRerunState.selectedIds.add(i.id);
-        });
-        // 2. 找到下一组的第一张废片
-        const allGarmentIds = [...new Set(ecommerceRerunState.items.map(i => i.garment_id))];
-        const currentGroupIdx = allGarmentIds.indexOf(item.garment_id);
-        const nextGroupId = allGarmentIds[currentGroupIdx + 1];
-        // 3. 如果有下一组，保留对比面板位置不动，只更新内容为下一组的数据
-        if (nextGroupId) {
-            const nextIndex = ecommerceRerunState.items.findIndex(i => i.garment_id === nextGroupId);
-            if (nextIndex >= 0) {
-                // 记录当前滚动位置，防止页面跳动
-                const scrollY = window.scrollY;
-                // 更新activeIndex为下一组，然后重新渲染对比面板（会原地替换）
-                ecommerceRerunState.activeIndex = nextIndex;
-                renderEcommerceRerunCompare(nextIndex);
-                // 恢复滚动位置，保持界面不动
-                window.scrollTo(0, scrollY);
-                showToast(`已勾选整组 ${item.garment_name}（${sameGroupItems.length}张），已切换到下一组`, 'success');
-            }
+        item.rerun_prompt = promptValue;
+        if (syncEnabled) {
+            sameGroupItems.forEach(entry => {
+                entry.rerun_prompt = promptValue;
+                entry.references = ecommerceCloneRerunReferences(item.references);
+                ecommerceRerunState.selectedIds.add(entry.id);
+            });
+            showToast(`已把当前设置同步到本套${sameGroupItems.length}张废片`, 'success');
         } else {
-            // 没有下一组了，移除对比面板，提示用户可以批量重做
-            compare.remove();
-            ecommerceRerunState.activeIndex = -1;
-            renderEcommerceRerunList();
-            showToast(`已勾选整组 ${item.garment_name}（${sameGroupItems.length}张），所有组已处理完，可以批量重做了`, 'success');
+            ecommerceRerunState.selectedIds.add(item.id);
         }
+        advanceEcommerceRerunWorkflow(index, syncEnabled);
     });
 }
 
@@ -13982,6 +14054,7 @@ document.getElementById('btn-ecommerce-rerun-scan-single')?.addEventListener('cl
     scanEcommerceRerun();
 });
 document.getElementById('btn-ecommerce-rerun-select-folder')?.addEventListener('click', () => chooseEcommerceFolder('ecommerce-rerun-result-path'));
+document.getElementById('btn-ecommerce-rerun-adjust-close')?.addEventListener('click', () => closeEcommerceRerunAdjustPanel(true));
 document.getElementById('btn-ecommerce-rerun-refresh')?.addEventListener('click', async event => {
     const button = event.currentTarget;
     const select = document.getElementById('ecommerce-rerun-batch-select');

@@ -15,8 +15,6 @@ import base64
 import subprocess
 import socket
 import errno
-import platform
-import sys
 try:
     from send2trash import send2trash as _trash_send
 except ImportError:
@@ -29,62 +27,10 @@ import requests
 from PIL import Image, ImageOps, ImageDraw
 from flask import Flask, jsonify, request, render_template, send_from_directory, send_file
 
-APP_NAME = '样片工厂'
-
-
-def _resolve_runtime_paths(*, frozen=None, system=None, environ=None, home=None,
-                           module_file=None, meipass=None):
-    """Resolve immutable resources and mutable per-user storage on every OS."""
-    frozen = getattr(sys, 'frozen', False) if frozen is None else bool(frozen)
-    system = platform.system() if system is None else system
-    environ = os.environ if environ is None else environ
-    home = os.path.expanduser('~') if home is None else home
-    module_file = __file__ if module_file is None else module_file
-    resource_dir = (
-        (meipass or getattr(sys, '_MEIPASS', os.path.dirname(sys.executable)))
-        if frozen else os.path.dirname(os.path.abspath(module_file))
-    )
-
-    if not frozen:
-        user_root = resource_dir
-    elif system == 'Windows':
-        user_root = os.path.join(
-            environ.get('LOCALAPPDATA') or environ.get('APPDATA') or home,
-            APP_NAME,
-        )
-    elif system == 'Darwin':
-        user_root = os.path.join(home, 'Library', 'Application Support', APP_NAME)
-    else:
-        user_root = os.path.join(
-            environ.get('XDG_DATA_HOME') or os.path.join(home, '.local', 'share'),
-            APP_NAME,
-        )
-
-    return {
-        'resource_dir': os.path.abspath(resource_dir),
-        'user_root': os.path.abspath(user_root),
-    }
-
-
-_RUNTIME_PATHS = _resolve_runtime_paths()
-RESOURCE_DIR = _RUNTIME_PATHS['resource_dir']
-USER_DATA_ROOT = _RUNTIME_PATHS['user_root']
-BASE_DIR = RESOURCE_DIR
-DATA_DIR = os.path.join(USER_DATA_ROOT, 'data')
-IMAGES_DIR = os.path.join(USER_DATA_ROOT, 'static', 'images')
-BACKUP_DIR = os.path.join(USER_DATA_ROOT, 'backups')
-LOG_DIR = os.path.join(USER_DATA_ROOT, 'logs')
-DWPOSE_MODEL_DIR = os.path.join(USER_DATA_ROOT, 'models', 'dwpose')
-DWPOSE_CACHE_DIR = os.path.join(IMAGES_DIR, 'dwpose_cache')
-
 # 防止解压炸弹：限制PIL最大像素数（1亿像素≈10K×10K）
 Image.MAX_IMAGE_PIXELS = 100_000_000
 
-app = Flask(
-    __name__,
-    template_folder=os.path.join(RESOURCE_DIR, 'templates'),
-    static_folder=None,
-)
+app = Flask(__name__)
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 app.jinja_env.auto_reload = True
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
@@ -128,6 +74,7 @@ _dwpose_model = None
 _dwpose_lock = threading.Lock()
 
 # 日志配置：控制台 + 轮转文件
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
 os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
@@ -180,7 +127,14 @@ def _disable_global_proxy_env():
 
 _disable_global_proxy_env()
 
-# DWPose 模型与缓存目录（打包后写入用户数据目录，不修改程序安装目录）
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'images')
+BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backups')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# DWPose 模型与缓存目录
+DWPOSE_MODEL_DIR = os.path.join(BASE_DIR, 'models', 'dwpose')
+DWPOSE_CACHE_DIR = os.path.join(IMAGES_DIR, 'dwpose_cache')
 os.makedirs(DWPOSE_CACHE_DIR, exist_ok=True)
 
 # 首次运行会从 HuggingFace 下载 ONNX（体积较大）。国内网络不稳定时可自行设置：
@@ -475,43 +429,6 @@ def ensure_data_dir():
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
 
-def _init_default_data():
-    """Copy clean bundled defaults once; never overwrite a user's files."""
-    ensure_data_dir()
-    defaults_dir = os.path.join(RESOURCE_DIR, 'default_data')
-    if not os.path.isdir(defaults_dir):
-        return
-    for name in os.listdir(defaults_dir):
-        if not name.endswith('.json'):
-            continue
-        src = os.path.join(defaults_dir, name)
-        dst = os.path.join(DATA_DIR, name)
-        if not os.path.exists(dst):
-            shutil.copy2(src, dst)
-    default_images = os.path.join(RESOURCE_DIR, 'default_assets', 'images')
-    if os.path.isdir(default_images):
-        for name in os.listdir(default_images):
-            src = os.path.join(default_images, name)
-            dst = os.path.join(IMAGES_DIR, name)
-            if os.path.isfile(src) and not os.path.exists(dst):
-                shutil.copy2(src, dst)
-
-
-def _migrate_legacy_data():
-    """Migrate data bundled by pre-1.5 frozen builds into per-user storage."""
-    if not getattr(sys, 'frozen', False):
-        return
-    legacy_dir = os.path.join(RESOURCE_DIR, 'data')
-    if not os.path.isdir(legacy_dir) or os.path.realpath(legacy_dir) == os.path.realpath(DATA_DIR):
-        return
-    ensure_data_dir()
-    for name in os.listdir(legacy_dir):
-        src = os.path.join(legacy_dir, name)
-        dst = os.path.join(DATA_DIR, name)
-        if os.path.isfile(src) and not os.path.exists(dst):
-            shutil.copy2(src, dst)
-
-
 def load_json(filename):
     """安全加载 JSON，支持损坏时自动从备份恢复"""
     filepath = os.path.join(DATA_DIR, filename)
@@ -573,101 +490,24 @@ def gen_id(prefix='id'):
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
-def _open_path(path):
-    """Open a file or folder using the current desktop environment."""
-    real = os.path.abspath(os.path.expanduser(path))
-    system = platform.system()
-    if system == 'Windows':
-        os.startfile(real)  # type: ignore[attr-defined]
-    elif system == 'Darwin':
-        subprocess.run(['open', real], check=True, timeout=30)
-    else:
-        subprocess.run(['xdg-open', real], check=True, timeout=30)
-
-
-def _open_files(paths):
-    cleaned = [os.path.abspath(p) for p in paths if os.path.isfile(p)]
-    if not cleaned:
-        raise FileNotFoundError('没有可打开的文件')
-    if platform.system() == 'Darwin':
-        subprocess.Popen(
-            ['open', '-n', '-a', 'Preview', *cleaned],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    else:
-        for path in cleaned:
-            _open_path(path)
-
-
-def _resolve_app_image_url(url):
-    text = str(url or '')
-    prefix = '/static/images/'
-    if text.startswith(prefix):
-        candidate = os.path.realpath(os.path.join(IMAGES_DIR, text[len(prefix):]))
-        if candidate.startswith(os.path.realpath(IMAGES_DIR) + os.sep):
-            return candidate
-    return None
-
-
-def _copy_files_to_system_clipboard(paths):
-    system = platform.system()
-    if system == 'Windows':
-        quoted = ','.join("'" + p.replace("'", "''") + "'" for p in paths)
-        script = (
-            'Add-Type -AssemblyName System.Windows.Forms; '
-            '$items=New-Object System.Collections.Specialized.StringCollection; '
-            f'$items.AddRange(@({quoted})); '
-            '[System.Windows.Forms.Clipboard]::SetFileDropList($items)'
-        )
-        subprocess.run(
-            ['powershell.exe', '-NoProfile', '-STA', '-Command', script],
-            check=True,
-            timeout=30,
-        )
-        return
-    if system == 'Darwin':
-        refs = []
-        for path in paths:
-            escaped = path.replace('\\', '\\\\').replace('"', '\\"')
-            refs.append(f'POSIX file "{escaped}"')
-        subprocess.run(
-            ['osascript', '-e', f'set the clipboard to {{{", ".join(refs)}}}'],
-            check=True,
-            timeout=30,
-        )
-        return
-    raise RuntimeError('当前系统暂不支持文件剪贴板')
-
-
 def _move_path_to_trash(path):
-    """Move a file/folder to the platform recycle bin."""
+    """Move a file/folder to the macOS Trash instead of deleting permanently."""
     real = os.path.realpath(os.path.expanduser(path))
     if not os.path.exists(real):
         raise FileNotFoundError(real)
-    if _trash_send is not None:
-        _trash_send(real)
-        return
-    if platform.system() == 'Darwin':
-        escaped = real.replace('\\', '\\\\').replace('"', '\\"')
-        script = f'tell application "Finder" to move POSIX file "{escaped}" to trash'
-        subprocess.run(['osascript', '-e', script], check=True, timeout=30)
-        return
-    raise RuntimeError('缺少 send2trash，无法安全移到回收站')
+    escaped = real.replace('\\', '\\\\').replace('"', '\\"')
+    script = f'tell application "Finder" to move POSIX file "{escaped}" to trash'
+    subprocess.run(['osascript', '-e', script], check=True, timeout=30)
 
 
 def _move_paths_to_trash(paths):
-    """Batch move files/folders to the platform recycle bin."""
+    """Batch move files/folders to Trash to avoid repeated Finder prompts/sounds."""
     cleaned = []
     for p in paths or []:
         real = os.path.realpath(os.path.expanduser(p))
         if os.path.exists(real):
             cleaned.append(real)
     if not cleaned:
-        return
-    if _trash_send is not None or platform.system() != 'Darwin':
-        for path in cleaned:
-            _move_path_to_trash(path)
         return
     refs = []
     for p in cleaned:
@@ -797,9 +637,7 @@ def index():
 
 @app.route('/static/<path:filename>')
 def static_files(filename):
-    if filename.startswith('images/'):
-        return send_from_directory(IMAGES_DIR, filename[len('images/'):])
-    return send_from_directory(os.path.join(RESOURCE_DIR, 'static'), filename)
+    return send_from_directory(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static'), filename)
 
 
 # ========== 分类 API ==========
@@ -5227,22 +5065,37 @@ last_temp_dir = None
 
 @app.route('/api/copy-images-to-sys', methods=['POST'])
 def copy_images_to_sys_clipboard():
-    """将多张本地图片写入 macOS/Windows 文件剪贴板。"""
+    """方案一：利用 osascript 将多张本地图片写入 macOS 剪贴板"""
     try:
         image_urls = request.json.get('images', [])
         if not image_urls:
             return jsonify({'success': False, 'message': '没有图片'})
 
         abs_paths = []
+        base_dir = os.path.dirname(os.path.abspath(__file__))
         for url in image_urls:
-            local_path = _resolve_app_image_url(url)
-            if local_path and os.path.exists(local_path):
+            local_path = os.path.join(base_dir, url.lstrip('/'))
+            # 防止路径遍历
+            if not os.path.realpath(local_path).startswith(os.path.realpath(base_dir)):
+                continue
+            if os.path.exists(local_path):
                 abs_paths.append(local_path)
 
         if not abs_paths:
             return jsonify({'success': False, 'message': '文件不存在'})
 
-        _copy_files_to_system_clipboard(abs_paths)
+        # 用 AppleScript 将多个文件写入系统剪贴板
+        # 转义路径中的双引号和反斜杠，防止 AppleScript 注入
+        def _escape_applescript_path(p):
+            p = p.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+            return p
+        applescript_parts = []
+        for p in abs_paths:
+            safe_p = _escape_applescript_path(p)
+            applescript_parts.append(f'POSIX file "{safe_p}"')
+        applescript_files = ", ".join(applescript_parts)
+        script = f'set the clipboard to {{{applescript_files}}}'
+        subprocess.run(['osascript', '-e', script], check=True)
         logger.info(f"已将{len(abs_paths)}张图片写入系统剪贴板")
         return jsonify({'success': True, 'count': len(abs_paths)})
     except Exception as e:
@@ -5267,16 +5120,21 @@ def reveal_temp_images():
         temp_dir = tempfile.mkdtemp(prefix="ai_export_images_")
         last_temp_dir = temp_dir
 
+        base_dir = os.path.dirname(os.path.abspath(__file__))
         for i, url in enumerate(image_urls):
-            local_path = _resolve_app_image_url(url)
-            if local_path and os.path.exists(local_path):
+            local_path = os.path.join(base_dir, url.lstrip('/'))
+            # 防止路径遍历
+            if not os.path.realpath(local_path).startswith(os.path.realpath(base_dir)):
+                continue
+            if os.path.exists(local_path):
                 original_filename = os.path.basename(local_path)
                 safe_filename = f"{i+1:02d}_{original_filename}"
                 dest_path = os.path.join(temp_dir, safe_filename)
                 shutil.copy2(local_path, dest_path)
 
-        _open_path(temp_dir)
-        logger.info(f"已将{len(image_urls)}张图片聚合到 {temp_dir} 并打开文件管理器")
+        # 打开访达
+        subprocess.run(['open', temp_dir])
+        logger.info(f"已将{len(image_urls)}张图片聚合到 {temp_dir} 并打开访达")
         return jsonify({'success': True, 'count': len(image_urls), 'path': temp_dir})
     except Exception as e:
         logger.error(f"聚合图片失败: {e}")
@@ -5385,38 +5243,6 @@ def _get_local_version():
     return {"version": "0.0.0", "name": "样片工厂", "repo": "lengjueqi-coder/TTyangpian"}
 
 
-def _version_tuple(value):
-    """Parse release versions such as v1.5.0 and 1.5.0-beta safely."""
-    numbers = re.findall(r'\d+', str(value or '').lstrip('vV').split('-', 1)[0])
-    return tuple(int(part) for part in numbers[:4]) or (0,)
-
-
-def _select_release_asset(release, *, frozen=None, system=None):
-    """Choose only an asset built for this runtime and operating system."""
-    frozen = getattr(sys, 'frozen', False) if frozen is None else bool(frozen)
-    system = platform.system() if system is None else system
-    assets = release.get('assets', []) if isinstance(release, dict) else []
-
-    if not frozen:
-        predicates = [lambda name: name.lower().endswith('-source.zip')]
-    elif system == 'Windows':
-        predicates = [
-            lambda name: name.lower().endswith('-windows-x64-setup.exe'),
-            lambda name: name.lower().endswith('-windows-x64.zip'),
-        ]
-    elif system == 'Darwin':
-        predicates = [lambda name: name.lower().endswith('.dmg')]
-    else:
-        predicates = [lambda name: name.lower().endswith('-source.zip')]
-
-    for predicate in predicates:
-        for asset in assets:
-            name = str(asset.get('name') or '')
-            if predicate(name) and asset.get('browser_download_url'):
-                return asset
-    return None
-
-
 @app.route('/api/check-update')
 def check_update():
     """检查 GitHub 是否有新版本"""
@@ -5437,17 +5263,25 @@ def check_update():
         if not remote_ver:
             return jsonify({"has_update": False, "error": "无法获取远程版本号"})
 
-        has_update = _version_tuple(remote_ver) > _version_tuple(local_ver)
-        asset = _select_release_asset(release)
-        download_url = asset.get('browser_download_url') if asset else None
+        # 比较版本号（简单字符串比较，格式 x.y.z）
+        def ver_tuple(v):
+            parts = v.split('.')
+            return tuple(int(p) for p in parts if p.isdigit())
+
+        has_update = ver_tuple(remote_ver) > ver_tuple(local_ver)
+
+        # 找 zip asset
+        download_url = None
+        for asset in release.get('assets', []):
+            if asset.get('name', '').endswith('.zip'):
+                download_url = asset['browser_download_url']
+                break
 
         return jsonify({
             "has_update": has_update,
             "local_version": local_ver,
             "remote_version": remote_ver,
             "download_url": download_url,
-            "asset_name": asset.get('name') if asset else None,
-            "install_mode": "installer" if getattr(sys, 'frozen', False) else "source",
             "release_notes": release.get('body', ''),
             "html_url": release.get('html_url', '')
         })
@@ -5464,7 +5298,7 @@ _update_state_lock = threading.Lock()
 @app.route('/api/do-update', methods=['POST'])
 @_local_only
 def do_update():
-    """下载并校验平台更新；源码版覆盖，打包版启动系统安装器。"""
+    """执行一键更新：下载最新 release zip → 解压覆盖 → 重启"""
     global _update_state
     with _update_state_lock:
         if _update_state["running"]:
@@ -5491,54 +5325,35 @@ def do_update():
         with _update_state_lock:
             _update_state = {"running": True, "progress": "正在下载...", "error": None}
         try:
-            # 1. 下载更新资产
+            # 1. 下载 zip
             _set_update_state(progress="正在下载更新包...")
             logger.info(f"[更新] 开始下载: {download_url}")
             resp = requests.get(download_url, timeout=120, stream=True)
             resp.raise_for_status()
-            asset_name = os.path.basename(urlparse(download_url).path) or 'TTyangpian_update.bin'
-            update_path = os.path.join(tempfile.gettempdir(), asset_name)
-            with open(update_path, 'wb') as f:
+            zip_path = os.path.join(tempfile.gettempdir(), 'TTyangpian_update.zip')
+            with open(zip_path, 'wb') as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     f.write(chunk)
-            logger.info(f"[更新] 下载完成: {update_path}")
+            logger.info(f"[更新] 下载完成: {zip_path}")
 
-            checksum_url = download_url + '.sha256'
-            checksum_resp = _http_request('GET', checksum_url, timeout=20)
-            if checksum_resp.status_code != 200:
-                raise ValueError('更新包缺少SHA256校验文件，已拒绝安装')
-            expected_hash = checksum_resp.text.strip().split()[0].lower()
-            actual_hash = _file_sha256(update_path).lower()
-            if not re.fullmatch(r'[0-9a-f]{64}', expected_hash) or actual_hash != expected_hash:
-                raise ValueError('更新包SHA256校验失败')
-
-            # 打包应用不能安全覆盖正在运行的二进制，交给系统安装器完成。
-            if getattr(sys, 'frozen', False):
-                _set_update_state(progress="校验完成，正在启动安装程序...")
-                if platform.system() == 'Windows' and update_path.lower().endswith('.exe'):
-                    subprocess.Popen(
-                        [update_path, '/SILENT', '/CLOSEAPPLICATIONS', '/RESTARTAPPLICATIONS'],
-                        close_fds=True,
-                    )
-                elif platform.system() == 'Darwin' and update_path.lower().endswith('.dmg'):
-                    _open_path(update_path)
-                else:
-                    raise ValueError('更新资产与当前系统不匹配')
-                _set_update_state(
-                    progress="安装程序已启动，请按提示完成更新。",
-                    running=False,
-                )
-                return
-
-            if not update_path.lower().endswith('.zip'):
-                raise ValueError('源码版更新必须使用ZIP资产')
+            # After writing zip_path, verify SHA256 if available
+            try:
+                checksum_url = download_url + '.sha256'
+                checksum_resp = _http_request('GET', checksum_url, timeout=10)
+                if checksum_resp.status_code == 200:
+                    expected_hash = checksum_resp.text.strip().split()[0]
+                    actual_hash = _file_sha256(zip_path)
+                    if actual_hash != expected_hash:
+                        raise ValueError(f"更新包SHA256校验失败")
+            except Exception as e:
+                logger.warning(f'[更新] SHA256校验跳过: {e}')
 
             # 2. 解压到临时目录
             _set_update_state(progress="正在解压...")
             extract_dir = os.path.join(tempfile.gettempdir(), 'TTyangpian_update_extracted')
             if os.path.exists(extract_dir):
                 shutil.rmtree(extract_dir, ignore_errors=True)
-            with zipfile.ZipFile(update_path, 'r') as zf:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
                 _safe_extract_zip(zf, extract_dir)
             logger.info(f"[更新] 解压完成: {extract_dir}")
 
@@ -5551,25 +5366,23 @@ def do_update():
 
             # 3. 覆盖本地文件（保留用户数据）
             _set_update_state(progress="正在替换文件...")
-            preserve = {
-                'venv', 'build_venv', 'data', 'logs', 'backups', 'models',
-                'outputs', 'output', '_运行缓存', '_成品输出', '__pycache__',
-                '.DS_Store', '.claude', '.git',
-            }
+            preserve = {'venv', 'data', 'logs', 'backups', '__pycache__', '.DS_Store', '.claude', '.git', 'static'}
             for item in os.listdir(src_dir):
                 if item in preserve:
                     continue
                 src = os.path.join(src_dir, item)
                 dst = os.path.join(BASE_DIR, item)
                 if os.path.isdir(src):
-                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst, ignore_errors=True)
+                    shutil.copytree(src, dst)
                 else:
                     shutil.copy2(src, dst)
             logger.info("[更新] 文件替换完成")
 
             # 4. 清理
             try:
-                os.remove(update_path)
+                os.remove(zip_path)
                 shutil.rmtree(extract_dir, ignore_errors=True)
             except Exception:
                 pass
@@ -5605,19 +5418,20 @@ def open_download_folder():
     base_path = body.get('path', '~/Downloads/AI生图/')
     base_path = os.path.expanduser(base_path)
 
-    # 路径安全校验：允许用户目录和已验证的外置盘目录
+    # 路径安全校验：只允许打开用户目录下的路径
     abs_base = os.path.abspath(base_path)
-    if not _is_allowed_user_storage_path(abs_base):
-        return jsonify({"error": "路径不在允许的用户存储位置内"}), 400
+    home_dir = os.path.expanduser('~')
+    if not abs_base.startswith(home_dir):
+        return jsonify({"error": "路径必须在用户主目录下"}), 400
 
     # 创建日期子文件夹（与save-image-to-path一致）
     date_folder = datetime.now().strftime('%Y-%m-%d')
     target_dir = os.path.join(base_path, date_folder)
 
-    # 校验最终路径仍在允许范围内
+    # 校验最终路径也在用户目录下
     abs_target = os.path.abspath(target_dir)
-    if not _is_allowed_user_storage_path(abs_target):
-        return jsonify({"error": "路径不在允许的用户存储位置内"}), 400
+    if not abs_target.startswith(home_dir):
+        return jsonify({"error": "路径必须在用户主目录下"}), 400
 
     try:
         os.makedirs(target_dir, exist_ok=True)
@@ -5625,7 +5439,7 @@ def open_download_folder():
         return jsonify({"error": f"无法创建目录: {e}"}), 400
 
     try:
-        _open_path(abs_target)
+        subprocess.run(['open', abs_target], check=True)
         logger.info(f'[open-folder] 打开文件夹: {abs_target}')
         return jsonify({"ok": True, "path": abs_target})
     except Exception as e:
@@ -5635,7 +5449,8 @@ def open_download_folder():
 
 @app.route('/api/select-folder', methods=['POST'])
 def select_folder():
-    """打开当前操作系统的原生文件夹选择器。"""
+    """打开 macOS 原生文件夹选择器，返回用户选择的路径
+    使用 AppleScript choose folder 对话框（系统自带 Tcl/Tk 8.5 与 macOS 15.7 不兼容会崩溃，不能用 tkinter）"""
     try:
         body = request.get_json(silent=True) or {}
         # 优先使用前端传入的路径，否则回退到全局配置
@@ -5650,38 +5465,23 @@ def select_folder():
         else:
             initial_dir = os.path.expanduser('~')
 
-        if platform.system() == 'Windows':
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes('-topmost', True)
-            try:
-                selected = filedialog.askdirectory(
-                    title='选择并授权样片工厂使用这个文件夹',
-                    initialdir=initial_dir,
-                    mustexist=True,
-                )
-            finally:
-                root.destroy()
-        elif platform.system() == 'Darwin':
-            escaped_dir = initial_dir.replace('\\', '\\\\').replace('"', '\\"')
-            applescript = f'''
-            set defaultLocation to POSIX file "{escaped_dir}"
-            try
-                set chosenFolder to choose folder with prompt "选择并授权样片工厂使用这个文件夹" default location defaultLocation
-                return POSIX path of chosenFolder
-            on error number -128
-                return ""
-            end try
-            '''
-            result = subprocess.run(
-                ['osascript', '-e', applescript],
-                capture_output=True, text=True, timeout=120
-            )
-            selected = result.stdout.strip()
-        else:
-            return jsonify({"error": "当前系统暂不支持原生文件夹选择器"}), 501
+        # 使用 AppleScript 的 choose folder 对话框，不依赖 tkinter
+        # 需要转义路径中的特殊字符以防 AppleScript 语法错误
+        escaped_dir = initial_dir.replace('\\', '\\\\').replace('"', '\\"')
+        applescript = f'''
+        set defaultLocation to POSIX file "{escaped_dir}"
+        try
+            set chosenFolder to choose folder with prompt "选择并授权样片工厂使用这个文件夹" default location defaultLocation
+            return POSIX path of chosenFolder
+        on error number -128
+            return ""
+        end try
+        '''
+        result = subprocess.run(
+            ['osascript', '-e', applescript],
+            capture_output=True, text=True, timeout=120
+        )
+        selected = result.stdout.strip()
 
         if selected:
             real_selected = os.path.realpath(selected)
@@ -5728,20 +5528,6 @@ def _is_allowed_user_storage_path(path):
 
     home = os.path.realpath(os.path.expanduser('~'))
     if real == home or real.startswith(home + os.sep):
-        return True
-
-    if platform.system() == 'Windows':
-        drive, tail = os.path.splitdrive(real)
-        if not drive or not tail:
-            return False
-        blocked = []
-        for key in ('SystemRoot', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramData'):
-            value = os.environ.get(key)
-            if value:
-                blocked.append(os.path.normcase(os.path.realpath(value)))
-        normalized = os.path.normcase(real)
-        if any(normalized == root or normalized.startswith(root + os.sep) for root in blocked):
-            return False
         return True
 
     volumes = os.path.realpath('/Volumes')
@@ -5961,7 +5747,7 @@ def _ecommerce_macos_storage_helper(operation, *paths):
     能绕过 TCC 对 ~/Downloads、~/Desktop、/Volumes/外置盘 等受保护目录的写入限制。
     退路：用 osascript `do shell script`（在某些 macOS 版本下也能工作）。
     """
-    if platform.system() != 'Darwin':
+    if os.uname().sysname != 'Darwin':
         return False, '仅macOS支持系统兼容写入'
 
     # 构造 shell 命令（所有路径用 shlex.quote 转义，避免注入）
@@ -6096,8 +5882,8 @@ def _ecommerce_remove_path(path):
 
 
 def _ecommerce_write_json_file(path, payload):
-    os.makedirs(os.path.join(USER_DATA_ROOT, '_运行缓存', '_临时记录'), exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix='record-', suffix='.json', dir=os.path.join(USER_DATA_ROOT, '_运行缓存', '_临时记录'))
+    os.makedirs(os.path.join(BASE_DIR, '_运行缓存', '_临时记录'), exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='record-', suffix='.json', dir=os.path.join(BASE_DIR, '_运行缓存', '_临时记录'))
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -6115,11 +5901,7 @@ def _ecommerce_write_json_file(path, payload):
 def _ecommerce_probe_writable_directory(path, allow_macos_helper=True):
     """实际创建并删除临时文件，不能只依赖 os.access（macOS TCC 下会误报可写）。"""
     real = os.path.realpath(os.path.expanduser(str(path or '')))
-    if platform.system() == 'Windows':
-        system_drive = os.path.splitdrive(os.environ.get('SystemRoot', 'C:\\Windows'))[0].lower()
-        external = bool(os.path.splitdrive(real)[0]) and os.path.splitdrive(real)[0].lower() != system_drive
-    else:
-        external = real.startswith(os.path.realpath('/Volumes') + os.sep)
+    external = real.startswith(os.path.realpath('/Volumes') + os.sep)
     probe_path = ''
     try:
         os.makedirs(real, exist_ok=True)
@@ -6186,18 +5968,13 @@ def ecommerce_check_output_path():
 
 @app.route('/api/ecommerce/open-storage-permission-settings', methods=['POST'])
 def ecommerce_open_storage_permission_settings():
-    """打开当前系统的文件权限设置入口。"""
+    """打开macOS隐私设置；权限本身必须由用户亲自授予。"""
     try:
-        if platform.system() == 'Darwin':
-            subprocess.Popen(
-                ['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        elif platform.system() == 'Windows':
-            subprocess.Popen(['explorer.exe', 'ms-settings:privacy-broadfilesystemaccess'])
-        else:
-            return jsonify({'error': '当前系统没有统一的文件权限设置入口'}), 501
+        subprocess.Popen(
+            ['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         return jsonify({'ok': True})
     except OSError as exc:
         return jsonify({'error': f'无法打开系统权限设置: {exc}'}), 500
@@ -6510,7 +6287,7 @@ def _ecommerce_clean_prompt_action(action):
         raise ValueError('提示词不能为空')
     cleaned = _ecommerce_clean_target_actions([{
         **action,
-        'action_image': action.get('action_image') or os.path.join(tempfile.gettempdir(), 'prompt-image-placeholder.jpg'),
+        'action_image': action.get('action_image') or '/tmp/prompt-image-placeholder.jpg',
         'prompt': prompt,
     }])[0]
     cleaned.pop('id', None)
@@ -6768,7 +6545,7 @@ def ecommerce_batches():
     else:
         actions_for_batch = (template.get('actions') or [])[:action_limit or None]
 
-    output_path = body.get('output_path') or os.path.join(USER_DATA_ROOT, '_运行缓存')
+    output_path = body.get('output_path') or os.path.join(os.path.dirname(os.path.abspath(__file__)), '_运行缓存')
     output_path, err = _ecommerce_safe_user_path(output_path, must_exist=False)
     if err:
         return jsonify({'error': err}), 400
@@ -6780,14 +6557,14 @@ def ecommerce_batches():
         # 用户选的目录没权限，fallback 到应用自己的目录
         cache_fallback_reason = cache_probe.get('error') or cache_probe.get('hint') or '目录不可写'
         logger.warning(f'[ecommerce] 用户指定的缓存目录不可写 ({output_path}): {cache_fallback_reason}，fallback 到应用目录')
-        output_path = os.path.join(USER_DATA_ROOT, '_运行缓存')
+        output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_运行缓存')
         fallback_cache_probe = _ecommerce_probe_writable_directory(output_path, allow_macos_helper=False)
         if not fallback_cache_probe.get('writable'):
             return jsonify({'error': f"缓存目录与本地回退目录都不可写: {fallback_cache_probe.get('error') or fallback_cache_probe.get('hint')}"}), 500
 
     batch_id = gen_id('ecbatch')
     batch_name = str(body.get('name') or f"电商批次 {datetime.now().strftime('%m-%d %H:%M')}").strip()
-    requested_final_output_path = body.get('final_output_path') or os.path.join(USER_DATA_ROOT, '_成品输出')
+    requested_final_output_path = body.get('final_output_path') or os.path.join(os.path.dirname(os.path.abspath(__file__)), '_成品输出')
     final_output_path = requested_final_output_path
     final_output_path, final_err = _ecommerce_safe_user_path(final_output_path, must_exist=False)
     if final_err:
@@ -6807,7 +6584,7 @@ def ecommerce_batches():
                 'permission_hint': final_probe.get('hint') or '',
                 'can_use_local_fallback': True,
             }), 409
-        fallback_final = os.path.join(USER_DATA_ROOT, '_成品输出')
+        fallback_final = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_成品输出')
         fallback_final_probe = _ecommerce_probe_writable_directory(fallback_final)
         if not fallback_final_probe.get('writable'):
             return jsonify({'error': f"成品目录与本地回退目录都不可写: {fallback_final_probe.get('error') or fallback_final_probe.get('hint')}"}), 500
@@ -7791,7 +7568,7 @@ def _ecommerce_sample_result_dir(batch, garment):
     fallback = ((batch.get('settings') or {}).get('archive_fallback_garments') or {}).get(garment.get('name'))
     if mapped or fallback:
         return os.path.realpath(os.path.expanduser(mapped or fallback))
-    cache_root = os.path.realpath(os.path.expanduser(batch.get('output_path') or os.path.join(USER_DATA_ROOT, '_运行缓存')))
+    cache_root = os.path.realpath(os.path.expanduser(batch.get('output_path') or os.path.join(BASE_DIR, '_运行缓存')))
     garment_name = _ecommerce_safe_name(garment.get('name') or garment.get('id'), garment.get('id') or '服装')
     return os.path.join(cache_root, '_生成样本备份', garment_name)
 
@@ -8915,7 +8692,7 @@ def ecommerce_local_image():
 
 @app.route('/api/ecommerce/open-preview', methods=['POST'])
 def ecommerce_open_preview():
-    """Open validated local images in the platform image viewer."""
+    """Open validated local images in a separate macOS Preview instance."""
     body = request.get_json(silent=True) or {}
     raw_paths = body.get('paths') or []
     if not isinstance(raw_paths, list):
@@ -8931,11 +8708,14 @@ def ecommerce_open_preview():
     if not paths:
         return jsonify({'error': '没有可打开的本地图片'}), 400
     try:
-        _open_files(paths)
+        subprocess.Popen(
+            ['open', '-n', '-a', 'Preview', *paths],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         return jsonify({'ok': True, 'count': len(paths)})
     except Exception as exc:
         logger.error(f'[ecommerce-preview] 打开系统预览失败: {exc}', exc_info=True)
-        return jsonify({'error': '无法打开系统图片预览'}), 500
+        return jsonify({'error': '无法打开macOS预览'}), 500
 
 
 @app.route('/api/ecommerce/crop-reference', methods=['POST'])
@@ -8961,7 +8741,7 @@ def ecommerce_crop_reference():
     if scale < 0.08:
         return jsonify({'error': '裁剪区域太小'}), 400
     batch = _ecommerce_batch_snapshot(batch_id) if batch_id else None
-    cache_root = os.path.expanduser((batch or {}).get('output_path') or os.path.join(USER_DATA_ROOT, '_运行缓存'))
+    cache_root = os.path.expanduser((batch or {}).get('output_path') or os.path.join(BASE_DIR, '_运行缓存'))
     target_dir = os.path.join(cache_root, '_重做临时参考图')
     os.makedirs(target_dir, exist_ok=True)
     target = os.path.join(target_dir, f"crop-{datetime.now().strftime('%Y%m%d%H%M%S')}-{gen_id('crop')}.jpg")
@@ -9022,7 +8802,7 @@ def ecommerce_open_folder():
             return jsonify({'error': '文件夹尚未生成，请先运行批次'}), 400
 
     try:
-        _open_path(target)
+        subprocess.run(['open', target], check=True)
         logger.info(f'[ecommerce-open-folder] 打开文件夹: {target}')
         return jsonify({'ok': True, 'path': target})
     except Exception as exc:
@@ -11014,8 +10794,6 @@ def check_existing_instance(start_port=5800, max_tries=20):
 # ========== 启动 ==========
 
 if __name__ == '__main__':
-    _migrate_legacy_data()
-    _init_default_data()
     # 先检测是否已有本程序实例在运行（扫描 5800-5819 全范围）
     existing_port = check_existing_instance(5800)
     if existing_port:
@@ -11057,7 +10835,7 @@ if __name__ == '__main__':
     hot_reload = os.environ.get('AI_HOT_RELOAD', '1').strip().lower() in ('1', 'true', 'yes', 'on')
 
     # 将端口写入临时文件，供启动脚本读取实际运行端口
-    _port_file = os.path.join(tempfile.gettempdir(), 'ai_prompt_generator_port')
+    _port_file = '/tmp/ai_prompt_generator_port'
     try:
         with open(_port_file, 'w') as f:
             f.write(str(port))

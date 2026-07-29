@@ -5,7 +5,9 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from unittest.mock import Mock, patch
 
 from PIL import Image
@@ -41,6 +43,29 @@ class EcommerceBatchTest(unittest.TestCase):
         for number in range(1, count + 1):
             self.make_image(os.path.join(folder, f"{number}-参考.jpg"))
         return folder
+
+    def test_rerun_ui_exposes_draw_count_and_single_prompt_has_priority(self):
+        script_path = os.path.join(os.path.dirname(app_module.__file__), 'static', 'js', 'app.js')
+        template_path = os.path.join(os.path.dirname(app_module.__file__), 'templates', 'index.html')
+        with open(script_path, encoding='utf-8') as handle:
+            script = handle.read()
+        with open(template_path, encoding='utf-8') as handle:
+            template = handle.read()
+        self.assertIn('id="ecommerce-rerun-draw-count"', script)
+        self.assertIn('Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5))', script)
+        self.assertIn("String(item.rerun_prompt || '').trim() || prompt", script)
+        self.assertIn('预计付费生图 ${paidCallTotal} 张', script)
+        self.assertIn('参考图支持1～9张', script)
+        self.assertIn('class="ecommerce-rerun-sync-select"', script)
+        self.assertIn('function ecommerceRerunAdjustmentTargets(item)', script)
+        self.assertIn('advanceEcommerceRerunWorkflow(index, syncEnabled)', script)
+        self.assertIn('保存当前并下一张', script)
+        self.assertIn('id="ecommerce-rerun-adjust-panel"', template)
+        self.assertIn('id="ecommerce-rerun-adjust-host"', template)
+        self.assertIn("const host = document.getElementById('ecommerce-rerun-adjust-host')", script)
+        self.assertIn('`第 ${currentGroupIdx + 1}/${allGarmentIds.length} 套 · ${item.garment_name}`', script)
+        self.assertIn('`本套第 ${currentItemInGarment + 1}/${sameGarmentItems.length} 张', script)
+        self.assertNotIn('list.appendChild(compare)', script)
 
     def test_scan_requires_all_six_numbered_images(self):
         self.make_garment("完整款")
@@ -287,12 +312,56 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(payload["garment_count"], 3)
         self.assertEqual([g["name"] for g in payload["garments"]], ["批量/001", "批量/002", "批量/003"])
 
-    def test_rerun_prompt_reuses_original_or_appends_correction(self):
+    def test_rerun_prompt_reuses_original_or_uses_replacement(self):
         self.assertEqual(app_module._ecommerce_rerun_prompt("原提示词", ""), "原提示词")
         self.assertEqual(
             app_module._ecommerce_rerun_prompt("原提示词", "盘扣数量必须一致"),
-            "原提示词\n\n本次重做补充要求：盘扣数量必须一致",
+            "盘扣数量必须一致",
         )
+
+    def test_rerun_accepts_one_through_nine_selected_references(self):
+        target = os.path.join(self.user_temp.name, 'nine-ref-target.jpg')
+        candidate = os.path.join(self.user_temp.name, 'nine-ref-candidate.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'nine-ref-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(candidate)
+        references = []
+        for index in range(9):
+            path = os.path.join(self.user_temp.name, f'nine-ref-{index + 1}.jpg')
+            self.make_image(path, color=(40 + index * 10, 80, 120))
+            references.append(path)
+        action = {
+            'id': 'a1', 'order': 0, 'name': '背面', 'action_image': target, 'prompt': '原提示词',
+            'platform': 'runninghub', 'model_key': 'rhart-image-n-g31-flash/image-to-image-2k',
+            'endpoint': 'rhart-image-n-g31-flash/image-to-image', 'resolution': '2k',
+        }
+        batch = {
+            'id': 'one-to-nine-references', 'name': '1到9张参考图', 'run_code': 'RUN',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False},
+            'template': {'actions': [action]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': references[:6]}],
+            'tasks': [{'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a1', 'action_order': 0, 'action_name': '背面', 'state': 'accepted', 'attempts': []}],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+        captured_counts = []
+
+        def fake_generate(_batch, _task, garment, _action, _prompt, _attempt):
+            captured_counts.append(len(garment.get('images') or []))
+            return candidate
+
+        with patch.object(app_module, '_ecommerce_generate_candidate', side_effect=fake_generate):
+            for selected in (references[:1], references):
+                response = self.client.post('/api/ecommerce/regenerate', json={
+                    'batch_id': batch['id'], 'item_id': 'g1-1', 'result_path': result_dir,
+                    'reference_images': selected, 'prompt': '', 'count': 1,
+                })
+                self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured_counts, [1, 9])
 
     def test_detail_repair_prompt_is_generic_and_accepts_optional_correction(self):
         prompt = app_module._ecommerce_detail_repair_prompt()
@@ -422,8 +491,65 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(second['scan_count'], 2)
 
     def test_batch_accepts_enterprise_concurrency_up_to_100(self):
-        self.assertEqual(min(99, app_module.ECOMMERCE_MAX_CONCURRENCY), 99)
         self.assertEqual(app_module.ECOMMERCE_MAX_CONCURRENCY, 100)
+
+    def test_rerun_ui_accepts_100_and_explains_platform_limits(self):
+        script_path = os.path.join(os.path.dirname(app_module.__file__), 'static', 'js', 'app.js')
+        with open(script_path, 'r', encoding='utf-8') as handle:
+            script = handle.read()
+        self.assertIn('id="ecommerce-rerun-concurrency" type="number" min="1" max="100"', script)
+        self.assertIn('Math.min(100, selectedCount || 1)', script)
+        self.assertIn('RH企业线路官方上限100', script)
+        self.assertIn('HK未公布固定上限', script)
+
+    def test_rerun_attempt_ids_do_not_overwrite_each_other(self):
+        batch = {'tasks': [{'id': 'task-1', 'attempts': []}]}
+        app_module._ecommerce_sync_attempt(batch, 'task-1', {'id': 'rerun-a', 'number': 99, 'archived_path': '/a.jpg'})
+        app_module._ecommerce_sync_attempt(batch, 'task-1', {'id': 'rerun-b', 'number': 99, 'archived_path': '/b.jpg'})
+        attempts = batch['tasks'][0]['attempts']
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual({row['id'] for row in attempts}, {'rerun-a', 'rerun-b'})
+
+    def test_29_out_of_order_rerun_archives_stay_in_bound_garment_folders(self):
+        candidates_root = os.path.join(self.user_temp.name, '乱序候选')
+        results_root = os.path.join(self.user_temp.name, '乱序结果')
+        cache_root = os.path.join(self.user_temp.name, '乱序缓存')
+        os.makedirs(candidates_root)
+        garments = []
+        tasks = []
+        result_dirs = {}
+        candidates = {}
+        for index in range(29):
+            garment_id = f'g-{index:02d}'
+            garment_name = f'服装{index:02d}'
+            result_dir = os.path.join(results_root, garment_name)
+            candidate = os.path.join(candidates_root, f'{index:02d}.jpg')
+            self.make_image(candidate, color=(index * 7 % 255, 80, 120))
+            garments.append({'id': garment_id, 'name': garment_name, 'images': []})
+            tasks.append({'id': f't-{index:02d}', 'garment_id': garment_id, 'action_order': index % 11, 'action_name': f'动作{index % 11 + 1}'})
+            result_dirs[garment_id] = result_dir
+            candidates[garment_id] = candidate
+        batch = {
+            'id': 'rerun-out-of-order', 'run_code': 'RH-NB2-LC-4K-R01',
+            'output_path': cache_root, 'garments': garments, 'tasks': tasks,
+            'result_dirs': result_dirs, 'settings': {},
+        }
+
+        def archive(index):
+            # 故意让靠后的任务先返回，验证归档不依赖完成顺序。
+            time.sleep((28 - index) * 0.0005)
+            task = tasks[index]
+            return task['garment_id'], app_module._ecommerce_archive_sample(
+                batch, task, candidates[task['garment_id']], 1, 1,
+            )
+
+        with ThreadPoolExecutor(max_workers=29) as pool:
+            futures = [pool.submit(archive, index) for index in range(29)]
+            archived = [future.result() for future in as_completed(futures)]
+        self.assertEqual(len(archived), 29)
+        for garment_id, path in archived:
+            self.assertEqual(os.path.dirname(path), os.path.realpath(result_dirs[garment_id]))
+            self.assertTrue(os.path.isfile(path))
 
     def test_global_no_qc_runner_processes_tasks_across_garments(self):
         candidate_dir = os.path.join(self.user_temp.name, 'candidates')

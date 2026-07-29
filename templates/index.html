@@ -770,7 +770,7 @@
     <!-- 电商批量生图：目标替换参考图 × 服装文件夹，支持断点续跑与AI质检 -->
     <div id="ecommerce-mode" class="main-content ecommerce-mode" style="display:none">
         <section class="ecommerce-shell">
-            <!-- 顶部水平滚动轨道：4栏总宽超出视口时拖动可左右滚动 -->
+            <!-- 顶部水平滚动轨道：第5栏调整工作台展开后可左右滚动 -->
             <div class="ecommerce-scroll-track" id="ecommerce-scroll-track" hidden><div class="ecommerce-scroll-thumb" id="ecommerce-scroll-thumb"></div></div>
             <div class="ecommerce-grid" id="ecommerce-grid-scroll">
                 <article class="ecommerce-card ecommerce-card-material" data-workbench-panel="material">
@@ -1037,6 +1037,23 @@
                     </details>
                     <div id="ecommerce-rerun-list" class="ecommerce-rerun-list">
                         <div class="ecommerce-empty">扫描后这里会列出每套服装被删掉的动作，点击可进入对比与重做。</div>
+                    </div>
+                </article>
+
+                <div class="ecommerce-column-resizer" id="ecommerce-rerun-adjust-resizer" data-left="rerun" data-right="adjust" title="拖动调整废片列宽度" hidden></div>
+
+                <article class="ecommerce-card ecommerce-card-rerun-adjust" id="ecommerce-rerun-adjust-panel" data-workbench-panel="adjust" hidden>
+                    <div class="ecommerce-card-title">
+                        <span>5</span>调整细节
+                        <span class="ecommerce-help-tip" tabindex="0" data-tip="逐张调整重做提示词与1～9张参考图；可选择只修改当前图片，或同步到本套全部废片。">?</span>
+                        <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-adjust-close">关闭</button>
+                    </div>
+                    <div class="ecommerce-rerun-adjust-progress">
+                        <strong id="ecommerce-rerun-adjust-group-progress">未选择服装</strong>
+                        <span id="ecommerce-rerun-adjust-item-progress">点击第4栏的“调整参考图”</span>
+                    </div>
+                    <div id="ecommerce-rerun-adjust-host" class="ecommerce-rerun-adjust-host">
+                        <div class="ecommerce-empty">从废片列表选择一张后，这里会显示独立调整工作台。</div>
                     </div>
                 </article>
             </div>
