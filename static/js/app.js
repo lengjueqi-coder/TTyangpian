@@ -12299,6 +12299,10 @@ document.getElementById('btn-ecommerce-force-reset')?.addEventListener('click', 
     }
 });
 document.getElementById('ecommerce-batch-select')?.addEventListener('change', async e => {
+    if (ecommerceRerunState.bulkProgress?.active) {
+        e.target.value = ecommerceRerunState.batchId || ecommerceState.currentBatchId || '';
+        return showToast('废片重做仍在运行或暂停中，请先继续并等待完成后再切换批次', 'warning');
+    }
     ecommerceState.currentBatchId = e.target.value;
     // 反向同步重做批次选择，并清理重做状态
     const rerunSelect = document.getElementById('ecommerce-rerun-batch-select');
@@ -12308,6 +12312,8 @@ document.getElementById('ecommerce-batch-select')?.addEventListener('change', as
     ecommerceRerunState.batchId = e.target.value;
     ecommerceRerunState.items = [];
     ecommerceRerunState.selectedIds = new Set();
+    ecommerceRerunState.rerunBatches = [];
+    ecommerceRerunState.activeRerunBatchId = '';
     ecommerceRerunState.activeIndex = -1;
     ecommerceRerunState.compareRefIndex = 0;
     ecommerceRerunState.groupSyncByGarment = new Map();
@@ -12544,7 +12550,8 @@ const ecommerceRerunState = {
     selectedIds: new Set(), bulkPrompt: '', bulkPlatform: '', bulkModelKey: '', bulkRatio: 'auto',
     bulkConcurrency: 10, bulkDrawCount: 1,
     groupSyncByGarment: new Map(),
-    bulkProgress: { active: false, total: 0, completed: 0, success: 0, failed: 0 }
+    bulkProgress: { active: false, paused: false, total: 0, completed: 0, success: 0, failed: 0 },
+    bulkPauseWaiters: [], rerunBatches: [], activeRerunBatchId: ''
 };
 const ecommerceGroupCompareState = { mode: 'rerun', data: null, refIndex: 0, resultIndex: 0 };
 const ecommerceCompareZoomState = { reference: 1, result: 1 };
@@ -12552,7 +12559,128 @@ const ecommerceComparePanState = {
     reference: { x: 0, y: 0 },
     result: { x: 0, y: 0 }
 };
+const ecommerceCompareFitFrames = { reference: 0, result: 0 };
 let ecommerceWasteExpanded = false;
+
+function ecommerceBuildRerunQueuePayload(item, config = {}) {
+    const singleSource = ['target_only', 'garment_prompt'].includes(item.generation_mode);
+    const referenceImages = singleSource ? [] : (item.references || [])
+        .filter(reference => reference.selected !== false)
+        .map(reference => reference.override_url || reference.url)
+        .filter(Boolean);
+    const drawCount = Math.max(1, Math.min(5, Number(config.drawCount) || 1));
+    return {
+        item_id: item.id, result_path: item.result_path || '',
+        mark_id: item.mark_id || '', marked_result_path: item.marked_result_path || '',
+        mode: 'full', prompt: String(item.rerun_prompt || '').trim() || String(config.prompt || ''),
+        reference_images: referenceImages,
+        count: Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5)),
+        model_override: {
+            platform: config.platform || ecommerceRerunState.bulkPlatform || 'runninghub',
+            model_key: config.modelKey || ecommerceRerunState.bulkModelKey,
+            aspect_ratio: config.ratio || ecommerceRerunState.bulkRatio || 'auto'
+        }
+    };
+}
+
+function renderEcommerceRerunBatches() {
+    const root = document.getElementById('ecommerce-rerun-batches');
+    if (!root) return;
+    const rows = ecommerceRerunState.rerunBatches || [];
+    if (!rows.length) {
+        root.innerHTML = '<div class="ecommerce-empty">暂无重做批次；开始批量重做后会自动保存。</div>';
+        return;
+    }
+    const labels = { running: '运行中', paused: '已暂停', interrupted: '已中断', partial: '部分完成', completed: '已完成' };
+    root.innerHTML = rows.slice(0, 5).map(row => {
+        const total = Number(row.total_count) || 0;
+        const done = Number(row.completed_count) || 0;
+        const remaining = Math.max(0, total - done);
+        const canContinue = remaining > 0 && ['running', 'paused', 'interrupted', 'partial'].includes(row.status);
+        const canFinalize = remaining > 0 && row.status !== 'partial';
+        const firstGarment = row.accepted_garments?.[0]?.id || '';
+        return `<div class="ecommerce-rerun-batch-row ${row.id === ecommerceRerunState.activeRerunBatchId ? 'is-active' : ''}" data-rerun-batch-id="${ecommerceEscape(row.id)}">
+            <strong>${ecommerceEscape(row.name || '废片重做')} · ${done}/${total}</strong>
+            <small>${labels[row.status] || row.status} · 已完成${done}张${remaining ? ` · 剩余${remaining}张` : ''}${row.legacy_recovered ? ' · 旧任务提示词无法还原，继续时复用原任务提示词' : ''}</small>
+            <span class="ecommerce-rerun-batch-actions">
+                ${canContinue ? '<button class="btn btn-primary ecommerce-rerun-session-resume" type="button">继续剩余</button>' : ''}
+                ${canFinalize ? '<button class="btn btn-outline ecommerce-rerun-session-finalize" type="button">结束本次</button>' : ''}
+                ${done && firstGarment ? `<button class="btn btn-outline ecommerce-rerun-session-review" data-garment-id="${ecommerceEscape(firstGarment)}" type="button">验片已完成</button>` : ''}
+            </span>
+        </div>`;
+    }).join('');
+    root.querySelectorAll('.ecommerce-rerun-session-resume').forEach(button => button.addEventListener('click', async () => {
+        const row = button.closest('.ecommerce-rerun-batch-row');
+        await resumeEcommerceRerunBatch(row?.dataset.rerunBatchId || '');
+    }));
+    root.querySelectorAll('.ecommerce-rerun-session-finalize').forEach(button => button.addEventListener('click', async () => {
+        const id = button.closest('.ecommerce-rerun-batch-row')?.dataset.rerunBatchId || '';
+        if (!id || !confirm('结束本次重做？\n\n已完成图片会形成可验片批次；剩余废片仍保留，可稍后重新扫描或继续。')) return;
+        await ecommerceApi('POST', `/api/ecommerce/rerun-batches/${encodeURIComponent(id)}/action`, { action: 'finalize' });
+        await loadEcommerceRerunBatches();
+    }));
+    root.querySelectorAll('.ecommerce-rerun-session-review').forEach(button => button.addEventListener('click', async () => {
+        const row = button.closest('.ecommerce-rerun-batch-row');
+        await openEcommerceRerunBatchCompare(row?.dataset.rerunBatchId || '', button.dataset.garmentId || '');
+    }));
+}
+
+async function loadEcommerceRerunBatches() {
+    const batchId = ecommerceRerunState.batchId || ecommerceState.currentBatchId;
+    if (!batchId) return;
+    const data = await ecommerceApi('GET', `/api/ecommerce/rerun-batches?batch_id=${encodeURIComponent(batchId)}`);
+    ecommerceRerunState.rerunBatches = data.rerun_batches || [];
+    renderEcommerceRerunBatches();
+}
+
+async function recoverLatestEcommerceRerunBatch() {
+    if ((ecommerceRerunState.rerunBatches || []).length) return;
+    const config = {
+        prompt: ecommerceRerunState.bulkPrompt || '', platform: ecommerceRerunState.bulkPlatform,
+        modelKey: ecommerceRerunState.bulkModelKey, ratio: ecommerceRerunState.bulkRatio,
+        drawCount: ecommerceRerunState.bulkDrawCount
+    };
+    const items = ecommerceRerunState.items.map(item => ecommerceBuildRerunQueuePayload(item, config));
+    try {
+        const data = await ecommerceApi('POST', '/api/ecommerce/rerun-batches/recover-latest', {
+            batch_id: ecommerceRerunState.batchId, items,
+            settings: { concurrency: ecommerceRerunState.bulkConcurrency || 1, ...config }
+        });
+        if (data.rerun_batch) {
+            ecommerceRerunState.rerunBatches = [data.rerun_batch];
+            renderEcommerceRerunBatches();
+            if (data.created) showToast(`已恢复上次重做批次：完成${data.rerun_batch.completed_count}/${data.rerun_batch.total_count}`, 'success');
+        }
+    } catch (error) {
+        if (!String(error.message || '').includes('没有找到')) console.warn('[rerun-recover]', error);
+    }
+}
+
+async function openEcommerceRerunBatchCompare(rerunBatchId, garmentId) {
+    if (!rerunBatchId || !garmentId) return;
+    const detail = await ecommerceApi('GET', `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}`);
+    const session = detail.rerun_batch;
+    const data = await ecommerceApi('GET', `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}/garments/${encodeURIComponent(garmentId)}/compare`);
+    ecommerceGroupCompareState.mode = 'group';
+    ecommerceGroupCompareState.data = data;
+    ecommerceGroupCompareState.refIndex = 0;
+    ecommerceGroupCompareState.resultIndex = 0;
+    ecommerceGroupCompareState.garmentList = session.accepted_garments || [{ id: garmentId, name: data.garment_name }];
+    ecommerceGroupCompareState.currentGarmentIndex = ecommerceGroupCompareState.garmentList.findIndex(entry => entry.id === garmentId);
+    ecommerceCompareZoomState.reference = 1;
+    ecommerceCompareZoomState.result = 1;
+    resetEcommerceComparePan('reference');
+    resetEcommerceComparePan('result');
+    updateEcommerceCompareHeading(data, data.garment_name);
+    updateEcommerceImageCompare();
+    updateEcommerceCompareGarmentNav();
+    const overlay = document.getElementById('ecommerce-compare-overlay');
+    if (overlay) {
+        overlay.hidden = false;
+        overlay.setAttribute('aria-hidden', 'false');
+        document.body.classList.add('ecommerce-compare-open');
+    }
+}
 
 function ecommerceRerunGroupSyncEnabled(item) {
     return !!(item && ecommerceRerunState.groupSyncByGarment.get(item.garment_id));
@@ -12957,8 +13085,9 @@ function applyEcommerceCompareZoom(side, center = false) {
     const zoom = Math.max(0.5, Math.min(4, Number(ecommerceCompareZoomState[safeSide]) || 1));
     ecommerceCompareZoomState[safeSide] = zoom;
     if (center) resetEcommerceComparePan(safeSide);
-    const fitWidth = Math.max(1, scroller.clientWidth - 8);
-    const fitHeight = Math.max(1, scroller.clientHeight - 8);
+    const viewport = scroller.getBoundingClientRect();
+    const fitWidth = Math.max(1, Math.floor(viewport.width) - 8);
+    const fitHeight = Math.max(1, Math.floor(viewport.height) - 8);
     const fitScale = Math.min(fitWidth / image.naturalWidth, fitHeight / image.naturalHeight);
     image.style.width = `${Math.max(1, Math.round(image.naturalWidth * fitScale * zoom))}px`;
     image.style.height = `${Math.max(1, Math.round(image.naturalHeight * fitScale * zoom))}px`;
@@ -12975,6 +13104,18 @@ function applyEcommerceCompareZoom(side, center = false) {
         else if (action === '2') isActive = Math.abs(zoom - 2) < 0.1;
         else if (action === '4') isActive = Math.abs(zoom - 4) < 0.15;
         btn.classList.toggle('is-active', isActive);
+    });
+}
+
+function scheduleEcommerceCompareZoom(side, center = false) {
+    const safeSide = side === 'result' ? 'result' : 'reference';
+    if (ecommerceCompareFitFrames[safeSide]) cancelAnimationFrame(ecommerceCompareFitFrames[safeSide]);
+    // 等图片解码和 grid 布局都稳定后只计算一次，避免用上一张图片造成的临时行高适配。
+    ecommerceCompareFitFrames[safeSide] = requestAnimationFrame(() => {
+        ecommerceCompareFitFrames[safeSide] = requestAnimationFrame(() => {
+            ecommerceCompareFitFrames[safeSide] = 0;
+            applyEcommerceCompareZoom(safeSide, center);
+        });
     });
 }
 
@@ -13002,7 +13143,7 @@ function setEcommerceCompareImage(side, url, alt = '') {
     const sourceChanged = image.dataset.sourceUrl !== nextUrl;
     if (alt) image.alt = alt;
     if (!sourceChanged) {
-        if (image.complete && image.naturalWidth) applyEcommerceCompareZoom(safeSide);
+        if (image.complete && image.naturalWidth) scheduleEcommerceCompareZoom(safeSide);
         return;
     }
     if (image.dataset.pendingSourceUrl === nextUrl) return;
@@ -13014,10 +13155,10 @@ function setEcommerceCompareImage(side, url, alt = '') {
         image.dataset.sourceUrl = nextUrl;
         resetEcommerceComparePan(safeSide);
         image.onload = () => {
-            if (image.dataset.sourceUrl === nextUrl) applyEcommerceCompareZoom(safeSide);
+            if (image.dataset.sourceUrl === nextUrl) scheduleEcommerceCompareZoom(safeSide);
         };
         image.src = nextUrl;
-        if (image.complete && image.naturalWidth) applyEcommerceCompareZoom(safeSide);
+        if (image.complete && image.naturalWidth) scheduleEcommerceCompareZoom(safeSide);
     };
     loader.onerror = () => {
         if (image.dataset.pendingSourceUrl === nextUrl) image.dataset.pendingSourceUrl = '';
@@ -13117,27 +13258,35 @@ function updateEcommerceImageCompare() {
         button.disabled = groupMode && results.length < 2;
         button.style.visibility = groupMode && results.length < 2 ? 'hidden' : '';
     });
-    const garmentIndicator = document.getElementById('ecommerce-compare-garment-indicator');
-    const prevGarmentBtn = document.getElementById('ecommerce-compare-prev-garment');
-    const nextGarmentBtn = document.getElementById('ecommerce-compare-next-garment');
-    if (garmentIndicator && groupMode && ecommerceState.detail) {
-        const garments = ecommerceState.detail.garments || [];
+    const garmentIndicators = [
+        document.getElementById('ecommerce-compare-garment-indicator-top'),
+        document.getElementById('ecommerce-compare-garment-indicator')
+    ].filter(Boolean);
+    const garmentNavButtons = [
+        document.getElementById('ecommerce-compare-prev-garment'),
+        document.getElementById('ecommerce-compare-next-garment'),
+        document.getElementById('ecommerce-compare-prev-garment-bottom'),
+        document.getElementById('ecommerce-compare-next-garment-bottom')
+    ].filter(Boolean);
+    if (groupMode && ecommerceState.detail) {
+        const garments = group?.rerun_batch_id
+            ? (ecommerceGroupCompareState.garmentList || [])
+            : (ecommerceState.detail.garments || []);
         const currentGid = ecommerceGroupCompareState.data?.garment_id;
         const gIdx = garments.findIndex(g => g.id === currentGid);
         if (gIdx >= 0 && garments.length > 1) {
-            garmentIndicator.textContent = `${gIdx + 1}/${garments.length} · ${ecommerceGroupCompareState.data?.garment_name || ''}`;
-            garmentIndicator.hidden = false;
-            if (prevGarmentBtn) prevGarmentBtn.hidden = false;
-            if (nextGarmentBtn) nextGarmentBtn.hidden = false;
+            garmentIndicators.forEach(indicator => {
+                indicator.textContent = `${gIdx + 1}/${garments.length} · ${ecommerceGroupCompareState.data?.garment_name || ''}`;
+                indicator.hidden = false;
+            });
+            garmentNavButtons.forEach(button => { button.hidden = false; });
         } else {
-            garmentIndicator.hidden = true;
-            if (prevGarmentBtn) prevGarmentBtn.hidden = true;
-            if (nextGarmentBtn) nextGarmentBtn.hidden = true;
+            garmentIndicators.forEach(indicator => { indicator.hidden = true; });
+            garmentNavButtons.forEach(button => { button.hidden = true; });
         }
     } else {
-        if (garmentIndicator) garmentIndicator.hidden = true;
-        if (prevGarmentBtn) prevGarmentBtn.hidden = true;
-        if (nextGarmentBtn) nextGarmentBtn.hidden = true;
+        garmentIndicators.forEach(indicator => { indicator.hidden = true; });
+        garmentNavButtons.forEach(button => { button.hidden = true; });
     }
     // "删除此图"按钮：只在 group 模式且当前图未删除时显示
     const deleteBtn = document.getElementById('ecommerce-compare-delete');
@@ -13236,10 +13385,14 @@ async function openEcommerceGroupCompare(garmentId) {
 function updateEcommerceCompareGarmentNav() {
     const list = ecommerceGroupCompareState.garmentList || [];
     const idx = ecommerceGroupCompareState.currentGarmentIndex ?? -1;
-    const prevBtn = document.getElementById('ecommerce-compare-prev-garment');
-    const nextBtn = document.getElementById('ecommerce-compare-next-garment');
-    if (prevBtn) prevBtn.disabled = idx <= 0;
-    if (nextBtn) nextBtn.disabled = idx < 0 || idx >= list.length - 1;
+    ['ecommerce-compare-prev-garment', 'ecommerce-compare-prev-garment-bottom'].forEach(id => {
+        const button = document.getElementById(id);
+        if (button) button.disabled = idx <= 0;
+    });
+    ['ecommerce-compare-next-garment', 'ecommerce-compare-next-garment-bottom'].forEach(id => {
+        const button = document.getElementById(id);
+        if (button) button.disabled = idx < 0 || idx >= list.length - 1;
+    });
 }
 
 function updateEcommerceCompareHeading(data, fallbackName = '') {
@@ -13270,7 +13423,11 @@ async function switchEcommerceCompareGarment(direction) {
     if (!batchId) return false;
     ecommerceGroupCompareState.switching = true;
     try {
-        const data = await ecommerceApi('GET', `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(target.id)}/compare`);
+        const rerunBatchId = ecommerceGroupCompareState.data?.rerun_batch_id || '';
+        const compareUrl = rerunBatchId
+            ? `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}/garments/${encodeURIComponent(target.id)}/compare`
+            : `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(target.id)}/compare`;
+        const data = await ecommerceApi('GET', compareUrl);
         ecommerceGroupCompareState.data = data;
         ecommerceGroupCompareState.refIndex = 0;
         ecommerceGroupCompareState.resultIndex = 0;
@@ -13327,7 +13484,10 @@ async function deleteEcommerceCurrentResult() {
                 await ecommerceApi('POST', '/api/ecommerce/undo-delete', {
                     batch_id: batchId, garment_id: garmentId, path: deletedResult.path
                 });
-                const restored = await ecommerceApi('GET', `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(garmentId)}/compare`);
+                const restoredUrl = group?.rerun_batch_id
+                    ? `/api/ecommerce/rerun-batches/${encodeURIComponent(group.rerun_batch_id)}/garments/${encodeURIComponent(garmentId)}/compare`
+                    : `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(garmentId)}/compare`;
+                const restored = await ecommerceApi('GET', restoredUrl);
                 if (restored && restored.results) {
                     ecommerceGroupCompareState.data = restored;
                     const restoredIdx = restored.results.findIndex(r => r.path === deletedResult.path);
@@ -13534,6 +13694,10 @@ async function scanEcommerceRerun() {
         const total = ecommerceRerunState.items.length;
         if (summary) summary.textContent = total ? `${resultPath ? '所选单组' : '整批'}共扫描到 ${total} 张废片待重做` : `${resultPath ? '所选单组' : '整批'}没有废片`;
         renderEcommerceRerunList();
+        // “缺失废片”与“已经重做成功的图片”是两类数据。扫描完缺失项后，
+        // 单独加载持久化重做批次，让已完成图片即使刷新页面也仍可验片。
+        await loadEcommerceRerunBatches();
+        await recoverLatestEcommerceRerunBatch();
         await loadEcommerceWasteStats();
     } catch (e) {
         if (summary) summary.textContent = `扫描失败：${e.message}`;
@@ -13619,8 +13783,13 @@ function renderEcommerceRerunList() {
         <textarea id="ecommerce-rerun-bulk-prompt" placeholder="批量新提示词；留空时复用原提示词，填写后完整替换原提示词">${ecommerceEscape(ecommerceRerunState.bulkPrompt || '')}</textarea>
         <button type="button" class="btn btn-primary btn-compact" id="btn-ecommerce-rerun-bulk" ${selectedCount ? '' : 'disabled'}>批量重做已选 ${selectedCount} 张</button>
         <div class="ecommerce-rerun-progress" id="ecommerce-rerun-progress" ${progress.active || progress.total ? '' : 'hidden'}>
-            <div><span id="ecommerce-rerun-progress-label">${progress.active ? '正在重做' : '上次重做'} ${progress.completed || 0}/${progress.total || 0}</span><span id="ecommerce-rerun-progress-counts">成功${progress.success || 0} · 失败${progress.failed || 0}</span></div>
+            <div><span id="ecommerce-rerun-progress-label">${progress.paused ? '已暂停提交' : progress.active ? '正在重做' : '上次重做'} ${progress.completed || 0}/${progress.total || 0}</span><span id="ecommerce-rerun-progress-counts">成功${progress.success || 0} · 失败${progress.failed || 0}</span></div>
             <div class="ecommerce-rerun-progress-track"><i id="ecommerce-rerun-progress-fill" style="width:${progress.total ? Math.round((progress.completed || 0) / progress.total * 100) : 0}%"></i></div>
+            <div class="ecommerce-rerun-progress-actions">
+                <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-pause" title="停止提交新任务；已经提交的平台任务会继续返回并归档" ${progress.active && !progress.paused ? '' : 'hidden'}>暂停提交</button>
+                <button type="button" class="btn btn-primary btn-compact" id="btn-ecommerce-rerun-resume" title="从尚未提交的废片继续，不重复已完成任务" ${progress.active && progress.paused ? '' : 'hidden'}>继续</button>
+                <small>暂停不会取消已经提交且可能已扣费的任务</small>
+            </div>
         </div>
     </div>${groupsHtml}`;
     list.querySelector('#ecommerce-rerun-select-all')?.addEventListener('change', event => {
@@ -13708,6 +13877,8 @@ function renderEcommerceRerunList() {
     });
     updateRerunConcurrencyHint();
     list.querySelector('#btn-ecommerce-rerun-bulk')?.addEventListener('click', bulkRegenerateEcommerceSelected);
+    list.querySelector('#btn-ecommerce-rerun-pause')?.addEventListener('click', () => setEcommerceRerunPaused(true));
+    list.querySelector('#btn-ecommerce-rerun-resume')?.addEventListener('click', () => setEcommerceRerunPaused(false));
     list.querySelectorAll('.ecommerce-rerun-item').forEach(row => {
         row.addEventListener('click', event => {
             if (event.target.closest('input')) return;
@@ -13753,7 +13924,7 @@ function updateEcommerceRerunProgress() {
     const root = document.getElementById('ecommerce-rerun-progress');
     if (root) root.hidden = !(progress.active || progress.total);
     const label = document.getElementById('ecommerce-rerun-progress-label');
-    if (label) label.textContent = `${progress.active ? '正在重做' : '重做完成'} ${progress.completed || 0}/${progress.total || 0}`;
+    if (label) label.textContent = `${progress.paused ? '已暂停提交' : progress.active ? '正在重做' : '重做完成'} ${progress.completed || 0}/${progress.total || 0}`;
     const counts = document.getElementById('ecommerce-rerun-progress-counts');
     if (counts) {
         const retryText = progress.retrying ? ` · 重试${progress.retrying}` : '';
@@ -13761,127 +13932,184 @@ function updateEcommerceRerunProgress() {
     }
     const fill = document.getElementById('ecommerce-rerun-progress-fill');
     if (fill) fill.style.width = `${progress.total ? Math.round((progress.completed || 0) / progress.total * 100) : 0}%`;
+    const pauseButton = document.getElementById('btn-ecommerce-rerun-pause');
+    const resumeButton = document.getElementById('btn-ecommerce-rerun-resume');
+    if (pauseButton) {
+        pauseButton.hidden = !progress.active || !!progress.paused;
+        pauseButton.disabled = !progress.active || !!progress.paused;
+    }
+    if (resumeButton) {
+        resumeButton.hidden = !progress.active || !progress.paused;
+        resumeButton.disabled = !progress.active || !progress.paused;
+    }
+}
+
+async function setEcommerceRerunPaused(paused) {
+    const progress = ecommerceRerunState.bulkProgress || {};
+    if (!progress.active || !!progress.paused === !!paused) return;
+    const rerunBatchId = ecommerceRerunState.activeRerunBatchId;
+    if (rerunBatchId) {
+        try {
+            await ecommerceApi('POST', `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}/action`, {
+                action: paused ? 'pause' : 'resume'
+            });
+        } catch (error) {
+            return showToast(`${paused ? '暂停' : '继续'}失败：${error.message}`, 'error');
+        }
+    }
+    progress.paused = !!paused;
+    if (!progress.paused) {
+        const waiters = ecommerceRerunState.bulkPauseWaiters.splice(0);
+        waiters.forEach(resolve => resolve());
+    }
+    updateEcommerceRerunProgress();
+    showToast(
+        progress.paused
+            ? '已暂停提交新任务；已提交任务仍会正常返回并归档'
+            : `已继续，将从第${(progress.completed || 0) + 1}项附近接着提交`,
+        progress.paused ? 'warning' : 'success'
+    );
+    loadEcommerceRerunBatches().catch(error => console.warn('[rerun-batches] refresh failed', error));
+}
+
+function ecommerceRerunBlocksNavigation() {
+    if (!ecommerceRerunState.bulkProgress?.active) return false;
+    showToast('废片重做仍在运行或暂停中，请先继续并等待完成', 'warning');
+    return true;
+}
+
+function waitForEcommerceRerunResume() {
+    const progress = ecommerceRerunState.bulkProgress || {};
+    if (!progress.active || !progress.paused) return Promise.resolve();
+    return new Promise(resolve => ecommerceRerunState.bulkPauseWaiters.push(resolve));
+}
+
+async function runEcommercePersistedRerunBatch(session, button = null) {
+    if (!session?.id) throw new Error('重做批次无效');
+    if (ecommerceRerunState.bulkProgress?.active) return showToast('已有重做批次正在运行', 'warning');
+    const detail = await ecommerceApi('GET', `/api/ecommerce/rerun-batches/${encodeURIComponent(session.id)}`);
+    session = detail.rerun_batch || session;
+    const pendingItems = (session.items || []).filter(item => item.status === 'pending' || item.status === 'failed');
+    const concurrency = Math.max(1, Math.min(100, Number(session.settings?.concurrency) || 1, Math.max(1, pendingItems.length)));
+    const list = document.getElementById('ecommerce-rerun-list');
+    ecommerceRerunState.activeRerunBatchId = session.id;
+    ecommerceRerunState.batchId = session.batch_id;
+    ecommerceRerunState.bulkProgress = {
+        active: true, paused: false, total: Number(session.total_count) || (session.items || []).length,
+        completed: Number(session.completed_count) || 0, success: Number(session.completed_count) || 0,
+        failed: 0, retrying: 0
+    };
+    ecommerceRerunState.bulkPauseWaiters = [];
+    if (list) list.classList.add('is-running');
+    if (button) button.disabled = true;
+    updateEcommerceRerunProgress();
+    let cursor = 0;
+    const failures = [];
+    const callWithRetry = async entry => {
+        let lastError = '';
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            if (attempt > 1) await waitForEcommerceRerunResume();
+            try {
+                return await ecommerceApi('POST', '/api/ecommerce/regenerate', {
+                    ...(entry.payload || {}), batch_id: session.batch_id,
+                    rerun_batch_id: session.id
+                }, 600000);
+            } catch (error) {
+                lastError = error.message || String(error);
+                if (attempt < 2) {
+                    ecommerceRerunState.bulkProgress.retrying += 1;
+                    updateEcommerceRerunProgress();
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+            }
+        }
+        throw new Error(lastError);
+    };
+    const worker = async () => {
+        while (cursor < pendingItems.length) {
+            await waitForEcommerceRerunResume();
+            if (cursor >= pendingItems.length) return;
+            const entry = pendingItems[cursor++];
+            try {
+                await callWithRetry(entry);
+                ecommerceRerunState.bulkProgress.success += 1;
+            } catch (error) {
+                failures.push(`${entry.garment_name}·动作${entry.action_order}：${error.message}`);
+                ecommerceRerunState.bulkProgress.failed += 1;
+            }
+            ecommerceRerunState.bulkProgress.completed += 1;
+            updateEcommerceRerunProgress();
+        }
+    };
+    try {
+        if (pendingItems.length) await Promise.all(Array.from({ length: concurrency }, () => worker()));
+        if (failures.length) {
+            await ecommerceApi('POST', `/api/ecommerce/rerun-batches/${encodeURIComponent(session.id)}/action`, { action: 'pause' });
+            console.warn('[ecommerce-rerun-batch] failures', failures);
+            showToast(`本次完成${pendingItems.length - failures.length}项，${failures.length}项仍可点击“继续剩余”重试`, 'warning');
+        } else if (pendingItems.length) {
+            showToast(`重做批次已完成，本次补齐${pendingItems.length}项`, 'success');
+        } else {
+            showToast('没有尚待提交的任务；仍在途的任务返回后会自动归档', 'info');
+        }
+    } finally {
+        ecommerceRerunState.bulkProgress.active = false;
+        ecommerceRerunState.bulkProgress.paused = false;
+        ecommerceRerunState.bulkPauseWaiters.splice(0).forEach(resolve => resolve());
+        ecommerceRerunState.activeRerunBatchId = '';
+        if (list) list.classList.remove('is-running');
+        if (button?.isConnected) button.disabled = false;
+        updateEcommerceRerunProgress();
+        await loadEcommerceRerunBatches();
+        try { await scanEcommerceRerun(); } catch (error) { console.warn('[rerun-batch] rescan failed', error); }
+        try { await refreshEcommerceBatch(); } catch (error) { console.warn('[rerun-batch] refresh failed', error); }
+    }
+}
+
+async function resumeEcommerceRerunBatch(rerunBatchId) {
+    if (!rerunBatchId) return;
+    if (ecommerceRerunState.bulkProgress?.active) return showToast('已有重做批次正在运行', 'warning');
+    try {
+        const response = await ecommerceApi('POST', `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}/action`, { action: 'resume' });
+        await runEcommercePersistedRerunBatch(response.rerun_batch);
+    } catch (error) {
+        showToast(`继续失败：${error.message}`, 'error');
+    }
 }
 
 async function bulkRegenerateEcommerceSelected() {
     const selectedItems = ecommerceRerunState.items.filter(item => ecommerceRerunState.selectedIds.has(item.id));
     if (!selectedItems.length) return showToast('请至少勾选一张废片', 'error');
     const prompt = document.getElementById('ecommerce-rerun-bulk-prompt')?.value.trim() || '';
-    ecommerceRerunState.bulkPrompt = prompt;
     const platform = ecommerceRerunState.bulkPlatform || 'runninghub';
     const modelKey = ecommerceRerunState.bulkModelKey;
     const ratio = ecommerceRerunState.bulkRatio || 'auto';
-    const modelSelect = document.getElementById('ecommerce-rerun-bulk-model');
-    const modelLabel = modelSelect?.selectedOptions?.[0]?.textContent || modelKey;
     const concurrency = Math.max(1, Math.min(100, Number(document.getElementById('ecommerce-rerun-concurrency')?.value) || ecommerceRerunState.bulkConcurrency || 10));
     const drawCount = Math.max(1, Math.min(5, Number(document.getElementById('ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
-    ecommerceRerunState.bulkDrawCount = drawCount;
-    const paidCallTotal = selectedItems.reduce(
-        (sum, item) => sum + Math.max(drawCount, Math.min(5, parseInt(item.missing_count, 10) || 1)), 0
-    );
-    const individualPromptCount = selectedItems.filter(item => String(item.rerun_prompt || '').trim()).length;
-    // 流程级保证：并发永远不超过待重做数量，且每张独立重做无需倍数对齐
-    const effectiveConcurrency = Math.min(concurrency, selectedItems.length);
-    ecommerceRerunState.bulkConcurrency = concurrency;
     if (!modelKey) return showToast('请选择批量重做模型', 'error');
-    const concurrencyNote = effectiveConcurrency < concurrency ? `（实际${effectiveConcurrency}，超过待重做数量自动截断）` : '';
-    const promptNote = individualPromptCount
-        ? `提示词：${individualPromptCount}项使用单项新提示词，其余${prompt ? '使用批量新提示词' : '复用原提示词'}`
-        : `提示词：${prompt ? '全部使用批量新提示词' : '全部复用原提示词'}`;
-    if (!confirm(`确定批量重做 ${selectedItems.length} 项？\n\n平台/模型：${platform === 'runninghub' ? 'RH' : 'HK'} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${concurrency}${concurrencyNote}\n每项生成：${drawCount}张（原本缺失更多时自动补齐）\n${promptNote}\n\n预计付费生图 ${paidCallTotal} 张。`)) return;
+    const modelLabel = document.getElementById('ecommerce-rerun-bulk-model')?.selectedOptions?.[0]?.textContent || modelKey;
+    const paidCallTotal = selectedItems.reduce((sum, item) => sum + Math.max(drawCount, Math.min(5, parseInt(item.missing_count, 10) || 1)), 0);
+    if (!confirm(`确定批量重做 ${selectedItems.length} 项？\n\n平台/模型：${platform === 'runninghub' ? 'RH' : 'HK'} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${Math.min(concurrency, selectedItems.length)}\n每项生成：${drawCount}张\n\n预计付费生图 ${paidCallTotal} 张。刷新页面后也可以继续或验片。`)) return;
+    const config = { prompt, platform, modelKey, ratio, drawCount };
+    const queueItems = selectedItems.map(item => ecommerceBuildRerunQueuePayload(item, config));
+    const invalid = selectedItems.find((item, index) => !['target_only', 'garment_prompt'].includes(item.generation_mode) && !queueItems[index].reference_images.length);
+    if (invalid) return showToast(`${invalid.garment_name}·动作${invalid.action_order}没有可用服装参考图`, 'error');
+    ecommerceRerunState.bulkPrompt = prompt;
+    ecommerceRerunState.bulkConcurrency = concurrency;
+    ecommerceRerunState.bulkDrawCount = drawCount;
     const button = document.getElementById('btn-ecommerce-rerun-bulk');
     if (button) button.disabled = true;
-    const list = document.getElementById('ecommerce-rerun-list');
-    if (list) {
-        list.classList.add('is-running');
-        list.querySelectorAll('input, select, textarea, button').forEach(control => { if (control !== button) control.disabled = true; });
-    }
-    let cursor = 0;
-    const failures = [];
-    ecommerceRerunState.bulkProgress = { active: true, total: selectedItems.length, completed: 0, success: 0, failed: 0, retrying: 0 };
-    updateEcommerceRerunProgress();
-    // 前端再包一层重试：后端内部已有3次重试，这里对整个请求再重试1次，
-    // 处理偶发的网络断开或服务端进程重启等极端情况。
-    const callRegenerateWithRetry = async (item, referenceImages, prompt) => {
-        const maxFrontRetries = 2;
-        // 每条待处理项至少补齐缺失数，用户设置更大时用于抽卡。
-        const rerunCount = Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5));
-        let lastError = '';
-        for (let attempt = 1; attempt <= maxFrontRetries; attempt++) {
-            try {
-                return await ecommerceApi('POST', '/api/ecommerce/regenerate', {
-                    batch_id: ecommerceRerunState.batchId,
-                    item_id: item.id,
-                    result_path: item.result_path || '',
-                    mark_id: item.mark_id || '',
-                    marked_result_path: item.marked_result_path || '',
-                    mode: 'full',
-                    prompt: prompt,
-                    reference_images: referenceImages,
-                    count: rerunCount,
-                    model_override: { platform, model_key: modelKey, aspect_ratio: ratio }
-                }, 600000);
-            } catch (error) {
-                lastError = error.message || String(error);
-                if (attempt < maxFrontRetries) {
-                    ecommerceRerunState.bulkProgress.retrying = (ecommerceRerunState.bulkProgress.retrying || 0) + 1;
-                    updateEcommerceRerunProgress();
-                    ecommerceToast(`${item.garment_name}·动作${item.action_order} 第${attempt}次失败，5秒后整体重试…`);
-                    await new Promise(r => setTimeout(r, 5000));
-                }
-            }
-        }
-        throw new Error(lastError);
-    };
-    const runOne = async () => {
-        while (cursor < selectedItems.length) {
-            const item = selectedItems[cursor++];
-            const singleSource = ['target_only', 'garment_prompt'].includes(item.generation_mode);
-            const referenceImages = singleSource ? [] : (item.references || [])
-                .filter(reference => reference.selected !== false)
-                .map(reference => reference.override_url || reference.url)
-                .filter(Boolean);
-            if (!singleSource && !referenceImages.length) {
-                failures.push(`${item.garment_name}·动作${item.action_order}：没有可用服装参考图`);
-                ecommerceRerunState.bulkProgress.failed += 1;
-                ecommerceRerunState.bulkProgress.completed += 1;
-                updateEcommerceRerunProgress();
-                continue;
-            }
-            try {
-                await callRegenerateWithRetry(item, referenceImages, String(item.rerun_prompt || '').trim() || prompt);
-                ecommerceRerunState.bulkProgress.success += 1;
-            } catch (error) {
-                failures.push(`${item.garment_name}·动作${item.action_order}：${error.message}`);
-                ecommerceRerunState.bulkProgress.failed += 1;
-            }
-            ecommerceRerunState.bulkProgress.completed += 1;
-            updateEcommerceRerunProgress();
-            if (button) button.textContent = `批量重做 ${ecommerceRerunState.bulkProgress.completed}/${selectedItems.length}`;
-        }
-    };
     try {
-        await Promise.all(Array.from({ length: effectiveConcurrency }, () => runOne()));
-        const totalRetries = ecommerceRerunState.bulkProgress.retrying || 0;
-        if (failures.length) {
-            const retryNote = totalRetries ? `（自动重试${totalRetries}次后仍失败）` : '';
-            showToast(`批量重做完成：成功${selectedItems.length - failures.length}张，失败${failures.length}张${retryNote}；失败项仍保留在列表`, 'warning');
-            console.warn('[ecommerce-rerun-bulk] failures', failures);
-        } else {
-            const retryNote = totalRetries ? `（其中自动重试成功${totalRetries}次）` : '';
-            showToast(`已完成${selectedItems.length}张废片批量重做${retryNote}`, 'success');
-        }
-        await scanEcommerceRerun();
-        // 重做完成后刷新主结果列表，确保新生成的图片立即可见
-        try { await refreshEcommerceBatch(); } catch (e) { console.warn('[rerun-bulk] refresh batch failed', e); }
-    } finally {
-        ecommerceRerunState.bulkProgress.active = false;
-        updateEcommerceRerunProgress();
-        if (list) list.classList.remove('is-running');
-        if (button?.isConnected) {
-            button.disabled = false;
-            button.textContent = `批量重做已选 ${selectedItems.length} 张`;
-        }
+        const response = await ecommerceApi('POST', '/api/ecommerce/rerun-batches', {
+            batch_id: ecommerceRerunState.batchId,
+            name: `废片重做 ${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+            settings: { concurrency, prompt, platform, modelKey, ratio, drawCount },
+            items: queueItems
+        });
+        await runEcommercePersistedRerunBatch(response.rerun_batch, button);
+    } catch (error) {
+        showToast(`创建重做批次失败：${error.message}`, 'error');
+        if (button?.isConnected) button.disabled = false;
     }
 }
 
@@ -14045,17 +14273,20 @@ function renderEcommerceRerunCompare(index) {
 }
 
 document.getElementById('btn-ecommerce-rerun-scan')?.addEventListener('click', () => {
+    if (ecommerceRerunBlocksNavigation()) return;
     const input = document.getElementById('ecommerce-rerun-result-path');
     if (input) input.value = '';
     scanEcommerceRerun();
 });
 document.getElementById('btn-ecommerce-rerun-scan-single')?.addEventListener('click', () => {
+    if (ecommerceRerunBlocksNavigation()) return;
     if (!document.getElementById('ecommerce-rerun-result-path')?.value.trim()) return showToast('请先从上方打开一组结果，或选择单组结果文件夹', 'error');
     scanEcommerceRerun();
 });
 document.getElementById('btn-ecommerce-rerun-select-folder')?.addEventListener('click', () => chooseEcommerceFolder('ecommerce-rerun-result-path'));
 document.getElementById('btn-ecommerce-rerun-adjust-close')?.addEventListener('click', () => closeEcommerceRerunAdjustPanel(true));
 document.getElementById('btn-ecommerce-rerun-refresh')?.addEventListener('click', async event => {
+    if (ecommerceRerunBlocksNavigation()) return;
     const button = event.currentTarget;
     const select = document.getElementById('ecommerce-rerun-batch-select');
     const selectedBatchId = select?.value || ecommerceRerunState.batchId || '';
@@ -14083,6 +14314,10 @@ document.getElementById('btn-ecommerce-rerun-expand')?.addEventListener('click',
 });
 document.getElementById('ecommerce-rerun-batch-select')?.addEventListener('change', async e => {
     if (!e.target.value) return;
+    if (ecommerceRerunState.bulkProgress?.active) {
+        e.target.value = ecommerceRerunState.batchId || '';
+        return showToast('废片重做仍在运行或暂停中，请先继续并等待完成后再切换批次', 'warning');
+    }
     ecommerceState.currentBatchId = e.target.value;
     // 同步主批次选择器（避免两个下拉框不一致）
     const mainSelect = document.getElementById('ecommerce-batch-select');
@@ -14102,6 +14337,7 @@ document.getElementById('ecommerce-rerun-batch-select')?.addEventListener('chang
     const rerunSummary = document.getElementById('ecommerce-rerun-summary');
     if (rerunSummary) rerunSummary.textContent = '';
     await refreshEcommerceBatch();
+    await loadEcommerceRerunBatches();
 });
 document.getElementById('ecommerce-reference-close')?.addEventListener('click', closeEcommerceReferenceReview);
 document.getElementById('ecommerce-reference-overlay')?.addEventListener('click', e => {
@@ -14110,8 +14346,18 @@ document.getElementById('ecommerce-reference-overlay')?.addEventListener('click'
 document.getElementById('ecommerce-reference-prev')?.addEventListener('click', e => { e.stopPropagation(); ecommerceReferenceReview.index -= 1; updateEcommerceReferenceReview(); });
 document.getElementById('ecommerce-reference-next')?.addEventListener('click', e => { e.stopPropagation(); ecommerceReferenceReview.index += 1; updateEcommerceReferenceReview(); });
 document.getElementById('ecommerce-compare-close')?.addEventListener('click', closeEcommerceImageCompare);
-document.getElementById('ecommerce-compare-prev-garment')?.addEventListener('click', e => { e.stopPropagation(); switchEcommerceCompareGarment(-1); });
-document.getElementById('ecommerce-compare-next-garment')?.addEventListener('click', e => { e.stopPropagation(); switchEcommerceCompareGarment(1); });
+['ecommerce-compare-prev-garment', 'ecommerce-compare-prev-garment-bottom'].forEach(id => {
+    document.getElementById(id)?.addEventListener('click', e => {
+        e.stopPropagation();
+        switchEcommerceCompareGarment(-1);
+    });
+});
+['ecommerce-compare-next-garment', 'ecommerce-compare-next-garment-bottom'].forEach(id => {
+    document.getElementById(id)?.addEventListener('click', e => {
+        e.stopPropagation();
+        switchEcommerceCompareGarment(1);
+    });
+});
 document.getElementById('ecommerce-compare-delete')?.addEventListener('click', e => { e.stopPropagation(); deleteEcommerceCurrentResult(); });
 document.getElementById('ecommerce-compare-mark-redo')?.addEventListener('click', e => { e.stopPropagation(); markEcommerceCurrentRedo(); });
 document.getElementById('ecommerce-compare-overlay')?.addEventListener('click', e => {

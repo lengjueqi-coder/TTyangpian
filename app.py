@@ -109,6 +109,7 @@ ecommerce_reference_locks = {}
 ecommerce_reference_data_cache = {}
 ECOMMERCE_REFERENCE_DATA_CACHE_MAX = 48
 ECOMMERCE_MAX_CONCURRENCY = 100
+ecommerce_rerun_item_locks = {}
 # 归档文件名的“检查是否存在 + 选择后缀 + 写入”必须是一个原子操作。
 # 高并发废片重做可能让同一套服装、同一动作的多个候选同时返回；不加锁时
 # 两个线程可能同时选中同一个文件名，造成覆盖或记录指向错误。
@@ -5572,7 +5573,7 @@ def do_update():
             # 3. 覆盖本地文件（保留用户数据）
             _set_update_state(progress="正在替换文件...")
             preserve = {
-                'venv', 'build_venv', 'data', 'logs', 'backups', 'models',
+                'venv', '.venv', '.runtime', 'build_venv', 'data', 'logs', 'backups', 'models',
                 'outputs', 'output', '_运行缓存', '_成品输出', '__pycache__',
                 '.DS_Store', '.claude', '.git',
             }
@@ -5599,7 +5600,6 @@ def do_update():
             logger.info("[更新] 准备重启服务")
 
             # 用新进程替换当前进程
-            import sys
             time.sleep(1)
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -5670,38 +5670,23 @@ def select_folder():
         else:
             initial_dir = os.path.expanduser('~')
 
-        if platform.system() == 'Windows':
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes('-topmost', True)
-            try:
-                selected = filedialog.askdirectory(
-                    title='选择并授权样片工厂使用这个文件夹',
-                    initialdir=initial_dir,
-                    mustexist=True,
-                )
-            finally:
-                root.destroy()
-        elif platform.system() == 'Darwin':
-            escaped_dir = initial_dir.replace('\\', '\\\\').replace('"', '\\"')
-            applescript = f'''
-            set defaultLocation to POSIX file "{escaped_dir}"
-            try
-                set chosenFolder to choose folder with prompt "选择并授权样片工厂使用这个文件夹" default location defaultLocation
-                return POSIX path of chosenFolder
-            on error number -128
-                return ""
-            end try
-            '''
-            result = subprocess.run(
-                ['osascript', '-e', applescript],
-                capture_output=True, text=True, timeout=120
-            )
-            selected = result.stdout.strip()
-        else:
-            return jsonify({"error": "当前系统暂不支持原生文件夹选择器"}), 501
+        # 使用 AppleScript 的 choose folder 对话框，不依赖 tkinter
+        # 需要转义路径中的特殊字符以防 AppleScript 语法错误
+        escaped_dir = initial_dir.replace('\\', '\\\\').replace('"', '\\"')
+        applescript = f'''
+        set defaultLocation to POSIX file "{escaped_dir}"
+        try
+            set chosenFolder to choose folder with prompt "选择并授权样片工厂使用这个文件夹" default location defaultLocation
+            return POSIX path of chosenFolder
+        on error number -128
+            return ""
+        end try
+        '''
+        result = subprocess.run(
+            ['osascript', '-e', applescript],
+            capture_output=True, text=True, timeout=120
+        )
+        selected = result.stdout.strip()
 
         if selected:
             real_selected = os.path.realpath(selected)
@@ -5750,20 +5735,6 @@ def _is_allowed_user_storage_path(path):
     if real == home or real.startswith(home + os.sep):
         return True
 
-    if platform.system() == 'Windows':
-        drive, tail = os.path.splitdrive(real)
-        if not drive or not tail:
-            return False
-        blocked = []
-        for key in ('SystemRoot', 'ProgramFiles', 'ProgramFiles(x86)', 'ProgramData'):
-            value = os.environ.get(key)
-            if value:
-                blocked.append(os.path.normcase(os.path.realpath(value)))
-        normalized = os.path.normcase(real)
-        if any(normalized == root or normalized.startswith(root + os.sep) for root in blocked):
-            return False
-        return True
-
     volumes = os.path.realpath('/Volumes')
     if real.startswith(volumes + os.sep):
         # /Volumes/盘名 至少 3 段（['', 'Volumes', '盘名']）；盘根目录也允许
@@ -5794,7 +5765,7 @@ def _is_allowed_user_storage_path(path):
 
 
 def _ecommerce_default_store():
-    return {'version': 2, 'templates': [], 'batches': [], 'waste_scans': []}
+    return {'version': 2, 'templates': [], 'batches': [], 'waste_scans': [], 'rerun_batches': []}
 
 
 def _ecommerce_load_store():
@@ -5807,6 +5778,8 @@ def _ecommerce_load_store():
         data['batches'] = []
     if not isinstance(data.get('waste_scans'), list):
         data['waste_scans'] = []
+    if not isinstance(data.get('rerun_batches'), list):
+        data['rerun_batches'] = []
     return data
 
 
@@ -5960,6 +5933,60 @@ def _ecommerce_batch_snapshot(batch_id):
         return json.loads(json.dumps(batch, ensure_ascii=False)) if batch else None
 
 
+def _ecommerce_find_rerun_batch(store, rerun_batch_id):
+    return next((row for row in store.get('rerun_batches', []) if row.get('id') == rerun_batch_id), None)
+
+
+def _ecommerce_rerun_batch_snapshot(rerun_batch_id):
+    with ecommerce_lock:
+        row = _ecommerce_find_rerun_batch(_ecommerce_load_store(), rerun_batch_id)
+        return json.loads(json.dumps(row, ensure_ascii=False)) if row else None
+
+
+def _ecommerce_mutate_rerun_batch(rerun_batch_id, mutator):
+    with ecommerce_lock:
+        store = _ecommerce_load_store()
+        row = _ecommerce_find_rerun_batch(store, rerun_batch_id)
+        if not row:
+            return None
+        result = mutator(row)
+        row['updated_at'] = datetime.now().isoformat(timespec='seconds')
+        _ecommerce_save_store(store)
+        return result if result is not None else row
+
+
+def _ecommerce_refresh_rerun_batch_counts(row):
+    items = row.get('items') or []
+    counts = {state: 0 for state in ('pending', 'running', 'accepted', 'failed')}
+    for item in items:
+        state = item.get('status') or 'pending'
+        counts[state if state in counts else 'pending'] += 1
+    row['counts'] = counts
+    row['completed_count'] = counts['accepted']
+    row['total_count'] = len(items)
+    if items and counts['accepted'] == len(items):
+        row['status'] = 'completed'
+        row['finished_at'] = row.get('finished_at') or datetime.now().isoformat(timespec='seconds')
+    return counts
+
+
+def _ecommerce_rerun_batch_summary(row, include_items=False):
+    snapshot = json.loads(json.dumps(row, ensure_ascii=False))
+    _ecommerce_refresh_rerun_batch_counts(snapshot)
+    accepted = [item for item in snapshot.get('items') or [] if item.get('status') == 'accepted']
+    garments = []
+    seen = set()
+    for item in accepted:
+        garment_id = item.get('garment_id')
+        if garment_id and garment_id not in seen:
+            seen.add(garment_id)
+            garments.append({'id': garment_id, 'name': item.get('garment_name') or garment_id})
+    snapshot['accepted_garments'] = garments
+    if not include_items:
+        snapshot.pop('items', None)
+    return snapshot
+
+
 def _ecommerce_safe_user_path(path, must_exist=False, directory=False):
     if not path:
         return None, '路径为空'
@@ -5981,7 +6008,7 @@ def _ecommerce_macos_storage_helper(operation, *paths):
     能绕过 TCC 对 ~/Downloads、~/Desktop、/Volumes/外置盘 等受保护目录的写入限制。
     退路：用 osascript `do shell script`（在某些 macOS 版本下也能工作）。
     """
-    if platform.system() != 'Darwin':
+    if os.uname().sysname != 'Darwin':
         return False, '仅macOS支持系统兼容写入'
 
     # 构造 shell 命令（所有路径用 shlex.quote 转义，避免注入）
@@ -6116,8 +6143,8 @@ def _ecommerce_remove_path(path):
 
 
 def _ecommerce_write_json_file(path, payload):
-    os.makedirs(os.path.join(USER_DATA_ROOT, '_运行缓存', '_临时记录'), exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix='record-', suffix='.json', dir=os.path.join(USER_DATA_ROOT, '_运行缓存', '_临时记录'))
+    os.makedirs(os.path.join(BASE_DIR, '_运行缓存', '_临时记录'), exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='record-', suffix='.json', dir=os.path.join(BASE_DIR, '_运行缓存', '_临时记录'))
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -6135,11 +6162,7 @@ def _ecommerce_write_json_file(path, payload):
 def _ecommerce_probe_writable_directory(path, allow_macos_helper=True):
     """实际创建并删除临时文件，不能只依赖 os.access（macOS TCC 下会误报可写）。"""
     real = os.path.realpath(os.path.expanduser(str(path or '')))
-    if platform.system() == 'Windows':
-        system_drive = os.path.splitdrive(os.environ.get('SystemRoot', 'C:\\Windows'))[0].lower()
-        external = bool(os.path.splitdrive(real)[0]) and os.path.splitdrive(real)[0].lower() != system_drive
-    else:
-        external = real.startswith(os.path.realpath('/Volumes') + os.sep)
+    external = real.startswith(os.path.realpath('/Volumes') + os.sep)
     probe_path = ''
     try:
         os.makedirs(real, exist_ok=True)
@@ -6206,18 +6229,13 @@ def ecommerce_check_output_path():
 
 @app.route('/api/ecommerce/open-storage-permission-settings', methods=['POST'])
 def ecommerce_open_storage_permission_settings():
-    """打开当前系统的文件权限设置入口。"""
+    """打开macOS隐私设置；权限本身必须由用户亲自授予。"""
     try:
-        if platform.system() == 'Darwin':
-            subprocess.Popen(
-                ['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        elif platform.system() == 'Windows':
-            subprocess.Popen(['explorer.exe', 'ms-settings:privacy-broadfilesystemaccess'])
-        else:
-            return jsonify({'error': '当前系统没有统一的文件权限设置入口'}), 501
+        subprocess.Popen(
+            ['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         return jsonify({'ok': True})
     except OSError as exc:
         return jsonify({'error': f'无法打开系统权限设置: {exc}'}), 500
@@ -6530,7 +6548,7 @@ def _ecommerce_clean_prompt_action(action):
         raise ValueError('提示词不能为空')
     cleaned = _ecommerce_clean_target_actions([{
         **action,
-        'action_image': action.get('action_image') or os.path.join(tempfile.gettempdir(), 'prompt-image-placeholder.jpg'),
+        'action_image': action.get('action_image') or '/tmp/prompt-image-placeholder.jpg',
         'prompt': prompt,
     }])[0]
     cleaned.pop('id', None)
@@ -6788,7 +6806,7 @@ def ecommerce_batches():
     else:
         actions_for_batch = (template.get('actions') or [])[:action_limit or None]
 
-    output_path = body.get('output_path') or os.path.join(USER_DATA_ROOT, '_运行缓存')
+    output_path = body.get('output_path') or os.path.join(os.path.dirname(os.path.abspath(__file__)), '_运行缓存')
     output_path, err = _ecommerce_safe_user_path(output_path, must_exist=False)
     if err:
         return jsonify({'error': err}), 400
@@ -6800,14 +6818,14 @@ def ecommerce_batches():
         # 用户选的目录没权限，fallback 到应用自己的目录
         cache_fallback_reason = cache_probe.get('error') or cache_probe.get('hint') or '目录不可写'
         logger.warning(f'[ecommerce] 用户指定的缓存目录不可写 ({output_path}): {cache_fallback_reason}，fallback 到应用目录')
-        output_path = os.path.join(USER_DATA_ROOT, '_运行缓存')
+        output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_运行缓存')
         fallback_cache_probe = _ecommerce_probe_writable_directory(output_path, allow_macos_helper=False)
         if not fallback_cache_probe.get('writable'):
             return jsonify({'error': f"缓存目录与本地回退目录都不可写: {fallback_cache_probe.get('error') or fallback_cache_probe.get('hint')}"}), 500
 
     batch_id = gen_id('ecbatch')
     batch_name = str(body.get('name') or f"电商批次 {datetime.now().strftime('%m-%d %H:%M')}").strip()
-    requested_final_output_path = body.get('final_output_path') or os.path.join(USER_DATA_ROOT, '_成品输出')
+    requested_final_output_path = body.get('final_output_path') or os.path.join(os.path.dirname(os.path.abspath(__file__)), '_成品输出')
     final_output_path = requested_final_output_path
     final_output_path, final_err = _ecommerce_safe_user_path(final_output_path, must_exist=False)
     if final_err:
@@ -6827,7 +6845,7 @@ def ecommerce_batches():
                 'permission_hint': final_probe.get('hint') or '',
                 'can_use_local_fallback': True,
             }), 409
-        fallback_final = os.path.join(USER_DATA_ROOT, '_成品输出')
+        fallback_final = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_成品输出')
         fallback_final_probe = _ecommerce_probe_writable_directory(fallback_final)
         if not fallback_final_probe.get('writable'):
             return jsonify({'error': f"成品目录与本地回退目录都不可写: {fallback_final_probe.get('error') or fallback_final_probe.get('hint')}"}), 500
@@ -7811,7 +7829,7 @@ def _ecommerce_sample_result_dir(batch, garment):
     fallback = ((batch.get('settings') or {}).get('archive_fallback_garments') or {}).get(garment.get('name'))
     if mapped or fallback:
         return os.path.realpath(os.path.expanduser(mapped or fallback))
-    cache_root = os.path.realpath(os.path.expanduser(batch.get('output_path') or os.path.join(USER_DATA_ROOT, '_运行缓存')))
+    cache_root = os.path.realpath(os.path.expanduser(batch.get('output_path') or os.path.join(BASE_DIR, '_运行缓存')))
     garment_name = _ecommerce_safe_name(garment.get('name') or garment.get('id'), garment.get('id') or '服装')
     return os.path.join(cache_root, '_生成样本备份', garment_name)
 
@@ -8935,7 +8953,7 @@ def ecommerce_local_image():
 
 @app.route('/api/ecommerce/open-preview', methods=['POST'])
 def ecommerce_open_preview():
-    """Open validated local images in the platform image viewer."""
+    """Open validated local images in a separate macOS Preview instance."""
     body = request.get_json(silent=True) or {}
     raw_paths = body.get('paths') or []
     if not isinstance(raw_paths, list):
@@ -8951,11 +8969,14 @@ def ecommerce_open_preview():
     if not paths:
         return jsonify({'error': '没有可打开的本地图片'}), 400
     try:
-        _open_files(paths)
+        subprocess.Popen(
+            ['open', '-n', '-a', 'Preview', *paths],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         return jsonify({'ok': True, 'count': len(paths)})
     except Exception as exc:
         logger.error(f'[ecommerce-preview] 打开系统预览失败: {exc}', exc_info=True)
-        return jsonify({'error': '无法打开系统图片预览'}), 500
+        return jsonify({'error': '无法打开macOS预览'}), 500
 
 
 @app.route('/api/ecommerce/crop-reference', methods=['POST'])
@@ -8981,7 +9002,7 @@ def ecommerce_crop_reference():
     if scale < 0.08:
         return jsonify({'error': '裁剪区域太小'}), 400
     batch = _ecommerce_batch_snapshot(batch_id) if batch_id else None
-    cache_root = os.path.expanduser((batch or {}).get('output_path') or os.path.join(USER_DATA_ROOT, '_运行缓存'))
+    cache_root = os.path.expanduser((batch or {}).get('output_path') or os.path.join(BASE_DIR, '_运行缓存'))
     target_dir = os.path.join(cache_root, '_重做临时参考图')
     os.makedirs(target_dir, exist_ok=True)
     target = os.path.join(target_dir, f"crop-{datetime.now().strftime('%Y%m%d%H%M%S')}-{gen_id('crop')}.jpg")
@@ -9042,7 +9063,7 @@ def ecommerce_open_folder():
             return jsonify({'error': '文件夹尚未生成，请先运行批次'}), 400
 
     try:
-        _open_path(target)
+        subprocess.run(['open', target], check=True)
         logger.info(f'[ecommerce-open-folder] 打开文件夹: {target}')
         return jsonify({'ok': True, 'path': target})
     except Exception as exc:
@@ -10308,6 +10329,253 @@ def ecommerce_upload_temp_image():
     return jsonify({'url': _ecommerce_local_image_url(target), 'path': target})
 
 
+def _ecommerce_validate_rerun_queue_item(batch, raw):
+    item_id = str((raw or {}).get('item_id') or (raw or {}).get('id') or '').strip()
+    clean_item_id = item_id.split('-marked', 1)[0] if '-marked' in item_id else item_id
+    try:
+        garment_id, action_order_text = clean_item_id.rsplit('-', 1)
+        action_order = int(action_order_text)
+    except (ValueError, AttributeError):
+        raise ValueError(f'废片任务编号无效: {item_id}')
+    garment = _ecommerce_find_garment(batch, garment_id)
+    if not garment:
+        raise ValueError(f'找不到废片对应服装: {item_id}')
+    task = next((task for task in batch.get('tasks', [])
+                 if task.get('garment_id') == garment_id
+                 and int(task.get('action_order') or 0) == action_order - 1), None)
+    if not task:
+        raise ValueError(f'找不到废片对应动作: {item_id}')
+    expected_result_path = os.path.realpath(_ecommerce_sample_result_dir(batch, garment) or '')
+    requested_result_path = os.path.realpath(os.path.expanduser(str((raw or {}).get('result_path') or expected_result_path)))
+    if not expected_result_path or requested_result_path != expected_result_path:
+        raise ValueError(f'废片结果目录不匹配: {item_id}')
+    payload = {
+        'batch_id': batch.get('id'), 'item_id': item_id,
+        'result_path': expected_result_path,
+        'mark_id': str((raw or {}).get('mark_id') or ''),
+        'marked_result_path': str((raw or {}).get('marked_result_path') or ''),
+        'mode': str((raw or {}).get('mode') or 'full'),
+        'prompt': str((raw or {}).get('prompt') or ''),
+        'reference_images': list((raw or {}).get('reference_images') or [])[:9],
+        'count': max(1, min(int((raw or {}).get('count') or 1), 5)),
+        'model_override': dict((raw or {}).get('model_override') or {}),
+    }
+    return {
+        'id': str((raw or {}).get('queue_id') or gen_id('ecritem')),
+        'item_id': item_id, 'garment_id': garment_id,
+        'garment_name': garment.get('name') or garment_id,
+        'action_order': action_order,
+        'action_name': task.get('action_name') or f'目标图{action_order}',
+        'status': 'pending', 'payload': payload, 'archived_paths': [],
+        'created_at': datetime.now().isoformat(timespec='seconds'),
+    }
+
+
+@app.route('/api/ecommerce/rerun-batches', methods=['GET', 'POST'])
+def ecommerce_rerun_batches():
+    if request.method == 'GET':
+        batch_id = str(request.args.get('batch_id') or '')
+        with ecommerce_lock:
+            rows = list(_ecommerce_load_store().get('rerun_batches') or [])
+        if batch_id:
+            rows = [row for row in rows if row.get('batch_id') == batch_id]
+        rows.sort(key=lambda row: row.get('created_at') or '', reverse=True)
+        return jsonify({'rerun_batches': [_ecommerce_rerun_batch_summary(row) for row in rows[:20]]})
+    body = request.get_json(silent=True) or {}
+    batch_id = str(body.get('batch_id') or '')
+    batch = _ecommerce_batch_snapshot(batch_id)
+    if not batch:
+        return jsonify({'error': '找不到原始批次'}), 404
+    raw_items = body.get('items') or []
+    if not isinstance(raw_items, list) or not raw_items:
+        return jsonify({'error': '没有可创建重做批次的任务'}), 400
+    try:
+        items = [_ecommerce_validate_rerun_queue_item(batch, raw) for raw in raw_items[:500]]
+    except (ValueError, TypeError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    now = datetime.now().isoformat(timespec='seconds')
+    row = {
+        'id': gen_id('ecrbatch'), 'batch_id': batch_id,
+        'name': str(body.get('name') or f"废片重做 {datetime.now().strftime('%m-%d %H:%M')}").strip(),
+        'status': 'running', 'settings': dict(body.get('settings') or {}),
+        'items': items, 'created_at': now, 'updated_at': now,
+        'started_at': now, 'finished_at': '', 'legacy_recovered': False,
+    }
+    _ecommerce_refresh_rerun_batch_counts(row)
+    with ecommerce_lock:
+        store = _ecommerce_load_store()
+        store.setdefault('rerun_batches', []).append(row)
+        store['rerun_batches'] = store['rerun_batches'][-100:]
+        _ecommerce_save_store(store)
+    return jsonify({'ok': True, 'rerun_batch': _ecommerce_rerun_batch_summary(row, include_items=True)}), 201
+
+
+@app.route('/api/ecommerce/rerun-batches/recover-latest', methods=['POST'])
+def ecommerce_recover_latest_rerun_batch():
+    """把旧版浏览器刷新前已完成的重做结果与当前未完成项合并为可恢复批次。"""
+    body = request.get_json(silent=True) or {}
+    batch_id = str(body.get('batch_id') or '')
+    batch = _ecommerce_batch_snapshot(batch_id)
+    if not batch:
+        return jsonify({'error': '找不到原始批次'}), 404
+    with ecommerce_lock:
+        existing = [row for row in _ecommerce_load_store().get('rerun_batches') or [] if row.get('batch_id') == batch_id]
+    if existing:
+        latest = sorted(existing, key=lambda row: row.get('created_at') or '')[-1]
+        return jsonify({'ok': True, 'created': False, 'rerun_batch': _ecommerce_rerun_batch_summary(latest, include_items=True)})
+    attempts = []
+    task_by_id = {task.get('id'): task for task in batch.get('tasks') or []}
+    for task in batch.get('tasks') or []:
+        for attempt in task.get('attempts') or []:
+            path = attempt.get('archived_path') or ''
+            if attempt.get('rerun') and path and os.path.isfile(path) and attempt.get('started_at'):
+                attempts.append((attempt.get('started_at'), task, attempt))
+    attempts.sort(key=lambda entry: entry[0])
+    if not attempts:
+        return jsonify({'error': '没有找到可恢复的历史重做结果'}), 404
+    # 只取最近一段连续重做；相邻任务超过30分钟视为另一批。
+    streak = [attempts[-1]]
+    for entry in reversed(attempts[:-1]):
+        later = datetime.fromisoformat(streak[-1][0])
+        earlier = datetime.fromisoformat(entry[0])
+        if (later - earlier).total_seconds() > 1800:
+            break
+        streak.append(entry)
+    streak.reverse()
+    accepted_by_item_id = {}
+    for _started, task, attempt in streak:
+        garment = _ecommerce_find_garment(batch, task.get('garment_id'))
+        if not garment:
+            continue
+        item_id = f"{task.get('garment_id')}-{int(task.get('action_order') or 0) + 1}"
+        entry = accepted_by_item_id.setdefault(item_id, {
+            'id': str(attempt.get('id') or gen_id('ecritem')), 'item_id': item_id,
+            'garment_id': task.get('garment_id'), 'garment_name': garment.get('name') or task.get('garment_name'),
+            'action_order': int(task.get('action_order') or 0) + 1,
+            'action_name': task.get('action_name') or '', 'status': 'accepted',
+            'payload': {}, 'archived_paths': [],
+            'started_at': attempt.get('started_at') or '', 'finished_at': attempt.get('finished_at') or '',
+        })
+        archived_path = attempt.get('archived_path')
+        if archived_path and os.path.realpath(archived_path) not in {
+            os.path.realpath(path) for path in entry['archived_paths']
+        }:
+            entry['archived_paths'].append(archived_path)
+        entry['finished_at'] = attempt.get('finished_at') or entry.get('finished_at') or ''
+    accepted_items = list(accepted_by_item_id.values())
+    try:
+        pending_items = [_ecommerce_validate_rerun_queue_item(batch, raw) for raw in (body.get('items') or [])[:500]]
+    except (ValueError, TypeError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    accepted_item_ids = {item.get('item_id') for item in accepted_items}
+    pending_items = [item for item in pending_items if item.get('item_id') not in accepted_item_ids]
+    # 旧版没有保存浏览器队列，但最近一次已完成 attempt 会保存真实模型。
+    # 用它恢复平台/模型/比例，避免“继续”时悄悄换回原批次模型。
+    latest_signature = dict(streak[-1][2].get('model_signature') or {})
+    recovered_model_override = {
+        'platform': latest_signature.get('platform') or '',
+        'model_key': latest_signature.get('model_key') or '',
+        'aspect_ratio': latest_signature.get('aspect_ratio') or 'auto',
+    }
+    if recovered_model_override['platform'] and recovered_model_override['model_key']:
+        for item in pending_items:
+            item.setdefault('payload', {})['model_override'] = dict(recovered_model_override)
+    now = datetime.now().isoformat(timespec='seconds')
+    recovered_settings = dict(body.get('settings') or {})
+    recovered_settings.update({
+        'concurrency': 1,  # 旧版并发无法可靠还原，安全地按1继续
+        'platform': recovered_model_override.get('platform') or recovered_settings.get('platform'),
+        'modelKey': recovered_model_override.get('model_key') or recovered_settings.get('modelKey'),
+        'ratio': recovered_model_override.get('aspect_ratio') or recovered_settings.get('ratio') or 'auto',
+        'prompt_recovered': False,
+    })
+    row = {
+        'id': gen_id('ecrbatch'), 'batch_id': batch_id,
+        'name': f"恢复的废片重做 {datetime.now().strftime('%m-%d %H:%M')}",
+        'status': 'interrupted', 'settings': recovered_settings,
+        'items': accepted_items + pending_items, 'created_at': streak[0][0],
+        'updated_at': now, 'started_at': streak[0][0], 'finished_at': '',
+        'legacy_recovered': True,
+    }
+    _ecommerce_refresh_rerun_batch_counts(row)
+    if pending_items:
+        row['status'] = 'interrupted'
+    with ecommerce_lock:
+        store = _ecommerce_load_store()
+        store.setdefault('rerun_batches', []).append(row)
+        _ecommerce_save_store(store)
+    return jsonify({'ok': True, 'created': True, 'rerun_batch': _ecommerce_rerun_batch_summary(row, include_items=True)})
+
+
+@app.route('/api/ecommerce/rerun-batches/<rerun_batch_id>', methods=['GET'])
+def ecommerce_get_rerun_batch(rerun_batch_id):
+    row = _ecommerce_rerun_batch_snapshot(rerun_batch_id)
+    if not row:
+        return jsonify({'error': '找不到重做批次'}), 404
+    return jsonify({'rerun_batch': _ecommerce_rerun_batch_summary(row, include_items=True)})
+
+
+@app.route('/api/ecommerce/rerun-batches/<rerun_batch_id>/action', methods=['POST'])
+def ecommerce_rerun_batch_action(rerun_batch_id):
+    body = request.get_json(silent=True) or {}
+    action = str(body.get('action') or '').lower()
+    row = _ecommerce_rerun_batch_snapshot(rerun_batch_id)
+    if not row:
+        return jsonify({'error': '找不到重做批次'}), 404
+    if action == 'pause':
+        _ecommerce_mutate_rerun_batch(rerun_batch_id, lambda item: item.update({'status': 'paused'}))
+    elif action == 'resume':
+        def resume(item):
+            item['status'] = 'running'
+            for task in item.get('items') or []:
+                if task.get('status') == 'failed':
+                    task['status'] = 'pending'
+                    task['error'] = ''
+                elif task.get('status') == 'running':
+                    # 页面刷新不会取消仍在服务端执行的请求。只回收已经超过
+                    # 单次请求最长等待时间的陈旧任务，避免立即继续时重复扣费。
+                    try:
+                        started_at = datetime.fromisoformat(task.get('started_at') or '')
+                    except (TypeError, ValueError):
+                        started_at = None
+                    if started_at and (datetime.now() - started_at).total_seconds() > 12 * 60:
+                        task['status'] = 'pending'
+                        task['error'] = '上次请求已超过12分钟，已安全放回待处理队列'
+        _ecommerce_mutate_rerun_batch(rerun_batch_id, resume)
+    elif action == 'finalize':
+        _ecommerce_mutate_rerun_batch(rerun_batch_id, lambda item: item.update({
+            'status': 'partial' if int(item.get('completed_count') or 0) < int(item.get('total_count') or 0) else 'completed',
+            'finished_at': datetime.now().isoformat(timespec='seconds'),
+        }))
+    else:
+        return jsonify({'error': '不支持的重做批次操作'}), 400
+    updated = _ecommerce_rerun_batch_snapshot(rerun_batch_id)
+    return jsonify({'ok': True, 'rerun_batch': _ecommerce_rerun_batch_summary(updated, include_items=True)})
+
+
+@app.route('/api/ecommerce/rerun-batches/<rerun_batch_id>/garments/<garment_id>/compare', methods=['GET'])
+def ecommerce_rerun_batch_compare(rerun_batch_id, garment_id):
+    row = _ecommerce_rerun_batch_snapshot(rerun_batch_id)
+    if not row:
+        return jsonify({'error': '找不到重做批次'}), 404
+    batch = _ecommerce_batch_snapshot(row.get('batch_id'))
+    garment = _ecommerce_find_garment(batch, garment_id) if batch else None
+    if not garment:
+        return jsonify({'error': '找不到服装'}), 404
+    payload = _ecommerce_group_compare_payload(batch, garment)
+    allowed = {
+        os.path.realpath(path)
+        for item in row.get('items') or [] if item.get('status') == 'accepted' and item.get('garment_id') == garment_id
+        for path in item.get('archived_paths') or [] if path and os.path.isfile(path)
+    }
+    payload['results'] = [result for result in payload.get('results') or [] if os.path.realpath(result.get('path') or '') in allowed]
+    payload['rerun_batch_id'] = rerun_batch_id
+    payload['rerun_batch_name'] = row.get('name') or rerun_batch_id
+    if not payload['results']:
+        return jsonify({'error': '这个重做批次在该套服装下没有可验收图片'}), 409
+    return jsonify(payload)
+
+
 @app.route('/api/ecommerce/regenerate', methods=['POST'])
 def ecommerce_regenerate():
     """废片重做：对指定服装+动作重新生成一张，归档回原 AI 结果目录。
@@ -10317,6 +10585,7 @@ def ecommerce_regenerate():
     body = request.get_json(silent=True) or {}
     batch_id = str(body.get('batch_id') or '')
     item_id = str(body.get('item_id') or '')
+    rerun_batch_id = str(body.get('rerun_batch_id') or '')
     mark_id = str(body.get('mark_id') or '').strip()
     marked_result_path = str(body.get('marked_result_path') or '').strip()
     marked_result_real = os.path.realpath(os.path.expanduser(marked_result_path)) if marked_result_path else ''
@@ -10356,6 +10625,25 @@ def ecommerce_regenerate():
     task = next((t for t in batch.get('tasks', []) if t.get('garment_id') == garment_id and int(t.get('action_order') or 0) == action_order - 1), None)
     if not task:
         return jsonify({'error': '找不到任务'}), 404
+    rerun_queue_item = None
+    if rerun_batch_id:
+        rerun_batch = _ecommerce_rerun_batch_snapshot(rerun_batch_id)
+        if not rerun_batch or rerun_batch.get('batch_id') != batch_id:
+            return jsonify({'error': '重做批次与原始批次不匹配'}), 409
+        rerun_queue_item = next((entry for entry in rerun_batch.get('items') or [] if entry.get('item_id') == item_id), None)
+        if not rerun_queue_item:
+            return jsonify({'error': '这张废片不属于当前重做批次'}), 409
+        cached_paths = [path for path in rerun_queue_item.get('archived_paths') or [] if os.path.isfile(path)]
+        if rerun_queue_item.get('status') == 'accepted' and cached_paths:
+            return jsonify({
+                'ok': True, 'cached': True, 'archived_path': cached_paths[0],
+                'archived_list': cached_paths, 'success_count': len(cached_paths),
+                'total_count': len(cached_paths), 'rerun_batch_id': rerun_batch_id,
+            })
+        if rerun_batch.get('status') not in {'running', 'resuming'}:
+            return jsonify({'error': '重做批次当前未运行，请先点击继续'}), 409
+        if rerun_queue_item.get('status') == 'running':
+            return jsonify({'error': '该废片已经在后台重做，请等待返回后刷新'}), 409
     # 构建可覆盖参考图的 garment 副本
     garment_copy = dict(garment)
     images = list(garment.get('images') or [])
@@ -10400,6 +10688,13 @@ def ecommerce_regenerate():
         prompt = _ecommerce_detail_repair_prompt(prompt_override)
     else:
         prompt = _ecommerce_rerun_prompt(action.get('prompt'), prompt_override)
+    if rerun_batch_id:
+        def mark_rerun_running(row):
+            entry = next((item for item in row.get('items') or [] if item.get('item_id') == item_id), None)
+            if entry:
+                entry.update({'status': 'running', 'started_at': datetime.now().isoformat(timespec='seconds'), 'error': ''})
+            _ecommerce_refresh_rerun_batch_counts(row)
+        _ecommerce_mutate_rerun_batch(rerun_batch_id, mark_rerun_running)
     attempt = {
         'id': f'{rerun_operation_id}-1',
         'number': 99,
@@ -10461,6 +10756,13 @@ def ecommerce_regenerate():
             if archived_list:
                 logger.warning(f'[ecommerce-regenerate] 第{sample_number}/{rerun_count}张失败，已有{len(archived_list)}张成功')
                 break
+            if rerun_batch_id:
+                def mark_rerun_failed(row):
+                    entry = next((item for item in row.get('items') or [] if item.get('item_id') == item_id), None)
+                    if entry:
+                        entry.update({'status': 'failed', 'error': last_error, 'finished_at': datetime.now().isoformat(timespec='seconds')})
+                    _ecommerce_refresh_rerun_batch_counts(row)
+                _ecommerce_mutate_rerun_batch(rerun_batch_id, mark_rerun_failed)
             return jsonify({'error': f'第{sample_number}张重做失败（已重试{ECOMMERCE_RERUN_MAX_ATTEMPTS}次）：{last_error}'}), 500
         previous_source = _ecommerce_find_rerun_source(batch, task, garment, action_order)
         history_path = ''
@@ -10565,6 +10867,17 @@ def ecommerce_regenerate():
     final_history = history_path_list[0] if history_path_list else ''
     final_result_model = result_model if archived_list else {}
     logger.info(f'[ecommerce-regenerate] 重做完成: 共{len(archived_list)}/{rerun_count}张成功')
+    if rerun_batch_id and archived_list:
+        def mark_rerun_accepted(row):
+            entry = next((item for item in row.get('items') or [] if item.get('item_id') == item_id), None)
+            if entry:
+                entry.update({
+                    'status': 'accepted', 'archived_paths': list(archived_list),
+                    'finished_at': datetime.now().isoformat(timespec='seconds'), 'error': '',
+                    'model_signature': final_result_model,
+                })
+            _ecommerce_refresh_rerun_batch_counts(row)
+        _ecommerce_mutate_rerun_batch(rerun_batch_id, mark_rerun_accepted)
     return jsonify({
         'ok': True,
         'archived_path': final_archived,
@@ -10575,6 +10888,7 @@ def ecommerce_regenerate():
         'model_signature': final_result_model,
         'success_count': len(archived_list),
         'total_count': rerun_count,
+        'rerun_batch_id': rerun_batch_id,
     })
 
 

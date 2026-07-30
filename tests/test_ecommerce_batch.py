@@ -53,7 +53,7 @@ class EcommerceBatchTest(unittest.TestCase):
             template = handle.read()
         self.assertIn('id="ecommerce-rerun-draw-count"', script)
         self.assertIn('Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5))', script)
-        self.assertIn("String(item.rerun_prompt || '').trim() || prompt", script)
+        self.assertIn("String(item.rerun_prompt || '').trim() || String(config.prompt || '')", script)
         self.assertIn('预计付费生图 ${paidCallTotal} 张', script)
         self.assertIn('参考图支持1～9张', script)
         self.assertIn('class="ecommerce-rerun-sync-select"', script)
@@ -501,6 +501,150 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertIn('Math.min(100, selectedCount || 1)', script)
         self.assertIn('RH企业线路官方上限100', script)
         self.assertIn('HK未公布固定上限', script)
+
+    def test_rerun_ui_can_pause_new_submissions_and_resume_without_resetting_cursor(self):
+        project_dir = os.path.dirname(app_module.__file__)
+        with open(os.path.join(project_dir, 'static', 'js', 'app.js'), 'r', encoding='utf-8') as handle:
+            script = handle.read()
+        with open(os.path.join(project_dir, 'static', 'css', 'style.css'), 'r', encoding='utf-8') as handle:
+            styles = handle.read()
+        self.assertIn('id="btn-ecommerce-rerun-pause"', script)
+        self.assertIn('id="btn-ecommerce-rerun-resume"', script)
+        self.assertIn('function setEcommerceRerunPaused(paused)', script)
+        self.assertIn('function waitForEcommerceRerunResume()', script)
+        self.assertIn('await waitForEcommerceRerunResume();', script)
+        self.assertIn('if (attempt > 1) await waitForEcommerceRerunResume();', script)
+        self.assertLess(
+            script.index('await waitForEcommerceRerunResume();'),
+            script.index('const entry = pendingItems[cursor++];'),
+        )
+        self.assertIn('ecommerceRerunState.bulkPauseWaiters.splice(0).forEach(resolve => resolve())', script)
+        self.assertIn('暂停不会取消已经提交且可能已扣费的任务', script)
+        self.assertIn('function ecommerceRerunBlocksNavigation()', script)
+        self.assertIn("action: paused ? 'pause' : 'resume'", script)
+        self.assertIn('rerun_batch_id: session.id', script)
+        self.assertIn('.ecommerce-rerun-progress-actions', styles)
+
+    def test_rerun_batch_persists_and_repeat_request_is_idempotent(self):
+        target = os.path.join(self.user_temp.name, '目标.jpg')
+        reference = os.path.join(self.user_temp.name, '参考.jpg')
+        candidate = os.path.join(self.user_temp.name, '候选.jpg')
+        result_dir = os.path.join(self.user_temp.name, '成品')
+        os.makedirs(result_dir)
+        for path in (target, reference, candidate):
+            self.make_image(path)
+        batch = {
+            'id': 'persistent-rerun', 'name': '持久化重做', 'output_path': self.user_temp.name,
+            'run_code': 'RH-NB2-LC-2K-R01', 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False},
+            'template': {'actions': [{
+                'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                'prompt': '原提示词', 'platform': 'runninghub',
+                'model_key': 'rhart-image-n-g31-flash/image-to-image-2k',
+                'endpoint': 'rhart-image-n-g31-flash/image-to-image', 'resolution': '2k',
+            }]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{
+                'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a1',
+                'action_order': 0, 'action_name': '正面', 'state': 'accepted',
+                'accepted_path': os.path.join(result_dir, '已删除.jpg'), 'attempts': [],
+            }],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [], 'rerun_batches': [],
+        })
+        created = self.client.post('/api/ecommerce/rerun-batches', json={
+            'batch_id': batch['id'], 'settings': {'concurrency': 3},
+            'items': [{
+                'item_id': 'g1-1', 'result_path': result_dir, 'reference_images': [reference],
+                'count': 1, 'prompt': '', 'mode': 'full',
+            }],
+        })
+        self.assertEqual(created.status_code, 201, created.get_json())
+        rerun_batch = created.get_json()['rerun_batch']
+        self.assertEqual(rerun_batch['total_count'], 1)
+        request_body = dict(rerun_batch['items'][0]['payload'])
+        request_body['rerun_batch_id'] = rerun_batch['id']
+        with patch.object(app_module, '_ecommerce_generate_candidate', return_value=candidate) as generate:
+            first = self.client.post('/api/ecommerce/regenerate', json=request_body)
+            second = self.client.post('/api/ecommerce/regenerate', json=request_body)
+        self.assertEqual(first.status_code, 200, first.get_json())
+        self.assertEqual(second.status_code, 200, second.get_json())
+        self.assertTrue(second.get_json()['cached'])
+        generate.assert_called_once()
+        detail = self.client.get(f"/api/ecommerce/rerun-batches/{rerun_batch['id']}").get_json()['rerun_batch']
+        self.assertEqual(detail['status'], 'completed')
+        self.assertEqual(detail['completed_count'], 1)
+        self.assertTrue(os.path.isfile(detail['items'][0]['archived_paths'][0]))
+
+    def test_recover_legacy_rerun_combines_completed_and_missing_items(self):
+        target1 = os.path.join(self.user_temp.name, '目标1.jpg')
+        target2 = os.path.join(self.user_temp.name, '目标2.jpg')
+        reference = os.path.join(self.user_temp.name, '服装.jpg')
+        result_dir = os.path.join(self.user_temp.name, '恢复成品')
+        os.makedirs(result_dir)
+        completed = os.path.join(result_dir, 'RH-GPT2-LC-4K-R06-AI-01.jpg')
+        for path in (target1, target2, reference, completed):
+            self.make_image(path)
+        started = '2026-07-29T19:10:00'
+        actions = [
+            {'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target1, 'prompt': '提示词'},
+            {'id': 'a2', 'order': 1, 'name': '背面', 'action_image': target2, 'prompt': '提示词'},
+        ]
+        batch = {
+            'id': 'recover-rerun', 'name': '恢复旧重做', 'output_path': self.user_temp.name,
+            'result_dirs': {'g1': result_dir}, 'settings': {'samples_per_action': 1},
+            'template': {'actions': actions},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [
+                {'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a1', 'action_order': 0,
+                 'action_name': '正面', 'attempts': [{'id': 'old-rerun', 'rerun': True, 'started_at': started,
+                                                    'finished_at': started, 'archived_path': completed,
+                                                    'model_signature': {
+                                                        'platform': 'runninghub',
+                                                        'model_key': 'rhart-image-g-2/image-to-image-4k',
+                                                        'aspect_ratio': '2:3',
+                                                    }}]},
+                {'id': 't2', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a2', 'action_order': 1,
+                 'action_name': '背面', 'attempts': []},
+            ],
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [], 'rerun_batches': [],
+        })
+        response = self.client.post('/api/ecommerce/rerun-batches/recover-latest', json={
+            'batch_id': batch['id'],
+            'items': [{
+                'item_id': 'g1-2', 'result_path': result_dir, 'reference_images': [reference],
+                'count': 1, 'prompt': '', 'mode': 'full',
+            }],
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        recovered = response.get_json()['rerun_batch']
+        self.assertTrue(recovered['legacy_recovered'])
+        self.assertEqual(recovered['status'], 'interrupted')
+        self.assertEqual(recovered['completed_count'], 1)
+        self.assertEqual(recovered['total_count'], 2)
+        self.assertEqual({item['status'] for item in recovered['items']}, {'accepted', 'pending'})
+        self.assertEqual(recovered['settings']['concurrency'], 1)
+        pending = next(item for item in recovered['items'] if item['status'] == 'pending')
+        self.assertEqual(pending['payload']['model_override']['model_key'], 'rhart-image-g-2/image-to-image-4k')
+        self.assertEqual(pending['payload']['model_override']['aspect_ratio'], '2:3')
+
+    def test_rerun_batch_ui_offers_continue_finalize_and_completed_review(self):
+        project_dir = os.path.dirname(app_module.__file__)
+        with open(os.path.join(project_dir, 'static', 'js', 'app.js'), encoding='utf-8') as handle:
+            script = handle.read()
+        with open(os.path.join(project_dir, 'templates', 'index.html'), encoding='utf-8') as handle:
+            template = handle.read()
+        self.assertIn('id="ecommerce-rerun-batches"', template)
+        self.assertIn('继续剩余', script)
+        self.assertIn('结束本次', script)
+        self.assertIn('验片已完成', script)
+        self.assertIn('/api/ecommerce/rerun-batches/recover-latest', script)
+        self.assertIn('runEcommercePersistedRerunBatch', script)
+        self.assertIn('/garments/${encodeURIComponent(garmentId)}/compare', script)
 
     def test_rerun_attempt_ids_do_not_overwrite_each_other(self):
         batch = {'tasks': [{'id': 'task-1', 'attempts': []}]}
@@ -2186,8 +2330,10 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertNotIn('navigateEcommerceGarment(', script)
         self.assertEqual(script.count('ecommerceCompareZoomState = {'), 1)
         self.assertIn('const switched = await switchEcommerceCompareGarment(1);', script)
-        self.assertEqual(script.count("getElementById('ecommerce-compare-next-garment')?.addEventListener"), 1)
-        self.assertEqual(script.count("getElementById('ecommerce-compare-prev-garment')?.addEventListener"), 1)
+        self.assertIn("['ecommerce-compare-prev-garment', 'ecommerce-compare-prev-garment-bottom'].forEach", script)
+        self.assertIn("['ecommerce-compare-next-garment', 'ecommerce-compare-next-garment-bottom'].forEach", script)
+        self.assertIn("document.getElementById('ecommerce-compare-prev-garment-bottom')", script)
+        self.assertIn("document.getElementById('ecommerce-compare-next-garment-bottom')", script)
 
     def test_compare_canvas_keeps_zoom_and_supports_unbounded_two_axis_pan(self):
         project_dir = os.path.dirname(app_module.__file__)
@@ -2205,11 +2351,17 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertIn('pan.x = cursorX - centerX', script)
         self.assertIn('dragState.panX + dx', script)
         self.assertIn("image.dataset.pendingSourceUrl === nextUrl", script)
+        self.assertIn('function scheduleEcommerceCompareZoom(side, center = false)', script)
+        self.assertIn('scheduleEcommerceCompareZoom(safeSide)', script)
+        self.assertIn('const viewport = scroller.getBoundingClientRect();', script)
         self.assertIn('resultThumbs.hidden = !groupMode;', script)
         self.assertIn('.ecommerce-compare-image-scroll {', styles)
         self.assertIn('overflow: hidden;', styles)
         self.assertIn('touch-action: none;', styles)
         self.assertIn('.ecommerce-compare-thumbnails { width: 100%; height: 80px;', styles)
+        self.assertIn('.ecommerce-compare-pane-reference { grid-template-rows: minmax(0, 1fr) auto;', styles)
+        self.assertIn('.ecommerce-compare-pane-results { grid-template-rows: minmax(0, 1fr) auto auto auto;', styles)
+        self.assertNotIn('.ecommerce-compare-pane-reference { grid-template-rows: auto 1fr auto;', styles)
 
 
 if __name__ == "__main__":
