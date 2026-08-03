@@ -5467,7 +5467,9 @@ def do_update():
 
             # 3. 覆盖本地文件（保留用户数据）
             _set_update_state(progress="正在替换文件...")
-            preserve = {'venv', 'data', 'logs', 'backups', '__pycache__', '.DS_Store', '.claude', '.git', 'static'}
+            # static 是程序代码（前端 JS/CSS），必须随版本覆盖；用户图片和任务数据
+            # 都在 data / logs / backups 等目录中，不应被更新包触碰。
+            preserve = {'venv', 'data', 'logs', 'backups', '__pycache__', '.DS_Store', '.claude', '.git'}
             for item in os.listdir(src_dir):
                 if item in preserve:
                     continue
