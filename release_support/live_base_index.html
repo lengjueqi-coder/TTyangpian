@@ -348,8 +348,11 @@
                         <optgroup label="RunningHub 官方稳定版（实测高价，批量慎用）">
                             <option value="rhart-image-g-2-official/image-to-image-2k">ChatGPT Image 2｜2K｜官方稳定｜¥2.77/张</option>
                             <option value="rhart-image-g-2-official/image-to-image-4k">ChatGPT Image 2｜4K｜官方稳定｜¥4.16/张</option>
+                            <option value="rhart-image-g-2-medium/image-to-image-2k">ChatGPT Image 2｜2K｜官方稳定·中档｜¥1.13/张</option>
+                            <option value="rhart-image-g-2-medium/image-to-image-4k">ChatGPT Image 2｜4K｜官方稳定·中档｜¥1.13/张</option>
                             <option value="rhart-image-n-g31-flash-official/image-to-image-2k">Nano Banana 2｜2K｜官方稳定｜¥0.74/张</option>
                             <option value="rhart-image-n-g31-flash-official/image-to-image-4k">Nano Banana 2｜4K｜官方稳定｜¥0.99/张</option>
+                            <option value="rhart-image-n-pro-official/edit-ultra-4k">全能图片 Pro｜图生图 Ultra｜4K官方稳定｜¥1.50/张</option>
                         </optgroup>
                         <optgroup label="RunningHub 低价渠道版（不稳定）">
                             <option value="rhart-image-g-2/image-to-image-2k">ChatGPT Image 2｜2K请求｜低价｜¥0.10/张｜可能返1K</option>
@@ -660,8 +663,11 @@
                     <optgroup label="RunningHub 官方稳定版（实测高价，批量慎用）">
                         <option value="rhart-image-g-2-official/image-to-image-2k">ChatGPT Image 2｜2K｜官方稳定｜¥2.77/张</option>
                         <option value="rhart-image-g-2-official/image-to-image-4k">ChatGPT Image 2｜4K｜官方稳定｜¥4.16/张</option>
+                        <option value="rhart-image-g-2-medium/image-to-image-2k">ChatGPT Image 2｜2K｜官方稳定·中档｜¥1.13/张</option>
+                        <option value="rhart-image-g-2-medium/image-to-image-4k">ChatGPT Image 2｜4K｜官方稳定·中档｜¥1.13/张</option>
                         <option value="rhart-image-n-g31-flash-official/image-to-image-2k">Nano Banana 2｜2K｜官方稳定｜¥0.74/张</option>
                         <option value="rhart-image-n-g31-flash-official/image-to-image-4k">Nano Banana 2｜4K｜官方稳定｜¥0.99/张</option>
+                        <option value="rhart-image-n-pro-official/edit-ultra-4k">全能图片 Pro｜图生图 Ultra｜4K官方稳定｜¥1.50/张</option>
                     </optgroup>
                     <optgroup label="RunningHub 低价渠道版（不稳定）">
                         <option value="rhart-image-g-2/image-to-image-2k">ChatGPT Image 2｜2K请求｜低价｜¥0.10/张｜可能返1K</option>
@@ -776,7 +782,7 @@
                 <article class="ecommerce-card ecommerce-card-material" data-workbench-panel="material">
                     <div class="ecommerce-card-title">
                         <span>1</span>素材与模型
-                        <span class="ecommerce-help-tip" tabindex="0" data-tip="加载 1～20 张需要换衣服的目标人物图。你加载多少张，每套服装就依次换多少张；每张目标图都会与该套服装实际加载的1～6张实拍参考图一起提交。可选择图片文件夹，也可一次拖入或选择多张图片。">?</span>
+                        <span class="ecommerce-help-tip" tabindex="0" data-tip="加载 1～20 张需要换衣服的目标人物图。默认模式会提交整套服装参考；开启精准匹配后，每张目标图只提交你匹配的1张服装参考图。">?</span>
                     </div>
                     <div class="ecommerce-source-pickers">
                         <section class="ecommerce-source-picker">
@@ -797,8 +803,9 @@
                                 <input id="ecommerce-garment-files" type="file" accept="image/jpeg,image/png,image/webp" multiple hidden>
                                 <b>＋</b><strong>将服装图或文件夹拖到这里</strong>
                                 <button type="button" class="ecommerce-tile-action" id="btn-ecommerce-select-garment-files">选择图片</button>
+                                <button type="button" class="ecommerce-tile-action ecommerce-folder-action" id="btn-ecommerce-select-garment-folder">选择大文件夹</button>
                             </div>
-                            <button id="btn-ecommerce-select-root" hidden>选择文件夹</button>
+                            <button id="btn-ecommerce-select-root" class="ecommerce-folder-picker-fallback" type="button">选择服装根目录并递归扫描</button>
                             <button id="btn-ecommerce-scan" hidden>扫描</button>
                             <input id="ecommerce-clothing-root" type="hidden">
                             <div id="ecommerce-garment-preview" class="ecommerce-garment-preview"></div>
@@ -806,9 +813,11 @@
                             <div id="ecommerce-garment-list" class="ecommerce-mini-list"></div>
                         </section>
                     </div>
-                    <div class="ecommerce-prompt-templates-bar" id="ecommerce-prompt-templates-bar">
-                        <div class="ecommerce-prompt-templates-list" id="ecommerce-prompt-templates-list"></div>
-                        <select id="ecommerce-prompt-templates-more" class="ecommerce-prompt-templates-more" style="display:none;"><option value="">更多模板…</option></select>
+                    <div class="ecommerce-prompt-templates-bar ecommerce-shared-prompt-templates" id="ecommerce-prompt-templates-bar" data-ecommerce-prompt-template-target="#ecommerce-standard-prompt">
+                        <span class="ecommerce-shared-prompt-label">共用提示词模板</span>
+                        <div class="ecommerce-shared-prompt-list ecommerce-prompt-templates-list" id="ecommerce-prompt-templates-list"></div>
+                        <select id="ecommerce-prompt-templates-more" class="ecommerce-shared-prompt-more ecommerce-prompt-templates-more"><option value="">更多模板…</option></select>
+                        <button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button>
                     </div>
                     <label class="ecommerce-field-label" for="ecommerce-standard-prompt">换装提示词</label>
                     <textarea id="ecommerce-standard-prompt" rows="5">将服装参考图中的衣服精准替换到图1人物身上，并保持图1的背景、道具、动作、五官和发型完全不变。仅替换服装；图2起为同一套衣服本次提供的全部多角度、多景别参考，需综合学习并严格还原衣领、衣襟、盘扣数量与形状、开叉位置、拉链、袖口、材质和花纹。让服装自然贴合身体曲线，专业相机拍摄，写实、真实自然。</textarea>
@@ -833,8 +842,11 @@
                                 <optgroup label="RunningHub 官方稳定版（实测高价，批量慎用）">
                                     <option value="rhart-image-g-2-official/image-to-image-2k">GPT2-2K｜官方｜¥2.77</option>
                                     <option value="rhart-image-g-2-official/image-to-image-4k">GPT2-4K｜官方｜¥4.16</option>
+                                    <option value="rhart-image-g-2-medium/image-to-image-2k">GPT2-2K｜官方中档｜¥1.13</option>
+                                    <option value="rhart-image-g-2-medium/image-to-image-4k">GPT2-4K｜官方中档｜¥1.13</option>
                                     <option value="rhart-image-n-g31-flash-official/image-to-image-2k">Nano2-2K｜官方｜¥0.74</option>
                                     <option value="rhart-image-n-g31-flash-official/image-to-image-4k">Nano2-4K｜官方｜¥0.99</option>
+                                    <option value="rhart-image-n-pro-official/edit-ultra-4k">Pro Ultra-4K｜官方｜¥1.50</option>
                                 </optgroup>
                                 <optgroup label="RunningHub 低价渠道版（分辨率/稳定性有风险）">
                                     <option value="rhart-image-g-2/image-to-image-2k">GPT2-2K｜低价｜¥0.10</option>
@@ -870,57 +882,23 @@
 
                 <div class="ecommerce-column-resizer" data-left="material" data-right="qc" title="拖动调整两栏宽度"></div>
 
-                <article class="ecommerce-card ecommerce-card-qc" data-workbench-panel="qc">
-                    <div class="ecommerce-card-title"><span>2</span>自检 <span id="ecommerce-qc-help" class="ecommerce-help-tip" tabindex="0" data-tip="关闭时只生成并归档，不调用视觉质检；开启后按阈值检查服装细节，失败最多重试3次。">?</span><label class="ecommerce-qc-switch ecommerce-qc-switch-inline"><input id="ecommerce-qc-enabled" type="checkbox"><span class="ecommerce-qc-switch-track"><span class="ecommerce-qc-switch-thumb"></span></span><span class="ecommerce-qc-switch-label">开启</span></label><button type="button" class="btn btn-outline btn-compact ecommerce-api-entry" id="btn-ecommerce-open-rh-api">API</button></div>
-                    <details class="ecommerce-api-switch" id="ecommerce-rh-api-switch">
-                        <summary>
-                            <strong>RunningHub 企业 API 账号</strong>
-                            <small id="ecommerce-rh-account-status">正在读取当前账号…</small>
-                        </summary>
-                        <div class="ecommerce-api-switch-body">
-                            <label>更换 API Key
-                                <input type="password" id="ecommerce-rh-api-key" placeholder="粘贴新的企业共享 Key；不更换则留空" autocomplete="off">
-                            </label>
-                            <label>RunningHub 新域名接口
-                                <input type="text" id="ecommerce-rh-base-url" placeholder="https://www.runninghub.ai/openapi/v2">
-                            </label>
-                            <div class="ecommerce-row">
-                                <button class="btn btn-primary" id="btn-ecommerce-save-rh-api">保存并免费验证</button>
-                                <small id="ecommerce-rh-api-result">验证使用官方价格预估接口，不生成图片、不扣费。</small>
-                            </div>
-                            <div class="ecommerce-notice">这里保存的是软件调用“企业标准模型 API”的当前账号，普通生图、拆图和电商批量都会共同使用。RunningHub 官网工作流约两毛/张与企业API是不同计费线路。批次运行中请先暂停再换Key。</div>
-                        </div>
+                <article class="ecommerce-card ecommerce-card-qc ecommerce-card-precision" data-workbench-panel="qc">
+                    <div class="ecommerce-card-title"><span>2</span>人工精准匹配参考图</div>
+                    <p class="ecommerce-help">为第一套服装建立目标图与服装参考图的序号映射；后续服装按相同序号自动匹配。确认后，每次请求只提交一张动作图和一张服装图。</p>
+                    <label class="ecommerce-precision-toggle"><input id="ecommerce-precision-matching" type="checkbox" checked><span>人工精准匹配（默认开启）</span><small>主动关闭后使用原有默认模式</small></label>
+                    <!-- 保留 API 配置挂载点供已有初始化逻辑和旧批次兼容；不作为第二栏可见内容。 -->
+                    <details id="ecommerce-rh-api-switch" hidden>
+                        <input id="ecommerce-rh-api-key" type="password">
+                        <input id="ecommerce-rh-base-url" type="text">
+                        <button id="btn-ecommerce-save-rh-api" type="button"></button>
+                        <span id="ecommerce-rh-api-result"></span><span id="ecommerce-rh-account-status"></span>
                     </details>
-                    <div class="ecommerce-settings-grid">
-                        <label>模型
-                            <input id="ecommerce-qc-model" value="gemini-2.5-pro">
-                        </label>
-                        <label>建档
-                            <select id="ecommerce-profile-mode">
-                                <option value="visual_sheets" selected>视觉证据缓存（推荐，0次额外AI）</option>
-                                <option value="ai_text">AI文字建档（实验，每套多1次）</option>
-                            </select>
-                        </label>
-                        <label>分数
-                            <input id="ecommerce-qc-threshold" type="number" min="50" max="100" value="85">
-                        </label>
+                    <div id="ecommerce-precision-panel" class="ecommerce-precision-panel" hidden>
+                        <div class="ecommerce-notice">精准模式已启用：AI 质检和生成返回状态不在此处显示。</div>
+                        <button type="button" class="btn btn-primary" id="btn-ecommerce-open-precision-matching">打开精准匹配</button>
+                        <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-clear-precision">清空匹配</button>
+                        <span id="ecommerce-precision-status" class="ecommerce-summary">尚未完成匹配</span>
                     </div>
-                    <div class="ecommerce-qc-switch-wrap">
-                        <div id="ecommerce-qc-off-hint" class="ecommerce-qc-off-hint" style="display:none;">已关闭 AI 质检：每张目标图会生成 <strong id="ecommerce-qc-off-samples">1</strong> 张供你人工挑选，按本次运行缩写归档到独立成品目录，不再走三轮重试。废片可在第5板块批量重做。</div>
-                        <div id="ecommerce-qc-on-hint" class="ecommerce-notice">默认建档只在本地生成六视图总览和关键细节拼图，不增加AI建档费用。每张候选质检上传2张证据图和1张候选图；失败最多重试到3张，之后转人工复核。</div>
-                    </div>
-                    <details class="ecommerce-results-disclosure">
-                        <summary>生成与返回状态</summary>
-                    <div class="ecommerce-inline-results">
-                        <div class="ecommerce-results-head">
-                            <strong>生成返回与质检状态</strong>
-                            <select id="ecommerce-batch-select"><option value="">暂无运行记录</option></select>
-                        </div>
-                        <div id="ecommerce-task-list" class="ecommerce-task-list">
-                            <div class="ecommerce-empty">运行后在这里查看每套服装 × 每张目标图的生成返回、质检结果和归档状态。</div>
-                        </div>
-                    </div>
-                    </details>
                 </article>
 
                 <div class="ecommerce-column-resizer" data-left="qc" data-right="run" title="拖动调整两栏宽度"></div>
@@ -1059,6 +1037,25 @@
                         <div class="ecommerce-empty">从废片列表选择一张后，这里会显示独立调整工作台。</div>
                     </div>
                 </article>
+
+                <article class="ecommerce-card ecommerce-card-final-export" data-workbench-panel="final-export">
+                    <div class="ecommerce-card-title">
+                        <span>6</span>确认成品 · 一键导出
+                        <span class="ecommerce-help-tip" tabindex="0" data-tip="已确认质检完成的组会列在这里。可一键导出全部成品，或仅导出已确认的组。">?</span>
+                    </div>
+                    <div class="ecommerce-final-export-body">
+                        <div class="ecommerce-row">
+                            <input id="ecommerce-final-export-path" type="text" placeholder="选择最终成品导出位置">
+                            <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-final-export-folder">选择位置</button>
+                            <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-final-export-check">检查完整性</button>
+                            <button type="button" class="btn btn-primary btn-compact" id="btn-ecommerce-final-export-run">一键导出最终成品</button>
+                            <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-final-export-confirmed" hidden style="color:#15803d;border-color:#a7f3d0;" title="仅导出已确认质检完成的组">仅导出已确认</button>
+                            <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-final-export-open" hidden>打开导出文件夹</button>
+                        </div>
+                        <div id="ecommerce-final-export-status" class="ecommerce-summary">只有一张的动作自动选中；多张候选请在"对比"大图中点"设为最终成品"。</div>
+                        <div id="ecommerce-confirmed-groups" class="ecommerce-confirmed-groups" hidden></div>
+                    </div>
+                </article>
             </div>
         </section>
     </div>
@@ -1066,16 +1063,23 @@
     <div id="ecommerce-compare-overlay" class="ecommerce-compare-overlay" hidden aria-hidden="true">
         <div class="ecommerce-compare-shell" role="dialog" aria-modal="true" aria-label="服装废片放大对比">
             <header class="ecommerce-compare-toolbar">
-                <div><strong id="ecommerce-compare-title">废片对比</strong><small id="ecommerce-compare-help">Delete删除 · C裁剪 · ←→切换 · 滚轮缩放 · 拖拽平移 · PageUp/PageDown切换服装</small></div>
+                <div><strong id="ecommerce-compare-title">废片对比</strong><small id="ecommerce-compare-help">Delete删除并跳到下一张 · ←→抽卡切换 · ↑↓切换服装</small></div>
                 <div class="ecommerce-compare-toolbar-actions">
                     <button type="button" id="ecommerce-compare-prev-garment" class="btn btn-outline btn-compact" title="上一套服装 (PageUp)">‹ 上一套</button>
                     <span id="ecommerce-compare-garment-indicator-top" class="ecommerce-compare-garment-indicator"></span>
                     <button type="button" id="ecommerce-compare-next-garment" class="btn btn-primary btn-compact" title="下一套服装 (PageDown)">下一套 ›</button>
+                    <button type="button" id="ecommerce-compare-select-final" class="btn btn-outline btn-compact" hidden></button>
                     <button type="button" id="ecommerce-compare-mark-redo" class="btn btn-outline btn-compact" title="标记此图为待重做（不删除原图，重做后新旧图共存对比）" style="color:#2563eb;border-color:#93c5fd;">⚑ 标记重做</button>
                     <button type="button" id="ecommerce-compare-delete" class="btn btn-outline btn-compact" title="删除当前AI生成图（Delete键，移到回收站）" style="color:#dc2626;border-color:#fecaca;">✕ 删除</button>
+                    <button type="button" id="ecommerce-compare-recover" class="btn btn-outline btn-compact" hidden title="从回收站找回此图，与当前生成图并列对比" style="color:#059669;border-color:#a7f3d0;">↩ 找回</button>
+                    <button type="button" id="ecommerce-compare-confirm-group" class="btn btn-outline btn-compact" hidden title="确认该组质检完成，移入成品导出列表" style="color:#7c3aed;border-color:#c4b5fd;">✓ 确认该组</button>
+                    <button type="button" id="ecommerce-compare-unconfirm-group" class="btn btn-outline btn-compact" hidden title="撤销确认，返回待质检列表" style="color:#7c3aed;border-color:#c4b5fd;">↩ 撤销确认</button>
                     <button type="button" id="ecommerce-compare-close" aria-label="关闭对比">×</button>
                 </div>
             </header>
+            <div id="ecommerce-compare-confirmed-banner" class="ecommerce-compare-confirmed-banner" hidden>
+                <span>✓ 该组已确认质检完成，已移入成品导出列表</span>
+            </div>
             <div class="ecommerce-compare-stage">
                 <section class="ecommerce-compare-pane ecommerce-compare-pane-reference">
                     <div class="ecommerce-compare-label">
@@ -1123,7 +1127,7 @@
                         <button type="button" id="ecommerce-compare-next-garment-bottom" class="btn btn-primary btn-compact" title="下一套服装 (PageDown)">下一套 ›</button>
                     </div>
                     <div class="ecommerce-compare-shortcuts-hint">
-                        <kbd>Delete</kbd> 删除  <kbd>C</kbd> 裁剪  <kbd>←→</kbd> 切换  <kbd>滚轮</kbd> 缩放  <kbd>拖拽</kbd> 平移
+                        <kbd>Shift/Ctrl</kbd> 多选抽卡  <kbd>Delete</kbd> 批量删除  <kbd>←→</kbd> 抽卡切换  <kbd>↑↓</kbd> 切换目标图  <kbd>滚轮</kbd> 缩放  <kbd>拖拽</kbd> 平移
                     </div>
                 </section>
             </div>
@@ -1432,7 +1436,7 @@
                 </div>
                 <div class="form-group">
                     <label>模型名称</label>
-                    <input type="text" id="cfg-model-name" placeholder="DeepSeek: deepseek-chat | GLM: glm-4-flash">
+                    <input type="text" id="cfg-model-name" placeholder="DeepSeek: deepseek-v4-flash | GLM: glm-4-flash">
                 </div>
                 <div class="form-group">
                     <label>超时时间 (ms)</label>

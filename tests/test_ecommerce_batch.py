@@ -16,6 +16,9 @@ import app as app_module
 
 
 class EcommerceBatchTest(unittest.TestCase):
+    # Real data directory — tests must NEVER write here.
+    _REAL_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+
     def setUp(self):
         self.data_temp = tempfile.TemporaryDirectory()
         self.user_temp = tempfile.TemporaryDirectory(dir=os.environ.get("ECOMMERCE_TEST_TMP") or "/private/tmp")
@@ -23,6 +26,13 @@ class EcommerceBatchTest(unittest.TestCase):
         self.old_images_dir = app_module.IMAGES_DIR
         app_module.DATA_DIR = os.path.join(self.data_temp.name, "data")
         app_module.IMAGES_DIR = os.path.join(self.data_temp.name, "images")
+        # Safety check: ensure DATA_DIR is NOT pointing at the real data directory.
+        # This prevents tests from overwriting production data if isolation fails.
+        if os.path.realpath(app_module.DATA_DIR) == os.path.realpath(self._REAL_DATA_DIR):
+            raise RuntimeError(
+                f"Test DATA_DIR points at real data directory ({self._REAL_DATA_DIR}). "
+                f"Refusing to run tests that could overwrite production data."
+            )
         os.makedirs(app_module.DATA_DIR, exist_ok=True)
         os.makedirs(app_module.IMAGES_DIR, exist_ok=True)
         self.client = app_module.app.test_client()
@@ -52,7 +62,8 @@ class EcommerceBatchTest(unittest.TestCase):
         with open(template_path, encoding='utf-8') as handle:
             template = handle.read()
         self.assertIn('id="ecommerce-rerun-draw-count"', script)
-        self.assertIn('Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5))', script)
+        self.assertIn('count: drawCount', script)
+        self.assertNotIn('Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5))', script)
         self.assertIn("String(item.rerun_prompt || '').trim() || String(config.prompt || '')", script)
         self.assertIn('预计付费生图 ${paidCallTotal} 张', script)
         self.assertIn('参考图支持1～9张', script)
@@ -65,7 +76,139 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertIn("const host = document.getElementById('ecommerce-rerun-adjust-host')", script)
         self.assertIn('`第 ${currentGroupIdx + 1}/${allGarmentIds.length} 套 · ${item.garment_name}`', script)
         self.assertIn('`本套第 ${currentItemInGarment + 1}/${sameGarmentItems.length} 张', script)
+        self.assertIn('取消这一张重做', script)
+        self.assertIn('取消本套全部重做', script)
+        self.assertIn("'/api/ecommerce/cancel-rerun-items'", script)
+        self.assertIn("currentResult?.deleted ? '↶ 恢复此图' : '删除此图'", script)
+        self.assertIn('await refreshEcommerceFolderStatusCounts(folderContainer, ecommerceState.detail)', script)
+        self.assertIn('共保留 ${status.candidate_count} 张', script)
+        self.assertIn("'/api/ecommerce/export-final-products'", script)
+        self.assertIn('id="ecommerce-final-export-status"', template)
+        self.assertIn('function ecommerceCompareActionGroups', script)
+        self.assertIn('原始${originalCount}', script)
+        self.assertIn('一键导出最终成品', template)
+        self.assertNotIn('permanent: true', script)
         self.assertNotIn('list.appendChild(compare)', script)
+
+    def test_rerun_and_first_generation_share_one_prompt_template_library(self):
+        script_path = os.path.join(os.path.dirname(app_module.__file__), 'static', 'js', 'app.js')
+        style_path = os.path.join(os.path.dirname(app_module.__file__), 'static', 'css', 'style.css')
+        with open(script_path, encoding='utf-8') as handle:
+            script = handle.read()
+        with open(style_path, encoding='utf-8') as handle:
+            style = handle.read()
+        self.assertGreaterEqual(script.count('class="ecommerce-shared-prompt-templates"'), 2)
+        self.assertIn('data-ecommerce-prompt-template-target="#ecommerce-rerun-bulk-prompt"', script)
+        self.assertIn('data-ecommerce-prompt-template-target=".ecommerce-rerun-prompt"', script)
+        self.assertIn('function renderAllEcommercePromptTemplateSurfaces()', script)
+        self.assertIn('renderEcommerceRerunPromptTemplates(document)', script)
+        self.assertIn('三处已同步', script)
+        self.assertIn('.ecommerce-shared-prompt-templates', style)
+
+        response = self.client.put('/api/ecommerce/prompt-templates', json={
+            'templates': [
+                {'id': 'same', 'name': '首次生成模板', 'prompt': '完整换装提示词'},
+                {'id': 'same', 'name': '废片修正模板', 'prompt': '仅修正服装细节'},
+                {'id': 'empty', 'name': '', 'prompt': ''},
+            ],
+            'snippets': [],
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        saved = response.get_json()['templates']
+        self.assertEqual([row['name'] for row in saved], ['首次生成模板', '废片修正模板'])
+        self.assertEqual(len({row['id'] for row in saved}), 2)
+        loaded = self.client.get('/api/ecommerce/prompt-templates').get_json()
+        self.assertEqual(loaded['templates'], saved)
+
+    def test_group_compare_left_strip_uses_only_frozen_garment_references(self):
+        script_path = os.path.join(os.path.dirname(app_module.__file__), 'static', 'js', 'app.js')
+        with open(script_path, encoding='utf-8') as handle:
+            script = handle.read()
+        self.assertIn("groupUsesSingleSource && actionGroup?.reference?.url", script)
+        self.assertIn("thumbs.innerHTML = refs.map((entry, i) =>", script)
+        self.assertIn("ecommerceGroupCompareState.refIndex = Number(btn.dataset.refIndex)", script)
+        self.assertNotIn("const thumbEntries = groupMode ? actionGroups : refs", script)
+        self.assertNotIn("data-action-index=", script)
+
+    def test_retired_deepseek_aliases_migrate_to_current_flash_model(self):
+        self.assertEqual(
+            app_module._normalize_prompt_model('deepseek', 'deepseek-chat'),
+            'deepseek-v4-flash',
+        )
+        self.assertEqual(
+            app_module._normalize_prompt_model('deepseek', 'deepseek-reasoner'),
+            'deepseek-v4-flash',
+        )
+        self.assertEqual(
+            app_module._normalize_prompt_model('zhipu', 'glm-4-flash'),
+            'glm-4-flash',
+        )
+
+    def test_final_product_export_keeps_all_live_candidates_and_requires_no_missing_action(self):
+        target_one = os.path.join(self.user_temp.name, '目标1.jpg')
+        target_two = os.path.join(self.user_temp.name, '目标2.jpg')
+        reference = os.path.join(self.user_temp.name, '服装参考.jpg')
+        for path in (target_one, target_two, reference):
+            self.make_image(path)
+        result_dir = os.path.join(self.user_temp.name, '原批次结果', '服装A')
+        os.makedirs(result_dir)
+        action_one = os.path.join(result_dir, 'RH-NB2-LC-4K-R01-AI-01.jpg')
+        action_two_old = os.path.join(result_dir, 'RH-NB2-LC-4K-R01-AI-02.jpg')
+        action_two_new = os.path.join(result_dir, 'RH-GPT2-LC-4K-RR-AI-02-1.jpg')
+        self.make_image(action_one, color=(10, 20, 30))
+        self.make_image(action_two_old, color=(40, 50, 60))
+        self.make_image(action_two_new, color=(180, 190, 200))
+        batch = {
+            'id': 'final-export-batch', 'name': '旗袍最终整理',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1},
+            'template': {'actions': [
+                {'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target_one},
+                {'id': 'a2', 'order': 1, 'name': '背面', 'action_image': target_two},
+            ]},
+            'garments': [{
+                'id': 'g1', 'name': '服装A', 'relative_path': '系列一/服装A',
+                'path': self.user_temp.name, 'images': [reference], 'order': 0,
+            }],
+            'tasks': [
+                {'id': 't1', 'garment_id': 'g1', 'action_order': 0, 'action_name': '正面', 'attempts': []},
+                {'id': 't2', 'garment_id': 'g1', 'action_order': 1, 'action_name': '背面', 'attempts': []},
+            ],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [], 'rerun_batches': [],
+        })
+
+        status = self.client.get('/api/ecommerce/final-export-status?batch_id=final-export-batch')
+        self.assertEqual(status.status_code, 200, status.get_json())
+        payload = status.get_json()
+        self.assertTrue(payload['ready'])
+        self.assertEqual(payload['complete_actions'], 2)
+        self.assertEqual(payload['candidate_count'], 3)
+        self.assertEqual(payload['extra_candidates'], 1)
+
+        destination = os.path.join(self.user_temp.name, '交付目录')
+        os.makedirs(destination)
+        exported = self.client.post('/api/ecommerce/export-final-products', json={
+            'batch_id': batch['id'], 'destination': destination,
+        })
+        self.assertEqual(exported.status_code, 200, exported.get_json())
+        self.assertEqual(exported.get_json()['file_count'], 3)
+        export_root = exported.get_json()['path']
+        garment_dir = os.path.join(export_root, '系列一', '服装A')
+        final_dir = os.path.join(garment_dir, '成品图')
+        reference_dir = os.path.join(garment_dir, '服装参考图')
+        final_files = sorted(os.listdir(final_dir))
+        self.assertEqual(len(final_files), 3)
+        self.assertTrue(final_files[0].startswith('01-'))
+        self.assertTrue(final_files[1].startswith('02-'))
+        self.assertTrue(final_files[2].startswith('02-'))
+        self.assertTrue(any(os.path.basename(action_two_new) in name for name in final_files))
+        self.assertEqual(exported.get_json()['reference_file_count'], 1)
+        self.assertEqual(len(os.listdir(reference_dir)), 1)
+        self.assertTrue(os.path.isfile(action_two_old))
+        self.assertTrue(os.path.isfile(action_two_new))
 
     def test_scan_requires_all_six_numbered_images(self):
         self.make_garment("完整款")
@@ -130,6 +273,80 @@ class EcommerceBatchTest(unittest.TestCase):
         batch = response.get_json()['batch']
         self.assertEqual(len(batch['garments']), 1)
         self.assertEqual(len(batch['garments'][0]['images']), 2)
+
+    def test_batch_freezes_action_reference_and_rejects_internal_result_cache(self):
+        folder = self.make_garment("动作快照服装", count=2)
+        action_image = os.path.join(self.user_temp.name, '动作01.jpg')
+        self.make_image(action_image, color=(12, 34, 56))
+        with open(action_image, 'rb') as handle:
+            original_bytes = handle.read()
+        response = self.client.post('/api/ecommerce/batches', json={
+            'actions': [{'action_image': action_image, 'prompt': '保持服装，替换动作'}],
+            'garment_images': [os.path.join(folder, '1-参考.jpg')],
+            'output_path': self.user_temp.name,
+            'final_output_path': self.user_temp.name,
+            'qc_enabled': False,
+        })
+        self.assertEqual(response.status_code, 201, response.get_json())
+        action = response.get_json()['batch']['template']['actions'][0]
+        self.assertNotEqual(action['action_image'], os.path.realpath(action_image))
+        self.assertIn(os.path.join('_批次动作参考图', response.get_json()['batch']['id']), action['action_image'])
+        self.assertEqual(action['action_source_path'], os.path.realpath(action_image))
+        with open(action['action_image'], 'rb') as handle:
+            self.assertEqual(handle.read(), original_bytes)
+        self.make_image(action_image, color=(200, 210, 220))
+        with open(action['action_image'], 'rb') as handle:
+            self.assertEqual(handle.read(), original_bytes)
+
+        forbidden_dir = os.path.join(self.user_temp.name, '_生成样本备份', '1')
+        os.makedirs(forbidden_dir)
+        forbidden_image = os.path.join(forbidden_dir, 'AI-01.jpg')
+        self.make_image(forbidden_image)
+        with self.assertRaisesRegex(ValueError, '不能来自生成结果或历史缓存目录'):
+            app_module._ecommerce_snapshot_action_references(
+                [{'action_image': forbidden_image}], self.user_temp.name, 'forbidden-batch'
+            )
+
+    def test_rebind_action_references_uses_exact_natural_order_and_keeps_backup(self):
+        old_one = os.path.join(self.user_temp.name, 'old-1.jpg')
+        old_two = os.path.join(self.user_temp.name, 'old-2.jpg')
+        self.make_image(old_one)
+        self.make_image(old_two)
+        batch = {
+            'id': 'repair-batch', 'name': '待修复批次', 'status': 'completed',
+            'output_path': self.user_temp.name, 'generation_mode': 'garment_reference',
+            'template': {'id': 'tpl', 'name': '动作', 'actions': [
+                {'id': 'a1', 'order': 0, 'name': '旧1', 'action_image': old_one, 'prompt': 'p'},
+                {'id': 'a2', 'order': 1, 'name': '旧2', 'action_image': old_two, 'prompt': 'p'},
+            ]},
+            'tasks': [
+                {'id': 't1', 'garment_id': 'g1', 'action_order': 0, 'action_name': '旧1'},
+                {'id': 't2', 'garment_id': 'g1', 'action_order': 1, 'action_name': '旧2'},
+            ],
+            'garments': [], 'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch],
+            'waste_scans': [], 'rerun_batches': [],
+        })
+        action_root = os.path.join(self.user_temp.name, '动作替换参考图')
+        os.makedirs(action_root)
+        second = os.path.join(action_root, '动作10.jpg')
+        first = os.path.join(action_root, '动作2.jpg')
+        self.make_image(second, color=(100, 0, 0))
+        self.make_image(first, color=(0, 100, 0))
+        response = self.client.post(
+            '/api/ecommerce/batches/repair-batch/rebind-action-references',
+            json={'action_root': action_root},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual([row['name'] for row in payload['actions']], ['动作2', '动作10'])
+        self.assertTrue(os.path.isfile(payload['backup_path']))
+        repaired = app_module.load_json(app_module.ECOMMERCE_DATA_FILE)['batches'][0]
+        self.assertEqual([a['name'] for a in repaired['template']['actions']], ['动作2', '动作10'])
+        self.assertEqual([t['action_name'] for t in repaired['tasks']], ['动作2', '动作10'])
+        self.assertTrue(all(os.path.isfile(a['action_image']) for a in repaired['template']['actions']))
 
     def test_prompt_mode_single_selected_image_creates_exactly_one_task(self):
         source = os.path.join(self.user_temp.name, "single-garment.jpg")
@@ -362,6 +579,58 @@ class EcommerceBatchTest(unittest.TestCase):
                 })
                 self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(captured_counts, [1, 9])
+
+    def test_rerun_can_preview_and_override_target_action_for_current_item_only(self):
+        original_target = os.path.join(self.user_temp.name, '原动作.jpg')
+        replacement_target = os.path.join(self.user_temp.name, '临时动作.jpg')
+        reference = os.path.join(self.user_temp.name, '服装.jpg')
+        candidate = os.path.join(self.user_temp.name, '候选.jpg')
+        result_dir = os.path.join(self.user_temp.name, '动作替换结果')
+        os.makedirs(result_dir)
+        for path in (original_target, replacement_target, reference, candidate):
+            self.make_image(path)
+        action = {
+            'id': 'a1', 'order': 0, 'name': '背面', 'action_image': original_target, 'prompt': '原提示词',
+            'platform': 'runninghub', 'model_key': 'rhart-image-n-g31-flash/image-to-image-2k',
+            'endpoint': 'rhart-image-n-g31-flash/image-to-image', 'resolution': '2k',
+        }
+        batch = {
+            'id': 'target-action-override', 'name': '动作图本次覆盖', 'run_code': 'RUN',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False},
+            'template': {'actions': [action]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a1',
+                       'action_order': 0, 'action_name': '背面', 'state': 'accepted', 'attempts': []}],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+        captured = {}
+
+        def fake_generate(_batch, _task, _garment, submitted_action, _prompt, _attempt):
+            captured['action_image'] = submitted_action.get('action_image')
+            return candidate
+
+        with patch.object(app_module, '_ecommerce_generate_candidate', side_effect=fake_generate):
+            response = self.client.post('/api/ecommerce/regenerate', json={
+                'batch_id': batch['id'], 'item_id': 'g1-1', 'result_path': result_dir,
+                'reference_images': [reference], 'target_action_image': replacement_target,
+                'prompt': '', 'count': 1,
+            })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured['action_image'], replacement_target)
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        self.assertEqual(stored['template']['actions'][0]['action_image'], original_target)
+
+    def test_rerun_adjustment_ui_shows_replaceable_target_action_preview(self):
+        project_dir = os.path.dirname(app_module.__file__)
+        with open(os.path.join(project_dir, 'static', 'js', 'app.js'), encoding='utf-8') as handle:
+            script = handle.read()
+        self.assertIn('本次动作参考图（单击放大；拖入或双击替换）', script)
+        self.assertIn('target_action_image:', script)
+        self.assertIn('ecommerceReplaceRerunTargetAction', script)
 
     def test_detail_repair_prompt_is_generic_and_accepts_optional_correction(self):
         prompt = app_module._ecommerce_detail_repair_prompt()
@@ -825,6 +1094,16 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(post.call_count, 1)
         self.assertTrue(post.call_args.args[0].endswith("/media/upload/binary"))
+
+    def test_runninghub_hk_switched_image_host_is_allowed_without_trusting_parent_domain(self):
+        switched = "https://rh-hk-images-switch.xiaoyaoyou.com/input/test.jpg"
+        ok, error, _ = app_module._validate_url(switched, app_module.ALLOWED_IMAGE_DOMAINS)
+        self.assertTrue(ok, error)
+        unrelated = "https://untrusted.xiaoyaoyou.com/input/test.jpg"
+        ok, error, _ = app_module._validate_url(unrelated, app_module.ALLOWED_IMAGE_DOMAINS)
+        self.assertFalse(ok)
+        self.assertIn("域名不在白名单", error)
+        self.assertTrue(app_module._ecommerce_generation_needs_configuration(error))
 
     def test_action_folder_import_is_naturally_sorted_and_capped_at_twenty(self):
         action_root = os.path.join(self.user_temp.name, "动作组")
@@ -1405,6 +1684,53 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(saved_task["state"], "accepted")
         self.assertEqual(len(saved_task["attempts"]), 1)
 
+    def test_interrupted_rerun_reuses_exact_paid_provider_task(self):
+        batch = {
+            'id': 'rerun-provider-recovery',
+            'tasks': [{
+                'id': 'task-g1-a4', 'garment_id': 'g1', 'action_order': 3,
+                'attempts': [{
+                    'id': 'rerun-op-1', 'rerun': True, 'provider': 'runninghub',
+                    'status': 'submitted', 'request_id': 'paid-task-id',
+                    'rerun_sample': 1, 'rerun_total': 2,
+                    'rerun_operation_id': 'rerun-op',
+                    'source_deletion_ids': ['delete-1'], 'source_mark_id': '',
+                    'archived_path': '',
+                }],
+            }],
+        }
+        found = app_module._ecommerce_resumable_rerun_attempt(
+            batch, 'task-g1-a4', 1, 2, ['delete-1'], '', 'rerun-op'
+        )
+        self.assertEqual(found['request_id'], 'paid-task-id')
+        self.assertIsNone(app_module._ecommerce_resumable_rerun_attempt(
+            batch, 'task-g1-a4', 1, 2, ['another-delete'], '', 'rerun-op'
+        ))
+
+    def test_startup_marks_old_process_rerun_worker_recoverable(self):
+        store = {
+            'version': 2, 'templates': [], 'batches': [], 'waste_scans': [],
+            'rerun_batches': [{
+                'id': 'orphan-rerun', 'batch_id': 'b1', 'status': 'running',
+                'created_at': '2026-08-01T10:00:00', 'updated_at': '2026-08-01T10:01:00',
+                'items': [{
+                    'item_id': 'g1-1', 'garment_id': 'g1', 'garment_name': '服装1',
+                    'action_order': 1, 'status': 'running', 'worker_id': 'old-process',
+                    'payload': {'count': 2}, 'archived_paths': [],
+                }],
+            }],
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, store)
+        app_module._ecommerce_resume_running_batches()
+        recovered = app_module.load_json(app_module.ECOMMERCE_DATA_FILE)['rerun_batches'][0]
+        self.assertEqual(recovered['status'], 'interrupted')
+        self.assertEqual(recovered['items'][0]['status'], 'pending')
+        self.assertTrue(recovered['items'][0]['recovery_pending'])
+        summary = app_module._ecommerce_rerun_batch_summary(recovered)
+        self.assertEqual(summary['requested_image_count'], 2)
+        self.assertEqual(summary['returned_image_count'], 0)
+        self.assertEqual(summary['item_statuses'][0]['requested_count'], 2)
+
     def test_qc_service_failure_keeps_candidate_for_resume(self):
         garment_folder = self.make_garment("质检断点款")
         candidate = os.path.join(self.user_temp.name, "qc-candidate.jpg")
@@ -1534,7 +1860,7 @@ class EcommerceBatchTest(unittest.TestCase):
         archived = app_module._ecommerce_archive_sample(
             batch, task, candidate, 1, 1, run_code_override="RH-NBP-LC-4K-RR"
         )
-        self.assertEqual(os.path.basename(archived), "RH-NBP-LC-4K-RR-AI-01.jpg")
+        self.assertEqual(os.path.basename(archived), "RH-NBP-LC-4K-RR-AI-01-01.jpg")
 
     def test_deleted_sample_can_be_scanned_and_rerun_repeatedly(self):
         result_dir = os.path.join(self.user_temp.name, "repeat-rerun-results")
@@ -1642,7 +1968,7 @@ class EcommerceBatchTest(unittest.TestCase):
         self.make_image(deleted_preview, color=(160, 80, 90))
         app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {"version": 1, "templates": [], "batches": [batch]})
 
-        response = self.client.get("/api/ecommerce/batches/compare-batch/garments/g1/compare")
+        response = self.client.get("/api/ecommerce/batches/compare-batch/garments/g1/compare?show_deleted=1")
         self.assertEqual(response.status_code, 200, response.get_json())
         payload = response.get_json()
         self.assertEqual(len(payload["references"]), 2)
@@ -1683,6 +2009,11 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(len(compare['references']), 1)
         self.assertEqual(compare['references'][0]['path'], target)
         self.assertEqual(compare['references'][0]['role'], 'target')
+        self.assertEqual(len(compare['action_groups']), 1)
+        self.assertEqual(compare['action_groups'][0]['action_code'], 'A01')
+        self.assertEqual(compare['action_groups'][0]['reference']['path'], target)
+        self.assertEqual(compare['action_groups'][0]['original_count'], 1)
+        self.assertEqual(compare['action_groups'][0]['kept_count'], 1)
 
         os.remove(generated)
         scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
@@ -1726,8 +2057,8 @@ class EcommerceBatchTest(unittest.TestCase):
         response = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
         self.assertEqual(response.status_code, 200, response.get_json())
         items = response.get_json()['items']
+        # 抽卡模式必须达到批次目标数；这里实际只有2/3，应提示补1张。
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]['action_order'], 1)
         self.assertEqual(items[0]['actual_count'], 2)
         self.assertEqual(items[0]['expected_count'], 3)
         self.assertEqual(items[0]['missing_count'], 1)
@@ -1767,24 +2098,112 @@ class EcommerceBatchTest(unittest.TestCase):
             'batch_id': batch['id'], 'garment_id': 'g1', 'path': deleted_output,
         })
         self.assertEqual(deleted.status_code, 200, deleted.get_json())
-        self.assertTrue(os.path.isfile(deleted_output + '.deleted'))
+        deletion_id = deleted.get_json()['deletion_id']
+        stored_after_delete = app_module._ecommerce_batch_snapshot(batch['id'])
+        # 软删除模式：文件保留在源目录，不移动到回收站
+        record = stored_after_delete['deleted_samples'][0]
+        self.assertTrue(record.get('soft_delete'))
+        self.assertTrue(os.path.exists(deleted_output))
+
+        compare = self.client.get('/api/ecommerce/batches/deletion-ledger-scan/garments/g1/compare')
+        self.assertEqual(compare.status_code, 200, compare.get_json())
+        deleted_preview = next(row for row in compare.get_json()['results'] if row.get('deleted'))
+        self.assertEqual(deleted_preview['deletion_id'], deletion_id)
+        self.assertEqual(deleted_preview['original_path'], deleted_output)
 
         for _ in range(2):
             scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
             self.assertEqual(scan.status_code, 200, scan.get_json())
-            items = scan.get_json()['items']
-            self.assertEqual(len(items), 1)
-            self.assertEqual(items[0]['actual_count'], 1)
-            self.assertEqual(items[0]['deleted_record_count'], 1)
-            self.assertEqual(items[0]['missing_count'], 1)
-            self.assertTrue(os.path.isfile(items[0]['bad_photo_path']))
+            # 另一张候选仍有效，被删的抽卡不能再加入废片重做。
+            self.assertEqual(scan.get_json()['items'], [])
 
         stored = app_module._ecommerce_batch_snapshot(batch['id'])
         self.assertEqual(len(stored.get('deleted_samples') or []), 1)
         undo = self.client.post('/api/ecommerce/undo-delete', json={
-            'batch_id': batch['id'], 'garment_id': 'g1', 'path': deleted_output,
+            'batch_id': batch['id'], 'garment_id': 'g1', 'deletion_id': deletion_id,
         })
         self.assertEqual(undo.status_code, 200, undo.get_json())
+        scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+        self.assertEqual(scan.status_code, 200, scan.get_json())
+        self.assertEqual(scan.get_json()['items'], [])
+
+        # 第五步取消单张重做走同一条真实恢复链路，并可幂等退出扫描列表。
+        deleted_again = self.client.post('/api/ecommerce/delete-sample', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'path': deleted_output,
+        })
+        self.assertEqual(deleted_again.status_code, 200, deleted_again.get_json())
+        scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+        self.assertEqual(scan.get_json()['items'], [])
+        item = {
+            'id': 'g1-1', 'garment_id': 'g1', 'action_order': 1,
+            'deletion_ids': [deleted_again.get_json()['deletion_id']],
+        }
+        cancelled = self.client.post('/api/ecommerce/cancel-rerun-items', json={
+            'batch_id': batch['id'],
+            'items': [{
+                'item_id': item['id'], 'garment_id': item['garment_id'],
+                'action_order': item['action_order'], 'deletion_ids': item['deletion_ids'],
+            }],
+        })
+        self.assertEqual(cancelled.status_code, 200, cancelled.get_json())
+        self.assertEqual(cancelled.get_json()['cancelled_item_ids'], [item['id']])
+        # 软删除模式：文件始终在源目录
+        self.assertTrue(os.path.isfile(deleted_output))
+        scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+        self.assertEqual(scan.get_json()['items'], [])
+
+    def test_undo_delete_restores_legacy_rerun_from_full_resolution_candidate(self):
+        target = os.path.join(self.user_temp.name, 'legacy-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'legacy-reference.jpg')
+        candidate = os.path.join(self.user_temp.name, 'legacy-rerun-candidate.png')
+        result_dir = os.path.join(self.user_temp.name, 'legacy-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(reference)
+        Image.new('RGB', (96, 144), (220, 30, 40)).save(candidate, 'PNG')
+        output = os.path.join(result_dir, 'RUN-AI-01.png')
+        preview = os.path.join(self.user_temp.name, '_废片预览备份', 'legacy-restore', '款式1', 'AI-01.jpg')
+        os.makedirs(os.path.dirname(preview))
+        Image.new('RGB', (24, 36), (20, 30, 40)).save(preview, 'JPEG')
+        batch = {
+            'id': 'legacy-restore', 'name': '旧重做恢复', 'run_code': 'RUN',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False},
+            'template': {'actions': [{
+                'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                'prompt': '测试', 'platform': 'runninghub', 'model_key': 'nano/2k',
+            }]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{
+                'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1',
+                'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                'state': 'accepted', 'accepted_path': output,
+                'attempts': [{
+                    'id': 'rerun-1', 'rerun': True, 'status': 'archived',
+                    'candidate_path': candidate, 'archived_path': output,
+                }],
+            }],
+            'deleted_samples': [{
+                'id': 'legacy-deletion', 'garment_id': 'g1', 'garment_name': '款式1',
+                'action_order': 1, 'sample_index': 1, 'original_path': output,
+                'preview_path': preview, 'status': 'deleted',
+            }],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+
+        response = self.client.post('/api/ecommerce/undo-delete', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'deletion_id': 'legacy-deletion',
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()['restore_source'], 'rerun_candidate')
+        self.assertTrue(os.path.isfile(output))
+        self.assertTrue(os.path.isfile(candidate), '恢复不能移走唯一的4K生成备份')
+        with Image.open(output) as restored:
+            self.assertEqual(restored.size, (96, 144))
+            self.assertEqual(restored.getpixel((0, 0)), (220, 30, 40))
         scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
         self.assertEqual(scan.status_code, 200, scan.get_json())
         self.assertEqual(scan.get_json()['items'], [])
@@ -1826,11 +2245,7 @@ class EcommerceBatchTest(unittest.TestCase):
         for _ in range(2):
             scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
             self.assertEqual(scan.status_code, 200, scan.get_json())
-            items = scan.get_json()['items']
-            self.assertEqual(len(items), 1)
-            self.assertEqual(items[0]['actual_count'], 1)
-            self.assertEqual(items[0]['deleted_record_count'], 1)
-            self.assertEqual(items[0]['bad_photo_path'], preview)
+            self.assertEqual(scan.get_json()['items'], [])
         stored = app_module._ecommerce_batch_snapshot(batch['id'])
         self.assertEqual(len(stored.get('deleted_samples') or []), 1)
         self.assertEqual(stored['deleted_samples'][0]['original_path'], old_output)
@@ -1899,11 +2314,9 @@ class EcommerceBatchTest(unittest.TestCase):
             scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
             self.assertEqual(scan.status_code, 200, scan.get_json())
             items = scan.get_json()['items']
-            self.assertEqual(len(items), 2)
-            waste = next(item for item in items if not item.get('marked_redo'))
-            marked = next(item for item in items if item.get('marked_redo'))
-            self.assertTrue(waste['also_marked_redo'])
-            self.assertIn(mark_ids[0], waste['merged_mark_ids'])
+            self.assertEqual(len(items), 1)
+            marked = items[0]
+            self.assertTrue(marked.get('marked_redo'))
             self.assertEqual(marked['mark_id'], mark_ids[1])
             self.assertEqual(marked['bad_photo_path'], outputs[1])
 
@@ -1926,6 +2339,77 @@ class EcommerceBatchTest(unittest.TestCase):
         scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
         self.assertEqual(scan.status_code, 200, scan.get_json())
         self.assertEqual(scan.get_json()['items'], [])
+
+    def test_three_draws_settle_only_the_selected_deletion_and_stay_in_one_action(self):
+        target = os.path.join(self.user_temp.name, 'draw-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'draw-reference.jpg')
+        candidate = os.path.join(self.user_temp.name, 'draw-candidate.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'draw-results')
+        os.makedirs(result_dir)
+        for path in (target, reference, candidate):
+            self.make_image(path)
+        outputs = [
+            os.path.join(result_dir, f'RUN-R0{index}-AI-01.jpg')
+            for index in range(1, 4)
+        ]
+        for index, path in enumerate(outputs):
+            self.make_image(path, color=(60 + index * 30, 90, 120))
+        action = {
+            'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+            'prompt': '测试', 'platform': 'runninghub',
+            'model_key': 'rhart-image-n-g31-flash/image-to-image-2k',
+            'endpoint': 'rhart-image-n-g31-flash/image-to-image', 'resolution': '2k',
+        }
+        batch = {
+            'id': 'draw-settlement', 'name': '抽卡结算', 'run_code': 'RUN-RR',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False},
+            'template': {'actions': [action]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{
+                'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1',
+                'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                'state': 'accepted', 'accepted_path': outputs[0],
+                'attempts': [{'archived_path': path} for path in outputs],
+            }],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [], 'rerun_batches': [],
+        })
+
+        deletion_ids = []
+        for path in outputs[:2]:
+            response = self.client.post('/api/ecommerce/delete-sample', json={
+                'batch_id': batch['id'], 'garment_id': 'g1', 'path': path,
+            })
+            self.assertEqual(response.status_code, 200, response.get_json())
+            deletion_ids.append(response.get_json()['deletion_id'])
+
+        with patch.object(app_module, '_ecommerce_generate_candidate', return_value=candidate):
+            rerun = self.client.post('/api/ecommerce/regenerate', json={
+                'batch_id': batch['id'], 'item_id': 'g1-1', 'result_path': result_dir,
+                'reference_images': [reference], 'deletion_ids': [deletion_ids[0]],
+                'prompt': '', 'count': 3,
+            })
+        self.assertEqual(rerun.status_code, 200, rerun.get_json())
+        self.assertEqual(rerun.get_json()['success_count'], 3)
+
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        by_id = {row['id']: row for row in stored['deleted_samples']}
+        self.assertEqual(by_id[deletion_ids[0]]['status'], 'replaced')
+        self.assertEqual(by_id[deletion_ids[1]]['status'], 'deleted')
+        self.assertEqual(len(by_id[deletion_ids[0]]['replacement_candidates']), 3)
+
+        scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+        self.assertEqual(scan.status_code, 200, scan.get_json())
+        self.assertEqual(scan.get_json()['items'], [])
+
+        compare = self.client.get('/api/ecommerce/batches/draw-settlement/garments/g1/compare')
+        self.assertEqual(compare.status_code, 200, compare.get_json())
+        live = [row for row in compare.get_json()['results'] if not row.get('deleted')]
+        self.assertEqual(len(live), 4)
+        self.assertEqual({row['action_order'] for row in live}, {1})
 
     def test_target_only_rerun_accepts_empty_reference_list_and_keeps_garment_images_empty(self):
         target = os.path.join(self.user_temp.name, 'rerun-target.jpg')
@@ -2018,6 +2502,8 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(compare_data['generation_mode'], 'garment_prompt')
         self.assertEqual([ref['path'] for ref in compare_data['references']], [source_two])
         self.assertEqual(compare_data['references'][0]['role'], 'source_garment')
+        self.assertEqual(compare_data['action_groups'][0]['reference']['path'], source_two)
+        self.assertEqual(compare_data['action_groups'][0]['reference']['role'], 'source_image')
 
         os.remove(generated_two)
         scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
@@ -2156,8 +2642,14 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertTrue(all(os.path.isfile(path) for path in archived))
         self.assertEqual(
             sorted(os.path.basename(path).rsplit('.', 1)[0].rsplit('-', 1)[-1] for path in archived),
-            ['1', '2', '3'],
+            ['CK01', 'CK02', 'CK03'],
         )
+        self.assertEqual(len(finished.get('result_assets') or []), 3)
+        manifest_path = os.path.join(os.path.dirname(archived[0]), 'asset-manifest.json')
+        with open(manifest_path, encoding='utf-8') as handle:
+            manifest = json.load(handle)
+        self.assertEqual(len(manifest['assets']), 3)
+        self.assertEqual({row['candidate_index'] for row in manifest['assets']}, {1, 2, 3})
 
     def test_model_signature_normalizes_resolution_for_waste_breakdown(self):
         lower = app_module._ecommerce_action_model_signature({
@@ -2362,6 +2854,356 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertIn('.ecommerce-compare-pane-reference { grid-template-rows: minmax(0, 1fr) auto;', styles)
         self.assertIn('.ecommerce-compare-pane-results { grid-template-rows: minmax(0, 1fr) auto auto auto;', styles)
         self.assertNotIn('.ecommerce-compare-pane-reference { grid-template-rows: auto 1fr auto;', styles)
+
+    def test_soft_deleted_files_excluded_from_final_candidates(self):
+        """软删除文件不应出现在最终候选列表中，阻止误选和误确认。"""
+        target = os.path.join(self.user_temp.name, 'softdel-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'softdel-ref.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'softdel-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(reference)
+        deleted_output = os.path.join(result_dir, 'RH-NB2-LC-2K-R01-AI-01.jpg')
+        self.make_image(deleted_output, color=(150, 70, 60))
+        batch = {
+            'id': 'softdel-batch', 'name': '软删除候选测试',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False},
+            'template': {'actions': [{
+                'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                'prompt': '测试', 'platform': 'runninghub', 'model_key': 'nano/2k',
+            }]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{
+                'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1',
+                'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                'state': 'accepted', 'accepted_path': deleted_output, 'attempts': [],
+            }],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+
+        # Mark for deletion (soft delete)
+        deleted = self.client.post('/api/ecommerce/delete-sample', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'path': deleted_output,
+        })
+        self.assertEqual(deleted.status_code, 200, deleted.get_json())
+
+        # _ecommerce_final_candidates should NOT include the soft-deleted file
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        garment = stored['garments'][0]
+        candidates = app_module._ecommerce_final_candidates(stored, garment)
+        self.assertEqual(candidates, {}, "Soft-deleted file should be excluded from final candidates")
+
+        # confirm-group should fail because the action has no valid candidates
+        confirm = self.client.post('/api/ecommerce/confirm-group', json={
+            'batch_id': batch['id'], 'garment_id': 'g1',
+        })
+        self.assertEqual(confirm.status_code, 409, confirm.get_json())
+
+        # Export status should report the action as missing
+        status = app_module._ecommerce_final_export_status(stored)
+        self.assertEqual(status['missing_actions'], 1)
+        self.assertFalse(status['ready'])
+
+    def test_recovered_file_identity_recognition(self):
+        """从回收站恢复的文件（-recovered后缀）应被身份识别正确解析。"""
+        # Direct unit test of identity function
+        identity = app_module._ecommerce_sample_identity('RH-NB2-LC-2K-R01-AI-01-recovered.jpg')
+        self.assertIsNotNone(identity, "Recovered file should be recognized")
+        self.assertEqual(identity['action_order'], 1)
+        self.assertEqual(identity['sample_index'], 1)
+
+        # With numeric suffix from _ecommerce_unique_copy
+        identity2 = app_module._ecommerce_sample_identity('RH-NB2-LC-2K-R01-AI-01-recovered-2.jpg')
+        self.assertIsNotNone(identity2, "Recovered file with suffix should be recognized")
+        self.assertEqual(identity2['action_order'], 1)
+
+        # Multi-sample recovered file (action 1, sample 3)
+        identity3 = app_module._ecommerce_sample_identity('RH-NB2-LC-2K-R01-AI-01-03-recovered.jpg')
+        self.assertIsNotNone(identity3)
+        self.assertEqual(identity3['action_order'], 1)
+        self.assertEqual(identity3['sample_index'], 3)
+
+    def test_confirm_group_and_export_confirmed_only(self):
+        """确认组 + 仅导出已确认组的完整流程。"""
+        target = os.path.join(self.user_temp.name, 'confirm-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'confirm-ref.jpg')
+        result_dir1 = os.path.join(self.user_temp.name, 'confirm-results-g1')
+        result_dir2 = os.path.join(self.user_temp.name, 'confirm-results-g2')
+        os.makedirs(result_dir1)
+        os.makedirs(result_dir2)
+        self.make_image(target)
+        self.make_image(reference)
+        output1 = os.path.join(result_dir1, 'RH-NB2-LC-2K-R01-AI-01.jpg')
+        output2 = os.path.join(result_dir2, 'RH-NB2-LC-2K-R01-AI-01.jpg')
+        self.make_image(output1, color=(100, 150, 200))
+        self.make_image(output2, color=(200, 100, 150))
+        batch = {
+            'id': 'confirm-batch', 'name': '确认组测试',
+            'output_path': self.user_temp.name,
+            'result_dirs': {'g1': result_dir1, 'g2': result_dir2},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False},
+            'template': {'actions': [{
+                'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                'prompt': '测试', 'platform': 'runninghub', 'model_key': 'nano/2k',
+            }]},
+            'garments': [
+                {'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]},
+                {'id': 'g2', 'name': '款式2', 'path': self.user_temp.name, 'images': [reference]},
+            ],
+            'tasks': [
+                {'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1',
+                 'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                 'state': 'accepted', 'accepted_path': output1, 'attempts': []},
+                {'id': 't2', 'garment_id': 'g2', 'garment_name': '款式2',
+                 'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                 'state': 'accepted', 'accepted_path': output2, 'attempts': []},
+            ],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+
+        # Confirm g1 only
+        confirm = self.client.post('/api/ecommerce/confirm-group', json={
+            'batch_id': batch['id'], 'garment_id': 'g1',
+        })
+        self.assertEqual(confirm.status_code, 200, confirm.get_json())
+        self.assertTrue(confirm.get_json()['ok'])
+
+        export_dir = os.path.join(self.user_temp.name, 'export-output')
+        os.makedirs(export_dir)
+        export = self.client.post('/api/ecommerce/export-final-products', json={
+            'batch_id': batch['id'], 'destination': export_dir, 'confirmed_only': True,
+        })
+        self.assertEqual(export.status_code, 200, export.get_json())
+        self.assertEqual(export.get_json()['file_count'], 1)
+        status = app_module._ecommerce_final_export_status(
+            app_module._ecommerce_batch_snapshot(batch['id']))
+        self.assertTrue(status['ready'])
+        unconfirm = self.client.post('/api/ecommerce/unconfirm-group', json={
+            'batch_id': batch['id'], 'garment_id': 'g1',
+        })
+        self.assertEqual(unconfirm.status_code, 200, unconfirm.get_json())
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        self.assertNotIn('g1', stored.get('confirmed_groups') or {})
+
+    def test_bj_result_is_valid_candidate_but_pending_mark_stays_bound_to_original(self):
+        target = os.path.join(self.user_temp.name, 'bj-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'bj-reference.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'bj-results')
+        os.makedirs(result_dir)
+        for path in (target, reference):
+            self.make_image(path)
+        original = os.path.join(result_dir, 'RUN-AI-01-01.jpg')
+        bj_result = os.path.join(result_dir, 'RUN-AI-01-BJ01.jpg')
+        self.make_image(original)
+        self.make_image(bj_result, color=(180, 90, 70))
+        batch = {
+            'id': 'bj-valid', 'name': 'BJ识别', 'output_path': self.user_temp.name,
+            'result_dirs': {'g1': result_dir},
+            'template': {'actions': [{'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target}]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'images': [reference]}],
+            'tasks': [{'id': 't1', 'garment_id': 'g1', 'action_id': 'a1', 'action_order': 0,
+                       'action_name': '正面', 'attempts': []}],
+            'marked_redo': [{'id': 'mark-original', 'garment_id': 'g1', 'action_order': 1,
+                             'result_path': original}],
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'rerun_batches': [],
+        })
+        identity = app_module._ecommerce_sample_identity(bj_result)
+        self.assertTrue(identity['is_marked_rerun'])
+        self.assertFalse(identity['is_marked_redo'])
+        self.assertTrue(identity['is_valid_result'])
+        payload = self.client.get('/api/ecommerce/batches/bj-valid/garments/g1/compare').get_json()
+        by_path = {row['path']: row for row in payload['results']}
+        self.assertTrue(by_path[original]['marked_redo'])
+        self.assertFalse(by_path[bj_result]['marked_redo'])
+        self.assertTrue(by_path[bj_result]['from_marked_redo'])
+        candidates = app_module._ecommerce_final_candidates(
+            app_module._ecommerce_batch_snapshot('bj-valid'), batch['garments'][0],
+        )
+        self.assertIn(bj_result, candidates[1])
+
+    def test_confirmed_group_rejects_delete_and_mark_until_unconfirmed(self):
+        target = os.path.join(self.user_temp.name, 'lock-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'lock-reference.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'lock-results')
+        os.makedirs(result_dir)
+        for path in (target, reference):
+            self.make_image(path)
+        result = os.path.join(result_dir, 'RUN-AI-01-01.jpg')
+        self.make_image(result)
+        batch = {
+            'id': 'confirmed-lock', 'name': '确认锁', 'output_path': self.user_temp.name,
+            'result_dirs': {'g1': result_dir},
+            'template': {'actions': [{'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target}]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'images': [reference]}],
+            'tasks': [{'id': 't1', 'garment_id': 'g1', 'action_order': 0, 'attempts': []}],
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'rerun_batches': [],
+        })
+        confirmed = self.client.post('/api/ecommerce/confirm-group', json={'batch_id': batch['id'], 'garment_id': 'g1'})
+        self.assertEqual(confirmed.status_code, 200, confirmed.get_json())
+        deleted = self.client.post('/api/ecommerce/delete-sample', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'path': result,
+        })
+        marked = self.client.post('/api/ecommerce/mark-redo', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'action_order': 1, 'result_path': result,
+        })
+        self.assertEqual(deleted.status_code, 409)
+        self.assertEqual(marked.status_code, 409)
+        self.assertTrue(os.path.isfile(result))
+
+    def test_persisted_three_draw_rerun_keeps_partial_and_retries_only_missing(self):
+        target = os.path.join(self.user_temp.name, 'strict-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'strict-reference.jpg')
+        candidate = os.path.join(self.user_temp.name, 'strict-candidate.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'strict-results')
+        os.makedirs(result_dir)
+        for path in (target, reference, candidate):
+            self.make_image(path)
+        action = {'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                  'prompt': '测试', 'platform': 'runninghub', 'model_key': 'nano/2k'}
+        batch = {
+            'id': 'strict-rerun', 'name': '严格抽卡', 'run_code': 'RUN',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'template': {'actions': [action]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'images': [reference]}],
+            'tasks': [{'id': 't1', 'garment_id': 'g1', 'action_id': 'a1', 'action_order': 0,
+                       'action_name': '正面', 'attempts': []}],
+        }
+        queue_item = {
+            'id': 'queue-1', 'item_id': 'g1-1', 'garment_id': 'g1', 'garment_name': '款式1',
+            'action_order': 1, 'status': 'pending', 'archived_paths': [],
+            'requested_count': 3, 'success_count': 0, 'remaining_count': 3,
+            'payload': {'count': 3},
+        }
+        rerun_batch = {
+            'id': 'rerun-strict-1', 'batch_id': batch['id'], 'name': '重做1',
+            'status': 'running', 'items': [queue_item], 'created_at': '2026-08-01T10:00:00',
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'rerun_batches': [rerun_batch],
+        })
+        phase = {'partial': True, 'calls': []}
+
+        def generate(_batch, _task, _garment, _action, _prompt, attempt):
+            phase['calls'].append((phase['partial'], attempt['rerun_sample']))
+            if phase['partial'] and attempt['rerun_sample'] >= 2:
+                raise RuntimeError('平台暂时少返')
+            return candidate
+
+        request_payload = {
+            'batch_id': batch['id'], 'rerun_batch_id': rerun_batch['id'],
+            'item_id': 'g1-1', 'result_path': result_dir,
+            'reference_images': [reference], 'count': 3,
+        }
+        with patch.object(app_module, '_ecommerce_generate_candidate', side_effect=generate), \
+                patch.object(app_module.time, 'sleep', return_value=None):
+            partial = self.client.post('/api/ecommerce/regenerate', json=request_payload)
+            self.assertEqual(partial.status_code, 503, partial.get_json())
+            self.assertEqual(partial.get_json()['success_count'], 1)
+            self.assertEqual(partial.get_json()['remaining_count'], 2)
+            phase['partial'] = False
+            completed = self.client.post('/api/ecommerce/regenerate', json=request_payload)
+        self.assertEqual(completed.status_code, 200, completed.get_json())
+        self.assertEqual(completed.get_json()['success_count'], 3)
+        self.assertEqual(completed.get_json()['remaining_count'], 0)
+        names = sorted(os.path.basename(path) for path in completed.get_json()['archived_list'])
+        self.assertTrue(all('-FP01-CK' in name for name in names))
+        self.assertEqual(sum(1 for partial_phase, sample in phase['calls'] if not partial_phase and sample == 1), 0)
+        stored_rerun = app_module._ecommerce_rerun_batch_snapshot(rerun_batch['id'])
+        self.assertEqual(stored_rerun['items'][0]['status'], 'accepted')
+        self.assertEqual(stored_rerun['items'][0]['success_count'], 3)
+
+    def test_recover_from_recycle_makes_file_visible_in_compare(self):
+        """从回收站恢复的文件应能在对比界面中被识别和显示。"""
+        target = os.path.join(self.user_temp.name, 'recover-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'recover-ref.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'recover-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(reference)
+        output = os.path.join(result_dir, 'RH-NB2-LC-2K-R01-AI-01.jpg')
+        self.make_image(output, color=(100, 200, 50))
+        batch = {
+            'id': 'recover-batch', 'name': '回收站恢复测试',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False},
+            'template': {'actions': [{
+                'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                'prompt': '测试', 'platform': 'runninghub', 'model_key': 'nano/2k',
+            }]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{
+                'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1',
+                'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                'state': 'accepted', 'accepted_path': output, 'attempts': [],
+            }],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+
+        # Soft delete
+        deleted = self.client.post('/api/ecommerce/delete-sample', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'path': output,
+        })
+        self.assertEqual(deleted.status_code, 200, deleted.get_json())
+        deletion_id = deleted.get_json()['deletion_id']
+
+        # Simulate hard delete: move file to recycle and update record
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        record = next(r for r in stored['deleted_samples'] if r['id'] == deletion_id)
+        recycle_path = app_module._ecommerce_deleted_recycle_path(stored, stored['garments'][0], output)
+        os.makedirs(os.path.dirname(recycle_path), exist_ok=True)
+        os.rename(output, recycle_path)
+
+        def update_record(sb):
+            for r in sb.get('deleted_samples') or []:
+                if r['id'] == deletion_id:
+                    r['soft_delete'] = False
+                    r['recycle_path'] = recycle_path
+        app_module._ecommerce_mutate_batch(batch['id'], update_record)
+
+        # Recover from recycle
+        recover = self.client.post('/api/ecommerce/recover-from-recycle', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'deletion_id': deletion_id,
+        })
+        self.assertEqual(recover.status_code, 200, recover.get_json())
+        recovered_path = recover.get_json()['recovered_path']
+        self.assertTrue(os.path.isfile(recovered_path))
+
+        # The recovered file should be recognized by identity function
+        identity = app_module._ecommerce_sample_identity(os.path.basename(recovered_path))
+        self.assertIsNotNone(identity, f"Recovered file {os.path.basename(recovered_path)} should be recognized")
+        self.assertEqual(identity['action_order'], 1)
+
+        # The recovered file should appear in final_candidates
+        stored2 = app_module._ecommerce_batch_snapshot(batch['id'])
+        candidates = app_module._ecommerce_final_candidates(stored2, stored2['garments'][0])
+        self.assertIn(1, candidates, "Action order 1 should have candidates after recovery")
+        self.assertTrue(any(os.path.realpath(p) == os.path.realpath(recovered_path) for p in candidates[1]))
+
+        # The deletion record should be marked as 'recovered' (not active)
+        record_after = next(r for r in stored2['deleted_samples'] if r['id'] == deletion_id)
+        self.assertEqual(record_after['status'], 'recovered')
+        active_deletions = app_module._ecommerce_active_deleted_samples(stored2, 'g1')
+        self.assertEqual(len(active_deletions), 0, "No active deletions should remain after recovery")
+
+        # Group should now be confirmable (no active deletions, has candidates)
+        confirm = self.client.post('/api/ecommerce/confirm-group', json={
+            'batch_id': batch['id'], 'garment_id': 'g1',
+        })
+        self.assertEqual(confirm.status_code, 200, confirm.get_json())
 
 
 if __name__ == "__main__":

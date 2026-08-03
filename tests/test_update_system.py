@@ -49,13 +49,13 @@ class UpdateSystemTest(unittest.TestCase):
             payload = app_module.app.test_client().get('/api/check-update').get_json()
         self.assertFalse(payload['has_update'])
         self.assertEqual(payload['release_status'], 'local_ahead')
-        self.assertEqual(payload['local_version'], '1.5.1')
+        self.assertEqual(payload['local_version'], '15.5.0')
         self.assertEqual(payload['remote_version'], '1.4.0')
 
     def test_check_update_rejects_release_without_compatible_asset(self):
         response = Mock(status_code=200)
         response.json.return_value = {
-            'tag_name': 'v1.6.0', 'assets': [], 'body': '', 'html_url': 'https://github.com/release'
+            'tag_name': 'v15.6.0', 'assets': [], 'body': '', 'html_url': 'https://github.com/release'
         }
         with patch.object(app_module.requests, 'get', return_value=response):
             payload = app_module.app.test_client().get('/api/check-update').get_json()

@@ -2942,8 +2942,8 @@ body {
 .ecommerce-folder-preview-head { display: flex; align-items: center; gap: 5px; margin-top: 8px; padding-top: 7px; border-top: 1px solid #eaecf0; }
 .ecommerce-folder-preview-head strong { color: #182230; font-size: 12px; font-weight: 650; }
 .ecommerce-folder-preview-head small { color: #98a2b3; font-size: 10px; line-height: 1.4; }
-.ecommerce-result-folders { margin-top: 5px; max-height: 220px; overflow-y: auto; overflow-x: hidden; border: 1px solid #eaecf0; border-radius: 7px; }
-.ecommerce-folder-row { display: grid; grid-template-columns: fit-content(126px) max-content max-content; justify-content: start; gap: 5px; align-items: center; min-width: 0; padding: 4px 6px; border-bottom: 1px solid #f0f2f5; font-size: 10px; color: #475467; }
+.ecommerce-result-folders { margin-top: 5px; max-height: 160px; overflow-y: auto; overflow-x: hidden; border: 1px solid #eaecf0; border-radius: 7px; }
+.ecommerce-folder-row { display: grid; grid-template-columns: fit-content(126px) max-content max-content; justify-content: start; gap: 5px; align-items: center; min-width: 0; padding: 4px 6px; border-bottom: 1px solid #f0f2f5; border-left: 3px solid transparent; font-size: 10px; color: #475467; }
 .ecommerce-folder-row > :first-child { min-width: 56px; }
 .ecommerce-folder-row:not(.is-head) { content-visibility: auto; contain-intrinsic-size: 42px; }
 .ecommerce-folder-row:last-child { border-bottom: 0; }
@@ -2995,12 +2995,27 @@ body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-waste-rate.is-low { background: #ecfdf3; color: #027a48; }
 .ecommerce-waste-rate.is-mid { background: #fffaeb; color: #b54708; }
 .ecommerce-waste-rate.is-high { background: #fef3f2; color: #b42318; }
-.ecommerce-rerun-list { margin-top: 8px; min-height: 200px; border: 1px solid #eaecf0; border-radius: 8px; }
+.ecommerce-rerun-list { margin-top: 8px; min-height: 120px; flex: 1 1 0; overflow-y: auto; border: 1px solid #eaecf0; border-radius: 8px; }
 .ecommerce-rerun-batches { display: grid; gap: 5px; margin-top: 7px; }
+.ecommerce-final-export { margin-top: 7px; border: 1px solid #bbf7d0; border-radius: 7px; overflow: hidden; background: #f0fdf4; }
+.ecommerce-final-export > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; cursor: pointer; list-style: none; color: #166534; }
+.ecommerce-final-export > summary::-webkit-details-marker { display: none; }
+.ecommerce-final-export > summary strong { font-size: 10px; }
+.ecommerce-final-export > summary small { color: #15803d; font-size: 9px; }
+.ecommerce-final-export-body { display: grid; gap: 5px; padding: 7px; border-top: 1px solid #bbf7d0; background: #fff; }
+.ecommerce-final-export-body .ecommerce-row { flex-wrap: wrap; }
+.ecommerce-final-export-body input { min-width: 150px; flex: 1 1 180px; }
+#ecommerce-final-export-status.is-ready { border-color: #86efac; background: #f0fdf4; color: #166534; }
 .ecommerce-rerun-batch-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 5px 8px; align-items: center; padding: 6px 7px; border: 1px solid #d0d5dd; border-radius: 7px; background: #fff; font-size: 9px; }
 .ecommerce-rerun-batch-row.is-active { border-color: #84adff; background: #eff4ff; }
 .ecommerce-rerun-batch-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #344054; }
 .ecommerce-rerun-batch-row small { color: #667085; }
+.ecommerce-rerun-batch-item-statuses { grid-column: 1 / -1; display: grid; gap: 2px; padding-top: 3px; border-top: 1px dashed #e4e7ec; }
+.ecommerce-rerun-batch-item-status { display: block; color: #475467; line-height: 1.35; }
+.ecommerce-rerun-batch-item-status.is-accepted { color: #067647; }
+.ecommerce-rerun-batch-item-status.is-partial,
+.ecommerce-rerun-batch-item-status.is-running { color: #b54708; }
+.ecommerce-rerun-batch-item-status.is-failed { color: #b42318; }
 .ecommerce-rerun-batch-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; grid-row: 1 / span 2; grid-column: 2; }
 .ecommerce-rerun-batch-actions .btn { min-height: 25px; padding: 3px 7px; font-size: 9px; }
 .ecommerce-rerun-bulk-bar { position: sticky; top: 0; z-index: 4; display: grid; gap: 6px; padding: 8px; border-bottom: 1px solid #d0d5dd; background: #f8fafc; box-shadow: 0 3px 8px rgba(16,24,40,.06); }
@@ -3048,10 +3063,18 @@ body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-rerun-compare-head strong { font-size: 12px; color: #182230; }
 .ecommerce-rerun-sync-choice { display: inline-flex; align-items: center; gap: 4px; color: #475467; font-size: 9px; white-space: nowrap; }
 .ecommerce-rerun-sync-choice select { max-width: 116px; padding: 4px 5px; border: 1px solid #d0d5dd; border-radius: 5px; background: #fff; color: #344054; font-size: 9px; }
-.ecommerce-rerun-compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ecommerce-rerun-compare-grid { display: grid; grid-template-columns: minmax(120px,.8fr) minmax(120px,.8fr) minmax(220px,1.4fr); gap: 10px; }
 .ecommerce-rerun-compare-col { display: flex; flex-direction: column; gap: 4px; }
 .ecommerce-rerun-compare-col h4 { margin: 0; font-size: 10px; color: #667085; font-weight: 600; }
 .ecommerce-rerun-compare-img { width: 100%; border-radius: 6px; border: 1px solid #eaecf0; }
+.ecommerce-rerun-target-action { position: relative; display: flex; flex-direction: column; gap: 4px; min-height: 160px; padding: 6px; border: 1px solid #bfdbfe; border-radius: 7px; background: #eff6ff; cursor: zoom-in; outline: none; }
+.ecommerce-rerun-target-action:focus-visible { box-shadow: 0 0 0 3px rgba(37,99,235,.22); }
+.ecommerce-rerun-target-action img { width: 100%; min-height: 130px; max-height: 360px; flex: 1 1 auto; object-fit: contain; border-radius: 5px; background: #101828; }
+.ecommerce-rerun-target-action > span { padding: 3px 5px; border-radius: 4px; background: #dbeafe; color: #1d4ed8; font-size: 9px; font-weight: 700; text-align: center; }
+.ecommerce-rerun-target-action > small { color: #475467; font-size: 9px; text-align: center; overflow-wrap: anywhere; }
+.ecommerce-rerun-target-action.is-overridden { border-color: #16a34a; background: #f0fdf4; }
+.ecommerce-rerun-target-action.is-overridden > span { background: #dcfce7; color: #15803d; }
+.ecommerce-rerun-target-action.is-drop-target::after { content: '松手：替换当前动作参考图'; position: absolute; inset: 6px; z-index: 3; display: grid; place-items: center; border: 3px dashed #2563eb; border-radius: 6px; background: rgba(30,64,175,.88); color: #fff; font-size: 11px; font-weight: 700; text-align: center; pointer-events: none; }
 .ecommerce-rerun-refs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-top: 4px; }
 .ecommerce-rerun-ref { position: relative; }
 .ecommerce-rerun-ref img { width: 100%; height: 56px; object-fit: cover; border-radius: 4px; border: 1px solid #eaecf0; }
@@ -3059,7 +3082,13 @@ body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-rerun-ref.is-temporary img { border-color: #2e90fa; box-shadow: inset 0 0 0 1px #2e90fa; }
 .ecommerce-rerun-ref-state { position: absolute; top: 2px; right: 2px; padding: 1px 4px; border-radius: 3px; background: rgba(16,24,40,.82); color: #fff; font-size: 8px; pointer-events: none; }
 .ecommerce-rerun-prompt { width: 100%; min-height: 70px; margin-top: 8px; font-size: 11px; border: 1px solid #d0d5dd; border-radius: 6px; padding: 6px 8px; resize: vertical; font-family: inherit; }
-.ecommerce-rerun-actions { display: flex; gap: 6px; margin-top: 8px; }
+.ecommerce-shared-prompt-templates { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 8px; padding: 6px 8px; border: 1px solid #dbe4ef; border-radius: 7px; background: #f8fafc; }
+.ecommerce-shared-prompt-label { flex: 0 0 auto; font-size: 10px; font-weight: 700; color: #475467; }
+.ecommerce-shared-prompt-list { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.ecommerce-shared-prompt-more { max-width: 125px; padding: 3px 7px; border: 1px solid #d0d5dd; border-radius: 999px; background: #fff; font-size: 10px; }
+.ecommerce-shared-prompt-save { margin-left: auto; white-space: nowrap; }
+.ecommerce-shared-prompt-empty { color: #98a2b3; font-size: 10px; }
+.ecommerce-rerun-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .ecommerce-rerun-mode-switch { display: flex; align-items: center; gap: 4px; margin: 8px 0; padding: 3px; border: 1px solid #e4e7ec; border-radius: 7px; background: #f8fafc; }
 .ecommerce-rerun-mode-switch button { padding: 5px 9px; border: 0; border-radius: 5px; background: transparent; color: #667085; font-size: 10px; font-weight: 650; cursor: pointer; }
 .ecommerce-rerun-mode-switch button.is-active { background: #182230; color: #fff; box-shadow: 0 1px 3px rgba(16,24,40,.18); }
@@ -3102,7 +3131,12 @@ body.ecommerce-compare-open { overflow: hidden; }
 .ecommerce-reference-stage > img { max-width: 100%; max-height: 100%; min-height: 0; object-fit: contain; }
 .ecommerce-compare-overlay[hidden] { display: none; }
 .ecommerce-compare-overlay { position: fixed; inset: 0; z-index: 10050; background: rgba(7, 11, 18, .96); color: #f8fafc; display: grid; place-items: center; padding: 18px; }
-.ecommerce-compare-shell { width: min(1680px, 98vw); height: min(94vh, 1080px); display: grid; grid-template-rows: auto 1fr; border: 1px solid #344054; background: #101828; box-shadow: 0 28px 90px rgba(0,0,0,.55); }
+.ecommerce-compare-shell { width: min(1680px, 98vw); height: min(94vh, 1080px); display: grid; grid-template-rows: auto auto minmax(0, 1fr); border: 1px solid #344054; background: #101828; box-shadow: 0 28px 90px rgba(0,0,0,.55); transition: border-color .3s ease; }
+.ecommerce-compare-shell.is-group-confirmed { border-color: #22c55e; box-shadow: 0 28px 90px rgba(0,0,0,.55), 0 0 0 2px rgba(34,197,94,.3); }
+.ecommerce-compare-shell.is-group-confirmed .ecommerce-compare-toolbar { background: #14532d; border-bottom-color: #22c55e; }
+.ecommerce-compare-shell.is-group-confirmed .ecommerce-compare-toolbar strong { color: #86efac; }
+.ecommerce-compare-confirmed-banner { display: flex; align-items: center; justify-content: center; padding: 6px 14px; background: #22c55e; color: #052e16; font-size: 13px; font-weight: 700; letter-spacing: .3px; grid-row: 2; }
+.ecommerce-compare-confirmed-banner[hidden] { display: none; }
 .ecommerce-compare-toolbar { display: flex; align-items: center; justify-content: space-between; min-height: 54px; padding: 8px 14px; border-bottom: 1px solid #344054; background: #182230; }
 .ecommerce-compare-toolbar > div:first-child { display: flex; align-items: baseline; gap: 14px; flex: 1; min-width: 0; }
 .ecommerce-compare-toolbar strong { font-size: 14px; }
@@ -3116,7 +3150,7 @@ body.ecommerce-compare-open { overflow: hidden; }
 .ecommerce-compare-toolbar-actions button.btn-primary:hover:not(:disabled) { background: #1d4ed8; }
 .ecommerce-compare-toolbar-actions button.btn-outline { background: transparent; }
 .ecommerce-compare-toolbar-actions button#ecommerce-compare-close { width: 36px; min-width: 36px; padding: 0; font-size: 26px; }
-.ecommerce-compare-stage { min-height: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #344054; }
+.ecommerce-compare-stage { min-height: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #344054; grid-row: 3; }
 .ecommerce-compare-pane { position: relative; min-width: 0; min-height: 0; background: #0c111d; display: grid; place-items: center; padding: 44px 18px 18px; overflow: hidden; }
 /* 标签栏是 absolute，不占 grid 行。旧代码却为它预留了一行，导致主画布落进
    auto 行；每次换图后图片尺寸又反向参与行高计算，于是画布和图片逐次缩小。 */
@@ -3163,6 +3197,20 @@ body.ecommerce-compare-open { overflow: hidden; }
 .ecommerce-compare-result-thumbnails button.is-deleted span { background: #b42318; }
 .ecommerce-compare-result-thumbnails button.is-marked-redo { border-color: #2563eb; box-shadow: 0 0 0 1px #2563eb inset; }
 .ecommerce-compare-result-thumbnails button.is-marked-redo span { background: #1d4ed8; }
+.ecommerce-compare-result-thumbnails button.is-final-selected { border-color: #22c55e; box-shadow: 0 0 0 2px #22c55e inset; }
+.ecommerce-compare-result-thumbnails button.is-final-selected span { background: #15803d; }
+.ecommerce-compare-result-thumbnails button.is-recoverable { border-color: #059669; box-shadow: 0 0 0 1px #059669 inset; }
+.ecommerce-compare-result-thumbnails button.is-recoverable span { background: #047857; }
+.ecommerce-compare-pane-results.is-result-deleted { border: 2px solid #f04438; border-radius: 8px; box-shadow: 0 0 12px rgba(240,68,56,0.15); }
+.ecommerce-folder-row.is-confirmed { background: #dcfce7; border-left: 3px solid #22c55e; }
+.ecommerce-folder-row.is-confirmed .ecommerce-folder-identity b { color: #15803d; }
+.ecommerce-confirmed-badge { display: inline-block; margin-left: 4px; padding: 1px 5px; border-radius: 4px; background: #dcfce7; color: #15803d; font-size: 9px; font-weight: 600; white-space: nowrap; }
+.ecommerce-confirmed-groups { margin-top: 8px; border: 1px solid #d1fae5; border-radius: 8px; background: #f0fdf4; padding: 6px 8px; }
+.ecommerce-confirmed-header { font-size: 10px; font-weight: 600; color: #15803d; margin-bottom: 4px; }
+.ecommerce-confirmed-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; border-bottom: 1px solid #d1fae5; font-size: 10px; }
+.ecommerce-confirmed-row:last-child { border-bottom: 0; }
+.ecommerce-confirmed-name { flex: 1; color: #15803d; font-weight: 500; }
+.ecommerce-confirmed-time { color: #6b7280; font-size: 9px; }
 @media (max-width: 900px) { .ecommerce-compare-stage { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; } .ecommerce-compare-toolbar small { display:none; } .ecommerce-compare-thumbnails button { height: 46px; } }
 .ecommerce-task-list { margin-top: 10px; max-height: 430px; overflow: auto; border: 1px solid #eaecf0; border-radius: 8px; }
 .ecommerce-empty { padding: 30px; text-align: center; color: #98a2b3; font-size: 11px; }
@@ -3555,11 +3603,15 @@ body.ecommerce-compare-open { overflow: hidden; }
 }
 
 /* 四段式电商工作台（最后声明，覆盖旧响应式网格） */
-#ecommerce-mode.ecommerce-mode { overflow: hidden; }
-#ecommerce-mode .ecommerce-shell { height: 100%; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+#ecommerce-mode.ecommerce-mode { overflow-y: hidden; overflow-x: hidden; }
+/* 电商模式：main-content保持overflow:hidden，前3栏固定高度 */
+body.ecommerce-mode-active .main-content { overflow: hidden; }
+#ecommerce-mode .ecommerce-shell { height: 100%; min-height: 100%; overflow: hidden; display: flex; flex-direction: column; }
 /* 顶部水平滚动轨道：当4栏总宽超出视口时出现，拖动轨道thumb可左右滚动 */
 .ecommerce-scroll-track {
-    position: relative;
+    position: sticky;
+    top: 0;
+    z-index: 10;
     height: 6px;
     background: #eaecf0;
     border-radius: 3px;
@@ -3585,31 +3637,25 @@ body.ecommerce-compare-open { overflow: hidden; }
     display: flex;
     align-items: stretch;
     gap: 0;
-    /* 不限制width=100%，允许内部flex内容超出视口宽度 */
     min-width: 100%;
-    height: calc(100vh - 110px);
-    min-height: 520px;
+    min-height: calc(100vh - 120px);
     margin: 0;
     padding: 0 0 5px;
     overflow-x: auto;
     overflow-y: hidden;
-    scrollbar-width: none; /* Firefox: 隐藏原生滚动条，用顶部自定义 */
+    scrollbar-width: none;
 }
-#ecommerce-mode .ecommerce-grid::-webkit-scrollbar { display: none; } /* Chrome/Safari: 同上 */
+#ecommerce-mode .ecommerce-grid::-webkit-scrollbar { display: none; }
 #ecommerce-mode .ecommerce-grid > .ecommerce-card {
     box-sizing: border-box;
     flex: 0 0 auto;
     width: var(--workbench-width, 320px);
-    height: 100%;
+    min-height: calc(100vh - 130px);
     min-width: 180px;
-    min-height: 0;
     max-width: none;
     max-height: none;
     overflow: auto;
     resize: none;
-    /* 注意：不要使用 contain: layout paint，它会创建新的 containing block/stacking context，
-       在 Chrome/Safari 中会导致原生 <select> 下拉弹窗定位错误（尤其在父容器尺寸变化后）。
-       contain: layout 也会触发同样问题，所以这里完全移除 contain。 */
 }
 /* 拖动期间禁用内部所有 transition，避免与宽度变化叠加造成卡顿 */
 body.ecommerce-column-resizing #ecommerce-mode .ecommerce-card,
@@ -3622,11 +3668,56 @@ body.ecommerce-column-resizing #ecommerce-mode .ecommerce-card {
 #ecommerce-mode .ecommerce-card-material { --workbench-width: 400px; }
 #ecommerce-mode .ecommerce-card-qc { --workbench-width: 280px; }
 #ecommerce-mode .ecommerce-card-action { --workbench-width: 300px; }
-#ecommerce-mode .ecommerce-card-rerun { --workbench-width: 400px; grid-column: auto; }
+/* 第4栏废片重做：自身作为垂直滚动容器，内部内容可以上下滚动，
+   向下滚动时顶部"逐套验片"等区域被顶上去，下面列表完整展示。
+   三个滚动条：1)逐套验片内部滚动 2)废片列表内部滚动 3)第4栏整体滚动 */
+#ecommerce-mode .ecommerce-card-rerun {
+    --workbench-width: 420px;
+    grid-column: auto;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: calc(100vh - 130px);
+    max-height: calc(100vh - 130px);
+}
+/* 第4栏内各区域：标题、按钮区、逐套验片不压缩 */
+#ecommerce-mode .ecommerce-card-rerun > .ecommerce-card-title,
+#ecommerce-mode .ecommerce-card-rerun > .ecommerce-row,
+#ecommerce-mode .ecommerce-card-rerun > .ecommerce-folder-preview-head,
+#ecommerce-mode .ecommerce-card-rerun > .ecommerce-summary,
+#ecommerce-mode .ecommerce-card-rerun > .ecommerce-waste-stats,
+#ecommerce-mode .ecommerce-card-rerun > .ecommerce-rerun-batches { flex-shrink: 0; }
+/* 逐套验片（结果文件夹）：有限高度，内部可滚动 */
+#ecommerce-mode .ecommerce-card-rerun > #ecommerce-result-folders {
+    flex-shrink: 0;
+    max-height: 25vh;
+    overflow-y: auto;
+}
+/* 废片重做列表：有足够的最小高度撑开卡片产生总滚动条，内部可滚动 */
+#ecommerce-mode .ecommerce-card-rerun > #ecommerce-rerun-list {
+    flex-shrink: 0;
+    min-height: 500px;
+    overflow-y: auto;
+}
+/* 第4栏废片重做的标题不sticky，让它可以随卡片内部滚动被顶上去。
+   保持和其他卡片一致的负margin贴边效果，但position:static不吸附。 */
+#ecommerce-mode .ecommerce-card-rerun .ecommerce-card-title {
+    position: static;
+    margin: -12px -12px 0;
+    padding: 11px 12px 8px;
+    background: rgba(255,251,235,.96);
+}
 #ecommerce-mode .ecommerce-card-rerun-adjust { --workbench-width: 520px; border-color: #a7f3d0; background: linear-gradient(180deg,#ecfdf5,#fff); }
 #ecommerce-mode .ecommerce-card-rerun-adjust[hidden],
 #ecommerce-mode #ecommerce-rerun-adjust-resizer[hidden] { display: none !important; }
 #ecommerce-mode .ecommerce-card-rerun-adjust .ecommerce-card-title { background: rgba(236,253,245,.97); }
+#ecommerce-mode .ecommerce-card-final-export { --workbench-width: 380px; border-color: #bbf7d0; background: linear-gradient(180deg,#f0fdf4,#fff); display: flex; flex-direction: column; }
+#ecommerce-mode .ecommerce-card-final-export > .ecommerce-card-title { flex-shrink: 0; }
+#ecommerce-mode .ecommerce-card-final-export > .ecommerce-final-export-body { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+#ecommerce-mode .ecommerce-card-final-export .ecommerce-card-title { background: rgba(240,253,244,.97); }
+#ecommerce-mode .ecommerce-card-final-export .ecommerce-final-export-body { display: grid; gap: 5px; padding: 7px; background: #fff; }
+#ecommerce-mode .ecommerce-card-final-export .ecommerce-confirmed-groups { max-height: none; overflow: visible; }
 #btn-ecommerce-rerun-adjust-close { margin-left: auto; }
 .ecommerce-rerun-adjust-progress { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; padding: 8px 9px; border: 1px solid #a7f3d0; border-radius: 8px; background: #f0fdf4; color: #166534; }
 .ecommerce-rerun-adjust-progress strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
@@ -3745,3 +3836,10 @@ body.ecommerce-column-resizing { cursor: col-resize !important; user-select: non
     .ecommerce-scroll-track { display: none !important; }
     #ecommerce-mode .ecommerce-card-rerun { min-height: 360px; }
 }
+/* 人工精准匹配 */
+.ecommerce-wire-row{border:1px solid #dbe3ef;border-radius:10px;padding:10px;background:#f8fafc}.ecommerce-wire-row-title{font-size:12px;font-weight:700;color:#334155;margin-bottom:8px}.ecommerce-wire-cards{display:flex;gap:10px;overflow-x:auto;padding:4px 2px 8px;min-height:150px}.ecommerce-precision-dialog.is-dense .ecommerce-wire-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow-x:hidden;overflow-y:auto;max-height:32vh}.ecommerce-wire-target,.ecommerce-wire-garment{position:relative;flex:0 0 calc(108px * var(--precision-scale, 1));border:2px solid #dbe3ef;border-radius:8px;background:#fff;padding:5px;text-align:center;transition:.15s}.ecommerce-precision-dialog.is-dense .ecommerce-wire-target,.ecommerce-precision-dialog.is-dense .ecommerce-wire-garment{min-width:0}.ecommerce-wire-target img,.ecommerce-wire-garment img{display:block;width:calc(94px * var(--precision-scale, 1));height:calc(108px * var(--precision-scale, 1));object-fit:contain;background:#e2e8f0;border-radius:5px;margin:auto}.ecommerce-wire-target b,.ecommerce-wire-garment b{display:block;font-size:calc(11px * var(--precision-scale, 1));margin-top:5px;color:#334155}.ecommerce-wire-garment{cursor:grab}.ecommerce-wire-garment.is-dragging{opacity:.55}.ecommerce-wire-target{min-width:108px}.ecommerce-wire-target.is-drop-target{border-color:#2563eb;background:#dbeafe;transform:translateY(-2px)}.ecommerce-wire-target.is-matched{border-color:#16a34a}.ecommerce-wire-match{display:block;color:#16a34a;font-size:10px;margin-top:3px;white-space:nowrap}.ecommerce-wire-gap{height:24px;position:relative}.ecommerce-wire-gap:after{content:'拖动下排服装参考图到上排目标图';position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#64748b;font-size:11px;white-space:nowrap}.ecommerce-precision-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:8px 0;color:#64748b;font-size:11px}.ecommerce-precision-toolbar label{display:flex;align-items:center;gap:7px;color:#334155}.ecommerce-precision-toolbar input{width:180px;accent-color:#2563eb}.ecommerce-precision-toolbar output{min-width:42px;color:#2563eb;font-variant-numeric:tabular-nums}
+.ecommerce-precision-legend{display:flex;align-items:center;gap:8px;overflow-x:auto;padding:8px 0;border-bottom:1px solid #e5e7eb}.ecommerce-precision-legend>span:first-child{font-size:12px;font-weight:600;white-space:nowrap}.ecommerce-precision-legend-item{position:relative;display:inline-flex;flex:0 0 auto}.ecommerce-precision-legend-item img{width:58px;height:58px;object-fit:cover;border-radius:6px;border:1px solid #cbd5e1;background:#f1f5f9}.ecommerce-precision-legend-item b{position:absolute;right:3px;bottom:3px;background:#111827;color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.ecommerce-precision-row{display:grid;grid-template-columns:150px minmax(0,1fr);align-items:center;gap:10px}.ecommerce-precision-target{display:flex;flex-direction:column;gap:5px;font-size:12px}.ecommerce-precision-target img{width:100%;height:120px;object-fit:contain;background:#e2e8f0;border-radius:6px}.ecommerce-precision-choice-list{display:flex;gap:7px;overflow-x:auto;padding:4px 0}.ecommerce-precision-choice{position:relative;flex:0 0 74px;border:2px solid transparent;border-radius:8px;padding:3px;background:#f8fafc;cursor:pointer}.ecommerce-precision-choice img{display:block;width:66px;height:96px;object-fit:cover;border-radius:5px;background:#e2e8f0}.ecommerce-precision-choice span{position:absolute;right:5px;bottom:5px;background:rgba(15,23,42,.82);color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.ecommerce-precision-choice.is-selected{border-color:#2563eb;background:#dbeafe;box-shadow:0 0 0 2px rgba(37,99,235,.15)}
+.ecommerce-precision-toggle{display:flex;align-items:center;gap:8px;margin:10px 0 0;padding:8px 10px;border:1px solid #c7d2fe;border-radius:8px;background:#eef2ff;font-weight:600}.ecommerce-precision-toggle small{font-weight:400;color:#475569}.ecommerce-precision-panel{margin-top:8px}.ecommerce-precision-overlay{position:fixed;inset:0;z-index:10000;display:grid;place-items:center;background:rgba(15,23,42,.58);padding:24px}.ecommerce-precision-dialog{width:min(900px,96vw);max-height:90vh;overflow:auto;background:#fff;border-radius:14px;box-shadow:0 20px 70px rgba(0,0,0,.3);padding:18px}.ecommerce-precision-dialog header,.ecommerce-precision-dialog footer{display:flex;align-items:center;justify-content:space-between;gap:12px}.ecommerce-precision-dialog header{font-size:17px;border-bottom:1px solid #e5e7eb;padding-bottom:12px}.ecommerce-precision-dialog header button{border:0;background:none;font-size:26px;cursor:pointer}.ecommerce-precision-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin:14px 0}.ecommerce-precision-row{display:flex;flex-direction:column;gap:6px;border:1px solid #e5e7eb;border-radius:10px;padding:8px;background:#f8fafc}.ecommerce-precision-row img{width:100%;height:150px;object-fit:contain;background:#e2e8f0;border-radius:6px}.ecommerce-precision-row select{width:100%;padding:6px}.ecommerce-precision-dialog footer{justify-content:flex-end;border-top:1px solid #e5e7eb;padding-top:12px}
+.ecommerce-precision-dialog{height:min(760px,90vh);min-height:420px;resize:both;}
+.ecommerce-compare-result-thumbnails button.is-selected{border-color:#f59e0b!important;box-shadow:0 0 0 3px rgba(245,158,11,.9) inset,0 0 0 1px #f59e0b;background:#451a03}.ecommerce-compare-result-thumbnails button.is-selected span{background:#b45309!important;color:#fff}
+.ecommerce-rerun-reference-toolbar{display:flex;align-items:center;gap:8px;margin:8px 0 4px;padding:6px 8px;border:1px solid #dbe3ef;border-radius:6px;background:#f8fafc}.ecommerce-rerun-reference-toolbar strong{font-size:11px;color:#334155}.ecommerce-rerun-reference-toolbar small{color:#64748b;font-size:10px}

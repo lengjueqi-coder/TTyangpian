@@ -6220,12 +6220,14 @@ function switchMode(mode) {
         if (imageMode) imageMode.style.display = 'flex';
         if (splitMode) splitMode.style.display = 'none';
         if (ecommerceMode) ecommerceMode.style.display = 'none';
+        document.body.classList.remove('ecommerce-mode-active');
         if (!imageState.loaded) loadImageModeData();
     } else if (mode === 'split') {
         if (promptMode) promptMode.style.display = 'none';
         if (imageMode) imageMode.style.display = 'none';
         if (splitMode) splitMode.style.display = 'flex';
         if (ecommerceMode) ecommerceMode.style.display = 'none';
+        document.body.classList.remove('ecommerce-mode-active');
         if (!splitModeLoaded) loadSplitModeData();
         else renderSplitLibrary();
     } else if (mode === 'ecommerce') {
@@ -6233,12 +6235,14 @@ function switchMode(mode) {
         if (imageMode) imageMode.style.display = 'none';
         if (splitMode) splitMode.style.display = 'none';
         if (ecommerceMode) ecommerceMode.style.display = 'block';
+        document.body.classList.add('ecommerce-mode-active');
         setTimeout(() => loadEcommerceModeData(), 0);
     } else {
         if (promptMode) promptMode.style.display = 'flex';
         if (imageMode) imageMode.style.display = 'none';
         if (splitMode) splitMode.style.display = 'none';
         if (ecommerceMode) ecommerceMode.style.display = 'none';
+        document.body.classList.remove('ecommerce-mode-active');
     }
 
     // 切换后恢复提示词文本
@@ -10480,6 +10484,20 @@ const RH_MODELS = {
         aspectRatios: ['auto','1:1','1:2','2:1','1:3','3:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
     },
+    'rhart-image-g-2-medium/image-to-image-2k': {
+        name: 'ChatGPT Image 2｜2K｜官方稳定版·中档', shortName: 'GPT2中档-2K', price: '¥1.13/张', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2-official/image-to-image', fixedResolution: '2k',
+        channel: 'official-medium', resolutionGuaranteed: true, quality: 'medium',
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','1:2','2:1','1:3','3:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'], aspectRatioRequired: false
+    },
+    'rhart-image-g-2-medium/image-to-image-4k': {
+        name: 'ChatGPT Image 2｜4K｜官方稳定版·中档', shortName: 'GPT2中档-4K', price: '¥1.13/张', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2-official/image-to-image', fixedResolution: '4k',
+        channel: 'official-medium', resolutionGuaranteed: true, quality: 'medium',
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','1:2','2:1','1:3','3:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'], aspectRatioRequired: false
+    },
     'rhart-image-v1/edit': {
         name: 'V1-图生图-低价渠道版', shortName: 'V1', priceUsd: '0.05', price: '约¥0.34', type: 'image-to-image',
         maxImages: 5, maxImageMB: 10, hasResolution: false,
@@ -10518,7 +10536,7 @@ const RH_MODELS = {
     },
     'rhart-image-n-g31-flash-official/image-to-image': {
         name: 'V2(Gemini Flash)-图生图-官方稳定版', shortName: 'V2官方', price: '¥0.74～0.99/张', type: 'image-to-image',
-        channel: 'official', resolutionGuaranteed: true,
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
         maxImages: 14, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
@@ -10526,7 +10544,7 @@ const RH_MODELS = {
     'rhart-image-n-g31-flash-official/image-to-image-2k': {
         name: 'Nano Banana 2｜2K｜官方稳定版', shortName: 'NB2官方-2K', price: '¥0.74/张', type: 'image-to-image',
         endpoint: 'rhart-image-n-g31-flash-official/image-to-image', fixedResolution: '2k',
-        channel: 'official', resolutionGuaranteed: true,
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
         maxImages: 14, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
@@ -10534,7 +10552,7 @@ const RH_MODELS = {
     'rhart-image-n-g31-flash-official/image-to-image-4k': {
         name: 'Nano Banana 2｜4K｜官方稳定版', shortName: 'NB2官方-4K', price: '¥0.99/张', type: 'image-to-image',
         endpoint: 'rhart-image-n-g31-flash-official/image-to-image', fixedResolution: '4k',
-        channel: 'official', resolutionGuaranteed: true,
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
         maxImages: 14, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
@@ -10564,7 +10582,29 @@ const RH_MODELS = {
         aspectRatioRequired: false
     },
     'rhart-image-n-pro-official/edit': {
-        name: 'PRO-图生图-官方稳定版', shortName: 'PRO-official', price: '1', type: 'image-to-image',
+        name: '全能图片 Pro｜图生图 Ultra｜官方稳定版', shortName: 'Pro Ultra官方', price: '¥0.98/张（4K）', type: 'image-to-image',
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-n-pro-official/edit-ultra-4k': {
+        name: '全能图片 Pro｜图生图 Ultra｜4K｜官方稳定版', shortName: 'Pro Ultra官方-4K', price: '¥1.50/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-pro-official/edit-ultra', fixedResolution: '4k', channel: 'official', resolutionGuaranteed: true,
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'], aspectRatioRequired: false
+    },
+    'seedream-v5-pro/image-to-image-1k': {
+        name: '即梦Seedream 5.0 Pro｜1K｜图生图', shortName: 'SD5Pro-1K', price: '约¥0.30/张', type: 'image-to-image',
+        endpoint: 'seedream-v5-pro/image-to-image', fixedResolution: '1k',
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
+        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatioRequired: false
+    },
+    'seedream-v5-pro/image-to-image-2k': {
+        name: '即梦Seedream 5.0 Pro｜2K｜图生图', shortName: 'SD5Pro-2K', price: '约¥0.60/张', type: 'image-to-image',
+        endpoint: 'seedream-v5-pro/image-to-image', fixedResolution: '2k',
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
         maxImages: 10, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
@@ -10750,12 +10790,147 @@ const ecommerceState = {
     batches: [],
     scanned: null,
     importActions: null,
+    precisionMatching: null,
     rhConfig: null,
     currentBatchId: '',
     detail: null,
     pollTimer: null,
     renderCache: { batchList: '', tasks: '', folders: '', apiConfig: '' }
 };
+
+const ECOMMERCE_DRAFT_KEY = 'ecommerce_generation_draft_v2';
+const ECOMMERCE_DRAFT_FIELD_IDS = new Set(['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-qc-model','ecommerce-profile-mode','ecommerce-qc-threshold','ecommerce-samples-per-action','ecommerce-precision-matching']);
+function saveEcommerceDraft() {
+    try {
+        const ids = [...ECOMMERCE_DRAFT_FIELD_IDS];
+        const fields = {};
+        ids.forEach(id => { const el = document.getElementById(id); if (el) fields[id] = el.type === 'checkbox' ? el.checked : el.value; });
+        const draft = {
+            fields,
+            inlineGarment: ecommerceState.inlineGarment,
+            scanned: ecommerceState.scanned,
+            importActions: ecommerceState.importActions,
+            precisionMatching: ecommerceState.precisionMatching,
+            savedAt: Date.now()
+        };
+        localStorage.setItem(ECOMMERCE_DRAFT_KEY, JSON.stringify(draft));
+    } catch (e) { console.warn('[ecommerce] 保存草稿失败', e); }
+}
+function restoreEcommerceDraft() {
+    try {
+        const draft = JSON.parse(localStorage.getItem(ECOMMERCE_DRAFT_KEY) || 'null');
+        if (!draft) return false;
+        Object.entries(draft.fields || {}).forEach(([id, value]) => {
+            const el = document.getElementById(id);
+            if (id === 'ecommerce-import-rh-model' && value === 'rhart-image-n-pro-official/edit-4k') value = 'rhart-image-n-pro-official/edit-ultra-4k';
+            if (el && value !== undefined && value !== null) {
+                if (el.type === 'checkbox') el.checked = value === true || value === '1';
+                else el.value = value;
+            }
+        });
+        ecommerceState.inlineGarment = draft.inlineGarment || null;
+        ecommerceState.scanned = draft.scanned || null;
+        ecommerceState.importActions = draft.importActions || null;
+        ecommerceState.precisionMatching = draft.precisionMatching || null;
+        // 旧草稿可能只有 mapping 没有来源签名；这种情况不能继续默认为有效，
+        // 否则更换目标图/服装图后会把上一批编号静默套过来。
+        if (ecommerceState.precisionMatching && ecommerceState.precisionMatching.source_signature !== ecommercePrecisionSourceSignature()) {
+            ecommerceState.precisionMatching = null;
+        }
+        renderEcommerceGarmentPreview();
+        if (ecommerceState.importActions) renderEcommerceImportActionPreview(ecommerceState.importActions);
+        updateEcommerceGenerateButton();
+        updateEcommercePrecisionUi();
+        return true;
+    } catch (e) { console.warn('[ecommerce] 恢复草稿失败', e); return false; }
+}
+
+function ecommercePrecisionSourceSignature() {
+    const actions = ecommerceState.importActions?.actions || [];
+    const garments = ecommerceState.scanned?.garments || [];
+    const firstRefs = garments[0]?.images || [];
+    return JSON.stringify({
+        targets: actions.map(action => action.path || action.url || action.name || ''),
+        references: firstRefs.map(path => path.path || path.url || path || ''),
+        reference_garment: garments[0]?.id || garments[0]?.path || '',
+    });
+}
+
+function clearEcommercePrecisionMatching(message = '') {
+    ecommerceState.precisionMatching = null;
+    saveEcommerceDraft();
+    updateEcommercePrecisionUi();
+    if (message) showToast(message, 'success');
+}
+
+function updateEcommercePrecisionUi() {
+    const enabled = !!document.getElementById('ecommerce-precision-matching')?.checked;
+    const panel = document.getElementById('ecommerce-precision-panel');
+    const qcControls = document.querySelectorAll('#ecommerce-qc-enabled, #ecommerce-qc-model, #ecommerce-profile-mode, #ecommerce-qc-threshold');
+    if (panel) panel.hidden = !enabled;
+    qcControls.forEach(el => { el.disabled = enabled; });
+    const status = document.getElementById('ecommerce-precision-status');
+    const count = ecommerceState.precisionMatching?.mapping?.length || 0;
+    if (status) status.textContent = enabled && count ? `已匹配 ${count} 张目标图` : (enabled ? '请打开匹配界面' : '未启用');
+}
+
+function openEcommercePrecisionMatching() {
+    const actions = ecommerceState.importActions?.actions || [];
+    const garments = ecommerceState.scanned?.garments || [];
+    if (!actions.length) return showToast('请先加载目标替换参考图', 'error');
+    if (!garments.length) return showToast('请先加载并扫描服装参考图', 'error');
+    const refs = garments[0].images || [];
+    if (!refs.length) return showToast('第一套服装没有可用参考图', 'error');
+    const current = ecommerceState.precisionMatching?.mapping || [];
+    const overlay = document.createElement('div');
+    overlay.className = 'ecommerce-precision-overlay';
+    overlay.id = 'ecommerce-precision-overlay';
+    const denseLayout = actions.length > 10 || refs.length > 10;
+    overlay.innerHTML = `<div class="ecommerce-precision-dialog ecommerce-precision-wiring${denseLayout ? ' is-dense' : ''}" role="dialog" aria-modal="true"><header><strong>人工精准匹配参考图</strong><button type="button" id="ecommerce-precision-close">×</button></header><div class="ecommerce-precision-toolbar"><span>拖动下排服装参考图到上排目标图</span><label>显示大小 <input id="ecommerce-precision-scale" type="range" min="60" max="150" value="100" step="5"><output id="ecommerce-precision-scale-value">100%</output></label></div><p>一个服装参考图可以连接多个目标图；目标图也可以暂时不匹配。图片较多时会自动分成两列，使用上方滑块调整显示大小。</p><section class="ecommerce-wire-row ecommerce-wire-target-row"><div class="ecommerce-wire-row-title">目标动作参考图（最多20张）</div><div class="ecommerce-wire-cards">${actions.map((action, i) => { const selected = current[i] === undefined ? -1 : Number(current[i]); return `<div class="ecommerce-wire-target${selected >= 0 ? ' is-matched' : ''}" data-precision-row="${i}" ${selected >= 0 ? `data-precision-ref="${selected}"` : ''}><img src="${ecommerceEscape(ecommerceTargetImageSource(action))}" alt="目标图${i + 1}"><b>目标图${i + 1}</b><small class="ecommerce-wire-match">${selected >= 0 ? `已选服装图 ${selected + 1}` : '未匹配'}</small></div>`; }).join('')}</div></section><div class="ecommerce-wire-gap"></div><section class="ecommerce-wire-row ecommerce-wire-garment-row"><div class="ecommerce-wire-row-title">服装参考图（最多20张）</div><div class="ecommerce-wire-cards">${refs.map((path, j) => `<div class="ecommerce-wire-garment" draggable="true" data-precision-ref="${j}" title="拖动到上方目标图"><img src="${ecommerceEscape(ecommerceTargetImageSource({path}))}" alt="服装参考图${j + 1}"><b>服装图${j + 1}</b></div>`).join('')}</div></section><footer><button type="button" class="btn btn-outline" id="ecommerce-precision-cancel">取消</button><button type="button" class="btn btn-primary" id="ecommerce-precision-confirm">确认匹配</button></footer></div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    const scale = overlay.querySelector('#ecommerce-precision-scale');
+    const scaleValue = overlay.querySelector('#ecommerce-precision-scale-value');
+    scale?.addEventListener('input', event => {
+        const value = Number(event.target.value) || 100;
+        overlay.querySelector('.ecommerce-precision-dialog')?.style.setProperty('--precision-scale', String(value / 100));
+        if (scaleValue) scaleValue.value = `${value}%`;
+        if (scaleValue) scaleValue.textContent = `${value}%`;
+    });
+    overlay.querySelector('#ecommerce-precision-close').onclick = close;
+    overlay.querySelector('#ecommerce-precision-cancel').onclick = close;
+    let draggedRef = null;
+    overlay.querySelectorAll('.ecommerce-wire-garment').forEach(card => {
+        card.addEventListener('dragstart', event => { draggedRef = Number(card.dataset.precisionRef); card.classList.add('is-dragging'); event.dataTransfer.effectAllowed = 'copy'; });
+        card.addEventListener('dragend', () => { draggedRef = null; card.classList.remove('is-dragging'); });
+    });
+    overlay.querySelectorAll('.ecommerce-wire-target').forEach(target => {
+        target.addEventListener('dragover', event => { event.preventDefault(); target.classList.add('is-drop-target'); });
+        target.addEventListener('dragleave', () => target.classList.remove('is-drop-target'));
+        target.addEventListener('drop', event => {
+            event.preventDefault(); target.classList.remove('is-drop-target');
+            if (draggedRef === null) return;
+            target.dataset.precisionRef = String(draggedRef);
+            target.classList.add('is-matched');
+            const label = target.querySelector('.ecommerce-wire-match');
+            if (label) label.textContent = `已选服装图 ${draggedRef + 1}`;
+        });
+        target.addEventListener('click', () => { delete target.dataset.precisionRef; target.classList.remove('is-matched'); const label = target.querySelector('.ecommerce-wire-match'); if (label) label.textContent = '未匹配'; });
+    });
+    overlay.querySelector('#ecommerce-precision-confirm').onclick = () => {
+        const mapping = actions.map((_, i) => { const value = overlay.querySelector(`[data-precision-row="${i}"]`)?.dataset.precisionRef; return value === undefined ? -1 : Number(value); });
+        ecommerceState.precisionMatching = {
+            mapping,
+            reference_count: refs.length,
+            source_garment_id: garments[0].id,
+            source_signature: ecommercePrecisionSourceSignature(),
+        };
+        saveEcommerceDraft();
+        updateEcommercePrecisionUi();
+        close();
+        showToast(`已完成 ${mapping.length} 张目标图的精准匹配`, 'success');
+    };
+}
 
 function ecommerceEscape(value) {
     return String(value ?? '').replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
@@ -10828,13 +11003,25 @@ function ecommerceUndoToast(message, onUndo, duration = 5000) {
 }
 
 async function loadEcommerceModeData(force = false) {
+    // 页面刷新后优先恢复本地草稿；图片已经上传到本地图库，不需要用户重新选择。
+    restoreEcommerceDraft();
     // 先恢复上次的路径到输入框（无论是否已加载）
     const restoredPaths = restoreEcommerceInputPaths();
     if (ecommerceState.loaded && !force) {
         renderEcommerceBatchList();
         renderEcommerceRhApiConfig();
         loadEcommerceWasteStats().catch(() => {});
-        if (ecommerceState.currentBatchId) await refreshEcommerceBatch();
+        if (ecommerceState.currentBatchId) {
+            await refreshEcommerceBatch();
+            // 同步重做栏批次选择器并加载已确认组列表
+            const rerunSelect = document.getElementById('ecommerce-rerun-batch-select');
+            if (rerunSelect && rerunSelect.value !== ecommerceState.currentBatchId) {
+                ecommerceRerunState.batchId = ecommerceState.currentBatchId;
+                renderEcommerceRerunBatchOptions();
+                if (rerunSelect.value !== ecommerceState.currentBatchId) rerunSelect.value = ecommerceState.currentBatchId;
+            }
+            loadEcommerceFinalExportStatus(false).catch(() => {});
+        }
         return;
     }
     try {
@@ -10851,7 +11038,15 @@ async function loadEcommerceModeData(force = false) {
         renderEcommerceBatchList();
         renderEcommerceRhApiConfig();
         loadEcommerceWasteStats().catch(() => {});
-        if (ecommerceState.currentBatchId) await refreshEcommerceBatch();
+        if (ecommerceState.currentBatchId) {
+            await refreshEcommerceBatch();
+            // 同步重做栏批次选择器并加载已确认组列表
+            ecommerceRerunState.batchId = ecommerceState.currentBatchId;
+            renderEcommerceRerunBatchOptions();
+            const rerunSelect2 = document.getElementById('ecommerce-rerun-batch-select');
+            if (rerunSelect2 && rerunSelect2.value !== ecommerceState.currentBatchId) rerunSelect2.value = ecommerceState.currentBatchId;
+            loadEcommerceFinalExportStatus(false).catch(() => {});
+        }
         // 自动恢复：如果有上次的服装目录，自动扫描
         if (restoredPaths['ecommerce-clothing-root']) {
             scanEcommerceGarments().catch(e => console.warn('自动扫描服装目录失败:', e));
@@ -10862,6 +11057,7 @@ async function loadEcommerceModeData(force = false) {
                 const scanned = await ecommerceApi('POST', '/api/ecommerce/scan-action-root', { path: restoredPaths['ecommerce-action-root'] });
                 ecommerceState.importActions = scanned;
                 renderEcommerceImportActionPreview(scanned);
+                saveEcommerceDraft();
             } catch (e) {
                 console.warn('自动加载动作参考图失败:', e);
             }
@@ -10871,8 +11067,21 @@ async function loadEcommerceModeData(force = false) {
     }
 }
 
+// 电商批量工作台是长表单，输入、模型、比例、并发和已上传参考图都持续保存。
+['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-qc-model','ecommerce-profile-mode','ecommerce-qc-threshold','ecommerce-samples-per-action'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', saveEcommerceDraft);
+    document.getElementById(id)?.addEventListener('change', saveEcommerceDraft);
+});
+// 事件委托兜底：某些控件会在初始化后动态替换，不能只绑定初始DOM节点。
+document.addEventListener('input', event => {
+    if (ECOMMERCE_DRAFT_FIELD_IDS.has(event.target?.id)) saveEcommerceDraft();
+});
+document.addEventListener('change', event => {
+    if (ECOMMERCE_DRAFT_FIELD_IDS.has(event.target?.id)) saveEcommerceDraft();
+});
+
 function ecommerceRhApiSwitchBlocked() {
-    return ecommerceState.batches.some(batch => ['running', 'resuming'].includes(batch.status));
+    return ecommerceState.batches.some(batch => ['running', 'resuming', 'cancelling'].includes(batch.status));
 }
 
 function renderEcommerceRhApiConfig() {
@@ -10996,10 +11205,12 @@ function buildCurrentEcommerceTargetActions() {
     const loaded = ecommerceState.importActions;
     if (!loaded?.actions?.length) throw new Error('请先加载1～20张目标替换参考图');
     const settings = buildEcommercePromptAction();
+    const mapping = ecommerceState.precisionMatching?.mapping || [];
     return (loaded.actions || []).map((item, index) => ({
         ...settings,
         name: item.name || `目标图${index + 1}`,
         action_image: item.path,
+        ...(mapping.length ? { garment_reference_index: Number(mapping[index] ?? -1) } : {}),
     }));
 }
 
@@ -11061,10 +11272,12 @@ function renderEcommerceImportActionPreview(scanned) {
             const targetIndex = Number(card.dataset.targetIndex);
             const list = ecommerceState.importActions?.actions;
             if (!Array.isArray(list) || ecommerceTargetDragIndex === null || ecommerceTargetDragIndex === targetIndex) return;
+            clearEcommercePrecisionMatching();
             const [moved] = list.splice(ecommerceTargetDragIndex, 1);
             list.splice(targetIndex, 0, moved);
             ecommerceTargetDragIndex = null;
             renderEcommerceImportActionPreview(ecommerceState.importActions);
+            saveEcommerceDraft();
         });
     });
 }
@@ -11076,8 +11289,10 @@ async function chooseAndPreviewEcommerceActions() {
     if (summary) summary.textContent = '正在读取目标替换参考图…';
     try {
         const scanned = await ecommerceApi('POST', '/api/ecommerce/scan-action-root', { path: selected });
+        clearEcommercePrecisionMatching();
         ecommerceState.importActions = scanned;
         renderEcommerceImportActionPreview(scanned);
+        saveEcommerceDraft();
         showToast(`已自动加载${scanned.action_count || 0}张目标替换参考图`, 'success');
     } catch (e) {
         ecommerceState.importActions = null;
@@ -11111,6 +11326,7 @@ async function loadDroppedEcommerceTargetFiles(fileList) {
         total_found: allFiles.length,
         truncated: allFiles.length > 20,
     };
+    clearEcommercePrecisionMatching();
     ecommerceState.importActions = loaded;
     if (rootInput) rootInput.value = '';
     if (dropzone) dropzone.classList.add('is-uploading');
@@ -11141,6 +11357,7 @@ async function loadDroppedEcommerceTargetFiles(fileList) {
     if (dropzone) dropzone.classList.remove('is-uploading', 'is-dragover');
     if (fileInput) fileInput.value = '';
     renderEcommerceImportActionPreview(loaded);
+    saveEcommerceDraft();
     if (!loaded.actions.length) {
         ecommerceState.importActions = null;
         renderEcommerceImportActionPreview(null);
@@ -11152,6 +11369,7 @@ async function loadDroppedEcommerceTargetFiles(fileList) {
 }
 
 function clearEcommerceTargetReferences() {
+    clearEcommercePrecisionMatching();
     ecommerceState.importActions = null;
     const rootInput = document.getElementById('ecommerce-action-root');
     const fileInput = document.getElementById('ecommerce-target-files');
@@ -11160,9 +11378,11 @@ function clearEcommerceTargetReferences() {
     saveEcommerceLastPaths('ecommerce-action-root', '');
     renderEcommerceImportActionPreview(null);
     updateEcommerceGenerateButton();
+    saveEcommerceDraft();
 }
 
 function clearEcommerceGarmentReferences() {
+    clearEcommercePrecisionMatching();
     ecommerceState.inlineGarment = null;
     ecommerceState.scanned = null;
     const rootInput = document.getElementById('ecommerce-clothing-root');
@@ -11178,6 +11398,7 @@ function clearEcommerceGarmentReferences() {
     saveEcommerceLastPaths('ecommerce-clothing-root', '');
     renderEcommerceGarmentPreview();
     updateEcommerceGenerateButton();
+    saveEcommerceDraft();
 }
 
 async function chooseEcommerceFolder(inputId) {
@@ -11289,7 +11510,12 @@ async function scanEcommerceGarments() {
     if (scanBtn) { scanBtn.disabled = true; }
     try {
         const generationMode = ecommerceState.importActions?.actions?.length ? 'garment_reference' : 'garment_prompt';
-        ecommerceState.scanned = await ecommerceApi('POST', '/api/ecommerce/scan-clothing-root', { path, keyword, generation_mode: generationMode });
+        const scanned = await ecommerceApi('POST', '/api/ecommerce/scan-clothing-root', {
+            path, keyword, generation_mode: generationMode,
+            precision_matching: !!document.getElementById('ecommerce-precision-matching')?.checked,
+        });
+        clearEcommercePrecisionMatching();
+        ecommerceState.scanned = scanned;
         const valid = ecommerceState.scanned.garments || [];
         const invalid = ecommerceState.scanned.invalid || [];
         if (summary) summary.textContent = generationMode === 'garment_prompt'
@@ -11423,6 +11649,7 @@ async function loadDroppedEcommerceGarmentFiles(fileList, options = {}) {
         images: [],
         directoryDrop: isDirectoryDrop,
     };
+    clearEcommercePrecisionMatching();
     ecommerceState.inlineGarment = loaded;
     ecommerceState.scanned = null;
     document.getElementById('ecommerce-clothing-root').value = '';
@@ -11456,6 +11683,7 @@ async function loadDroppedEcommerceGarmentFiles(fileList, options = {}) {
         ? `单套测试：已按文件名顺序加载${loaded.images.length}张服装参考图；将生成 1 × 目标图数量 个任务。`
         : `${isDirectoryDrop ? `已递归加载${inlineGroups.length}个原目录、` : '已选择'}${loaded.images.length}张服装原图；将按原目录分类并分别使用当前提示词生成。`;
     updateEcommerceGenerateButton();
+    saveEcommerceDraft();
     showToast(isDirectoryDrop ? `已递归加载${inlineGroups.length}个目录、${loaded.images.length}张图` : `已加载${loaded.images.length}张服装参考图`, 'success');
 }
 
@@ -11473,7 +11701,7 @@ function renderEcommerceBatchList() {
 }
 
 function ecommerceStatusText(status) {
-    return ({draft:'待开始',running:'运行中',resuming:'恢复中',paused:'已暂停',completed:'已完成',interrupted:'有任务中断',cancelled:'已取消',pending:'等待',preparing:'生成中',configuration_required:'需要配置',submitted:'平台排队',awaiting_qc:'等待集中质检',qc:'质检中',retry_pending:'下一轮重生成',accepted:'已生成并归档',manual_review:'人工复核'})[status] || status || '未知';
+    return ({draft:'待开始',running:'运行中',resuming:'恢复中',cancelling:'取消收尾中',paused:'已暂停',completed:'已完成',interrupted:'有任务中断',cancelled:'已取消',pending:'等待',preparing:'生成中',configuration_required:'需要配置',submitted:'平台排队',awaiting_qc:'等待集中质检',qc:'质检中',retry_pending:'下一轮重生成',accepted:'已生成并归档',manual_review:'人工复核'})[status] || status || '未知';
 }
 
 function ecommerceTaskPassedAiQc(task) {
@@ -11505,7 +11733,7 @@ async function refreshEcommerceBatch() {
         renderEcommerceBatchList();
         renderEcommerceBatchDetail();
         renderEcommerceRhApiConfig();
-        scheduleEcommercePoll(data.batch.status === 'running' || data.batch.status === 'resuming');
+    scheduleEcommercePoll(['running', 'resuming', 'cancelling'].includes(data.batch.status));
     } catch (e) {
         showToast(`刷新批次失败：${e.message}`, 'error');
     }
@@ -11549,6 +11777,7 @@ function renderEcommerceBatchDetail() {
     const archivedWithoutQcCount = acceptedTasks.length - aiQcPassedCount - aiQcFailedArchivedCount;
     const usage = b.usage || {};
     const isRunning = b.status === 'running' || b.status === 'resuming';
+    const isCancelling = b.status === 'cancelling';
     const percent = b.task_total ? Math.round((b.done_total || 0) / b.task_total * 100) : 0;
     const archiveFallback = !!b.settings?.archive_fallback;
     const archiveSummary = b.final_output_path
@@ -11581,6 +11810,8 @@ function renderEcommerceBatchDetail() {
             if (samplesSetting > 1) statusHtml += `（每张抽${samplesSetting}次）`;
             if (b.settings && !b.settings.qc_enabled) statusHtml += ` ｜ 滑动窗口并发 ${b.settings.concurrency || 10}（上传4 / 下载6限流）`;
             progressStatus.innerHTML = statusHtml;
+        } else if (isCancelling) {
+            progressStatus.innerHTML = `<span class="status-running">正在取消</span> ｜ 已提交任务会继续返回，未提交任务已停止`;
         } else if (b.status === 'completed') {
             let statusHtml = `已完成 ｜ AI质检通过 ${aiQcPassedCount}，AI未通过但归档 ${aiQcFailedArchivedCount}，未质检归档 ${archivedWithoutQcCount}，失败 ${failedCount}`;
             if (failedCount > 0) statusHtml += ` ｜ <span class="status-error">${failedCount} 张需要处理，请检查具体错误；不要在确认API任务状态前直接重跑</span>`;
@@ -11598,7 +11829,11 @@ function renderEcommerceBatchDetail() {
     if (start) start.disabled = ['running','resuming','completed','cancelled'].includes(b.status);
     // 暂停按钮：running 和 resuming 都允许暂停（之前 resuming 状态无法暂停是 bug）
     if (pause) pause.disabled = !isRunning;
-    if (cancel) cancel.disabled = ['completed','cancelled'].includes(b.status);
+    if (cancel) {
+        cancel.disabled = ['completed','cancelled','cancelling'].includes(b.status);
+        if (isCancelling) cancel.textContent = '正在收回…';
+        else cancel.textContent = '取消';
+    }
     // 强制重置按钮：只在状态异常（resuming/interrupted）或卡住超过 5 秒的 running 状态显示
     const forceResetBtn = document.getElementById('btn-ecommerce-force-reset');
     if (forceResetBtn) {
@@ -11737,7 +11972,7 @@ function renderEcommerceResultFolders() {
         container.innerHTML = '<div class="ecommerce-empty">尚未扫描到服装文件夹。</div>';
         return;
     }
-    const folderSignature = `${b.id}|${b.run_code || ''}|${garments.map(g => g.id).join(',')}|${(b.tasks || []).map(t => `${t.id}:${t.state}:${t.updated_at || ''}`).join('|')}`;
+    const folderSignature = `${b.id}|${b.run_code || ''}|${garments.map(g => g.id).join(',')}|${(b.tasks || []).map(t => `${t.id}:${t.state}:${t.updated_at || ''}`).join('|')}|${JSON.stringify(b.confirmed_groups || {})}`;
     if (folderSignature === ecommerceState.renderCache.folders) return;
     ecommerceState.renderCache.folders = folderSignature;
     const tasksByGarment = {};
@@ -11767,9 +12002,11 @@ function renderEcommerceResultFolders() {
             ? (groupAction?.action_image || b.template?.actions?.[0]?.action_image)
             : '';
         const referenceUrl = ecommerceThumbnailUrl(ecommerceReferenceUrl(g.images?.[0] || fallbackTarget || ''), 120);
-        return `<div class="ecommerce-folder-row" data-garment-id="${ecommerceEscape(g.id)}" data-result-path="${ecommerceEscape(resultPath)}" data-garment-path="${ecommerceEscape(g.path)}" data-task-total="${total}">
+        const isConfirmed = !!(b.confirmed_groups && b.confirmed_groups[g.id]);
+        const confirmedBadge = isConfirmed ? '<span class="ecommerce-confirmed-badge" title="已确认该组">✓ 已确认</span>' : '';
+        return `<div class="ecommerce-folder-row${isConfirmed ? ' is-confirmed' : ''}" data-garment-id="${ecommerceEscape(g.id)}" data-result-path="${ecommerceEscape(resultPath)}" data-garment-path="${ecommerceEscape(g.path)}" data-task-total="${total}">
             <span class="ecommerce-folder-identity" title="${ecommerceEscape(g.path)}"><i>${index + 1}</i><b>${ecommerceEscape(g.name)}</b></span>
-            <span class="ecommerce-folder-status" title="${ecommerceEscape(statusDetail)}" data-result-path="${ecommerceEscape(resultPath)}" data-task-total="${total}">${statusText}</span>
+            <span class="ecommerce-folder-status" title="${ecommerceEscape(statusDetail)}" data-result-path="${ecommerceEscape(resultPath)}" data-task-total="${total}">${statusText}${confirmedBadge}</span>
             <span class="ecommerce-folder-actions">${referenceUrl ? `<img class="ecommerce-folder-ref-thumb ecommerce-folder-compare" src="${ecommerceEscape(referenceUrl)}" alt="${ecommerceEscape(g.name)}参考图" title="查看对比" loading="lazy" decoding="async">` : ''}<button class="btn btn-primary btn-compact ecommerce-folder-compare" type="button">对比</button><button class="btn btn-outline btn-compact ecommerce-folder-open" type="button" title="在访达中打开 ${ecommerceEscape(resultPath)}">📁 打开</button></span>
         </div>`;
     }).join('');
@@ -11826,6 +12063,12 @@ async function createAndStartEcommerceBatch() {
     const hasTargetImages = !!ecommerceState.importActions?.actions?.length;
     if (!hasGarmentImages) return showToast('请选择服装图片，或选择包含子文件夹的服装根目录', 'error');
     const generationMode = hasTargetImages ? 'garment_reference' : 'garment_prompt';
+    const precisionEnabled = generationMode === 'garment_reference' && !!document.getElementById('ecommerce-precision-matching')?.checked;
+    if (precisionEnabled) {
+        const actionCount = ecommerceState.importActions?.actions?.length || 0;
+        const mapping = ecommerceState.precisionMatching?.mapping || [];
+        if (mapping.length !== actionCount) return showToast('请先完成所有目标图的人工精准匹配', 'error');
+    }
     // 新建前一定刷新批次索引，避免后台已收尾而页面仍拿旧“运行中”状态阻止下一批。
     try {
         const latest = await ecommerceApi('GET', '/api/ecommerce/batches');
@@ -11835,7 +12078,7 @@ async function createAndStartEcommerceBatch() {
     } catch (error) {
         return showToast(`无法确认上一批是否已完成：${error.message}`, 'error');
     }
-    const activeBatch = ecommerceState.batches.find(batch => ['running', 'resuming'].includes(batch.status));
+    const activeBatch = ecommerceState.batches.find(batch => ['running', 'resuming', 'cancelling'].includes(batch.status));
     if (activeBatch) return showToast(`批次“${activeBatch.name || activeBatch.id}”仍在运行，请等待完成或先暂停，避免重复提交`, 'error');
     const button = document.getElementById('btn-ecommerce-create');
     const originalButtonText = button?.textContent || '';
@@ -11855,6 +12098,7 @@ async function createAndStartEcommerceBatch() {
         const promptAction = buildEcommercePromptAction();
         const currentActions = hasTargetImages ? buildCurrentEcommerceTargetActions() : [];
         const runningHubSpecs = new Map();
+        const runningHubPreflightWarnings = [];
         for (const action of (currentActions.length ? currentActions : [promptAction])) {
             if (action.platform !== 'runninghub') continue;
             const endpoint = action.endpoint || action.model_id || action.model_key;
@@ -11862,19 +12106,28 @@ async function createAndStartEcommerceBatch() {
             if (endpoint) runningHubSpecs.set(`${endpoint}|${resolution}`, { endpoint, resolution });
         }
         for (const spec of runningHubSpecs.values()) {
-            const preview = await ecommerceApi('POST', '/api/rh-preflight', {
-                model_id: spec.endpoint,
-                resolution: spec.resolution
-            });
-            const price = Number(preview.estimated_price);
-            if (Number.isFinite(price) && price > 0.5) {
-                const proceed = confirm(`RunningHub实时价格预估为 ${price} ${preview.currency || 'CNY'}/张，超过批量安全线0.50元。仍要创建并运行吗？`);
-                if (!proceed) throw new Error('已取消高价模型批次，请改用V2 Flash低价4K');
+            try {
+                const preview = await ecommerceApi('POST', '/api/rh-preflight', {
+                    model_id: spec.endpoint,
+                    resolution: spec.resolution
+                });
+                const price = Number(preview.estimated_price);
+                if (Number.isFinite(price) && price > 0.5) {
+                    const proceed = confirm(`RunningHub实时价格预估为 ${price} ${preview.currency || 'CNY'}/张，超过批量安全线0.50元。仍要创建并运行吗？`);
+                    if (!proceed) throw new Error('已取消高价模型批次，请改用V2 Flash低价4K');
+                }
+            } catch (preflightError) {
+                // 价格预估是非计费的安全提示，不应阻断批次创建；模型权限/参数错误会在真正提交时返回。
+                const message = preflightError?.message || '价格预估失败';
+                if (message.startsWith('已取消高价模型批次')) throw preflightError;
+                runningHubPreflightWarnings.push(`${spec.endpoint} ${spec.resolution.toUpperCase()}：${message}`);
+                console.warn('[ecommerce] RunningHub价格预检失败，继续创建批次', spec, preflightError);
             }
         }
         const data = await ecommerceApi('POST', '/api/ecommerce/batches', {
             name: document.getElementById('ecommerce-batch-name')?.value.trim() || '',
             actions: currentActions,
+            precision_matching: precisionEnabled,
             prompt_action: promptAction,
             template_name: generationMode === 'garment_prompt' ? '服装原图批量提示词' : '本次运行目标图',
             clothing_root: clothingRoot,
@@ -11894,7 +12147,7 @@ async function createAndStartEcommerceBatch() {
             garment_limit: 0,
             action_limit: 0,
             max_attempts: 3,
-            qc_enabled: generationMode === 'garment_reference' && !!document.getElementById('ecommerce-qc-enabled')?.checked,
+            qc_enabled: !precisionEnabled && generationMode === 'garment_reference' && !!document.getElementById('ecommerce-qc-enabled')?.checked,
             qc_model: document.getElementById('ecommerce-qc-model')?.value.trim() || 'gemini-2.5-pro',
             profile_mode: document.getElementById('ecommerce-profile-mode')?.value || 'visual_sheets',
             qc_threshold: Number(document.getElementById('ecommerce-qc-threshold')?.value || 85),
@@ -11918,7 +12171,10 @@ async function createAndStartEcommerceBatch() {
             }
         }
         await controlEcommerceBatch('start');
-        showToast(data.warning || `批次已开始：${data.batch.task_total}个任务`, data.warning ? 'warning' : 'success');
+        const preflightWarning = runningHubPreflightWarnings.length
+            ? `价格预检失败，已继续提交；若模型权限或参数不匹配，任务会在提交阶段标记失败。\n${runningHubPreflightWarnings.join('\n')}`
+            : '';
+        showToast([data.warning, preflightWarning].filter(Boolean).join('\n') || `批次已开始：${data.batch.task_total}个任务`, preflightWarning || data.warning ? 'warning' : 'success');
     } catch (e) {
         showToast(`创建批次失败：${e.message}`, 'error');
         if (button) { button.disabled = false; button.textContent = originalButtonText; }
@@ -11982,7 +12238,18 @@ if (ecommerceTargetDropzone) {
     });
 }
 document.getElementById('btn-ecommerce-select-garment-files')?.addEventListener('click', event => {
-    event.stopPropagation(); document.getElementById('ecommerce-garment-files')?.click();
+    event.preventDefault();
+    event.stopPropagation();
+    const input = document.getElementById('ecommerce-garment-files');
+    if (input) input.click();
+});
+// 文件夹入口必须走系统目录选择器：浏览器的多文件选择器在桌面壳中
+// 可能只返回当前层文件，不能可靠表达“整个大文件夹”。后端会递归扫描
+// 该根目录，并保留子文件夹分组；这条路径不会改变普通多图选择和拖拽逻辑。
+document.getElementById('btn-ecommerce-select-garment-folder')?.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    document.getElementById('btn-ecommerce-select-root')?.click();
 });
 document.getElementById('ecommerce-garment-files')?.addEventListener('change', event => {
     loadDroppedEcommerceGarmentFiles(event.target.files); event.target.value = '';
@@ -12011,9 +12278,9 @@ if (ecommerceGarmentDropzone) {
         }
     });
     ecommerceGarmentDropzone.addEventListener('click', event => {
-        if (event.target === ecommerceGarmentDropzone || event.target.closest('b, strong, span')) {
+        if (event.target === ecommerceGarmentDropzone || event.target.closest('b, strong, span, .ecommerce-tile-action')) {
             clearTimeout(garmentClickTimer);
-            garmentClickTimer = setTimeout(() => document.getElementById('ecommerce-garment-files')?.click(), 220);
+            garmentClickTimer = setTimeout(() => document.getElementById('ecommerce-garment-files')?.click(), 0);
         }
     });
     ecommerceGarmentDropzone.addEventListener('dblclick', event => {
@@ -12375,12 +12642,29 @@ document.getElementById('ecommerce-qc-enabled')?.addEventListener('change', asyn
         }
     }
 });
+document.getElementById('ecommerce-precision-matching')?.addEventListener('change', e => {
+    if (e.currentTarget.checked) {
+        const qc = document.getElementById('ecommerce-qc-enabled');
+        if (qc) qc.checked = false;
+        updateEcommerceQcToggleUi();
+    }
+    updateEcommercePrecisionUi();
+    saveEcommerceDraft();
+    if (e.currentTarget.checked && document.getElementById('ecommerce-clothing-root')?.value.trim()) {
+        scanEcommerceGarments().catch(error => showToast(`精准模式重新扫描失败：${error.message}`, 'error'));
+    }
+});
+document.getElementById('btn-ecommerce-open-precision-matching')?.addEventListener('click', openEcommercePrecisionMatching);
+document.getElementById('btn-ecommerce-clear-precision')?.addEventListener('click', () => {
+    clearEcommercePrecisionMatching('人工精准匹配已清空，请重新匹配');
+});
 document.getElementById('ecommerce-samples-per-action')?.addEventListener('change', updateEcommerceQcToggleUi);
 try {
     const savedQcPreference = localStorage.getItem(ECOMMERCE_QC_PREF_KEY);
     if (savedQcPreference !== null) document.getElementById('ecommerce-qc-enabled').checked = savedQcPreference === '1';
 } catch (_e) {}
 updateEcommerceQcToggleUi();
+updateEcommercePrecisionUi();
 
 function updateEcommerceAutoConcurrency(apply = false) {
     const actionCount = Math.max(1, ecommerceState.importActions?.actions?.length || 1);
@@ -12549,11 +12833,17 @@ const ecommerceRerunState = {
     batchId: '', items: [], activeIndex: -1, compareRefIndex: 0,
     selectedIds: new Set(), bulkPrompt: '', bulkPlatform: '', bulkModelKey: '', bulkRatio: 'auto',
     bulkConcurrency: 10, bulkDrawCount: 1,
+    // 调整面板确认后的临时修改：在本次提交前即使自动重新扫描，也不能回退到批次原始配置。
+    pendingEdits: new Map(),
     groupSyncByGarment: new Map(),
     bulkProgress: { active: false, paused: false, total: 0, completed: 0, success: 0, failed: 0 },
     bulkPauseWaiters: [], rerunBatches: [], activeRerunBatchId: ''
 };
-const ecommerceGroupCompareState = { mode: 'rerun', data: null, refIndex: 0, resultIndex: 0 };
+const ecommerceGroupCompareState = {
+    mode: 'rerun', data: null, refIndex: 0, resultIndex: 0,
+    actionIndex: 0, candidateIndex: 0, hadChanges: false,
+    selectedResultKeys: new Set(), resultSelectionAnchor: -1
+};
 const ecommerceCompareZoomState = { reference: 1, result: 1 };
 const ecommerceComparePanState = {
     reference: { x: 0, y: 0 },
@@ -12571,10 +12861,15 @@ function ecommerceBuildRerunQueuePayload(item, config = {}) {
     const drawCount = Math.max(1, Math.min(5, Number(config.drawCount) || 1));
     return {
         item_id: item.id, result_path: item.result_path || '',
+        deletion_ids: Array.isArray(item.deletion_ids) ? item.deletion_ids.filter(Boolean) : [],
         mark_id: item.mark_id || '', marked_result_path: item.marked_result_path || '',
         mode: 'full', prompt: String(item.rerun_prompt || '').trim() || String(config.prompt || ''),
         reference_images: referenceImages,
-        count: Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5)),
+        // 未临时替换时也必须把扫描时冻结的原始动作参考图传给后端。
+        // 留空会触发后端 fallback，误把生成结果/废片备份当成动作参考图。
+        target_action_image: String(item.target_action_override_url || item.target_action_url || '').trim(),
+        // 抽卡数是用户对每个待重做动作设置的候选数，不与缺口数取最大值。
+        count: drawCount,
         model_override: {
             platform: config.platform || ecommerceRerunState.bulkPlatform || 'runninghub',
             model_key: config.modelKey || ecommerceRerunState.bulkModelKey,
@@ -12596,12 +12891,29 @@ function renderEcommerceRerunBatches() {
         const total = Number(row.total_count) || 0;
         const done = Number(row.completed_count) || 0;
         const remaining = Math.max(0, total - done);
+        const returnedImages = Number(row.returned_image_count ?? row.accepted_image_count) || 0;
+        const requestedImages = Number(row.requested_image_count) || total;
+        const itemStateLabels = {
+            pending: '等待处理', running: '平台处理中', partial: '部分回填',
+            accepted: '回填成功', failed: '失败'
+        };
+        const itemLines = (row.item_statuses || []).map(item => {
+            const itemReturned = Number(item.success_count) || 0;
+            const itemRequested = Number(item.requested_count) || 1;
+            const stateText = item.recovery_pending
+                ? '应用重启后待接回（不会重复提交）'
+                : (itemStateLabels[item.status] || item.status || '等待处理');
+            return `<span class="ecommerce-rerun-batch-item-status is-${ecommerceEscape(item.status || 'pending')}">
+                ${ecommerceEscape(item.garment_name)} · 动作${Number(item.action_order) || 0}：${stateText}，已回填 ${itemReturned}/${itemRequested} 张${item.error ? ` · ${ecommerceEscape(item.error)}` : ''}
+            </span>`;
+        }).join('');
         const canContinue = remaining > 0 && ['running', 'paused', 'interrupted', 'partial'].includes(row.status);
         const canFinalize = remaining > 0 && row.status !== 'partial';
         const firstGarment = row.accepted_garments?.[0]?.id || '';
         return `<div class="ecommerce-rerun-batch-row ${row.id === ecommerceRerunState.activeRerunBatchId ? 'is-active' : ''}" data-rerun-batch-id="${ecommerceEscape(row.id)}">
             <strong>${ecommerceEscape(row.name || '废片重做')} · ${done}/${total}</strong>
-            <small>${labels[row.status] || row.status} · 已完成${done}张${remaining ? ` · 剩余${remaining}张` : ''}${row.legacy_recovered ? ' · 旧任务提示词无法还原，继续时复用原任务提示词' : ''}</small>
+            <small>${labels[row.status] || row.status} · 成功${done}/${total}项 · 已回填${returnedImages}/${requestedImages}张图${remaining ? ` · 剩余${remaining}项` : ''}${row.legacy_recovered ? ' · 旧任务提示词无法还原，继续时复用原任务提示词' : ''}</small>
+            <div class="ecommerce-rerun-batch-item-statuses">${itemLines}</div>
             <span class="ecommerce-rerun-batch-actions">
                 ${canContinue ? '<button class="btn btn-primary ecommerce-rerun-session-resume" type="button">继续剩余</button>' : ''}
                 ${canFinalize ? '<button class="btn btn-outline ecommerce-rerun-session-finalize" type="button">结束本次</button>' : ''}
@@ -12611,7 +12923,7 @@ function renderEcommerceRerunBatches() {
     }).join('');
     root.querySelectorAll('.ecommerce-rerun-session-resume').forEach(button => button.addEventListener('click', async () => {
         const row = button.closest('.ecommerce-rerun-batch-row');
-        await resumeEcommerceRerunBatch(row?.dataset.rerunBatchId || '');
+        await resumeEcommerceRerunBatch(row?.dataset.rerunBatchId || '', button);
     }));
     root.querySelectorAll('.ecommerce-rerun-session-finalize').forEach(button => button.addEventListener('click', async () => {
         const id = button.closest('.ecommerce-rerun-batch-row')?.dataset.rerunBatchId || '';
@@ -12665,6 +12977,10 @@ async function openEcommerceRerunBatchCompare(rerunBatchId, garmentId) {
     ecommerceGroupCompareState.data = data;
     ecommerceGroupCompareState.refIndex = 0;
     ecommerceGroupCompareState.resultIndex = 0;
+    ecommerceGroupCompareState.actionIndex = 0;
+    ecommerceGroupCompareState.candidateIndex = 0;
+    ecommerceGroupCompareState.hadChanges = false;
+    clearEcommerceResultSelection();
     ecommerceGroupCompareState.garmentList = session.accepted_garments || [{ id: garmentId, name: data.garment_name }];
     ecommerceGroupCompareState.currentGarmentIndex = ecommerceGroupCompareState.garmentList.findIndex(entry => entry.id === garmentId);
     ecommerceCompareZoomState.reference = 1;
@@ -12695,6 +13011,65 @@ function ecommerceRerunAdjustmentTargets(item) {
 
 function ecommerceCloneRerunReferences(references) {
     return (references || []).map(reference => ({ ...reference }));
+}
+
+function ecommerceRerunTargetActionSource(item) {
+    return {
+        url: String(item?.target_action_override_url || item?.target_action_url || ''),
+        path: String(item?.target_action_override_path || item?.target_action_path || ''),
+        overridden: !!item?.target_action_override_url
+    };
+}
+
+function rememberEcommerceRerunEdits(item) {
+    if (!item?.id) return;
+    ecommerceRerunState.pendingEdits.set(item.id, {
+        target_action_override_url: item.target_action_override_url || '',
+        target_action_override_path: item.target_action_override_path || '',
+        references: ecommerceCloneRerunReferences(item.references),
+        rerun_prompt: item.rerun_prompt || ''
+    });
+}
+
+function restoreEcommerceRerunEdits(item) {
+    const saved = item?.id ? ecommerceRerunState.pendingEdits.get(item.id) : null;
+    if (!saved) return item;
+    if (saved.target_action_override_url) item.target_action_override_url = saved.target_action_override_url;
+    if (saved.target_action_override_path) item.target_action_override_path = saved.target_action_override_path;
+    if (Array.isArray(saved.references) && saved.references.length) item.references = ecommerceCloneRerunReferences(saved.references);
+    if (saved.rerun_prompt) item.rerun_prompt = saved.rerun_prompt;
+    return item;
+}
+
+async function ecommerceReplaceRerunTargetAction(item, file, index) {
+    if (!item || !file) return;
+    if (!/^image\//i.test(file.type || '') && !/\.(jpe?g|png|webp)$/i.test(file.name || '')) {
+        return showToast('动作参考图只支持 JPG、PNG 或 WEBP', 'error');
+    }
+    try {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('batch_id', ecommerceRerunState.batchId);
+        const response = await fetch('/api/ecommerce/upload-temp-image', { method: 'POST', body: formData });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.url) throw new Error(data.error || '上传失败');
+        // 动作图覆盖永远只属于当前动作，不能随“同步本套”复制给其他动作。
+        item.target_action_override_url = data.url;
+        item.target_action_override_path = data.path;
+        rememberEcommerceRerunEdits(item);
+        renderEcommerceRerunCompare(index);
+        showToast(`动作${item.action_order}已换成本次重做临时参考图`, 'success');
+    } catch (error) {
+        showToast(`动作参考图替换失败：${error.message}`, 'error');
+    }
+}
+
+function ecommercePickRerunTargetAction(item, index) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/jpeg,image/png,image/webp';
+    input.onchange = () => ecommerceReplaceRerunTargetAction(item, input.files?.[0], index);
+    input.click();
 }
 
 function setEcommerceRerunAdjustPanelVisible(visible, scrollIntoView = false) {
@@ -12742,6 +13117,55 @@ function advanceEcommerceRerunWorkflow(currentIndex, syncWholeGarment) {
         ? `本套下一张：${next.action_name || `动作${next.action_order}`}`
         : `下一套：${next.garment_name || ''}`);
     return true;
+}
+
+function ecommerceRerunCancellationPayload(item) {
+    return {
+        item_id: item.id,
+        garment_id: item.garment_id,
+        action_order: item.action_order,
+        deletion_ids: item.deletion_ids || [],
+        mark_id: item.mark_id || '',
+        mark_ids: item.merged_mark_ids || [],
+        marked_result_path: item.marked_result_path || ''
+    };
+}
+
+async function cancelEcommerceRerunItems(items, wholeGarment = false) {
+    const targets = (items || []).filter(Boolean);
+    if (!targets.length) return;
+    const message = wholeGarment
+        ? `取消“${targets[0].garment_name}”本套全部 ${targets.length} 张重做？\n\n已删除图片会恢复原文件，手动标记会撤销；恢复后刷新扫描不会再进入重做。`
+        : `取消这张重做？\n\n如果它是误删废片，将恢复原图；如果它是手动标记，将撤销标记。`;
+    if (!confirm(message)) return;
+    const oldIndex = ecommerceRerunState.activeIndex;
+    try {
+        const response = await ecommerceApi('POST', '/api/ecommerce/cancel-rerun-items', {
+            batch_id: ecommerceRerunState.batchId,
+            items: targets.map(ecommerceRerunCancellationPayload)
+        });
+        const cancelled = new Set(response.cancelled_item_ids || []);
+        cancelled.forEach(id => ecommerceRerunState.selectedIds.delete(id));
+        ecommerceRerunState.items = ecommerceRerunState.items.filter(entry => !cancelled.has(entry.id));
+        if (!cancelled.size) throw new Error((response.errors || []).join('；') || '没有取消任何项目');
+
+        if (!ecommerceRerunState.items.length) {
+            closeEcommerceRerunAdjustPanel(false);
+            renderEcommerceRerunList();
+        } else {
+            const nextIndex = Math.min(Math.max(0, oldIndex), ecommerceRerunState.items.length - 1);
+            ecommerceRerunState.activeIndex = nextIndex;
+            renderEcommerceRerunList();
+            renderEcommerceRerunCompare(nextIndex);
+        }
+        const actionLabel = wholeGarment ? `已取消本套 ${cancelled.size} 张重做` : '已取消这一张重做';
+        ecommerceToast(`${actionLabel}；恢复/撤销已写入，下次扫描不会重复出现`);
+        if ((response.errors || []).length) {
+            showToast(`另有项目未能恢复：${response.errors.join('；')}`, 'warning');
+        }
+    } catch (error) {
+        showToast(`取消重做失败：${error.message}`, 'error');
+    }
 }
 
 function ecommerceThumbnailUrl(url, maxEdge = 320) {
@@ -13059,6 +13483,44 @@ function closeEcommerceImageCompare() {
     overlay.hidden = true;
     overlay.setAttribute('aria-hidden', 'true');
     document.body.classList.remove('ecommerce-compare-open');
+    // 对比期间如果有删除/标记/确认等操作，自动刷新废片重做列表
+    if (ecommerceGroupCompareState.hadChanges) {
+        ecommerceGroupCompareState.hadChanges = false;
+        autoScanEcommerceRerunAfterCompare();
+    }
+}
+
+// 关闭对比界面后自动刷新废片重做列表
+async function autoScanEcommerceRerunAfterCompare() {
+    const batchId = ecommerceGroupCompareState.data?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    if (!batchId) return;
+    // 同步重做栏的批次选择器
+    const rerunSelect = document.getElementById('ecommerce-rerun-batch-select');
+    if (rerunSelect) {
+        renderEcommerceRerunBatchOptions();
+        if (rerunSelect.value !== batchId) {
+            rerunSelect.value = batchId;
+        }
+    }
+    // 同步重做状态
+    ecommerceRerunState.batchId = batchId;
+    // 清除单组路径限制，确保整批扫描所有废片
+    const singlePathInput = document.getElementById('ecommerce-rerun-result-path');
+    if (singlePathInput) singlePathInput.value = '';
+    // 刷新批次数据并扫描废片
+    try {
+        await refreshEcommerceBatch();
+        renderEcommerceResultFolders();
+        await scanEcommerceRerun();
+        const total = ecommerceRerunState.items.length;
+        if (total > 0) {
+            ecommerceToast(`已自动扫描到 ${total} 张废片待重做，工具栏已就绪`, 'success');
+        } else {
+            ecommerceToast('已自动扫描，当前没有废片待重做', 'info');
+        }
+    } catch (e) {
+        console.warn('[auto-rescan] failed', e);
+    }
 }
 
 function resetEcommerceComparePan(side) {
@@ -13142,6 +13604,13 @@ function setEcommerceCompareImage(side, url, alt = '') {
     const nextUrl = String(url || '');
     const sourceChanged = image.dataset.sourceUrl !== nextUrl;
     if (alt) image.alt = alt;
+    if (!nextUrl) {
+        image.dataset.pendingSourceUrl = '';
+        image.dataset.sourceUrl = '';
+        image.removeAttribute('src');
+        resetEcommerceComparePan(safeSide);
+        return;
+    }
     if (!sourceChanged) {
         if (image.complete && image.naturalWidth) scheduleEcommerceCompareZoom(safeSide);
         return;
@@ -13166,24 +13635,84 @@ function setEcommerceCompareImage(side, url, alt = '') {
     loader.src = nextUrl;
 }
 
+function ecommerceCompareActionGroups(group = ecommerceGroupCompareState.data) {
+    if (!group) return [];
+    if (Array.isArray(group.action_groups) && group.action_groups.length) return group.action_groups;
+    const grouped = new Map();
+    for (const result of (group.results || [])) {
+        const order = Number(result.action_order) || 1;
+        if (!grouped.has(order)) grouped.set(order, {
+            action_order: order, action_code: `A${String(order).padStart(2, '0')}`,
+            action_name: result.action_name || `第${order}张`, results: [], reference: {}
+        });
+        grouped.get(order).results.push(result);
+    }
+    return [...grouped.values()].sort((a, b) => a.action_order - b.action_order);
+}
+
+function ecommerceCurrentActionGroup() {
+    const groups = ecommerceCompareActionGroups();
+    if (!groups.length) return null;
+    ecommerceGroupCompareState.actionIndex = Math.max(0, Math.min(ecommerceGroupCompareState.actionIndex || 0, groups.length - 1));
+    return groups[ecommerceGroupCompareState.actionIndex];
+}
+
+function ecommerceCurrentGroupResult() {
+    const actionGroup = ecommerceCurrentActionGroup();
+    const results = actionGroup?.results || [];
+    if (!results.length) return null;
+    ecommerceGroupCompareState.candidateIndex = Math.max(0, Math.min(ecommerceGroupCompareState.candidateIndex || 0, results.length - 1));
+    return results[ecommerceGroupCompareState.candidateIndex] || null;
+}
+
+function ecommerceResultSelectionKey(result) {
+    return result ? `${result.path || ''}|${result.deletion_id || ''}` : '';
+}
+
+function clearEcommerceResultSelection() {
+    ecommerceGroupCompareState.selectedResultKeys = new Set();
+    ecommerceGroupCompareState.resultSelectionAnchor = -1;
+}
+
+function ecommerceSelectedCurrentActionResults(results) {
+    const selected = ecommerceGroupCompareState.selectedResultKeys || new Set();
+    return results.filter(result => selected.has(ecommerceResultSelectionKey(result)) && !result.deleted);
+}
+
+function ecommerceSyncGroupFlatIndex(result = ecommerceCurrentGroupResult()) {
+    const flatResults = ecommerceGroupCompareState.data?.results || [];
+    const index = result ? flatResults.findIndex(entry =>
+        entry === result || (entry.path === result.path && entry.deletion_id === result.deletion_id)
+    ) : -1;
+    ecommerceGroupCompareState.resultIndex = Math.max(0, index);
+    return ecommerceGroupCompareState.resultIndex;
+}
+
 function updateEcommerceImageCompare() {
     const groupMode = ecommerceGroupCompareState.mode === 'group';
     const item = groupMode ? null : ecommerceRerunState.items[ecommerceRerunState.activeIndex];
     const group = groupMode ? ecommerceGroupCompareState.data : null;
     if ((!groupMode && !item) || (groupMode && !group)) return;
-    let refs = groupMode ? (group.references || []) : (item.references || []);
+    const actionGroups = groupMode ? ecommerceCompareActionGroups(group) : [];
+    if (groupMode) {
+        ecommerceGroupCompareState.actionIndex = Math.max(0, Math.min(ecommerceGroupCompareState.actionIndex || 0, Math.max(0, actionGroups.length - 1)));
+    }
+    const actionGroup = groupMode ? (actionGroups[ecommerceGroupCompareState.actionIndex] || null) : null;
+    const groupUsesSingleSource = groupMode && ['target_only', 'garment_prompt'].includes(group.generation_mode);
+    // 服装参考图+动作参考图模式：左侧永远只显示该服装冻结的参考图。
+    // 动作参考和AI结果都不得进入左侧缩略图容器。
+    let refs = groupMode
+        ? (groupUsesSingleSource && actionGroup?.reference?.url
+            ? [actionGroup.reference]
+            : (group.references || []))
+        : (item.references || []);
     if (!groupMode && item) {
         refs = [
             { url: item.bad_photo_url || '', name: '废片', _isBadPhoto: true },
             ...refs
         ];
     }
-    const groupResults = groupMode ? (group.results || []) : [];
-    if (groupMode && ['target_only', 'garment_prompt'].includes(group.generation_mode) && groupResults.length) {
-        const currentResult = groupResults[Math.max(0, Math.min(ecommerceGroupCompareState.resultIndex, groupResults.length - 1))];
-        const matchingIndex = refs.findIndex(entry => Number(entry.action_order) === Number(currentResult?.action_order));
-        if (matchingIndex >= 0) ecommerceGroupCompareState.refIndex = matchingIndex;
-    }
+    const groupResults = groupMode ? (actionGroup?.results || []) : [];
     const requestedRefIndex = groupMode ? ecommerceGroupCompareState.refIndex : ecommerceRerunState.compareRefIndex;
     const index = Math.max(0, Math.min(requestedRefIndex, refs.length - 1));
     if (groupMode) ecommerceGroupCompareState.refIndex = index;
@@ -13193,16 +13722,18 @@ function updateEcommerceImageCompare() {
         url: item.bad_photo_url || '', deleted: true, action_order: item.action_order,
         action_name: item.action_name || ''
     }];
-    const resultIndex = Math.max(0, Math.min(groupMode ? ecommerceGroupCompareState.resultIndex : 0, results.length - 1));
-    if (groupMode) ecommerceGroupCompareState.resultIndex = resultIndex;
+    const resultIndex = Math.max(0, Math.min(groupMode ? ecommerceGroupCompareState.candidateIndex : 0, results.length - 1));
+    if (groupMode) ecommerceGroupCompareState.candidateIndex = resultIndex;
     const result = results[resultIndex] || {};
+    if (groupMode) ecommerceSyncGroupFlatIndex(result);
     const refImage = document.getElementById('ecommerce-compare-reference-image');
     const badImage = document.getElementById('ecommerce-compare-bad-image');
     const isBadPhotoRef = !groupMode && ref._isBadPhoto;
-    if (refImage) setEcommerceCompareImage('reference', ecommerceThumbnailUrl(ref.override_url || ref.url || '', 1200), '服装实拍参考大图');
+    // 对比区只显示当前一张参考图，直接加载原始文件；列表缩略图仍走压缩预览。
+    if (refImage) setEcommerceCompareImage('reference', ref.override_url || ref.url || '', '服装实拍参考原图');
     if (badImage) setEcommerceCompareImage(
         'result',
-        ecommerceThumbnailUrl(result.url || '', 1200),
+        result.url || '',
         result.deleted ? '已删废片备份' : `生成图·动作${result.action_order || resultIndex + 1}`
     );
     const refLabel = document.getElementById('ecommerce-compare-ref-label');
@@ -13222,16 +13753,34 @@ function updateEcommerceImageCompare() {
     }
     const counter = document.getElementById('ecommerce-compare-counter');
     if (counter) {
-        if (groupMode) counter.textContent = `${index + 1} / ${refs.length || 0}`;
+        if (groupMode) counter.textContent = `${refs.length ? index + 1 : 0} / ${refs.length}`;
         else counter.textContent = index === 0 ? '废片' : `${index} / ${refs.length - 1}`;
     }
     const resultCounter = document.getElementById('ecommerce-compare-result-counter');
-    if (resultCounter) resultCounter.textContent = `${resultIndex + 1} / ${results.length || 0}`;
+    if (resultCounter) {
+        if (groupMode) {
+            const originalCount = Number(actionGroup?.original_count ?? results.length);
+            const keptCount = Number(actionGroup?.kept_count ?? results.filter(entry => !entry.deleted && !entry.marked_redo).length);
+            const deletedCount = Number(actionGroup?.deleted_count ?? results.filter(entry => entry.deleted).length);
+            const markedCount = Number(actionGroup?.marked_count ?? results.filter(entry => entry.marked_redo).length);
+            const garmentNo = Math.max(0, ecommerceGroupCompareState.currentGarmentIndex || 0) + 1;
+            const garmentTotal = (ecommerceGroupCompareState.garmentList || []).length || 1;
+            resultCounter.textContent = `第${garmentNo}/${garmentTotal}套 · ${actionGroup?.action_code || ''} · 原始${originalCount} · 保留${keptCount} · 已删${deletedCount}${markedCount ? ` · 标记${markedCount}` : ''} · 当前${results.length ? resultIndex + 1 : 0}/${results.length}张`;
+        } else {
+            resultCounter.textContent = `${resultIndex + 1} / ${results.length || 0}`;
+        }
+    }
     const resultLabel = document.getElementById('ecommerce-compare-result-label');
     if (resultLabel) {
         const markedBadge = result.marked_redo ? ' ⚑ 已标记重做 ' : '';
         const deletedBadge = result.deleted ? ' ⚠ 已删除 ' : '';
-        if (result.deleted) {
+        if (groupMode && !results.length) {
+            resultLabel.innerHTML = `⚠ ${ecommerceEscape(actionGroup?.action_code || '当前动作')}暂无候选图，需要废片重做`;
+            resultLabel.style.color = '#f04438';
+        } else if (result.deleted && result.recoverable) {
+            resultLabel.innerHTML = `↩ 回收站可找回 · 动作${result.action_order || resultIndex + 1} · ${ecommerceEscape(result.action_name || '')}`;
+            resultLabel.style.color = '#059669';
+        } else if (result.deleted) {
             resultLabel.innerHTML = `⚠ 已删除 · 动作${result.action_order || resultIndex + 1} · ${ecommerceEscape(result.action_name || '')}`;
             resultLabel.style.color = '#f04438';
         } else if (result.marked_redo) {
@@ -13255,8 +13804,8 @@ function updateEcommerceImageCompare() {
         const button = document.getElementById(id);
         if (!button) return;
         button.hidden = !groupMode;
-        button.disabled = groupMode && results.length < 2;
-        button.style.visibility = groupMode && results.length < 2 ? 'hidden' : '';
+        button.disabled = groupMode && actionGroups.length < 2 && results.length < 2;
+        button.style.visibility = groupMode && actionGroups.length < 2 && results.length < 2 ? 'hidden' : '';
     });
     const garmentIndicators = [
         document.getElementById('ecommerce-compare-garment-indicator-top'),
@@ -13288,18 +13837,27 @@ function updateEcommerceImageCompare() {
         garmentIndicators.forEach(indicator => { indicator.hidden = true; });
         garmentNavButtons.forEach(button => { button.hidden = true; });
     }
-    // "删除此图"按钮：只在 group 模式且当前图未删除时显示
+    const finalBtn = document.getElementById('ecommerce-compare-select-final');
+    if (finalBtn) finalBtn.hidden = true;
+    // 删除后的轻量预览仍保留按钮；再次点击会恢复原图。
+    // 回收站中的图片（recoverable）不显示删除按钮，改为显示"找回"按钮。
     const deleteBtn = document.getElementById('ecommerce-compare-delete');
     if (deleteBtn) {
         const currentResult = results[resultIndex];
-        deleteBtn.hidden = !groupMode || !currentResult || currentResult.deleted;
-        deleteBtn.textContent = currentResult?.deleted ? '已删除' : '删除此图';
+        const isRecoverable = currentResult?.deleted && currentResult?.recoverable;
+        deleteBtn.hidden = !groupMode || !currentResult || isRecoverable || !!group?.confirmed;
+        if (!deleteBtn.hidden) {
+            deleteBtn.textContent = currentResult?.deleted ? '↶ 恢复此图' : '删除此图';
+            deleteBtn.title = currentResult?.deleted
+                ? '恢复误删的原图，并从废片重做列表中移除'
+                : '软删除当前图片；之后仍可在这里或调整细节中恢复';
+        }
     }
     // "标记重做"按钮：只在 group 模式且当前图未删除时显示
     const markBtn = document.getElementById('ecommerce-compare-mark-redo');
     if (markBtn) {
         const currentResult = results[resultIndex];
-        markBtn.hidden = !groupMode || !currentResult || currentResult.deleted;
+        markBtn.hidden = !groupMode || !currentResult || currentResult.deleted || !!group?.confirmed;
         if (currentResult?.marked_redo) {
             markBtn.textContent = '✓ 已标记重做（点击取消）';
             markBtn.style.background = '#2563eb';
@@ -13312,6 +13870,68 @@ function updateEcommerceImageCompare() {
             markBtn.style.color = '#2563eb';
             markBtn.style.borderColor = '#93c5fd';
             markBtn.style.fontWeight = '';
+        }
+    }
+    // 标红当前结果面板（软删除/已删除状态）
+    const resultPane = document.querySelector('.ecommerce-compare-pane-results');
+    if (resultPane) {
+        const currentResult = results[resultIndex];
+        resultPane.classList.toggle('is-result-deleted', groupMode && !!currentResult?.deleted);
+    }
+    // "找回"按钮：当前图为已删除且可从回收站找回时显示
+    const recoverBtn = document.getElementById('ecommerce-compare-recover');
+    if (recoverBtn) {
+        const currentResult = results[resultIndex];
+        recoverBtn.hidden = !groupMode || !currentResult?.deleted || !currentResult?.recoverable;
+    }
+    // "确认该组"/"撤销确认"按钮：只在 group 模式显示
+    const confirmBtn = document.getElementById('ecommerce-compare-confirm-group');
+    const unconfirmBtn = document.getElementById('ecommerce-compare-unconfirm-group');
+    const compareShell = document.querySelector('.ecommerce-compare-shell');
+    if (confirmBtn && unconfirmBtn) {
+        const isConfirmed = !!(groupMode && group?.confirmed);
+        const hasPendingMarks = groupMode && (group?.results || []).some(r => r.marked_redo);
+        // 只有当前仍在 marked_redo 台账里的原图不算成品。
+        // BJ 只表示这张候选由“标记重做”产生，返回后是正常有效候选。
+        const totalActions = groupMode ? (group?.action_count || (group?.references?.length || 10)) : 10;
+        const nonDeletedByAction = {};
+        let nonDeletedCount = 0;
+        if (groupMode) {
+            for (const r of (group?.results || [])) {
+                if (!r.deleted && !r.marked_redo) {
+                    nonDeletedByAction[r.action_order] = (nonDeletedByAction[r.action_order] || 0) + 1;
+                    nonDeletedCount++;
+                }
+            }
+        }
+        const missingActions = [];
+        for (let i = 1; i <= totalActions; i++) {
+            if (!nonDeletedByAction[i]) missingActions.push(i);
+        }
+        const allActionsCovered = groupMode && missingActions.length === 0;
+        const canConfirm = allActionsCovered && !hasPendingMarks;
+        unconfirmBtn.hidden = !isConfirmed;
+        confirmBtn.hidden = isConfirmed || !groupMode;
+        if (!confirmBtn.hidden) {
+            confirmBtn.disabled = !canConfirm;
+            if (hasPendingMarks) {
+                confirmBtn.title = '该组还有标记重做的图片，请先处理';
+            } else if (!allActionsCovered) {
+                confirmBtn.title = `以下动作还缺少成品图：${missingActions.join('、')}（请重新生成或恢复废片）`;
+            } else {
+                confirmBtn.title = nonDeletedCount === totalActions
+                    ? '该组刚好每张动作匹配，点击确认移入成品导出列表'
+                    : `该组已有全部${totalActions}个动作的成品图（共${nonDeletedCount}张），点击确认移入成品导出列表`;
+            }
+            confirmBtn.style.opacity = confirmBtn.disabled ? '0.5' : '';
+        }
+        // 确认状态视觉反馈：整个对比窗口边框变绿 + 工具栏变绿 + 状态横幅
+        if (compareShell) {
+            compareShell.classList.toggle('is-group-confirmed', isConfirmed);
+        }
+        const confirmBanner = document.getElementById('ecommerce-compare-confirmed-banner');
+        if (confirmBanner) {
+            confirmBanner.hidden = !isConfirmed;
         }
     }
     const thumbs = document.getElementById('ecommerce-compare-thumbnails');
@@ -13337,15 +13957,86 @@ function updateEcommerceImageCompare() {
             if (i === resultIndex) classes.push('is-active');
             if (entry.deleted) classes.push('is-deleted');
             if (entry.marked_redo) classes.push('is-marked-redo');
-            const label = entry.deleted ? `废${entry.action_order || i + 1}` : (entry.marked_redo ? `标${entry.action_order || i + 1}` : `${entry.action_order || i + 1}`);
-            const title = entry.deleted ? '已删废片·本地备份' : (entry.marked_redo ? '已标记为待重做（原图保留）' : '生成图');
+            if (entry.recoverable) classes.push('is-recoverable');
+            if (ecommerceGroupCompareState.selectedResultKeys?.has(ecommerceResultSelectionKey(entry))) classes.push('is-selected');
+            let label, title;
+            if (entry.deleted && entry.recoverable) {
+                label = `回${entry.action_order || i + 1}`;
+                title = '已删至回收站·可找回对比';
+            } else if (entry.deleted) {
+                label = `废${entry.action_order || i + 1}`;
+                title = '已标记删除·待重做补齐';
+            } else if (entry.marked_redo) {
+                label = `标${entry.action_order || i + 1}`;
+                title = '已标记为待重做（原图保留）';
+            } else {
+                label = `${entry.action_order || i + 1}`;
+                title = '保留候选图';
+            }
             return `<button type="button" data-result-index="${i}" class="${classes.join(' ')}" title="${ecommerceEscape(title)}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(entry.url || '', 180))}" alt="动作${entry.action_order || i + 1}"><span>${label}</span></button>`;
         }).join('') : '';
         resultThumbs.querySelectorAll('button').forEach(button => button.addEventListener('click', event => {
             event.stopPropagation();
-            ecommerceGroupCompareState.resultIndex = Number(button.dataset.resultIndex);
+            if (resultThumbs.dataset.marqueeCompleted === '1') {
+                delete resultThumbs.dataset.marqueeCompleted;
+                event.preventDefault();
+                return;
+            }
+            const index = Number(button.dataset.resultIndex);
+            const clicked = results[index];
+            const selected = ecommerceGroupCompareState.selectedResultKeys || new Set();
+            if (event.shiftKey && ecommerceGroupCompareState.resultSelectionAnchor >= 0) {
+                const start = Math.min(ecommerceGroupCompareState.resultSelectionAnchor, index);
+                const end = Math.max(ecommerceGroupCompareState.resultSelectionAnchor, index);
+                selected.clear();
+                for (let i = start; i <= end; i++) if (!results[i]?.deleted) selected.add(ecommerceResultSelectionKey(results[i]));
+            } else if (event.ctrlKey || event.metaKey) {
+                const key = ecommerceResultSelectionKey(clicked);
+                if (selected.has(key)) selected.delete(key); else if (!clicked?.deleted) selected.add(key);
+                ecommerceGroupCompareState.resultSelectionAnchor = index;
+            } else {
+                selected.clear();
+                ecommerceGroupCompareState.resultSelectionAnchor = index;
+            }
+            ecommerceGroupCompareState.selectedResultKeys = selected;
+            ecommerceGroupCompareState.candidateIndex = index;
             updateEcommerceImageCompare();
         }));
+        if (resultThumbs.dataset.selectionHandlersBound !== '1') {
+        resultThumbs.dataset.selectionHandlersBound = '1';
+        let marqueeStart = null;
+        let marqueeMoved = false;
+        resultThumbs.addEventListener('pointerdown', event => {
+            if (event.button !== 0) return;
+            marqueeStart = { x: event.clientX, y: event.clientY };
+            marqueeMoved = false;
+        });
+        resultThumbs.addEventListener('pointermove', event => {
+            if (!marqueeStart) return;
+            if (Math.hypot(event.clientX - marqueeStart.x, event.clientY - marqueeStart.y) > 6) marqueeMoved = true;
+        });
+        resultThumbs.addEventListener('pointerup', event => {
+            if (!marqueeStart || !marqueeMoved) { marqueeStart = null; return; }
+            const left = Math.min(marqueeStart.x, event.clientX);
+            const right = Math.max(marqueeStart.x, event.clientX);
+            const top = Math.min(marqueeStart.y, event.clientY);
+            const bottom = Math.max(marqueeStart.y, event.clientY);
+            const selected = ecommerceGroupCompareState.selectedResultKeys || new Set();
+            const currentResults = ecommerceCurrentActionGroup()?.results || [];
+            resultThumbs.querySelectorAll('button[data-result-index]').forEach(button => {
+                const rect = button.getBoundingClientRect();
+                const hit = rect.right >= left && rect.left <= right && rect.bottom >= top && rect.top <= bottom;
+                if (hit) {
+                    const entry = currentResults[Number(button.dataset.resultIndex)];
+                    if (!entry?.deleted) selected.add(ecommerceResultSelectionKey(entry));
+                }
+            });
+            ecommerceGroupCompareState.selectedResultKeys = selected;
+            resultThumbs.dataset.marqueeCompleted = '1';
+            marqueeStart = null;
+            updateEcommerceImageCompare();
+        });
+        }
     }
 }
 
@@ -13357,6 +14048,9 @@ async function openEcommerceGroupCompare(garmentId) {
     ecommerceGroupCompareState.data = data;
     ecommerceGroupCompareState.refIndex = 0;
     ecommerceGroupCompareState.resultIndex = 0;
+    ecommerceGroupCompareState.actionIndex = 0;
+    ecommerceGroupCompareState.candidateIndex = 0;
+    ecommerceGroupCompareState.hadChanges = false;
     ecommerceCompareZoomState.reference = 1;
     ecommerceCompareZoomState.result = 1;
     resetEcommerceComparePan('reference');
@@ -13431,6 +14125,8 @@ async function switchEcommerceCompareGarment(direction) {
         ecommerceGroupCompareState.data = data;
         ecommerceGroupCompareState.refIndex = 0;
         ecommerceGroupCompareState.resultIndex = 0;
+        ecommerceGroupCompareState.actionIndex = 0;
+        ecommerceGroupCompareState.candidateIndex = 0;
         ecommerceGroupCompareState.currentGarmentIndex = idx;
         updateEcommerceCompareHeading(data, target.name);
         updateEcommerceImageCompare();
@@ -13445,70 +14141,180 @@ async function switchEcommerceCompareGarment(direction) {
     }
 }
 
-// 删除当前显示的AI生成图
+async function reloadEcommerceActiveCompare(preferred = {}) {
+    const group = ecommerceGroupCompareState.data;
+    const batchId = group?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group?.garment_id || '';
+    if (!batchId || !garmentId) return null;
+    const url = group?.rerun_batch_id
+        ? `/api/ecommerce/rerun-batches/${encodeURIComponent(group.rerun_batch_id)}/garments/${encodeURIComponent(garmentId)}/compare`
+        : `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(garmentId)}/compare`;
+    const refreshed = await ecommerceApi('GET', url);
+    ecommerceGroupCompareState.data = refreshed;
+    const results = refreshed.results || [];
+    const preferredIndex = results.findIndex(entry =>
+        (preferred.deletionId && entry.deletion_id === preferred.deletionId)
+        || (preferred.path && (entry.path === preferred.path || entry.original_path === preferred.path))
+    );
+    ecommerceGroupCompareState.resultIndex = preferredIndex >= 0
+        ? preferredIndex
+        : Math.min(ecommerceGroupCompareState.resultIndex, Math.max(0, results.length - 1));
+    const preferredResult = results[ecommerceGroupCompareState.resultIndex] || null;
+    const actionGroups = ecommerceCompareActionGroups(refreshed);
+    if (preferredResult) {
+        const actionIndex = actionGroups.findIndex(entry => Number(entry.action_order) === Number(preferredResult.action_order));
+        ecommerceGroupCompareState.actionIndex = Math.max(0, actionIndex);
+        const candidates = actionGroups[ecommerceGroupCompareState.actionIndex]?.results || [];
+        const candidateIndex = candidates.findIndex(entry =>
+            entry === preferredResult || (entry.path === preferredResult.path && entry.deletion_id === preferredResult.deletion_id)
+        );
+        ecommerceGroupCompareState.candidateIndex = Math.max(0, candidateIndex);
+    } else {
+        ecommerceGroupCompareState.actionIndex = Math.min(ecommerceGroupCompareState.actionIndex || 0, Math.max(0, actionGroups.length - 1));
+        ecommerceGroupCompareState.candidateIndex = 0;
+    }
+    updateEcommerceImageCompare();
+    return refreshed;
+}
+
+async function restoreEcommerceDeletedResult(result) {
+    const group = ecommerceGroupCompareState.data;
+    const batchId = group?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group?.garment_id || '';
+    if (!batchId || !garmentId || !result?.deletion_id) throw new Error('缺少删除记录，请刷新后重试');
+    const response = await ecommerceApi('POST', '/api/ecommerce/undo-delete', {
+        batch_id: batchId,
+        garment_id: garmentId,
+        deletion_id: result.deletion_id
+    });
+    await reloadEcommerceActiveCompare({ path: result.original_path || '' });
+    ecommerceGroupCompareState.hadChanges = true;
+    const folderContainer = document.getElementById('ecommerce-result-folders');
+    if (folderContainer && ecommerceState.detail?.id === batchId) {
+        await refreshEcommerceFolderStatusCounts(folderContainer, ecommerceState.detail);
+    }
+    return response;
+}
+
+async function selectEcommerceCurrentFinalProduct() {
+    const group = ecommerceGroupCompareState.data;
+    const result = ecommerceCurrentGroupResult();
+    const batchId = group?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group?.garment_id || '';
+    if (!batchId || !garmentId || !result || result.deleted || !result.path) {
+        return showToast('当前没有可设为最终成品的图片', 'error');
+    }
+    try {
+        await ecommerceApi('POST', '/api/ecommerce/final-selection', {
+            batch_id: batchId,
+            garment_id: garmentId,
+            path: result.path
+        });
+        await reloadEcommerceActiveCompare({ path: result.path });
+        await loadEcommerceFinalExportStatus(false);
+        ecommerceToast(`已把动作${result.action_order}当前图片设为最终成品`);
+    } catch (error) {
+        showToast(`选择最终成品失败：${error.message}`, 'error');
+    }
+}
+
+// 删除当前显示的AI生成图；已删除预览再次点击则恢复。
 async function deleteEcommerceCurrentResult() {
     const groupMode = ecommerceGroupCompareState.mode === 'group';
     const group = groupMode ? ecommerceGroupCompareState.data : null;
-    const results = groupMode ? (group?.results || []) : [];
-    const resultIndex = groupMode ? ecommerceGroupCompareState.resultIndex : 0;
-    const result = results[resultIndex];
+    const result = groupMode ? ecommerceCurrentGroupResult() : null;
     if (!result) return showToast('没有可删除的AI图', 'error');
-    if (result.deleted) return showToast('此图已删除（当前显示的是废片备份）', 'warning');
+    if (result.deleted) {
+        try {
+            const restored = await restoreEcommerceDeletedResult(result);
+            const qualityNote = restored?.full_resolution === false ? '（仅找到预览备份）' : '（已恢复完整原图）';
+            ecommerceToast(`已恢复到成品文件夹${qualityNote}；完成数量已刷新`);
+        } catch (error) {
+            showToast(`恢复失败：${error.message}`, 'error');
+        }
+        return;
+    }
     if (!result.path) return showToast('找不到文件路径', 'error');
     const batchId = group?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
     const garmentId = group?.garment_id || '';
     if (!batchId || !garmentId) return showToast('缺少批次或服装信息', 'error');
     const basename = result.path.split('/').pop();
     const deletedResult = { ...result };
-    const deletedIndex = resultIndex;
-    let undone = false;
     try {
         const resp = await ecommerceApi('POST', '/api/ecommerce/delete-sample', {
             batch_id: batchId, garment_id: garmentId, path: result.path, permanent: false
         });
         if (!resp.ok && resp.error) throw new Error(resp.error);
-        results.splice(resultIndex, 1);
-        if (ecommerceGroupCompareState.resultIndex >= results.length && results.length > 0) {
-            ecommerceGroupCompareState.resultIndex = results.length - 1;
-        }
-        if (results.length === 0) {
-            // 该服装所有AI图都已删除：关闭对比界面，避免空白残留
-            closeEcommerceImageCompare();
-            showToast('这套服装的所有AI图已删除，已关闭对比界面', 'info');
-        } else {
-            updateEcommerceImageCompare();
+        deletedResult.deletion_id = resp.deletion_id || '';
+        deletedResult.original_path = resp.original_path || deletedResult.path;
+        ecommerceGroupCompareState.hadChanges = true;
+        const deletedCandidateIndex = ecommerceGroupCompareState.candidateIndex || 0;
+        await reloadEcommerceActiveCompare({ deletionId: resp.deletion_id || '', path: deletedResult.path });
+        // 抽卡验片时，删除当前候选后自动落到同一动作的下一张候选。
+        // 如果当前已经是最后一张，则停留在删除后的当前卡片，不跨动作误跳。
+        const nextCandidates = ecommerceCurrentActionGroup()?.results || [];
+        ecommerceGroupCompareState.candidateIndex = Math.min(deletedCandidateIndex + 1, Math.max(0, nextCandidates.length - 1));
+        updateEcommerceImageCompare();
+        // 删除后检查是否刚好每个动作一张图，如果是则提示用户可以确认
+        const refreshed = ecommerceGroupCompareState.data;
+        if (refreshed) {
+            const totalActions = refreshed.references?.length || 10;
+            const nonDeletedByAction = {};
+            let nonDeletedCount = 0;
+            for (const r of (refreshed.results || [])) {
+                if (!r.deleted) {
+                    nonDeletedByAction[r.action_order] = (nonDeletedByAction[r.action_order] || 0) + 1;
+                    nonDeletedCount++;
+                }
+            }
+            const allCovered = Array.from({length: totalActions}, (_, i) => i + 1).every(n => nonDeletedByAction[n]);
+            if (allCovered && nonDeletedCount === totalActions) {
+                ecommerceToast(`✓ 该组刚好${totalActions}张图全部匹配，可以确认了`, 'success');
+            } else if (allCovered && nonDeletedCount > totalActions) {
+                const extras = nonDeletedCount - totalActions;
+                ecommerceToast(`还有${extras}张多余图片可删除，全部动作已覆盖`, 'info');
+            }
         }
         ecommerceUndoToast(`已删除 ${basename}`, async () => {
-            undone = true;
             try {
-                await ecommerceApi('POST', '/api/ecommerce/undo-delete', {
-                    batch_id: batchId, garment_id: garmentId, path: deletedResult.path
-                });
-                const restoredUrl = group?.rerun_batch_id
-                    ? `/api/ecommerce/rerun-batches/${encodeURIComponent(group.rerun_batch_id)}/garments/${encodeURIComponent(garmentId)}/compare`
-                    : `/api/ecommerce/batches/${encodeURIComponent(batchId)}/garments/${encodeURIComponent(garmentId)}/compare`;
-                const restored = await ecommerceApi('GET', restoredUrl);
-                if (restored && restored.results) {
-                    ecommerceGroupCompareState.data = restored;
-                    const restoredIdx = restored.results.findIndex(r => r.path === deletedResult.path);
-                    ecommerceGroupCompareState.resultIndex = restoredIdx >= 0 ? restoredIdx : Math.min(deletedIndex, restored.results.length - 1);
-                    updateEcommerceImageCompare();
-                    ecommerceToast('已恢复');
-                }
+                await restoreEcommerceDeletedResult(deletedResult);
+                ecommerceToast('已恢复');
             } catch (e) {
                 showToast(`恢复失败：${e.message}`, 'error');
             }
         }, 5000);
-        setTimeout(async () => {
-            if (undone) return;
-            try {
-                await ecommerceApi('POST', '/api/ecommerce/delete-sample', {
-                    batch_id: batchId, garment_id: garmentId, path: deletedResult.path, permanent: true
-                });
-            } catch(e) { /* silent */ }
-        }, 5500);
     } catch (e) {
         showToast(`删除失败：${e.message}`, 'error');
+    }
+}
+
+async function deleteEcommerceSelectedResults() {
+    if (ecommerceGroupCompareState.mode !== 'group') return false;
+    const group = ecommerceGroupCompareState.data;
+    const results = ecommerceCurrentActionGroup()?.results || [];
+    const selected = ecommerceSelectedCurrentActionResults(results);
+    if (!selected.length) return false;
+    const batchId = group?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group?.garment_id || '';
+    if (!batchId || !garmentId) return false;
+    try {
+        const deleteResults = [];
+        for (const result of selected) {
+            const response = await ecommerceApi('POST', '/api/ecommerce/delete-sample', {
+                batch_id: batchId, garment_id: garmentId, path: result.path, permanent: false
+            });
+            if (!response.ok && response.error) throw new Error(response.error);
+            deleteResults.push(response);
+        }
+        clearEcommerceResultSelection();
+        ecommerceGroupCompareState.hadChanges = true;
+        await reloadEcommerceActiveCompare();
+        updateEcommerceImageCompare();
+        ecommerceToast(`已批量删除 ${deleteResults.length} 张抽卡候选图`);
+        return true;
+    } catch (error) {
+        showToast(`批量删除失败：${error.message}`, 'error');
+        return false;
     }
 }
 
@@ -13516,9 +14322,7 @@ async function deleteEcommerceCurrentResult() {
 async function markEcommerceCurrentRedo() {
     const groupMode = ecommerceGroupCompareState.mode === 'group';
     const group = groupMode ? ecommerceGroupCompareState.data : null;
-    const results = groupMode ? (group?.results || []) : [];
-    const resultIndex = groupMode ? ecommerceGroupCompareState.resultIndex : 0;
-    const result = results[resultIndex];
+    const result = groupMode ? ecommerceCurrentGroupResult() : null;
     if (!result) return showToast('没有可标记的AI图', 'error');
     if (!result.action_order) return showToast('缺少动作信息', 'error');
     const batchId = group?.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
@@ -13540,6 +14344,7 @@ async function markEcommerceCurrentRedo() {
             });
             if (!resp.ok && resp.error) throw new Error(resp.error);
             result.marked_redo = false;
+            ecommerceGroupCompareState.hadChanges = true;
             showToast(`已取消标记动作${result.action_order}`, 'info');
             updateEcommerceImageCompare();
         } catch (e) {
@@ -13558,10 +14363,71 @@ async function markEcommerceCurrentRedo() {
         if (!resp.ok && resp.error) throw new Error(resp.error);
         result.marked_redo = true;
         result.mark_id = resp.mark_id || result.mark_id || '';
+        ecommerceGroupCompareState.hadChanges = true;
         showToast(`✓ 已标记动作${result.action_order}为待重做（原图保留，重做时直接替换）`, 'success');
         updateEcommerceImageCompare();
     } catch (e) {
         showToast(`标记失败：${e.message}`, 'error');
+    }
+}
+
+// 确认该组质检完成，移入成品导出列表
+async function confirmEcommerceGroup() {
+    const group = ecommerceGroupCompareState.data;
+    if (!group) return showToast('没有可确认的组', 'error');
+    const batchId = group.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group.garment_id || '';
+    if (!batchId || !garmentId) return showToast('缺少批次或服装信息', 'error');
+    try {
+        const resp = await ecommerceApi('POST', '/api/ecommerce/confirm-group', { batch_id: batchId, garment_id: garmentId });
+        if (!resp.ok && resp.error) throw new Error(resp.error);
+        showToast(`✓ 已确认 ${group.garment_name || '该组'}，已移入成品导出列表`, 'success');
+        ecommerceGroupCompareState.hadChanges = true;
+        await reloadEcommerceActiveCompare();
+        await loadEcommerceFinalExportStatus(false);
+        renderEcommerceResultFolders();
+    } catch (e) {
+        showToast(`确认失败：${e.message}`, 'error');
+    }
+}
+
+// 撤销确认，返回待质检列表
+async function unconfirmEcommerceGroup() {
+    const group = ecommerceGroupCompareState.data;
+    if (!group) return showToast('没有可撤销的组', 'error');
+    const batchId = group.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group.garment_id || '';
+    if (!batchId || !garmentId) return showToast('缺少批次或服装信息', 'error');
+    try {
+        const resp = await ecommerceApi('POST', '/api/ecommerce/unconfirm-group', { batch_id: batchId, garment_id: garmentId });
+        if (!resp.ok && resp.error) throw new Error(resp.error);
+        showToast(`已撤销确认 ${group.garment_name || '该组'}，返回待质检列表`, 'info');
+        ecommerceGroupCompareState.hadChanges = true;
+        await reloadEcommerceActiveCompare();
+        await loadEcommerceFinalExportStatus(false);
+        renderEcommerceResultFolders();
+    } catch (e) {
+        showToast(`撤销失败：${e.message}`, 'error');
+    }
+}
+
+// 从回收站找回已删除的图片，与当前生成图并列对比
+async function recoverEcommerceFromRecycle() {
+    const group = ecommerceGroupCompareState.data;
+    if (!group) return showToast('没有可找回的组', 'error');
+    const batchId = group.batch_id || ecommerceState.detail?.id || ecommerceState.currentBatchId;
+    const garmentId = group.garment_id || '';
+    const currentResult = ecommerceCurrentGroupResult();
+    if (!currentResult?.deletion_id) return showToast('找不到删除记录', 'error');
+    try {
+        const resp = await ecommerceApi('POST', '/api/ecommerce/recover-from-recycle', {
+            batch_id: batchId, garment_id: garmentId, deletion_id: currentResult.deletion_id
+        });
+        if (!resp.ok && resp.error) throw new Error(resp.error);
+        showToast(`已找回图片，正在刷新对比`, 'success');
+        await reloadEcommerceActiveCompare();
+    } catch (e) {
+        showToast(`找回失败：${e.message}`, 'error');
     }
 }
 
@@ -13681,14 +14547,15 @@ async function scanEcommerceRerun() {
         const resultPath = document.getElementById('ecommerce-rerun-result-path')?.value.trim() || '';
         const data = await ecommerceApi('POST', '/api/ecommerce/scan-deleted', { batch_id: batchId, result_path: resultPath });
         ecommerceRerunState.batchId = batchId;
-        ecommerceRerunState.items = data.items || [];
+        ecommerceRerunState.items = (data.items || []).map(item => restoreEcommerceRerunEdits(item));
         ecommerceRerunState.activeIndex = -1;
         ecommerceRerunState.selectedIds = new Set(ecommerceRerunState.items.map(item => item.id));
         ecommerceRerunState.groupSyncByGarment = new Map();
         ecommerceRerunState.bulkPrompt = '';
         const firstModel = ecommerceRerunState.items[0]?.original_model || {};
-        ecommerceRerunState.bulkPlatform = firstModel.platform || 'runninghub';
-        const bulkKeys = ecommerceRerunState.bulkPlatform === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : ECOMMERCE_RERUN_HK_MODEL_KEYS;
+        const validPlatform = ['runninghub', 'oaihk'].includes(firstModel.platform) ? firstModel.platform : 'runninghub';
+        ecommerceRerunState.bulkPlatform = validPlatform;
+        const bulkKeys = validPlatform === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : ECOMMERCE_RERUN_HK_MODEL_KEYS;
         ecommerceRerunState.bulkModelKey = bulkKeys.includes(firstModel.model_key) ? firstModel.model_key : bulkKeys[0];
         ecommerceRerunState.bulkRatio = firstModel.aspect_ratio || 'auto';
         const total = ecommerceRerunState.items.length;
@@ -13699,9 +14566,23 @@ async function scanEcommerceRerun() {
         await loadEcommerceRerunBatches();
         await recoverLatestEcommerceRerunBatch();
         await loadEcommerceWasteStats();
+        await loadEcommerceFinalExportStatus(false);
     } catch (e) {
         if (summary) summary.textContent = `扫描失败：${e.message}`;
         if (list) list.innerHTML = `<div class="ecommerce-empty">扫描失败：${ecommerceEscape(e.message)}</div>`;
+    }
+}
+
+function bindEcommerceRerunProgressActions(scope = document) {
+    const el = scope.querySelector?.('#btn-ecommerce-rerun-pause') || document.getElementById('btn-ecommerce-rerun-pause');
+    if (el && !el.dataset.bound) {
+        el.dataset.bound = '1';
+        el.addEventListener('click', () => setEcommerceRerunPaused(true));
+    }
+    const el2 = scope.querySelector?.('#btn-ecommerce-rerun-resume') || document.getElementById('btn-ecommerce-rerun-resume');
+    if (el2 && !el2.dataset.bound) {
+        el2.dataset.bound = '1';
+        el2.addEventListener('click', () => setEcommerceRerunPaused(false));
     }
 }
 
@@ -13711,7 +14592,18 @@ function renderEcommerceRerunList() {
     const items = ecommerceRerunState.items;
     if (!items.length) {
         const last = ecommerceRerunState.bulkProgress || {};
-        list.innerHTML = `<div class="ecommerce-empty">没有废片，所有动作图都已补齐${last.total ? `<br><small>上次重做：成功${last.success || 0}张，失败${last.failed || 0}张</small>` : ''}</div>`;
+        const progressHtml = (last.active || last.total) ? `
+        <div class="ecommerce-rerun-progress" id="ecommerce-rerun-progress">
+            <div><span id="ecommerce-rerun-progress-label">${last.paused ? '已暂停提交' : last.active ? '正在重做' : '上次重做'} ${last.completed || 0}/${last.total || 0}</span><span id="ecommerce-rerun-progress-counts">成功${last.success || 0} · 失败${last.failed || 0}</span></div>
+            <div class="ecommerce-rerun-progress-track"><i id="ecommerce-rerun-progress-fill" style="width:${last.total ? Math.round((last.completed || 0) / last.total * 100) : 0}%"></i></div>
+            <div class="ecommerce-rerun-progress-actions">
+                <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-pause" ${last.active && !last.paused ? '' : 'hidden'}>暂停提交</button>
+                <button type="button" class="btn btn-primary btn-compact" id="btn-ecommerce-rerun-resume" ${last.active && last.paused ? '' : 'hidden'}>继续</button>
+                <small>暂停不会取消已经提交且可能已扣费的任务</small>
+            </div>
+        </div>` : '';
+        list.innerHTML = `<div class="ecommerce-empty">没有废片，所有动作图都已补齐${last.total ? `<br><small>上次重做：成功${last.success || 0}张，失败${last.failed || 0}张</small>` : ''}</div>${progressHtml}`;
+        bindEcommerceRerunProgressActions();
         return;
     }
     const grouped = new Map();
@@ -13732,8 +14624,8 @@ function renderEcommerceRerunList() {
                 ? `${markedCount}张标记重做｜本组全选`
                 : `${entries.length}张废片｜本组全选`;
         const rows = entries.map(({ item, index }) => {
-            const thumb = item.bad_photo_url
-                ? `<img class="ecommerce-rerun-thumb ecommerce-rerun-open-compare" src="${ecommerceEscape(ecommerceThumbnailUrl(item.bad_photo_url, 120))}" alt="${item.marked_redo ? '标记重做' : '废片'}" title="点击放大对比" loading="lazy" decoding="async">`
+            const thumb = item.target_action_url
+                ? `<img class="ecommerce-rerun-thumb ecommerce-rerun-open-compare" src="${ecommerceEscape(ecommerceThumbnailUrl(item.target_action_url, 120))}" alt="动作参考图" title="原始动作参考图；点击进入调整" loading="lazy" decoding="async">`
                 : '<span class="ecommerce-rerun-thumb" style="display:grid;place-items:center;color:#98a2b3;">无备份</span>';
             const typeBadge = item.marked_redo
                 ? '<span class="ecommerce-rerun-type-badge is-marked" title="标记重做：原图保留，重做后替换">⚑ 标记</span>'
@@ -13780,6 +14672,12 @@ function renderEcommerceRerunList() {
             <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-auto-concurrency">按已选自动</button>
             <small id="ecommerce-rerun-concurrency-hint">1–100；每张按批次/服装/动作身份归档，不按返回顺序归属</small>
         </div>
+        <div class="ecommerce-shared-prompt-templates" data-ecommerce-prompt-template-target="#ecommerce-rerun-bulk-prompt">
+            <span class="ecommerce-shared-prompt-label">共用提示词模板</span>
+            <div class="ecommerce-shared-prompt-list"></div>
+            <select class="ecommerce-shared-prompt-more"><option value="">更多模板…</option></select>
+            <button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button>
+        </div>
         <textarea id="ecommerce-rerun-bulk-prompt" placeholder="批量新提示词；留空时复用原提示词，填写后完整替换原提示词">${ecommerceEscape(ecommerceRerunState.bulkPrompt || '')}</textarea>
         <button type="button" class="btn btn-primary btn-compact" id="btn-ecommerce-rerun-bulk" ${selectedCount ? '' : 'disabled'}>批量重做已选 ${selectedCount} 张</button>
         <div class="ecommerce-rerun-progress" id="ecommerce-rerun-progress" ${progress.active || progress.total ? '' : 'hidden'}>
@@ -13792,6 +14690,7 @@ function renderEcommerceRerunList() {
             </div>
         </div>
     </div>${groupsHtml}`;
+    renderEcommerceRerunPromptTemplates(list);
     list.querySelector('#ecommerce-rerun-select-all')?.addEventListener('change', event => {
         ecommerceRerunState.selectedIds = event.target.checked ? new Set(items.map(item => item.id)) : new Set();
         renderEcommerceRerunList();
@@ -13856,7 +14755,7 @@ function renderEcommerceRerunList() {
         const inputVal = Math.max(1, Math.min(100, Number(list.querySelector('#ecommerce-rerun-concurrency')?.value) || 1));
         const effective = Math.min(inputVal, Math.max(1, currentSelected));
         const drawCount = Math.max(1, Math.min(5, Number(list.querySelector('#ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
-        const paidCount = selectedEntries.reduce((sum, item) => sum + Math.max(drawCount, Math.min(5, parseInt(item.missing_count, 10) || 1)), 0);
+        const paidCount = selectedEntries.length * drawCount;
         const hint = list.querySelector('#ecommerce-rerun-concurrency-hint');
         if (hint) hint.textContent = currentSelected
             ? `实际并发${effective}；已选${currentSelected}项 × 每项${drawCount}张，预计付费${paidCount}张；${ecommerceRerunState.bulkPlatform === 'runninghub' ? 'RH企业线路官方上限100' : 'HK未公布固定上限，限流时自动重试'}`
@@ -13877,8 +14776,7 @@ function renderEcommerceRerunList() {
     });
     updateRerunConcurrencyHint();
     list.querySelector('#btn-ecommerce-rerun-bulk')?.addEventListener('click', bulkRegenerateEcommerceSelected);
-    list.querySelector('#btn-ecommerce-rerun-pause')?.addEventListener('click', () => setEcommerceRerunPaused(true));
-    list.querySelector('#btn-ecommerce-rerun-resume')?.addEventListener('click', () => setEcommerceRerunPaused(false));
+    bindEcommerceRerunProgressActions(list);
     list.querySelectorAll('.ecommerce-rerun-item').forEach(row => {
         row.addEventListener('click', event => {
             if (event.target.closest('input')) return;
@@ -13896,11 +14794,14 @@ function renderEcommerceRerunList() {
 }
 
 const ECOMMERCE_RERUN_RH_MODEL_KEYS = [
+    'seedream-v5-pro/image-to-image-2k', 'seedream-v5-pro/image-to-image-1k',
     'rhart-image-n-g31-flash/image-to-image-2k', 'rhart-image-n-g31-flash/image-to-image-4k',
     'rhart-image-n-g31-flash-official/image-to-image-2k', 'rhart-image-n-g31-flash-official/image-to-image-4k',
     'rhart-image-n-pro/edit-2k', 'rhart-image-n-pro/edit-4k',
     'rhart-image-g-2/image-to-image-2k', 'rhart-image-g-2/image-to-image-4k',
-    'rhart-image-g-2-official/image-to-image-2k', 'rhart-image-g-2-official/image-to-image-4k'
+    'rhart-image-g-2-official/image-to-image-2k', 'rhart-image-g-2-official/image-to-image-4k',
+    'rhart-image-g-2-medium/image-to-image-2k', 'rhart-image-g-2-medium/image-to-image-4k',
+    'rhart-image-n-pro-official/edit-ultra-4k'
 ];
 const ECOMMERCE_RERUN_HK_MODEL_KEYS = [
     'fal-ai/banana/v3.1/flash', 'fal-ai/banana/v3.1/flash/2k', 'fal-ai/banana/v3.1/flash/4k',
@@ -13924,7 +14825,11 @@ function updateEcommerceRerunProgress() {
     const root = document.getElementById('ecommerce-rerun-progress');
     if (root) root.hidden = !(progress.active || progress.total);
     const label = document.getElementById('ecommerce-rerun-progress-label');
-    if (label) label.textContent = `${progress.paused ? '已暂停提交' : progress.active ? '正在重做' : '重做完成'} ${progress.completed || 0}/${progress.total || 0}`;
+    if (label) {
+        const statusText = progress.paused ? '已暂停提交' : progress.active ? '正在重做' : '重做完成';
+        const currentText = progress.currentTask ? ` · ${progress.currentTask}` : '';
+        label.textContent = `${statusText} ${progress.completed || 0}/${progress.total || 0}${currentText}`;
+    }
     const counts = document.getElementById('ecommerce-rerun-progress-counts');
     if (counts) {
         const retryText = progress.retrying ? ` · 重试${progress.retrying}` : '';
@@ -13987,27 +14892,58 @@ function waitForEcommerceRerunResume() {
 async function runEcommercePersistedRerunBatch(session, button = null) {
     if (!session?.id) throw new Error('重做批次无效');
     if (ecommerceRerunState.bulkProgress?.active) return showToast('已有重做批次正在运行', 'warning');
-    const detail = await ecommerceApi('GET', `/api/ecommerce/rerun-batches/${encodeURIComponent(session.id)}`);
-    session = detail.rerun_batch || session;
-    const pendingItems = (session.items || []).filter(item => item.status === 'pending' || item.status === 'failed');
-    const concurrency = Math.max(1, Math.min(100, Number(session.settings?.concurrency) || 1, Math.max(1, pendingItems.length)));
+    // 先设置进度状态并渲染进度条，让用户立即看到反馈
     const list = document.getElementById('ecommerce-rerun-list');
     ecommerceRerunState.activeRerunBatchId = session.id;
     ecommerceRerunState.batchId = session.batch_id;
+    const initialTotal = Number(session.total_count) || (session.items || []).length;
+    const initialCompleted = Number(session.completed_count) || 0;
     ecommerceRerunState.bulkProgress = {
-        active: true, paused: false, total: Number(session.total_count) || (session.items || []).length,
-        completed: Number(session.completed_count) || 0, success: Number(session.completed_count) || 0,
-        failed: 0, retrying: 0
+        active: true, paused: false, total: initialTotal,
+        completed: initialCompleted, success: initialCompleted,
+        failed: 0, retrying: 0, currentTask: ''
     };
     ecommerceRerunState.bulkPauseWaiters = [];
     if (list) list.classList.add('is-running');
     if (button) button.disabled = true;
+    renderEcommerceRerunList();
     updateEcommerceRerunProgress();
+    // 再拉取最新详情
+    let pendingItems = [];
+    let concurrency = 1;
+    try {
+        const detail = await ecommerceApi('GET', `/api/ecommerce/rerun-batches/${encodeURIComponent(session.id)}`);
+        session = detail.rerun_batch || session;
+        pendingItems = (session.items || []).filter(item => ['pending', 'failed', 'partial'].includes(item.status));
+        concurrency = Math.max(1, Math.min(100, Number(session.settings?.concurrency) || 1, Math.max(1, pendingItems.length)));
+        // 用最新数据刷新进度
+        ecommerceRerunState.bulkProgress.total = Number(session.total_count) || pendingItems.length + initialCompleted;
+        ecommerceRerunState.bulkProgress.completed = Number(session.completed_count) || initialCompleted;
+        ecommerceRerunState.bulkProgress.success = Number(session.completed_count) || initialCompleted;
+        updateEcommerceRerunProgress();
+    } catch (fetchErr) {
+        console.warn('[rerun-batch] 拉取详情失败，使用初始数据继续', fetchErr);
+    }
+    // 递交重做成功后立即刷新对比界面和扫描结果：
+    // 后端在创建rerun-batch时已经把软删除的废片移到回收站，
+    // 此时刷新可以让用户立即看到废片消失、目录干净。
+    try {
+        await refreshEcommerceBatch();
+        await scanEcommerceRerun();
+        await reloadEcommerceActiveCompare();
+        const folderContainer = document.getElementById('ecommerce-result-folders');
+        if (folderContainer && ecommerceState.detail) {
+            await refreshEcommerceFolderStatusCounts(folderContainer, ecommerceState.detail);
+        }
+    } catch (refreshErr) {
+        console.warn('[rerun-batch] 递交后刷新界面失败', refreshErr);
+    }
     let cursor = 0;
     const failures = [];
     const callWithRetry = async entry => {
         let lastError = '';
-        for (let attempt = 1; attempt <= 2; attempt++) {
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             if (attempt > 1) await waitForEcommerceRerunResume();
             try {
                 return await ecommerceApi('POST', '/api/ecommerce/regenerate', {
@@ -14016,10 +14952,12 @@ async function runEcommercePersistedRerunBatch(session, button = null) {
                 }, 600000);
             } catch (error) {
                 lastError = error.message || String(error);
-                if (attempt < 2) {
+                if (attempt < maxAttempts) {
                     ecommerceRerunState.bulkProgress.retrying += 1;
                     updateEcommerceRerunProgress();
-                    await new Promise(resolve => setTimeout(resolve, 5000));
+                    const backoff = 5000 * Math.pow(2, attempt - 1);
+                    console.warn(`[rerun-batch] ${entry.garment_name}·动作${entry.action_order} 第${attempt}次失败，${backoff / 1000}秒后重试: ${lastError}`);
+                    await new Promise(resolve => setTimeout(resolve, backoff));
                 }
             }
         }
@@ -14030,17 +14968,36 @@ async function runEcommercePersistedRerunBatch(session, button = null) {
             await waitForEcommerceRerunResume();
             if (cursor >= pendingItems.length) return;
             const entry = pendingItems[cursor++];
+            ecommerceRerunState.bulkProgress.currentTask = `${entry.garment_name}·动作${entry.action_order}`;
+            updateEcommerceRerunProgress();
             try {
                 await callWithRetry(entry);
                 ecommerceRerunState.bulkProgress.success += 1;
+                // 每张图成功后刷新主界面，用户能立即看到新结果
+                refreshEcommerceBatch().catch(() => {});
+                // 如果当前打开的对比视图就是这套服装，实时刷新让新图出现、废片消失
+                const currentGroup = ecommerceGroupCompareState.data;
+                if (currentGroup && currentGroup.garment_id === entry.garment_id) {
+                    reloadEcommerceActiveCompare().catch(() => {});
+                }
+                // 刷新结果文件夹计数
+                const folderContainer = document.getElementById('ecommerce-result-folders');
+                if (folderContainer && ecommerceState.detail) {
+                    refreshEcommerceFolderStatusCounts(folderContainer, ecommerceState.detail).catch(() => {});
+                }
             } catch (error) {
                 failures.push(`${entry.garment_name}·动作${entry.action_order}：${error.message}`);
                 ecommerceRerunState.bulkProgress.failed += 1;
             }
+            ecommerceRerunState.bulkProgress.currentTask = '';
             ecommerceRerunState.bulkProgress.completed += 1;
             updateEcommerceRerunProgress();
         }
     };
+    // 心跳定时器：每 5 秒刷新进度条，让用户看到界面还活着
+    const heartbeatTimer = setInterval(() => {
+        updateEcommerceRerunProgress();
+    }, 5000);
     try {
         if (pendingItems.length) await Promise.all(Array.from({ length: concurrency }, () => worker()));
         if (failures.length) {
@@ -14053,27 +15010,51 @@ async function runEcommercePersistedRerunBatch(session, button = null) {
             showToast('没有尚待提交的任务；仍在途的任务返回后会自动归档', 'info');
         }
     } finally {
+        clearInterval(heartbeatTimer);
         ecommerceRerunState.bulkProgress.active = false;
         ecommerceRerunState.bulkProgress.paused = false;
+        ecommerceRerunState.bulkProgress.currentTask = '';
         ecommerceRerunState.bulkPauseWaiters.splice(0).forEach(resolve => resolve());
         ecommerceRerunState.activeRerunBatchId = '';
         if (list) list.classList.remove('is-running');
-        if (button?.isConnected) button.disabled = false;
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = button.dataset.originalText || '继续剩余';
+        }
         updateEcommerceRerunProgress();
         await loadEcommerceRerunBatches();
         try { await scanEcommerceRerun(); } catch (error) { console.warn('[rerun-batch] rescan failed', error); }
         try { await refreshEcommerceBatch(); } catch (error) { console.warn('[rerun-batch] refresh failed', error); }
+        // 重做完成后刷新当前打开的对比视图，确保已移走的废片不再显示
+        try { await reloadEcommerceActiveCompare(); } catch (error) { console.warn('[rerun-batch] reload compare failed', error); }
+        // 刷新结果文件夹状态计数
+        try {
+            const folderContainer = document.getElementById('ecommerce-result-folders');
+            if (folderContainer && ecommerceState.detail) {
+                await refreshEcommerceFolderStatusCounts(folderContainer, ecommerceState.detail);
+            }
+        } catch (error) { console.warn('[rerun-batch] refresh folder counts failed', error); }
     }
 }
 
-async function resumeEcommerceRerunBatch(rerunBatchId) {
+async function resumeEcommerceRerunBatch(rerunBatchId, button = null) {
     if (!rerunBatchId) return;
     if (ecommerceRerunState.bulkProgress?.active) return showToast('已有重做批次正在运行', 'warning');
+    if (button) {
+        button.disabled = true;
+        button.dataset.originalText = button.textContent;
+        button.textContent = '正在启动…';
+    }
+    showToast('正在启动重做，请稍候…', 'info');
     try {
         const response = await ecommerceApi('POST', `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}/action`, { action: 'resume' });
-        await runEcommercePersistedRerunBatch(response.rerun_batch);
+        await runEcommercePersistedRerunBatch(response.rerun_batch, button);
     } catch (error) {
         showToast(`继续失败：${error.message}`, 'error');
+        if (button?.isConnected) {
+            button.disabled = false;
+            button.textContent = button.dataset.originalText || '继续剩余';
+        }
     }
 }
 
@@ -14088,7 +15069,7 @@ async function bulkRegenerateEcommerceSelected() {
     const drawCount = Math.max(1, Math.min(5, Number(document.getElementById('ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
     if (!modelKey) return showToast('请选择批量重做模型', 'error');
     const modelLabel = document.getElementById('ecommerce-rerun-bulk-model')?.selectedOptions?.[0]?.textContent || modelKey;
-    const paidCallTotal = selectedItems.reduce((sum, item) => sum + Math.max(drawCount, Math.min(5, parseInt(item.missing_count, 10) || 1)), 0);
+    const paidCallTotal = selectedItems.length * drawCount;
     if (!confirm(`确定批量重做 ${selectedItems.length} 项？\n\n平台/模型：${platform === 'runninghub' ? 'RH' : 'HK'} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${Math.min(concurrency, selectedItems.length)}\n每项生成：${drawCount}张\n\n预计付费生图 ${paidCallTotal} 张。刷新页面后也可以继续或验片。`)) return;
     const config = { prompt, platform, modelKey, ratio, drawCount };
     const queueItems = selectedItems.map(item => ecommerceBuildRerunQueuePayload(item, config));
@@ -14127,6 +15108,8 @@ function renderEcommerceRerunCompare(index) {
         ? '应用本套并下一套 →'
         : (hasNextInGarment ? '保存当前并下一张 →' : '保存当前并下一套 →');
     const sourceReferenceLabel = item.generation_mode === 'garment_prompt' ? '原始服装图' : '原始目标图';
+    const targetAction = ecommerceRerunTargetActionSource(item);
+    const allReferencesSelected = (item.references || []).length > 0 && (item.references || []).every(ref => ref.selected !== false);
     const refs = (item.references || []).map((ref, i) => {
         const url = ref.override_url || ref.url;
         return `<div class="ecommerce-rerun-ref ${ref.is_detail ? 'is-detail' : ''} ${ref.override_url ? 'is-cropped' : ''} ${ref.temporary_url ? 'is-temporary' : ''}" data-ref-index="${i}">
@@ -14143,7 +15126,16 @@ function renderEcommerceRerunCompare(index) {
             <div class="ecommerce-rerun-system-actions"><label class="ecommerce-rerun-sync-choice">同步本套 <select class="ecommerce-rerun-sync-select"><option value="no" ${syncWholeGarment ? '' : 'selected'}>否（逐张调整）</option><option value="yes" ${syncWholeGarment ? 'selected' : ''}>是（整套共用）</option></select></label><button type="button" class="btn btn-outline btn-compact ecommerce-preview-bad">系统预览废片</button><button type="button" class="btn btn-outline btn-compact ecommerce-preview-refs">系统预览参考组</button></div>
         </div>
         <p class="ecommerce-rerun-adjust-hint">${syncWholeGarment ? '已选择“同步本套”：参考图勾选、裁剪、换图、细节图和提示词会同步给本套全部废片。' : `已选择“逐张调整”：参考图支持1～9张，所有修改只影响当前图片；保存后继续本套下一张。`}</p>
+        <div class="ecommerce-rerun-reference-toolbar"><strong>服装参考图</strong><button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-toggle-refs">${allReferencesSelected ? '全不选' : '全选'}</button><small>默认全选；再次点击可全部取消</small></div>
         <div class="ecommerce-rerun-compare-grid">
+            <div class="ecommerce-rerun-compare-col ecommerce-rerun-target-col">
+                <h4>本次动作参考图（单击放大；拖入或双击替换）</h4>
+                <div class="ecommerce-rerun-target-action ${targetAction.overridden ? 'is-overridden' : ''}" tabindex="0" title="单击放大；拖入图片或双击选择图片，仅替换当前动作的本次重做">
+                    ${targetAction.url ? `<img src="${ecommerceEscape(ecommerceThumbnailUrl(targetAction.url, 720))}" alt="动作参考图" loading="lazy" decoding="async">` : '<div class="ecommerce-empty">没有动作参考图<br>拖入或双击补充</div>'}
+                    <span>${targetAction.overridden ? '本次已替换' : '批次绑定动作图'}</span>
+                    <small>动作${item.action_order} · ${ecommerceEscape(item.action_name || '')}</small>
+                </div>
+            </div>
             <div class="ecommerce-rerun-compare-col">
                 <h4>AI生成图（废片缓存）</h4>
                 ${item.bad_photo_url ? `<img class="ecommerce-rerun-compare-img" src="${ecommerceEscape(ecommerceThumbnailUrl(item.bad_photo_url, 720))}" alt="废片">` : '<div class="ecommerce-empty" style="padding:14px;">无备份（可能未走批量生成）</div>'}
@@ -14154,11 +15146,18 @@ function renderEcommerceRerunCompare(index) {
                 ${targetOnly ? '' : `<button type="button" class="btn btn-outline btn-compact ecommerce-rerun-add-detail" ${item.references.length >= 9 ? 'disabled' : ''}>＋ 添加局部细节图</button>`}
             </div>
         </div>
+        <div class="ecommerce-shared-prompt-templates" data-ecommerce-prompt-template-target=".ecommerce-rerun-prompt">
+            <span class="ecommerce-shared-prompt-label">共用提示词模板</span>
+            <div class="ecommerce-shared-prompt-list"></div>
+            <select class="ecommerce-shared-prompt-more"><option value="">更多模板…</option></select>
+            <button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button>
+        </div>
         <textarea class="ecommerce-rerun-prompt" placeholder="可选：这一张的新提示词；优先于批量提示词并完整替换原提示词，都留空则复用原提示词">${ecommerceEscape(item.rerun_prompt || '')}</textarea>
         <div class="ecommerce-rerun-actions">
             <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-adjustments">保存调整并勾选这一张</button>
             <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-next-group" style="background:#16a34a;border-color:#16a34a;">${workflowButtonLabel}</button>
-            <button class="btn btn-outline btn-compact" type="button" id="btn-ecommerce-rerun-cancel">取消调整</button>
+            <button class="btn btn-outline btn-compact" type="button" id="btn-ecommerce-rerun-cancel-item" title="误删会恢复原图；手动标记会撤销标记">取消这一张重做</button>
+            <button class="btn btn-outline btn-compact" type="button" id="btn-ecommerce-rerun-cancel-garment" title="取消并恢复本套当前扫描出的全部待重做图片">取消本套全部重做</button>
         </div>`;
     // 如果已有对比面板，替换它（保持位置不变）；否则追加到列表末尾
     if (existing) {
@@ -14167,6 +15166,7 @@ function renderEcommerceRerunCompare(index) {
         host.innerHTML = '';
         host.appendChild(compare);
     }
+    renderEcommerceRerunPromptTemplates(compare);
     // 显示当前是第几组/共几组
     const allGarmentIds = [...new Set(ecommerceRerunState.items.map(i => i.garment_id))];
     const currentGroupIdx = allGarmentIds.indexOf(item.garment_id);
@@ -14200,6 +15200,41 @@ function renderEcommerceRerunCompare(index) {
         (item.references || []).filter(ref => ref.selected !== false).map(ref => ref.override_path || ref.path)
     ));
     compare.querySelector('.ecommerce-rerun-compare-img[alt="废片"]')?.addEventListener('click', () => openEcommerceImageCompare(index, 0));
+    const targetActionCard = compare.querySelector('.ecommerce-rerun-target-action');
+    let targetActionPreviewTimer = null;
+    targetActionCard?.addEventListener('click', event => {
+        if (event.detail !== 1) return;
+        clearTimeout(targetActionPreviewTimer);
+        targetActionPreviewTimer = setTimeout(() => {
+            const current = ecommerceRerunTargetActionSource(item);
+            openEcommerceSystemPreview([current.path]);
+        }, 260);
+    });
+    targetActionCard?.addEventListener('dblclick', event => {
+        event.preventDefault();
+        clearTimeout(targetActionPreviewTimer);
+        ecommercePickRerunTargetAction(item, index);
+    });
+    targetActionCard?.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        ecommercePickRerunTargetAction(item, index);
+    });
+    targetActionCard?.addEventListener('dragover', event => {
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+        targetActionCard.classList.add('is-drop-target');
+    });
+    targetActionCard?.addEventListener('dragleave', event => {
+        if (!targetActionCard.contains(event.relatedTarget)) targetActionCard.classList.remove('is-drop-target');
+    });
+    targetActionCard?.addEventListener('drop', event => {
+        event.preventDefault();
+        targetActionCard.classList.remove('is-drop-target');
+        const file = [...(event.dataTransfer?.files || [])].find(candidate => /^image\//i.test(candidate.type || '') || /\.(jpe?g|png|webp)$/i.test(candidate.name || ''));
+        if (!file) return showToast('请拖入一张 JPG、PNG 或 WEBP 动作参考图', 'error');
+        ecommerceReplaceRerunTargetAction(item, file, index);
+    });
     compare.querySelectorAll('.ecommerce-rerun-open-ref').forEach(img => img.addEventListener('click', e => {
         openEcommerceImageCompare(index, Number(e.currentTarget.closest('.ecommerce-rerun-ref').dataset.refIndex) + 1);
     }));
@@ -14212,7 +15247,19 @@ function renderEcommerceRerunCompare(index) {
             if (entry.references?.[refIndex]) entry.references[refIndex].selected = input.checked;
         });
     }));
-    compare.querySelector('#btn-ecommerce-rerun-cancel')?.addEventListener('click', () => closeEcommerceRerunAdjustPanel(true));
+    compare.querySelector('#btn-ecommerce-rerun-toggle-refs')?.addEventListener('click', event => {
+        event.stopPropagation();
+        const refs = item.references || [];
+        const shouldSelectAll = refs.some(reference => reference.selected === false);
+        ecommerceRerunAdjustmentTargets(item).forEach(entry => {
+            (entry.references || []).forEach(reference => { reference.selected = shouldSelectAll; });
+        });
+        renderEcommerceRerunCompare(index);
+    });
+    compare.querySelector('#btn-ecommerce-rerun-cancel-item')?.addEventListener('click', () => cancelEcommerceRerunItems([item], false));
+    compare.querySelector('#btn-ecommerce-rerun-cancel-garment')?.addEventListener('click', () => cancelEcommerceRerunItems(
+        ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id), true
+    ));
     compare.querySelector('.ecommerce-rerun-add-detail')?.addEventListener('click', () => {
         const input = document.createElement('input');
         input.type = 'file';
@@ -14246,6 +15293,7 @@ function renderEcommerceRerunCompare(index) {
         const referenceImages = (item.references || []).filter(reference => reference.selected !== false);
         if (!targetOnly && !referenceImages.length) return showToast('请至少保留一张服装参考图', 'error');
         item.rerun_prompt = compare.querySelector('.ecommerce-rerun-prompt')?.value.trim() || '';
+        rememberEcommerceRerunEdits(item);
         ecommerceRerunState.selectedIds.add(item.id);
         closeEcommerceRerunAdjustPanel(true);
         showToast('已保存本次参考图调整并勾选该废片；点击上方批量重做才会扣费', 'success');
@@ -14258,10 +15306,12 @@ function renderEcommerceRerunCompare(index) {
         const syncEnabled = ecommerceRerunGroupSyncEnabled(item);
         const sameGroupItems = ecommerceRerunState.items.filter(i => i.garment_id === item.garment_id);
         item.rerun_prompt = promptValue;
+        rememberEcommerceRerunEdits(item);
         if (syncEnabled) {
             sameGroupItems.forEach(entry => {
                 entry.rerun_prompt = promptValue;
                 entry.references = ecommerceCloneRerunReferences(item.references);
+                rememberEcommerceRerunEdits(entry);
                 ecommerceRerunState.selectedIds.add(entry.id);
             });
             showToast(`已把当前设置同步到本套${sameGroupItems.length}张废片`, 'success');
@@ -14270,6 +15320,115 @@ function renderEcommerceRerunCompare(index) {
         }
         advanceEcommerceRerunWorkflow(index, syncEnabled);
     });
+}
+
+let ecommerceLastFinalExportPath = '';
+
+async function loadEcommerceFinalExportStatus(notify = false) {
+    const batchId = document.getElementById('ecommerce-rerun-batch-select')?.value
+        || ecommerceRerunState.batchId || ecommerceState.currentBatchId;
+    const host = document.getElementById('ecommerce-final-export-status');
+    const summary = document.getElementById('ecommerce-final-export-summary');
+    if (!batchId) {
+        if (host) host.textContent = '请先选择批次';
+        return null;
+    }
+    try {
+        const status = await ecommerceApi('GET', `/api/ecommerce/final-export-status?batch_id=${encodeURIComponent(batchId)}`);
+        const text = status.ready
+            ? `动作完整 ${status.complete_actions}/${status.total_actions}，共保留 ${status.candidate_count} 张（额外备选 ${status.extra_candidates} 张），可一键整理。`
+            : `动作完整 ${status.complete_actions}/${status.total_actions}；仍缺 ${status.missing_actions} 个动作；当前保留 ${status.candidate_count} 张。`;
+        if (host) {
+            host.textContent = text;
+            host.classList.toggle('is-ready', !!status.ready);
+        }
+        if (summary) summary.textContent = status.ready ? `已就绪 ${status.candidate_count}张` : `缺图 ${status.missing_actions}`;
+        // 渲染已确认组列表
+        const confirmedHost = document.getElementById('ecommerce-confirmed-groups');
+        if (confirmedHost) {
+            const confirmed = status.garments?.filter(g => g.confirmed) || [];
+            if (confirmed.length) {
+                confirmedHost.hidden = false;
+                confirmedHost.innerHTML = `<div class="ecommerce-confirmed-header">已确认 ${confirmed.length} 组（已移入导出列表）</div>` +
+                    confirmed.map(g => `<div class="ecommerce-confirmed-row" data-garment-id="${ecommerceEscape(g.garment_id)}">
+                        <span class="ecommerce-confirmed-name">✓ ${ecommerceEscape(g.garment_name)}</span>
+                        <span class="ecommerce-confirmed-time">${ecommerceEscape(g.confirmed_at || '')}</span>
+                        <button type="button" class="btn btn-outline btn-compact btn-ecommerce-unconfirm" data-garment-id="${ecommerceEscape(g.garment_id)}">撤销确认</button>
+                    </div>`).join('');
+                confirmedHost.querySelectorAll('.btn-ecommerce-unconfirm').forEach(btn => {
+                    btn.addEventListener('click', async () => {
+                        const gid = btn.dataset.garmentId;
+                        if (!gid || !batchId) return;
+                        try {
+                            const resp = await ecommerceApi('POST', '/api/ecommerce/unconfirm-group', { batch_id: batchId, garment_id: gid });
+                            if (!resp.ok && resp.error) throw new Error(resp.error);
+                            showToast('已撤销确认', 'info');
+                            await loadEcommerceFinalExportStatus(false);
+                            renderEcommerceResultFolders();
+                        } catch (e) {
+                            showToast(`撤销失败：${e.message}`, 'error');
+                        }
+                    });
+                });
+            } else {
+                confirmedHost.hidden = true;
+                confirmedHost.innerHTML = '';
+            }
+        }
+        // Toggle "仅导出已确认" button visibility
+        const exportConfirmedBtn = document.getElementById('btn-ecommerce-final-export-confirmed');
+        if (exportConfirmedBtn) exportConfirmedBtn.hidden = !(status.confirmed_count > 0);
+        if (notify) showToast(text, status.ready ? 'success' : 'warning');
+        return status;
+    } catch (error) {
+        if (host) host.textContent = `检查失败：${error.message}`;
+        if (notify) showToast(`最终成品检查失败：${error.message}`, 'error');
+        return null;
+    }
+}
+
+async function exportEcommerceFinalProducts(confirmedOnly = false) {
+    const batchId = document.getElementById('ecommerce-rerun-batch-select')?.value
+        || ecommerceRerunState.batchId || ecommerceState.currentBatchId;
+    if (!batchId) return showToast('请先选择批次', 'error');
+    const status = await loadEcommerceFinalExportStatus(false);
+    const confirmedCount = status?.confirmed_count || 0;
+    if (confirmedOnly) {
+        if (confirmedCount === 0) return showToast('没有已确认的组可导出', 'warning');
+    } else if (!status?.ready) {
+        if (confirmedCount > 0) {
+            return showToast(`批次还未完整（缺${status?.missing_actions || 0}个动作），但已有 ${confirmedCount} 组已确认。可点击"仅导出已确认"按钮导出已确认组。`, 'warning');
+        }
+        return showToast(`还不能整理：仍缺${status?.missing_actions || 0}个动作`, 'warning');
+    }
+    const input = document.getElementById('ecommerce-final-export-path');
+    let destination = input?.value.trim() || '';
+    if (!destination) destination = await chooseEcommerceFolder('ecommerce-final-export-path');
+    if (!destination) return;
+    const scopeText = confirmedOnly ? `已确认的 ${confirmedCount} 组` : `当前保留的 ${status.candidate_count} 张成品候选`;
+    if (!confirm(`把${scopeText}复制到所选文件夹？\n\n${confirmedOnly ? '仅导出已确认组' : '每个动作至少一张，标记重做和多轮抽卡留下的可用备选会一起复制'}；原文件不会移动或删除。`)) return;
+    const button = confirmedOnly
+        ? document.getElementById('btn-ecommerce-final-export-confirmed')
+        : document.getElementById('btn-ecommerce-final-export-run');
+    const originalText = button?.textContent || '';
+    if (button) { button.disabled = true; button.textContent = '正在导出…'; }
+    try {
+        const result = await ecommerceApi('POST', '/api/ecommerce/export-final-products', {
+            batch_id: batchId,
+            destination,
+            confirmed_only: confirmedOnly,
+        }, 130000);
+        ecommerceLastFinalExportPath = result.path || '';
+        const openButton = document.getElementById('btn-ecommerce-final-export-open');
+        if (openButton) openButton.hidden = !ecommerceLastFinalExportPath;
+        const host = document.getElementById('ecommerce-final-export-status');
+        if (host) host.textContent = `已导出 ${result.file_count} 张成品图 + ${result.reference_file_count || 0} 张服装参考图到：${result.path}`;
+        showToast(result.message || `最终成品导出完成：${result.file_count}张`, 'success');
+    } catch (error) {
+        showToast(`最终成品导出失败：${error.message}`, 'error');
+    } finally {
+        if (button) { button.disabled = false; button.textContent = originalText; }
+    }
 }
 
 document.getElementById('btn-ecommerce-rerun-scan')?.addEventListener('click', () => {
@@ -14284,6 +15443,18 @@ document.getElementById('btn-ecommerce-rerun-scan-single')?.addEventListener('cl
     scanEcommerceRerun();
 });
 document.getElementById('btn-ecommerce-rerun-select-folder')?.addEventListener('click', () => chooseEcommerceFolder('ecommerce-rerun-result-path'));
+document.getElementById('btn-ecommerce-final-export-folder')?.addEventListener('click', () => chooseEcommerceFolder('ecommerce-final-export-path'));
+document.getElementById('btn-ecommerce-final-export-check')?.addEventListener('click', () => loadEcommerceFinalExportStatus(true));
+document.getElementById('btn-ecommerce-final-export-run')?.addEventListener('click', () => exportEcommerceFinalProducts(false));
+document.getElementById('btn-ecommerce-final-export-confirmed')?.addEventListener('click', () => exportEcommerceFinalProducts(true));
+document.getElementById('btn-ecommerce-final-export-open')?.addEventListener('click', async () => {
+    if (!ecommerceLastFinalExportPath) return;
+    try {
+        await ecommerceApi('POST', '/api/ecommerce/open-folder', { path: ecommerceLastFinalExportPath });
+    } catch (error) {
+        showToast(`打开导出文件夹失败：${error.message}`, 'error');
+    }
+});
 document.getElementById('btn-ecommerce-rerun-adjust-close')?.addEventListener('click', () => closeEcommerceRerunAdjustPanel(true));
 document.getElementById('btn-ecommerce-rerun-refresh')?.addEventListener('click', async event => {
     if (ecommerceRerunBlocksNavigation()) return;
@@ -14338,6 +15509,7 @@ document.getElementById('ecommerce-rerun-batch-select')?.addEventListener('chang
     if (rerunSummary) rerunSummary.textContent = '';
     await refreshEcommerceBatch();
     await loadEcommerceRerunBatches();
+    await loadEcommerceFinalExportStatus(false);
 });
 document.getElementById('ecommerce-reference-close')?.addEventListener('click', closeEcommerceReferenceReview);
 document.getElementById('ecommerce-reference-overlay')?.addEventListener('click', e => {
@@ -14359,7 +15531,11 @@ document.getElementById('ecommerce-compare-close')?.addEventListener('click', cl
     });
 });
 document.getElementById('ecommerce-compare-delete')?.addEventListener('click', e => { e.stopPropagation(); deleteEcommerceCurrentResult(); });
+document.getElementById('ecommerce-compare-select-final')?.addEventListener('click', e => { e.stopPropagation(); selectEcommerceCurrentFinalProduct(); });
 document.getElementById('ecommerce-compare-mark-redo')?.addEventListener('click', e => { e.stopPropagation(); markEcommerceCurrentRedo(); });
+document.getElementById('ecommerce-compare-recover')?.addEventListener('click', e => { e.stopPropagation(); recoverEcommerceFromRecycle(); });
+document.getElementById('ecommerce-compare-confirm-group')?.addEventListener('click', e => { e.stopPropagation(); confirmEcommerceGroup(); });
+document.getElementById('ecommerce-compare-unconfirm-group')?.addEventListener('click', e => { e.stopPropagation(); unconfirmEcommerceGroup(); });
 document.getElementById('ecommerce-compare-overlay')?.addEventListener('click', e => {
     // 不再因为点击背景而自动关闭——只能通过 ESC 键或 × 按钮关闭
     // 避免用户整理图片时不小心点到空白区域导致退出，需要重新打开
@@ -14458,18 +15634,28 @@ document.getElementById('ecommerce-compare-prev')?.addEventListener('click', e =
     e.stopPropagation();
     const groupMode = ecommerceGroupCompareState.mode === 'group';
     const item = !groupMode ? ecommerceRerunState.items[ecommerceRerunState.activeIndex] : null;
-    const refCount = groupMode ? (ecommerceGroupCompareState.data?.references?.length || 1) : ((item?.references?.length || 0) + 1);
-    if (groupMode) ecommerceGroupCompareState.refIndex = (ecommerceGroupCompareState.refIndex - 1 + refCount) % refCount;
-    else ecommerceRerunState.compareRefIndex = (ecommerceRerunState.compareRefIndex - 1 + refCount) % refCount;
+    const currentAction = groupMode ? ecommerceCurrentActionGroup() : null;
+    const groupSingleSource = groupMode && ['target_only', 'garment_prompt'].includes(ecommerceGroupCompareState.data?.generation_mode);
+    const refCount = groupMode
+        ? (groupSingleSource && currentAction?.reference?.url ? 1 : (ecommerceGroupCompareState.data?.references?.length || 1))
+        : ((item?.references?.length || 0) + 1);
+    if (groupMode) {
+        ecommerceGroupCompareState.refIndex = (ecommerceGroupCompareState.refIndex - 1 + refCount) % refCount;
+    } else ecommerceRerunState.compareRefIndex = (ecommerceRerunState.compareRefIndex - 1 + refCount) % refCount;
     updateEcommerceImageCompare();
 });
 document.getElementById('ecommerce-compare-next')?.addEventListener('click', e => {
     e.stopPropagation();
     const groupMode = ecommerceGroupCompareState.mode === 'group';
     const item = !groupMode ? ecommerceRerunState.items[ecommerceRerunState.activeIndex] : null;
-    const refCount = groupMode ? (ecommerceGroupCompareState.data?.references?.length || 1) : ((item?.references?.length || 0) + 1);
-    if (groupMode) ecommerceGroupCompareState.refIndex = (ecommerceGroupCompareState.refIndex + 1) % refCount;
-    else ecommerceRerunState.compareRefIndex = (ecommerceRerunState.compareRefIndex + 1) % refCount;
+    const currentAction = groupMode ? ecommerceCurrentActionGroup() : null;
+    const groupSingleSource = groupMode && ['target_only', 'garment_prompt'].includes(ecommerceGroupCompareState.data?.generation_mode);
+    const refCount = groupMode
+        ? (groupSingleSource && currentAction?.reference?.url ? 1 : (ecommerceGroupCompareState.data?.references?.length || 1))
+        : ((item?.references?.length || 0) + 1);
+    if (groupMode) {
+        ecommerceGroupCompareState.refIndex = (ecommerceGroupCompareState.refIndex + 1) % refCount;
+    } else ecommerceRerunState.compareRefIndex = (ecommerceRerunState.compareRefIndex + 1) % refCount;
     updateEcommerceImageCompare();
 });
 document.getElementById('ecommerce-compare-result-prev')?.addEventListener('click', event => {
@@ -14482,20 +15668,32 @@ document.getElementById('ecommerce-compare-result-next')?.addEventListener('clic
 });
 
 async function navigateEcommerceResult(delta) {
-    const results = ecommerceGroupCompareState.data?.results || [];
-    const count = results.length || 1;
-    const nextIdx = ecommerceGroupCompareState.resultIndex + delta;
+    const actionGroups = ecommerceCompareActionGroups();
+    const actionIndex = ecommerceGroupCompareState.actionIndex || 0;
+    const results = actionGroups[actionIndex]?.results || [];
+    const nextIdx = (ecommerceGroupCompareState.candidateIndex || 0) + delta;
     if (nextIdx >= 0 && nextIdx < results.length) {
-        ecommerceGroupCompareState.resultIndex = nextIdx;
+        clearEcommerceResultSelection();
+        ecommerceGroupCompareState.candidateIndex = nextIdx;
         updateEcommerceImageCompare();
         return;
     }
-    if (delta < 0 && nextIdx < 0) {
-        ecommerceGroupCompareState.resultIndex = count - 1;
+    if (delta < 0 && actionIndex > 0) {
+        clearEcommerceResultSelection();
+        ecommerceGroupCompareState.actionIndex = actionIndex - 1;
+        const previousResults = actionGroups[actionIndex - 1]?.results || [];
+        ecommerceGroupCompareState.candidateIndex = Math.max(0, previousResults.length - 1);
         updateEcommerceImageCompare();
         return;
     }
-    if (delta > 0 && nextIdx >= results.length) {
+    if (delta > 0 && actionIndex < actionGroups.length - 1) {
+        clearEcommerceResultSelection();
+        ecommerceGroupCompareState.actionIndex = actionIndex + 1;
+        ecommerceGroupCompareState.candidateIndex = 0;
+        updateEcommerceImageCompare();
+        return;
+    }
+    if (delta > 0) {
         const garments = ecommerceGroupCompareState.garmentList || [];
         const gIdx = ecommerceGroupCompareState.currentGarmentIndex ?? -1;
         if (gIdx < 0 || gIdx >= garments.length - 1) {
@@ -14507,7 +15705,9 @@ async function navigateEcommerceResult(delta) {
         if (!ok) return;
         const switched = await switchEcommerceCompareGarment(1);
         if (switched) ecommerceToast(`已切换到"${nextGarment.name || '下一套'}"`);
+        return;
     }
+    ecommerceToast('已经是本套的第一个动作了');
 }
 document.getElementById('ecommerce-compare-crop-ref')?.addEventListener('click', event => {
     event.stopPropagation();
@@ -14624,10 +15824,20 @@ document.addEventListener('keydown', e => {
         return;
     }
     if (e.key === 'Escape') closeEcommerceImageCompare();
-    if (e.key === 'ArrowLeft') document.getElementById('ecommerce-compare-prev')?.click();
-    if (e.key === 'ArrowRight') document.getElementById('ecommerce-compare-next')?.click();
-    if (e.key === 'ArrowUp') { e.preventDefault(); navigateEcommerceResult(-1); }
-    if (e.key === 'ArrowDown') { e.preventDefault(); navigateEcommerceResult(1); }
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        // 人工质检的左右键专门切换同一动作的抽卡候选；参考图仍可点击缩略图切换。
+        if (ecommerceGroupCompareState.mode === 'group') {
+            e.preventDefault();
+            navigateEcommerceResult(e.key === 'ArrowLeft' ? -1 : 1);
+        } else {
+            document.getElementById(e.key === 'ArrowLeft' ? 'ecommerce-compare-prev' : 'ecommerce-compare-next')?.click();
+        }
+    }
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        // 上下键在同一套服装内切换目标参考图/动作；服装套切换仍使用界面按钮。
+        navigateEcommerceResult(e.key === 'ArrowUp' ? -1 : 1);
+    }
     if (e.key === 'Enter' && ecommerceGroupCompareState.mode === 'rerun') {
         const tag = e.target?.tagName;
         if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable) return;
@@ -14646,7 +15856,19 @@ document.addEventListener('keydown', e => {
         const tag = e.target?.tagName;
         if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable) return;
         e.preventDefault();
-        deleteEcommerceCurrentResult();
+        const selectedResults = ecommerceSelectedCurrentActionResults(ecommerceCurrentActionGroup()?.results || []);
+        if (selectedResults.length > 0) {
+            deleteEcommerceSelectedResults();
+            return;
+        }
+        const deleteBtn = document.getElementById('ecommerce-compare-delete');
+        const recoverBtn = document.getElementById('ecommerce-compare-recover');
+        // 回收站图片：Delete键触发找回而非删除
+        if (deleteBtn?.hidden && recoverBtn && !recoverBtn.hidden) {
+            recoverEcommerceFromRecycle();
+        } else if (!deleteBtn?.hidden) {
+            deleteEcommerceCurrentResult();
+        }
     }
     if (e.key === 'PageUp') { e.preventDefault(); switchEcommerceCompareGarment(-1); }
     if (e.key === 'PageDown') { e.preventDefault(); switchEcommerceCompareGarment(1); }
@@ -14666,7 +15888,7 @@ async function loadEcommercePromptTemplates() {
             if (!s.name) s.name = (s.text || '').slice(0, 12);
             return s;
         });
-        renderEcommercePromptTemplates();
+        renderAllEcommercePromptTemplateSurfaces();
         renderEcommerceInsertSnippets();
     } catch (e) {
         console.error('加载提示词模板失败', e);
@@ -14679,7 +15901,7 @@ function genEcommerceTemplateId() {
 
 async function saveEcommercePromptTemplates() {
     try {
-        await fetch('/api/ecommerce/prompt-templates', {
+        const response = await fetch('/api/ecommerce/prompt-templates', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -14687,9 +15909,98 @@ async function saveEcommercePromptTemplates() {
                 snippets: ecommercePromptTemplates.snippets
             })
         });
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.error || '保存模板失败');
+        }
+        return true;
     } catch (e) {
         console.error('保存提示词模板失败', e);
+        showToast(`保存提示词模板失败：${e.message}`, 'error');
+        return false;
     }
+}
+
+function renderAllEcommercePromptTemplateSurfaces() {
+    // 三个入口统一使用同一套模板库：首次生成、批量废片重做、单张调整参考图。
+    renderEcommerceRerunPromptTemplates(document);
+}
+
+function ecommercePromptTargetForSurface(surface) {
+    const selector = surface?.dataset?.ecommercePromptTemplateTarget || '';
+    if (!selector) return null;
+    const scope = surface.closest('.ecommerce-rerun-compare, .ecommerce-rerun-bulk-bar');
+    return scope?.querySelector(selector) || document.querySelector(selector);
+}
+
+function renderEcommerceRerunPromptTemplates(root = document) {
+    const surfaces = [];
+    if (root?.matches?.('.ecommerce-shared-prompt-templates')) surfaces.push(root);
+    root?.querySelectorAll?.('.ecommerce-shared-prompt-templates').forEach(surface => surfaces.push(surface));
+    surfaces.forEach(surface => {
+        const list = surface.querySelector('.ecommerce-shared-prompt-list');
+        const more = surface.querySelector('.ecommerce-shared-prompt-more');
+        const templates = ecommercePromptTemplates.templates || [];
+        const visible = templates.slice(0, 8);
+        const hidden = templates.slice(8);
+        if (list) {
+            list.innerHTML = visible.map(template => `
+                <span class="ecommerce-prompt-template-chip" data-id="${ecommerceEscape(template.id)}" title="${ecommerceEscape(template.prompt).slice(0, 100)}">
+                    <span class="chip-name">${ecommerceEscape(template.name)}</span>
+                    <span class="chip-delete" title="从两处模板库删除">×</span>
+                </span>`).join('') || '<small class="ecommerce-shared-prompt-empty">暂无模板，可把当前提示词存为模板</small>';
+            list.querySelectorAll('.ecommerce-prompt-template-chip').forEach(chip => {
+                chip.addEventListener('click', event => {
+                    if (event.target.classList.contains('chip-delete')) return;
+                    const template = templates.find(row => row.id === chip.dataset.id);
+                    const target = ecommercePromptTargetForSurface(surface);
+                    if (!template || !target) return;
+                    target.value = template.prompt || '';
+                    target.dispatchEvent(new Event('input', { bubbles: true }));
+                    target.focus();
+                    showToast(`已加载模板「${template.name}」`, 'success');
+                });
+                chip.querySelector('.chip-delete')?.addEventListener('click', async event => {
+                    event.stopPropagation();
+                    const template = templates.find(row => row.id === chip.dataset.id);
+                    if (!template || !confirm(`删除提示词模板「${template.name}」？\n\n首次生成、批量废片重做和单张调整参考图三处都会同时删除。`)) return;
+                    ecommercePromptTemplates.templates = ecommercePromptTemplates.templates.filter(row => row.id !== template.id);
+                    if (await saveEcommercePromptTemplates()) renderAllEcommercePromptTemplateSurfaces();
+                });
+            });
+        }
+        if (more) {
+            more.hidden = !hidden.length;
+            more.innerHTML = '<option value="">更多模板…</option>' + hidden.map(template =>
+                `<option value="${ecommerceEscape(template.id)}">${ecommerceEscape(template.name)}</option>`
+            ).join('');
+            more.onchange = () => {
+                const template = templates.find(row => row.id === more.value);
+                const target = ecommercePromptTargetForSurface(surface);
+                if (template && target) {
+                    target.value = template.prompt || '';
+                    target.dispatchEvent(new Event('input', { bubbles: true }));
+                    target.focus();
+                    showToast(`已加载模板「${template.name}」`, 'success');
+                }
+                more.value = '';
+            };
+        }
+        const saveButton = surface.querySelector('.ecommerce-shared-prompt-save');
+        if (saveButton) saveButton.onclick = async () => {
+            const target = ecommercePromptTargetForSurface(surface);
+            const promptText = target?.value?.trim() || '';
+            if (!promptText) return showToast('当前提示词为空，无法存为模板', 'error');
+            const inputName = window.prompt('请为这个模板起个名字：');
+            if (inputName === null) return;
+            const name = inputName.trim() || `模板${ecommercePromptTemplates.templates.length + 1}`;
+            ecommercePromptTemplates.templates.unshift({ id: genEcommerceTemplateId(), name, prompt: promptText });
+            if (await saveEcommercePromptTemplates()) {
+                renderAllEcommercePromptTemplateSurfaces();
+                showToast(`已存储模板「${name}」，三处已同步`, 'success');
+            }
+        };
+    });
 }
 
 function renderEcommercePromptTemplates() {
@@ -14729,7 +16040,7 @@ function renderEcommercePromptTemplates() {
             const id = e.target.dataset.id;
             ecommercePromptTemplates.templates = ecommercePromptTemplates.templates.filter(x => x.id !== id);
             saveEcommercePromptTemplates();
-            renderEcommercePromptTemplates();
+            renderAllEcommercePromptTemplateSurfaces();
         });
         // 拖拽排序
         chip.addEventListener('dragstart', e => {
@@ -14752,7 +16063,7 @@ function renderEcommercePromptTemplates() {
             const [moved] = ecommercePromptTemplates.templates.splice(ecommerceTemplateDragIndex, 1);
             ecommercePromptTemplates.templates.splice(targetIndex, 0, moved);
             saveEcommercePromptTemplates();
-            renderEcommercePromptTemplates();
+            renderAllEcommercePromptTemplateSurfaces();
         });
     });
     if (moreSelect) {
@@ -14850,7 +16161,7 @@ document.getElementById('btn-ecommerce-save-prompt-template')?.addEventListener(
     const templateName = name.trim() || `模板${ecommercePromptTemplates.templates.length + 1}`;
     ecommercePromptTemplates.templates.unshift({ id: genEcommerceTemplateId(), name: templateName, prompt: promptText });
     saveEcommercePromptTemplates();
-    renderEcommercePromptTemplates();
+    renderAllEcommercePromptTemplateSurfaces();
     showToast(`已存储模板「${templateName}」`, 'success');
 });
 
@@ -21866,4 +23177,12 @@ window.addEventListener('beforeunload', () => {
     if (_saveSplitQueueTimer) { clearTimeout(_saveSplitQueueTimer); _saveSplitQueueTimer = null; }
     saveQueueData();
     saveCurrentSplitQueueData();
+    saveEcommerceDraft();
+});
+
+// 等页面控件和电商模块都完成挂载后再恢复一次，避免初始化顺序覆盖草稿。
+window.addEventListener('DOMContentLoaded', () => {
+    setTimeout(() => {
+        if (typeof restoreEcommerceDraft === 'function') restoreEcommerceDraft();
+    }, 0);
 });

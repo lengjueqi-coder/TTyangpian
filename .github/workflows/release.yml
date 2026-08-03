@@ -1,0 +1,163 @@
+name: Build and release sample factory
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Validate release tree
+        run: |
+          python scripts/validate_release_tree.py
+          APP_VERSION="$(python -c 'import json; print(json.load(open("version.json"))["version"])')"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" != "v${APP_VERSION}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match version.json ${APP_VERSION}" >&2
+            exit 1
+          fi
+      - name: Build clean source package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME:-manual}"
+          ROOT="sample-factory-${VERSION}"
+          mkdir -p "release-assets/${ROOT}/static"
+          cp app.py desktop_app.py requirements.txt requirements-web.txt version.json start.sh 启动.command 启动样片工厂.command 使用说明.md "release-assets/${ROOT}/"
+          cp -R templates default_data default_assets "release-assets/${ROOT}/"
+          cp -R static/css static/js "release-assets/${ROOT}/static/"
+          (cd release-assets && zip -qr "sample-factory-${VERSION}-source.zip" "${ROOT}")
+          cd release-assets
+          shasum -a 256 "sample-factory-${VERSION}-source.zip" > "sample-factory-${VERSION}-source.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-release
+          path: release-assets/sample-factory-*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    env:
+      ECOMMERCE_TEST_TMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $version = (Get-Content version.json | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match version.json $version"
+          }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Test on Windows
+        run: python -m pytest -q tests
+      - name: Build Windows application
+        run: pyinstaller --clean --noconfirm packaging/sample_factory.spec
+      - name: Smoke test packaged executable
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath '.\dist\样片工厂\样片工厂.exe' -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Packaged smoke test failed with exit code $($process.ExitCode)" }
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DMyAppVersion=$env:APP_VERSION" 'packaging\windows\installer.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+          $asset = Get-Item "release-assets\sample-factory-v$env:APP_VERSION-windows-x64-setup.exe"
+          $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($asset.Name)" | Set-Content -NoNewline -Encoding ascii "$($asset.FullName).sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: release-assets/sample-factory-*
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-14
+    env:
+      ECOMMERCE_TEST_TMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
+      - name: Validate release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(python -c 'import json; print(json.load(open("version.json"))["version"])')"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" != "v${APP_VERSION}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match version.json ${APP_VERSION}" >&2
+            exit 1
+          fi
+          echo "APP_VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
+      - name: Test on macOS
+        run: python -m pytest -q tests
+      - name: Build macOS application
+        run: pyinstaller --clean --noconfirm packaging/sample_factory.spec
+      - name: Smoke test packaged application
+        run: dist/样片工厂.app/Contents/MacOS/样片工厂 --smoke-test
+      - name: Sign and build DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          codesign --force --deep --sign - dist/样片工厂.app
+          mkdir -p release-assets/dmg
+          cp -R dist/样片工厂.app release-assets/dmg/
+          ln -s /Applications release-assets/dmg/Applications
+          ARCH="$(uname -m)"
+          ASSET="release-assets/sample-factory-v${APP_VERSION}-macos-${ARCH}.dmg"
+          hdiutil create -volname '样片工厂' -srcfolder release-assets/dmg -ov -format UDZO "$ASSET"
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: release-assets/sample-factory-*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [source, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release'
+          merge-multiple: true
+          path: release-assets
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 样片工厂 ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            本版本同步当前样片工厂功能，并新增 Windows x64 安装包与真实 Windows CI 验证。
+
+            - Windows：下载 `windows-x64-setup.exe` 安装；用户数据保存在 `%LOCALAPPDATA%\样片工厂`，升级不会覆盖。
+            - macOS：下载对应 DMG；首次运行如被 Gatekeeper 拦截，请右键“打开”。
+            - 源码版：软件内“检查更新”会选择 `source.zip`，校验 SHA-256 后更新程序文件并保留用户数据。
+            - 安装版：软件会选择当前系统安装器，校验后启动安装流程。
+
+            Windows 与 macOS 安装包未使用商业代码签名证书，系统可能显示未知发布者警告。
+          files: release-assets/*
+          fail_on_unmatched_files: true
+
