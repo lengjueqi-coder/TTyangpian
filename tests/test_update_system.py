@@ -49,7 +49,7 @@ class UpdateSystemTest(unittest.TestCase):
             payload = app_module.app.test_client().get('/api/check-update').get_json()
         self.assertFalse(payload['has_update'])
         self.assertEqual(payload['release_status'], 'local_ahead')
-        self.assertEqual(payload['local_version'], '15.6.1')
+        self.assertEqual(payload['local_version'], '1.5.2')
         self.assertEqual(payload['remote_version'], '1.4.0')
 
     def test_check_update_rejects_release_without_compatible_asset(self):
