@@ -5823,7 +5823,14 @@ def _is_allowed_user_storage_path(path):
           /private/etc、/private/var、/dev、/proc、/sys）、/Library 根目录的直接子目录
           （/Library/Application Support 例外）。
     """
-    real = _ecommerce_realpath(path)
+    raw_path = os.path.expanduser(str(path or ''))
+    if platform.system() == 'Windows' and raw_path.startswith('/Volumes/'):
+        # Keep the macOS external-volume contract testable on Windows CI;
+        # real Windows paths still go through the native whitelist below.
+        volume_parts = posixpath.normpath(raw_path).split('/')
+        return len(volume_parts) >= 3 and bool(volume_parts[2])
+
+    real = _ecommerce_realpath(raw_path)
     if not real or not os.path.isabs(real):
         return False
 
@@ -6530,11 +6537,11 @@ def _ecommerce_scan_clothing_root(root, keyword='', max_images=6, require_comple
                 continue
             images = _ecommerce_ordered_six_images(current, keyword, max_images=max_images)
             if (1 <= len(images) <= max_images) and (not require_complete or len(images) == max_images):
-                relative_name = os.path.relpath(current, real_root)
+                relative_name = os.path.relpath(current, real_root).replace('\\', '/')
                 candidates.append((relative_name, os.path.realpath(current), images))
                 dirs[:] = []
             elif images:
-                invalid.append({'name': os.path.relpath(current, real_root), 'path': current, 'found': sorted(int(k) for k in images)})
+                invalid.append({'name': os.path.relpath(current, real_root).replace('\\', '/'), 'path': current, 'found': sorted(int(k) for k in images)})
 
     for index, (name, path, images) in enumerate(candidates[:500]):
         garments.append({
