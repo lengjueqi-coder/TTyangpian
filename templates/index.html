@@ -773,7 +773,7 @@
         </section>
     </div>
 
-    <!-- 电商批量生图：目标替换参考图 × 服装文件夹，支持断点续跑与AI质检 -->
+    <!-- 电商批量生图：目标替换参考图 × 服装文件夹，结果进入人工逐验 -->
     <div id="ecommerce-mode" class="main-content ecommerce-mode" style="display:none">
         <section class="ecommerce-shell">
             <!-- 顶部水平滚动轨道：第5栏调整工作台展开后可左右滚动 -->
@@ -894,7 +894,7 @@
                         <span id="ecommerce-rh-api-result"></span><span id="ecommerce-rh-account-status"></span>
                     </details>
                     <div id="ecommerce-precision-panel" class="ecommerce-precision-panel" hidden>
-                        <div class="ecommerce-notice">精准模式已启用：AI 质检和生成返回状态不在此处显示。</div>
+                        <div class="ecommerce-notice">精准模式已启用：生成结果会进入第4栏人工逐验，不做 AI 自动质检。</div>
                         <button type="button" class="btn btn-primary" id="btn-ecommerce-open-precision-matching">打开精准匹配</button>
                         <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-clear-precision">清空匹配</button>
                         <span id="ecommerce-precision-status" class="ecommerce-summary">尚未完成匹配</span>
@@ -905,7 +905,7 @@
 
                 <article class="ecommerce-card ecommerce-card-action" data-workbench-panel="run">
                     <div class="ecommerce-card-title"><span>3</span>运行 <span class="ecommerce-help-tip" tabindex="0" data-tip="素材分段上传，任务按稳定身份绑定并发执行；暂停后可继续，不会按上传完成顺序错配服装。">?</span></div>
-                    <p class="ecommerce-help">关闭质检时采用跨服装滑动窗口：素材限速上传、远端任务保持高并发、结果按任务身份独立归档。RunningHub企业线路最高可设100。</p>
+                    <p class="ecommerce-help">结果不经过 AI 自动质检，按“服装 × 动作 × 抽卡序号”独立归档；返回不足会自动补齐，完成后请到第4栏人工逐验。RunningHub企业线路最高可设100。</p>
                     <div class="ecommerce-settings-grid ecommerce-run-settings">
                         <label>并发
                             <div class="ecommerce-concurrency-control">
@@ -917,16 +917,22 @@
                             </div>
                             <small id="ecommerce-concurrency-hint">并发数会自动对齐为目标图数量的整数倍，避免跨服装混发。</small>
                         </label>
-                        <label>失败上限
-                            <select id="ecommerce-max-attempts" disabled><option value="3">3张</option></select>
+                        <label>网络/查询重试上限
+                            <select id="ecommerce-max-attempts" disabled><option value="5">5次</option></select>
+                            <small>已拿到 taskId 只查询原任务；供应商明确失败最多重新提交2次（总计3次）。</small>
                         </label>
-                        <label id="ecommerce-samples-label" class="ecommerce-disabled">每张数量
-                            <select id="ecommerce-samples-per-action" disabled>
+                        <label id="ecommerce-samples-label">每张数量
+                            <select id="ecommerce-samples-per-action">
                                 <option value="1" selected>1 张（省钱）</option>
                                 <option value="2">2 张（抽卡）</option>
                                 <option value="3">3 张</option>
                                 <option value="4">4 张</option>
                                 <option value="5">5 张</option>
+                                <option value="6">6 张</option>
+                                <option value="7">7 张</option>
+                                <option value="8">8 张</option>
+                                <option value="9">9 张</option>
+                                <option value="10">10 张</option>
                             </select>
                         </label>
                     </div>

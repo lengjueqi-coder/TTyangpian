@@ -110,6 +110,8 @@ ecommerce_reference_locks = {}
 ecommerce_reference_data_cache = {}
 ECOMMERCE_REFERENCE_DATA_CACHE_MAX = 48
 ECOMMERCE_MAX_CONCURRENCY = 100
+ECOMMERCE_TRANSPORT_RETRIES = 5
+ECOMMERCE_MAX_PROVIDER_SUBMISSIONS = 3
 ecommerce_rerun_item_locks = {}
 # 每次后端进程启动都有唯一身份。废片重做项记录处理它的进程；热重载后
 # worker_id 不一致就能确认旧请求已经失去本地执行者，而不是长期假装 running。
@@ -6039,7 +6041,14 @@ def _ecommerce_refresh_rerun_batch_counts(row):
     for item in items:
         state = item.get('status') or 'pending'
         requested = max(1, int((item.get('payload') or {}).get('count') or item.get('requested_count') or 1))
-        archived_count = len([path for path in item.get('archived_paths') or [] if path])
+        live_archived = list(dict.fromkeys(
+            path for path in item.get('archived_paths') or []
+            if _ecommerce_is_readable_image_file(path)
+        ))
+        # 只保留真实存在且可解码的回填结果。否则“已回填3张”的旧台账
+        # 会在第二次/第三次继续时挡住补齐，前端也会虚报完成。
+        item['archived_paths'] = live_archived
+        archived_count = len(live_archived)
         item['requested_count'] = requested
         item['success_count'] = archived_count
         item['remaining_count'] = max(0, requested - archived_count)
@@ -6594,13 +6603,18 @@ def _ecommerce_reconcile_batch_status(batch):
     tasks = batch.get('tasks') or []
     # 修复旧版本“抽卡少返仍标记 accepted”的历史数据：任务只有在
     # 实际归档数达到批次抽卡数时才算完成，否则恢复为 partial，进度不会虚报100%。
-    expected = max(1, min(int((batch.get('settings') or {}).get('samples_per_action') or 1), 5))
+    expected = max(1, min(int((batch.get('settings') or {}).get('samples_per_action') or 1), 10))
     repaired_partial = False
-    if expected > 1 and not (batch.get('settings') or {}).get('qc_enabled', False):
+    if expected > 1:
         for task in tasks:
             if task.get('state') != 'accepted':
                 continue
-            archived_count = sum(1 for attempt in task.get('attempts') or [] if attempt.get('archived_path'))
+            archived_count = len({
+                os.path.realpath(os.path.expanduser(attempt.get('archived_path') or ''))
+                for attempt in task.get('attempts') or []
+                if attempt.get('archived_path')
+                and _ecommerce_is_readable_image_file(attempt.get('archived_path'))
+            })
             if archived_count < expected:
                 task['state'] = 'partial'
                 task['last_error'] = f'抽卡部分回填：已完成{archived_count}/{expected}张，还缺{expected - archived_count}张'
@@ -7108,19 +7122,14 @@ def ecommerce_batches():
         'invalid_folders': invalid,
         'tasks': tasks,
         'reference_cache': {},
-        'usage': {'generation_requests': 0, 'profile_calls': 0, 'qc_calls': 0, 'qc_repair_calls': 0},
+        'usage': {'generation_requests': 0},
         'settings': {
-            'max_attempts': max(1, min(int(body.get('max_attempts') or 3), 3)),
+            'max_attempts': max(1, min(int(body.get('max_attempts') or 5), 5)),
             'concurrency': max(1, min(int(body.get('concurrency') or 10), ECOMMERCE_MAX_CONCURRENCY)),
-            'schedule_mode': 'garment_round_qc',
+            'schedule_mode': 'manual_review',
             'garment_limit': garment_limit,
             'action_limit': action_limit,
-            # 递归服装原图模式是逐图提示词编辑，不复用六视图服装质检。
-            'qc_enabled': bool(body.get('qc_enabled', True)) if generation_mode == 'garment_reference' else False,
-            'qc_model': str(body.get('qc_model') or 'gemini-2.5-pro').strip(),
-            'profile_mode': str(body.get('profile_mode') or 'visual_sheets').strip() if str(body.get('profile_mode') or 'visual_sheets').strip() in {'visual_sheets', 'ai_text'} else 'visual_sheets',
-            'qc_threshold': max(50, min(int(body.get('qc_threshold') or 85), 100)),
-            'samples_per_action': max(1, min(int(body.get('samples_per_action') or 1), 5)),
+            'samples_per_action': max(1, min(int(body.get('samples_per_action') or 1), 10)),
             'garment_keyword': garment_keyword,
             'generation_mode': generation_mode,
             'precision_matching': bool(body.get('precision_matching')) if generation_mode == 'garment_reference' else False,
@@ -7870,15 +7879,32 @@ def _ecommerce_download_candidate(batch, task, attempt_no, result_item):
                 if buf.tell() > 40 * 1024 * 1024:
                     raise RuntimeError('候选图超过40MB')
             raw = buf.getvalue()
-    ext = '.png' if 'png' in content_type else '.jpg'
+    if not raw:
+        raise RuntimeError('供应商返回空图片')
+    # 不能把“下载成功”当成“图片成功”。供应商偶尔会返回 HTML、损坏的
+    # 二进制或 0 字节文件；这些文件一旦落进结果目录，后续扫描就会把它
+    # 当成一张已经完成的抽卡，导致 3 张只显示 2 张却无法补齐。
+    detected_format = ''
     try:
         with Image.open(io.BytesIO(raw)) as img:
-            ext = '.png' if (img.format or '').upper() == 'PNG' else '.jpg'
-    except Exception:
-        pass
+            detected_format = str(img.format or '').upper()
+            img.verify()
+    except Exception as exc:
+        raise RuntimeError(f'供应商返回的内容不是可读取图片: {exc}') from exc
+    ext = {
+        'PNG': '.png', 'WEBP': '.webp', 'JPEG': '.jpg', 'JPG': '.jpg',
+    }.get(detected_format, '.jpg')
     path = os.path.join(work_dir, f'候选{attempt_no}{ext}')
-    with open(path, 'wb') as f:
-        f.write(raw)
+    part_path = f'{path}.part-{uuid.uuid4().hex[:10]}'
+    try:
+        with open(part_path, 'wb') as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(part_path, path)
+    finally:
+        if os.path.isfile(part_path):
+            os.remove(part_path)
     return path
 
 
@@ -8077,8 +8103,12 @@ def _ecommerce_generate_candidate(batch, task, garment, action, prompt, attempt)
             if 200 <= status < 300 and (state == 'SUCCESS' or results) and results:
                 _ecommerce_record_runninghub_usage(batch['id'], task['id'], attempt, data)
                 return _ecommerce_download_candidate(batch, task, attempt['number'], results[0])
-            if state in ('FAILED', 'ERROR', 'CANCELLED') or data.get('error') or data.get('errorMessage'):
+            if state in ('FAILED', 'ERROR', 'CANCELLED'):
+                attempt['provider_terminal_failure'] = True
+                _ecommerce_mutate_batch(batch['id'], lambda b: _ecommerce_sync_attempt(b, task['id'], attempt))
                 raise RuntimeError(data.get('errorMessage') or data.get('error') or data.get('message') or f'RunningHub任务{state}')
+            if data.get('error') or data.get('errorMessage'):
+                raise RuntimeError(data.get('errorMessage') or data.get('error') or data.get('message') or 'RunningHub查询失败')
             # 按任务序号错峰，避免100个任务在同一秒形成查询尖峰。
             time.sleep(delay + (int(task.get('order') or 0) % 5) * 0.35)
             delay = min(15, delay + 2)
@@ -8149,8 +8179,12 @@ def _ecommerce_generate_candidate(batch, task, garment, action, prompt, attempt)
         if 200 <= status < 300 and data.get('images'):
             return _ecommerce_download_candidate(batch, task, attempt['number'], data['images'][0])
         state = str(data.get('status') or '').upper()
-        if state in ('FAILED', 'ERROR', 'CANCELLED') or data.get('error'):
+        if state in ('FAILED', 'ERROR', 'CANCELLED'):
+            attempt['provider_terminal_failure'] = True
+            _ecommerce_mutate_batch(batch['id'], lambda b: _ecommerce_sync_attempt(b, task['id'], attempt))
             raise RuntimeError(data.get('error') or f'HK任务{state}')
+        if data.get('error'):
+            raise RuntimeError(data.get('error') or 'HK查询失败')
         time.sleep(delay)
         delay = min(10, delay + 1)
     raise TimeoutError('HK任务轮询超过60分钟')
@@ -8713,7 +8747,7 @@ def _ecommerce_generate_task_attempt(batch_id, task_id, number):
     if batch.get('status') in ('paused', 'cancelled'):
         return False
 
-    max_attempts = int((batch.get('settings') or {}).get('max_attempts') or 3)
+    max_attempts = int((batch.get('settings') or {}).get('max_attempts') or 5)
     if number < 1 or number > max_attempts:
         return False
     attempts = task.get('attempts') or []
@@ -8748,7 +8782,7 @@ def _ecommerce_generate_task_attempt(batch_id, task_id, number):
 
     _ecommerce_mutate_batch(batch_id, lambda b: (_ecommerce_set_task_state(b, task_id, 'preparing'), _ecommerce_sync_attempt(b, task_id, attempt)))
     generation_error = None
-    for transport_try in range(3):
+    for transport_try in range(ECOMMERCE_TRANSPORT_RETRIES):
         try:
             batch, task, garment, action = _ecommerce_task_context(batch_id, task_id)
             candidate = _ecommerce_generate_candidate(batch, task, garment, action, prompt, attempt)
@@ -8762,7 +8796,9 @@ def _ecommerce_generate_task_attempt(batch_id, task_id, number):
             generation_error = str(exc)
             if _ecommerce_generation_needs_configuration(generation_error):
                 break
-            if transport_try < 2:
+            if attempt.get('submission_uncertain') or attempt.get('provider_terminal_failure'):
+                break
+            if transport_try < ECOMMERCE_TRANSPORT_RETRIES - 1:
                 time.sleep(2 ** transport_try * 3)
     if not candidate:
         # 网络或平台临时错误不消耗候选轮次；恢复后继续同一个attempt/request_id。
@@ -8850,7 +8886,7 @@ def _ecommerce_qc_task_attempt(batch_id, task_id, number):
     batch, task, _, _ = _ecommerce_task_context(batch_id, task_id)
     attempt['mismatch_path'] = _ecommerce_archive_mismatch(batch, task, attempt)
     _ecommerce_mutate_batch(batch_id, lambda b: _ecommerce_sync_attempt(b, task_id, attempt))
-    max_attempts = int((batch.get('settings') or {}).get('max_attempts') or 3)
+    max_attempts = int((batch.get('settings') or {}).get('max_attempts') or 5)
     if number >= max_attempts:
         batch, task, _, _ = _ecommerce_task_context(batch_id, task_id)
         review = _ecommerce_archive_manual_review(batch, task)
@@ -8865,7 +8901,7 @@ def _ecommerce_run_task(batch_id, task_id):
     batch, task, _, _ = _ecommerce_task_context(batch_id, task_id)
     if not batch or not task:
         return
-    max_attempts = int((batch.get('settings') or {}).get('max_attempts') or 3)
+    max_attempts = int((batch.get('settings') or {}).get('max_attempts') or 5)
     for number in range(1, max_attempts + 1):
         _ecommerce_generate_task_attempt(batch_id, task_id, number)
         _ecommerce_qc_task_attempt(batch_id, task_id, number)
@@ -8936,7 +8972,7 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
         return
     settings = batch.get('settings') or {}
     concurrency = max(1, min(int(settings.get('concurrency') or 10), ECOMMERCE_MAX_CONCURRENCY))
-    samples_per_action = max(1, min(int(settings.get('samples_per_action') or 1), 5))
+    samples_per_action = max(1, min(int(settings.get('samples_per_action') or 1), 10))
 
     def run_one(task_id, sample_number):
         batch_ref, task_ref, garment_ref, action_ref = _ecommerce_task_context(batch_id, task_id)
@@ -8947,9 +8983,11 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
         if batch_ref.get('status') == 'cancelling' and not _ecommerce_task_has_inflight_request(task_ref):
             return task_id, None, '批次正在取消，未提交任务已停止'
         identity = _ecommerce_verify_task_identity(batch_ref, task_ref, garment_ref, action_ref)
-        existing = next((a for a in task_ref.get('attempts', []) if int(a.get('number') or 0) == sample_number), None)
+        sample_attempts = [a for a in task_ref.get('attempts', []) if int(a.get('number') or 0) == sample_number and a.get('sample')]
+        existing = sample_attempts[-1] if sample_attempts else None
+        provider_submit_count = sum(1 for item in sample_attempts if item.get('request_id'))
         attempt = dict(existing or {
-            'number': sample_number, 'request_id': '', 'candidate_path': '', 'qc': None,
+            'number': sample_number, 'request_id': '', 'candidate_path': '',
             'started_at': datetime.now().isoformat(timespec='seconds'), 'sample': True,
         })
         attempt['status'] = 'preparing'
@@ -8958,7 +8996,7 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
         candidate = attempt.get('candidate_path') if os.path.isfile(attempt.get('candidate_path') or '') else None
         error = ''
         if not candidate:
-            for transport_try in range(3):
+            for transport_try in range(ECOMMERCE_TRANSPORT_RETRIES):
                 try:
                     current_batch, current_task, current_garment, current_action = _ecommerce_task_context(batch_id, task_id)
                     _ecommerce_verify_task_identity(current_batch, current_task, current_garment, current_action)
@@ -8970,7 +9008,24 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
                     error = str(exc)
                     if _ecommerce_generation_needs_configuration(error) or isinstance(exc, PermissionError):
                         break
-                    if transport_try < 2:
+                    if attempt.get('submission_uncertain'):
+                        break
+                    if attempt.get('provider_terminal_failure'):
+                        provider_submit_count = max(provider_submit_count, 1)
+                        if provider_submit_count >= ECOMMERCE_MAX_PROVIDER_SUBMISSIONS:
+                            break
+                        provider_submit_count += 1
+                        attempt = {
+                            'id': gen_id('ecattempt'), 'number': sample_number,
+                            'status': 'preparing', 'request_id': '', 'candidate_path': '',
+                            'sample': True,
+                            'provider_resubmission': provider_submit_count,
+                            'started_at': datetime.now().isoformat(timespec='seconds'),
+                            'identity': identity,
+                        }
+                        _ecommerce_mutate_batch(batch_id, lambda b, a=attempt: _ecommerce_sync_attempt(b, task_id, a))
+                        continue
+                    if transport_try < ECOMMERCE_TRANSPORT_RETRIES - 1:
                         time.sleep(3 * (2 ** transport_try))
         if not candidate or not os.path.isfile(candidate):
             return task_id, None, error or '生成失败：未返回图片'
@@ -8981,7 +9036,7 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
         archived = _ecommerce_archive_sample(latest_batch, latest_task, candidate, sample_number, samples_per_action)
         def save_archived(b):
             task_obj = _ecommerce_find_task(b, task_id)
-            target = next((a for a in task_obj.get('attempts', []) if int(a.get('number') or 0) == sample_number), None) if task_obj else None
+            target = next((a for a in reversed(task_obj.get('attempts', [])) if int(a.get('number') or 0) == sample_number and a.get('sample')), None) if task_obj else None
             if target:
                 target.update({'candidate_path': candidate, 'archived_path': archived, 'status': 'accepted', 'finished_at': datetime.now().isoformat(timespec='seconds'), 'identity': identity})
             if task_obj:
@@ -8998,13 +9053,17 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
         # 和归档文件名仍是固定绑定，不会因返回顺序不同而串图。
         work_items = []
         for task_obj in sorted(current.get('tasks', []), key=lambda task: int(task.get('order') or 0)):
-            if task_obj.get('state') in ECOMMERCE_FINAL_TASK_STATES:
-                continue
             archived_numbers = {
                 int(attempt.get('number') or 0)
                 for attempt in task_obj.get('attempts', [])
                 if attempt.get('archived_path')
+                and 1 <= int(attempt.get('number') or 0) <= samples_per_action
+                and _ecommerce_is_readable_image_file(attempt.get('archived_path'))
             }
+            # “accepted” 只代表上次写入过台账，不能代表文件今天还存在。
+            # 外部移动/误删/磁盘同步不完整后，必须允许这个任务重新补齐。
+            if task_obj.get('state') in ECOMMERCE_FINAL_TASK_STATES and len(archived_numbers) >= samples_per_action:
+                continue
             for sample_number in range(1, samples_per_action + 1):
                 if sample_number not in archived_numbers:
                     work_items.append((task_obj['id'], sample_number))
@@ -9045,9 +9104,10 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
     if not current:
         return
     for task in current.get('tasks', []):
-        if task.get('state') in ECOMMERCE_FINAL_TASK_STATES:
-            continue
-        paths = [a.get('archived_path') for a in task.get('attempts', []) if a.get('archived_path')]
+        paths = list(dict.fromkeys(
+            a.get('archived_path') for a in task.get('attempts', [])
+            if a.get('archived_path') and _ecommerce_is_readable_image_file(a.get('archived_path'))
+        ))
         if paths:
             # 抽卡模式必须全部回填才算完成；只成功1/3或2/3时保留为
             # partial，让批次可以继续补齐，不能用“至少有一张”冒充100%。
@@ -9127,7 +9187,7 @@ def _ecommerce_run_batch_no_qc(batch_id):
     settings = batch.get('settings') or {}
     return _ecommerce_run_batch_no_qc_global(batch_id)
     concurrency = max(1, min(int(settings.get('concurrency') or 10), 20))
-    samples_per_action = max(1, min(int(settings.get('samples_per_action') or 1), 5))
+    samples_per_action = max(1, min(int(settings.get('samples_per_action') or 1), 10))
     garments = sorted(batch.get('garments', []), key=lambda g: int(g.get('order') or 0))
 
     def _gen_one_sample(task_id, sample_number):
@@ -9156,7 +9216,7 @@ def _ecommerce_run_batch_no_qc(batch_id):
         _ecommerce_mutate_batch(batch_id, _mark)
         prompt = action_ref.get('prompt') or ''
         last_err = None
-        for transport_try in range(3):
+        for transport_try in range(ECOMMERCE_TRANSPORT_RETRIES):
             try:
                 batch_ref, task_ref, garment_ref, action_ref = _ecommerce_task_context(batch_id, task_id)
                 identity = _ecommerce_verify_task_identity(batch_ref, task_ref, garment_ref, action_ref)
@@ -9289,12 +9349,16 @@ def _ecommerce_run_batch(batch_id):
         batch = _ecommerce_batch_snapshot(batch_id)
         if not batch or batch.get('status') not in ('running', 'resuming', 'cancelling'):
             return
+        # AI 自动质检已从产品流程移除。所有生成结果直接进入“人工逐验”，
+        # 由人工删除/标记重做，再由 scan-deleted 按结果账本决定下一步。
+        _ecommerce_run_batch_no_qc(batch_id)
+        return
         settings = batch.get('settings') or {}
         if not settings.get('qc_enabled', True):
             _ecommerce_run_batch_no_qc(batch_id)
             return
         concurrency = max(1, min(int(settings.get('concurrency') or 10), ECOMMERCE_MAX_CONCURRENCY))
-        max_attempts = max(1, min(int((batch.get('settings') or {}).get('max_attempts') or 3), 3))
+        max_attempts = max(1, min(int((batch.get('settings') or {}).get('max_attempts') or 5), 5))
         garments = sorted(batch.get('garments', []), key=lambda g: int(g.get('order') or 0))
         # 严格按服装、按轮执行：整轮动作全部生成后才集中质检；失败项进入下一轮。
         for garment in garments:
@@ -9498,7 +9562,7 @@ def ecommerce_batch_action(batch_id):
 
 @app.route('/api/ecommerce/batches/<batch_id>/settings', methods=['PATCH'])
 def ecommerce_batch_settings(batch_id):
-    """安全修改暂停批次的运行设置；关闭质检时保留并归档已有候选图。"""
+    """旧客户端兼容入口；AI 自动质检已经永久关闭。"""
     body = request.get_json(silent=True) or {}
     batch = _ecommerce_batch_snapshot(batch_id)
     if not batch:
@@ -9508,6 +9572,8 @@ def ecommerce_batch_settings(batch_id):
     if 'qc_enabled' not in body:
         return jsonify({'error': '没有可修改的设置'}), 400
     qc_enabled = bool(body.get('qc_enabled'))
+    if qc_enabled:
+        return jsonify({'error': 'AI自动质检已移除，请使用第4栏人工逐验'}), 410
     recovered = 0
     # 从质检模式切到人工挑选时，已经生成出来的候选不能丢，也不能重新扣费生成。
     if not qc_enabled and (batch.get('settings') or {}).get('qc_enabled', True):
@@ -9889,7 +9955,7 @@ def _ecommerce_record_waste_scan(batch, items, garment_ids=None, scope_label='�
             'current_deleted': deleted, 'waste_rate': round((deleted / generated * 100) if generated else 0, 2),
             'model_breakdown': model_rows, 'billed_cny': round(scoped_cost, 4),
             'run_code': batch.get('run_code') or '', 'scope_label': scope_label,
-            'qc_enabled': bool((batch.get('settings') or {}).get('qc_enabled', True)),
+            'manual_review': True,
         })
         existing['scan_count'] = int(existing.get('scan_count') or 0) + 1
         store['waste_scans'] = sorted(records, key=lambda r: r.get('last_scan_at') or '', reverse=True)[:100]
@@ -10090,6 +10156,109 @@ def _ecommerce_result_identity(batch, garment, path_or_name):
         identity = dict(identity)
         identity['identity_source'] = 'filename'
     return identity
+
+
+def _ecommerce_is_readable_image_file(path):
+    """Only count a complete, decodable image as a generated result."""
+    try:
+        if not path or not os.path.isfile(path) or os.path.getsize(path) <= 0:
+            return False
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _ecommerce_collect_action_inventory(batch, garment, action_order, active_deletions=None):
+    """Build the authoritative ledger for one garment/action pair.
+
+    The three sets are deliberately separate:
+      - current_paths: readable files currently on disk and not deleted;
+      - deleted_paths: unique paths confirmed by the deletion ledger;
+      - marked_paths: exact files the operator explicitly requested to redo.
+
+    A remaining image is never allowed to turn an action into a full-waste
+    rerun. A marked image is always a rerun, even when other images remain.
+    """
+    result_dir = _ecommerce_sample_result_dir(batch, garment)
+    garment_id = garment.get('id')
+    active_deletions = list(active_deletions or [])
+    deleted_paths = {
+        os.path.realpath(os.path.expanduser(row.get('original_path') or ''))
+        for row in active_deletions
+        if row.get('original_path')
+        and int(row.get('action_order') or 0) == int(action_order)
+    }
+    marked_records = []
+    marked_paths = set()
+    legacy_action_marked = False
+    for mark in batch.get('marked_redo') or []:
+        if mark.get('garment_id') != garment_id or int(mark.get('action_order') or 0) != int(action_order):
+            continue
+        marked_records.append(mark)
+        if mark.get('result_path'):
+            marked_paths.add(os.path.realpath(os.path.expanduser(mark.get('result_path') or '')))
+        else:
+            # Old versions stored only garment+action. Keep it as an action
+            # level mark; it still must force a rerun, but does not erase any
+            # current candidate from the quantity count.
+            legacy_action_marked = True
+
+    current_paths = []
+    if result_dir and os.path.isdir(result_dir):
+        try:
+            for name in os.listdir(result_dir):
+                path = os.path.join(result_dir, name)
+                if name == 'asset-manifest.json' or name.lower().endswith('.deleted'):
+                    continue
+                if not _ecommerce_is_readable_image_file(path):
+                    continue
+                identity = _ecommerce_result_identity(batch, garment, path)
+                if not identity or identity.get('action_order') != int(action_order):
+                    continue
+                if not identity.get('is_valid_result', False):
+                    continue
+                # A manifest row can survive after a deletion. Its status is
+                # a second, machine-readable deletion signal.
+                if str(identity.get('asset_status') or 'active') in {'deleted', 'recycled'}:
+                    continue
+                real = os.path.realpath(path)
+                if real in deleted_paths:
+                    continue
+                current_paths.append(real)
+        except OSError:
+            pass
+
+    current_paths = sorted(set(current_paths))
+    kept_paths = [path for path in current_paths if path not in marked_paths]
+    # A marked path that has already been physically removed is still an
+    # active mark, so the operator's instruction cannot silently disappear.
+    marked_count = len(marked_records)
+    known_count = len(set(current_paths) | deleted_paths)
+    expected_count = max(1, int((batch.get('settings') or {}).get('samples_per_action') or 1))
+    return {
+        'expected_count': expected_count,
+        'current_paths': current_paths,
+        'kept_paths': kept_paths,
+        'kept_count': len(kept_paths),
+        'deleted_paths': sorted(deleted_paths),
+        'deleted_count': len(deleted_paths),
+        'marked_paths': sorted(marked_paths),
+        'marked_count': marked_count,
+        'legacy_action_marked': legacy_action_marked,
+        'known_count': known_count,
+        'missing_count': max(0, expected_count - known_count),
+        'is_incomplete': known_count < expected_count,
+        # Full waste means every configured draw is accounted for as deleted
+        # and no unmarked candidate remains. A marked candidate is not a
+        # full-waste condition; it is emitted through the marked queue below.
+        'needs_waste_rerun': (
+            len(current_paths) == 0
+            and len(deleted_paths) >= expected_count
+        ),
+        'needs_marked_rerun': bool(marked_records),
+    }
 
 
 def _ecommerce_next_fp_round(result_dir, action_order):
@@ -10533,14 +10702,14 @@ def _ecommerce_group_compare_payload(batch, garment, show_deleted=False):
         seen_paths = set()
         for attempt in reversed(task.get('attempts') or []):
             path = attempt.get('archived_path')
-            if path and os.path.isfile(path):
+            if path and _ecommerce_is_readable_image_file(path):
                 real = os.path.realpath(path)
                 if real not in seen_paths:
                     seen_paths.add(real)
                     identity = _ecommerce_result_identity(batch, garment, path)
                     current_paths.append((path, identity))
         for path in (task.get('accepted_path'), task.get('manual_review_path')):
-            if path and os.path.isfile(path):
+            if path and _ecommerce_is_readable_image_file(path):
                 real = os.path.realpath(path)
                 if real not in seen_paths:
                     seen_paths.add(real)
@@ -10551,7 +10720,7 @@ def _ecommerce_group_compare_payload(batch, garment, show_deleted=False):
         if result_dir and os.path.isdir(result_dir):
             try:
                 for name in sorted(os.listdir(result_dir)):
-                    if not os.path.isfile(os.path.join(result_dir, name)):
+                    if not _ecommerce_is_readable_image_file(os.path.join(result_dir, name)):
                         continue
                     stem, ext = os.path.splitext(name)
                     if ext.lower() not in ECOMMERCE_IMAGE_EXTS:
@@ -10733,12 +10902,16 @@ def _ecommerce_final_candidates(batch, garment):
         return grouped
     for name in names:
         path = os.path.realpath(os.path.join(result_dir, name))
-        if not os.path.isfile(path) or name.lower().endswith('.deleted'):
+        if name == 'asset-manifest.json' or name.lower().endswith('.deleted'):
+            continue
+        if not _ecommerce_is_readable_image_file(path):
             continue
         if path in soft_deleted_paths:
             continue
         identity = _ecommerce_result_identity(batch, garment, path)
         if not identity:
+            continue
+        if str(identity.get('asset_status') or 'active') in {'deleted', 'recycled'}:
             continue
         if path in marked_paths or identity['action_order'] in marked_actions:
             continue
@@ -11780,6 +11953,9 @@ def ecommerce_scan_deleted():
             return jsonify({'error': '所选文件夹不属于当前批次，请选择该批次结果列表中的某一套服装文件夹'}), 400
         garments = matched
     items = []
+    # 生成数量不足和人工废片是两种不同状态：前者不能进入收费的废片重做队列。
+    # 这里仅作为扫描结果返回，供前端提示用户检查 API/文件落盘情况。
+    incomplete_items = []
     scan_deleted_original_paths = set()
     confirmed_groups = batch.get('confirmed_groups') or {}
     for garment in garments:
@@ -11788,53 +11964,12 @@ def ecommerce_scan_deleted():
             continue
         garment_actions = _ecommerce_actions_for_garment(batch, garment)
         action_count = len(garment_actions)
-        expected_samples = max(1, min(int((batch.get('settings') or {}).get('samples_per_action') or 1), 5))
+        expected_samples = max(1, min(int((batch.get('settings') or {}).get('samples_per_action') or 1), 10))
         if not action_count:
             continue
         garment_path = garment.get('path') or ''
         garment_name = garment.get('name') or garment.get('id') or '未命名'
         result_path = _ecommerce_sample_result_dir(batch, garment)
-
-        # 构建软删除路径集合（这些文件虽在磁盘但已被用户标记删除，不算有效图）
-        soft_deleted_paths = set()
-        for record in batch.get('deleted_samples') or []:
-            if record.get('garment_id') != garment.get('id'):
-                continue
-            if record.get('status') not in {'deleted', 'pending'}:
-                continue
-            if not record.get('soft_delete'):
-                continue
-            op = record.get('original_path') or ''
-            if op:
-                soft_deleted_paths.add(os.path.realpath(os.path.expanduser(op)))
-
-        # 扫描结果目录，统计每个动作的有效成品数量（排除软删除和当前台账标记）。
-        # BJ文件是标记重做返回的正常候选，不应排除。
-        valid_counts = {}
-        bj_paths = set()
-        if result_path and os.path.isdir(result_path):
-            try:
-                for name in os.listdir(result_path):
-                    fpath = os.path.join(result_path, name)
-                    if not os.path.isfile(fpath) or name.lower().endswith('.deleted'):
-                        continue
-                    identity = _ecommerce_result_identity(batch, garment, fpath)
-                    if not identity:
-                        continue
-                    order = identity['action_order']
-                    real = os.path.realpath(fpath)
-                    if real in soft_deleted_paths:
-                        continue
-                    if identity.get('is_marked_redo'):
-                        bj_paths.add(real)
-                        # 只兼容旧版身份数据；新版BJ不会进入此分支。
-                        continue
-                    valid_counts[order] = valid_counts.get(order, 0) + 1
-            except OSError:
-                pass
-
-        # 抽卡模式按目标数量检查，不能只检查“至少有一张”。
-        filesystem_missing = [i for i in range(1, action_count + 1) if valid_counts.get(i, 0) < expected_samples]
 
         # 收集活跃删除记录
         active_deletions_by_action = {}
@@ -11843,43 +11978,45 @@ def ecommerce_scan_deleted():
             if 1 <= order <= action_count:
                 active_deletions_by_action.setdefault(order, []).append(deleted_record)
         # 兼容历史推断删除
-        for deleted_record in _ecommerce_infer_historical_deletions(batch, garment, result_path, 1):
+        for deleted_record in _ecommerce_infer_historical_deletions(batch, garment, result_path, expected_samples):
             order = int(deleted_record.get('action_order') or 0)
             if 1 <= order <= action_count:
                 active_deletions_by_action.setdefault(order, []).append(deleted_record)
 
-        # 自动解决"已有有效图覆盖"的删除记录：
-        # 如果某动作已经有≥1张有效成品，则该动作的硬删除记录（非软删除、非推断）自动标记为auto_resolved
-        auto_resolved_ids = []
-        for order, records in list(active_deletions_by_action.items()):
-            if valid_counts.get(order, 0) >= 1:
-                for rec in records:
-                    if not rec.get('soft_delete') and not rec.get('inferred_from_archive') and rec.get('id'):
-                        orig = rec.get('original_path') or ''
-                        if not orig or not os.path.isfile(os.path.realpath(os.path.expanduser(orig))):
-                            auto_resolved_ids.append(rec['id'])
-        if auto_resolved_ids:
-            _ecommerce_auto_resolve_stale_deletions(batch_id, auto_resolved_ids)
-            # 刷新active_deletions
-            active_deletions_by_action = {}
-            for deleted_record in _ecommerce_active_deleted_samples(batch, garment.get('id')):
-                order = int(deleted_record.get('action_order') or 0)
-                if 1 <= order <= action_count:
-                    active_deletions_by_action.setdefault(order, []).append(deleted_record)
-            for deleted_record in _ecommerce_infer_historical_deletions(batch, garment, result_path, 1):
-                order = int(deleted_record.get('action_order') or 0)
-                if 1 <= order <= action_count:
-                    active_deletions_by_action.setdefault(order, []).append(deleted_record)
+        # 这里不能因为“目录里还有一张图”就自动解决删除记录。删除记录
+        # 是人工逐验的事实账本：抽5张、删4张、留1张时，4条记录必须继续
+        # 存在，后续第二/第三次扫描才能知道这组已经完整，而不是只返回1张。
+        inventory_by_order = {
+            order: _ecommerce_collect_action_inventory(
+                batch, garment, order,
+                active_deletions_by_action.get(order) or [],
+            )
+            for order in range(1, action_count + 1)
+        }
 
-        # 需要进入废片列表的动作：抽卡有效成品未达到目标数量，或有活跃删除记录造成缺口。
-        # 注意：软删除的文件仍在磁盘上但被标记删除，如果同动作还有其他有效图则OK；
-        # 如果所有图都被软删除（valid_counts=0），则该动作缺图
+        # 每个动作组都按“具体候选路径”去重后判断，不能只看动作是否缺图。
+        # 抽卡 N 张时，只有 N 张候选全部被人工删除，才是人工废片重做。
+        # 少删一张必须保留整组，不得把剩余好图重复提交并再次扣费。
         scan_orders = set()
-        for order in filesystem_missing:
-            scan_orders.add(order)
-        # 对于有删除记录但有效图=0的动作，也加入
-        for order in active_deletions_by_action:
-            if valid_counts.get(order, 0) < expected_samples:
+        for order in range(1, action_count + 1):
+            inventory = inventory_by_order[order]
+            deleted_records = active_deletions_by_action.get(order) or []
+            if inventory['is_incomplete']:
+                action = next((a for a in garment_actions if int(a.get('order') or 0) == order - 1), None)
+                if action:
+                    incomplete_items.append({
+                        'id': f"{garment.get('id')}-{order}-incomplete",
+                        'garment_id': garment.get('id'),
+                        'garment_name': garment_name,
+                        'action_order': order,
+                        'action_name': action.get('name') or f'目标图{order}',
+                        'expected_count': expected_samples,
+                        'actual_count': inventory['known_count'],
+                        'missing_count': inventory['missing_count'],
+                        'status': 'api_incomplete',
+                        'reason': '结果文件数量不足，或存在无法识别的结果文件；未自动加入废片重做。',
+                    })
+            if inventory['needs_waste_rerun']:
                 scan_orders.add(order)
 
         if not scan_orders:
@@ -11966,9 +12103,7 @@ def ecommerce_scan_deleted():
                 and mark.get('result_path')
                 and os.path.realpath(os.path.expanduser(mark.get('result_path') or '')) in deleted_originals
             ]
-            # 计算有效成品数量
-            valid_count = valid_counts.get(action_order, 0)
-            missing_count = max(0, expected_samples - valid_count)
+            inventory = inventory_by_order[action_order]
             items.append({
                 'id': f"{garment.get('id')}-{action_order}",
                 'garment_id': garment.get('id'),
@@ -11993,8 +12128,9 @@ def ecommerce_scan_deleted():
                 'model_signature': current_model,
                 'samples_per_action': expected_samples,
                 'expected_count': expected_samples,
-                'actual_count': valid_count,
-                'missing_count': missing_count,
+                'actual_count': inventory['kept_count'],
+                'missing_count': expected_samples,
+                'recommended_count': expected_samples,
                 'deletion_ids': [row.get('id') for row in deleted_records if row.get('id')],
                 'deleted_record_count': len(deleted_records),
                 'also_marked_redo': bool(overlapping_marks),
@@ -12093,11 +12229,14 @@ def ecommerce_scan_deleted():
             'marked_redo': True,  # 标记为"重做对比"而非"缺失废片"
             'mark_id': mark.get('id') or '',
             'marked_result_path': marked_result_path,
+            'recommended_count': 1,
             'missing_count': 1,
         })
     items.extend(marked_items)
     return jsonify({
         'items': items, 'total': len(items), 'stats': stats,
+        'incomplete_items': incomplete_items,
+        'incomplete_total': len(incomplete_items),
         'marked_count': len(marked_items), 'generation_mode': generation_mode,
         'confirmed_groups': confirmed_groups,
         'confirmed_count': len(confirmed_groups),
@@ -12159,7 +12298,7 @@ def _ecommerce_validate_rerun_queue_item(batch, raw):
         # 仅覆盖这一项废片重做所使用的动作参考图；不修改原批次模板，
         # 也不能被“同步本套”误用到其他动作。
         'target_action_image': str((raw or {}).get('target_action_image') or '').strip(),
-        'count': max(1, min(int((raw or {}).get('count') or 1), 5)),
+        'count': max(1, min(int((raw or {}).get('count') or 1), 10)),
         'model_override': dict((raw or {}).get('model_override') or {}),
     }
     requested_count = payload['count']
@@ -12590,7 +12729,7 @@ def _ecommerce_resumable_rerun_attempt(
     for attempt in reversed((task or {}).get('attempts') or []):
         if not attempt.get('rerun') or not attempt.get('request_id'):
             continue
-        if attempt.get('archived_path') and os.path.isfile(attempt.get('archived_path')):
+        if attempt.get('archived_path') and _ecommerce_is_readable_image_file(attempt.get('archived_path')):
             continue
         if int(attempt.get('rerun_sample') or 0) != int(sample_number):
             continue
@@ -12616,7 +12755,7 @@ def ecommerce_regenerate():
     支持提示词覆盖和参考图覆盖（仅本次重做，不改原服装文件夹）。
     """
     body = request.get_json(silent=True) or {}
-    requested_count = max(1, min(int(body.get('count') or 1), 5))
+    requested_count = max(1, min(int(body.get('count') or 1), 10))
     batch_id = str(body.get('batch_id') or '')
     item_id = str(body.get('item_id') or '')
     rerun_batch_id = str(body.get('rerun_batch_id') or '')
@@ -12699,8 +12838,11 @@ def ecommerce_regenerate():
             (rerun_queue_item.get('payload') or {}).get('count')
             or rerun_queue_item.get('requested_count')
             or requested_count
-        ), 5))
-        cached_paths = [path for path in rerun_queue_item.get('archived_paths') or [] if os.path.isfile(path)]
+        ), 10))
+        cached_paths = [
+            path for path in rerun_queue_item.get('archived_paths') or []
+            if _ecommerce_is_readable_image_file(path)
+        ]
         if rerun_queue_item.get('status') == 'accepted' and len(cached_paths) >= requested_count:
             return jsonify({
                 'ok': True, 'cached': True, 'archived_path': cached_paths[0],

@@ -62,7 +62,7 @@ class EcommerceBatchTest(unittest.TestCase):
         with open(template_path, encoding='utf-8') as handle:
             template = handle.read()
         self.assertIn('id="ecommerce-rerun-draw-count"', script)
-        self.assertIn('count: drawCount', script)
+        self.assertIn('count: requestedCount', script)
         self.assertNotIn('Math.max(drawCount, Math.min(parseInt(item.missing_count, 10) || 1, 5))', script)
         self.assertIn("String(item.rerun_prompt || '').trim() || String(config.prompt || '')", script)
         self.assertIn('预计付费生图 ${paidCallTotal} 张', script)
@@ -372,7 +372,7 @@ class EcommerceBatchTest(unittest.TestCase):
         batch = payload['batch']
         self.assertEqual(batch['generation_mode'], 'garment_prompt')
         self.assertEqual(batch['settings']['generation_mode'], 'garment_prompt')
-        self.assertFalse(batch['settings']['qc_enabled'])
+        self.assertNotIn('qc_enabled', batch['settings'])
         self.assertEqual(batch['task_total'], 1)
         self.assertEqual(batch['garments'][0]['images'], [os.path.realpath(source)])
         self.assertEqual(batch['template']['actions'][0]['action_image'], os.path.realpath(source))
@@ -983,14 +983,71 @@ class EcommerceBatchTest(unittest.TestCase):
             self.make_image(path)
             return path
 
+        def fake_archive(_batch, task, source, _number, _total):
+            path = os.path.join(candidate_dir, f"archive-{task['id']}.jpg")
+            self.make_image(path)
+            return path
+
         with patch.object(app_module, '_ecommerce_generate_candidate', side_effect=fake_generate), patch.object(
-            app_module, '_ecommerce_archive_sample', side_effect=lambda _b, task, _p, _n, _total: f"/archive/{task['id']}.jpg"
+            app_module, '_ecommerce_archive_sample', side_effect=fake_archive
         ):
             app_module._ecommerce_run_batch_no_qc_global('global1')
         updated = next(b for b in app_module._ecommerce_load_store()['batches'] if b['id'] == 'global1')
         self.assertEqual(updated['status'], 'completed')
         self.assertEqual([t['state'] for t in updated['tasks']], ['accepted', 'accepted'])
-        self.assertEqual([t['accepted_path'] for t in updated['tasks']], ['/archive/t0.jpg', '/archive/t1.jpg'])
+        self.assertTrue(all(os.path.isfile(t['accepted_path']) for t in updated['tasks']))
+
+    def test_global_runner_archives_exactly_requested_draw_count(self):
+        result_dir = os.path.join(self.user_temp.name, 'exact-draw-results')
+        candidate_dir = os.path.join(self.user_temp.name, 'exact-draw-candidates')
+        os.makedirs(result_dir)
+        os.makedirs(candidate_dir)
+        target = os.path.join(self.user_temp.name, 'exact-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'exact-reference.jpg')
+        self.make_image(target)
+        self.make_image(reference)
+        action = {'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target, 'prompt': '换装'}
+        garment = {'id': 'g1', 'name': '服装1', 'path': self.user_temp.name, 'images': [reference], 'order': 0}
+        task = {'id': 't1', 'order': 0, 'garment_id': 'g1', 'garment_name': '服装1', 'action_id': 'a1', 'action_order': 0, 'action_name': '正面', 'state': 'pending', 'attempts': []}
+        batch = {
+            'id': 'exact-draw', 'name': '精确抽卡', 'status': 'running', 'output_path': self.user_temp.name,
+            'result_dirs': {'g1': result_dir}, 'template': {'actions': [action]}, 'garments': [garment],
+            'tasks': [task], 'settings': {'concurrency': 3, 'samples_per_action': 3}, 'usage': {},
+        }
+        app_module._ecommerce_save_store({'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': []})
+        calls = []
+
+        def fake_generate(_batch, _task, _garment, _action, _prompt, attempt):
+            calls.append(int(attempt.get('number') or 0))
+            path = os.path.join(candidate_dir, f"candidate-{len(calls)}.jpg")
+            self.make_image(path, color=(len(calls) * 20, 80, 120))
+            return path
+
+        with patch.object(app_module, '_ecommerce_generate_candidate', side_effect=fake_generate):
+            app_module._ecommerce_run_batch_no_qc_global(batch['id'])
+        updated = app_module._ecommerce_batch_snapshot(batch['id'])
+        archived = [name for name in os.listdir(result_dir) if name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+        self.assertEqual(sorted(calls), [1, 2, 3])
+        self.assertEqual(len(archived), 3)
+        self.assertEqual(updated['tasks'][0]['state'], 'accepted')
+
+    def test_rerun_ledger_drops_stale_archived_paths_before_second_resume(self):
+        live = os.path.join(self.user_temp.name, 'rerun-live.jpg')
+        self.make_image(live)
+        row = {
+            'items': [{
+                'status': 'accepted', 'payload': {'count': 3},
+                'archived_paths': [live, os.path.join(self.user_temp.name, 'gone.jpg')],
+            }],
+            'status': 'completed',
+        }
+        app_module._ecommerce_refresh_rerun_batch_counts(row)
+        item = row['items'][0]
+        self.assertEqual(item['archived_paths'], [live])
+        self.assertEqual(item['success_count'], 1)
+        self.assertEqual(item['remaining_count'], 2)
+        self.assertEqual(item['status'], 'partial')
+        self.assertEqual(row['status'], 'partial')
 
     def test_single_garment_folder_with_six_images_is_a_valid_run_root(self):
         folder = self.make_garment("单套测试款")
@@ -1485,9 +1542,9 @@ class EcommerceBatchTest(unittest.TestCase):
         batch = response.get_json()["batch"]
         self.assertEqual(batch["task_total"], 4)
         self.assertEqual(len(batch["garments"]), 2)
-        self.assertEqual(batch["settings"]["max_attempts"], 3)
+        self.assertEqual(batch["settings"]["max_attempts"], 5)
         self.assertEqual(batch["settings"]["concurrency"], 3)
-        self.assertEqual(batch["settings"]["profile_mode"], "visual_sheets")
+        self.assertNotIn("profile_mode", batch["settings"])
 
     def test_create_batch_accepts_current_target_images_without_saved_group(self):
         garment_folder = self.make_garment("直接运行款")
@@ -2057,11 +2114,188 @@ class EcommerceBatchTest(unittest.TestCase):
         response = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
         self.assertEqual(response.status_code, 200, response.get_json())
         items = response.get_json()['items']
-        # 抽卡模式必须达到批次目标数；这里实际只有2/3，应提示补1张。
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]['actual_count'], 2)
-        self.assertEqual(items[0]['expected_count'], 3)
-        self.assertEqual(items[0]['missing_count'], 1)
+        # 结果只有2/3属于生成不完整，不是人工废片；不能进入收费重做列表。
+        self.assertEqual(items, [])
+        self.assertEqual(response.get_json()['incomplete_total'], 1)
+        self.assertEqual(response.get_json()['incomplete_items'][0]['actual_count'], 2)
+        self.assertEqual(response.get_json()['incomplete_items'][0]['missing_count'], 1)
+
+    def test_deleted_scan_repeatedly_keeps_partial_kept_image_out_of_waste_queue(self):
+        target = os.path.join(self.user_temp.name, 'ledger-partial-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'ledger-partial-reference.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'ledger-partial-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(reference)
+        outputs = []
+        for index in range(1, 6):
+            path = os.path.join(result_dir, f'RUN-AI-01-CK{index:02d}.jpg')
+            self.make_image(path, color=(index * 20, 80, 120))
+            outputs.append(path)
+        batch = {
+            'id': 'partial-ledger-repeat', 'name': '部分保留重复扫描',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 5},
+            'template': {'actions': [{'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target, 'prompt': '测试'}]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a1', 'action_order': 0, 'action_name': '正面', 'state': 'accepted', 'attempts': []}],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': []})
+        for path in outputs[:4]:
+            response = self.client.post('/api/ecommerce/delete-sample', json={
+                'batch_id': batch['id'], 'garment_id': 'g1', 'path': path,
+            })
+            self.assertEqual(response.status_code, 200, response.get_json())
+
+        first = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']}).get_json()
+        second = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']}).get_json()
+        for payload in (first, second):
+            self.assertEqual(payload['items'], [])
+            self.assertEqual(payload['incomplete_total'], 0)
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        self.assertEqual(len(app_module._ecommerce_active_deleted_samples(stored, 'g1', 1)), 4)
+
+    def test_marked_redo_is_returned_even_when_other_candidates_remain(self):
+        target = os.path.join(self.user_temp.name, 'marked-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'marked-reference.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'marked-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(reference)
+        marked_path = os.path.join(result_dir, 'RUN-AI-01-CK01.jpg')
+        self.make_image(marked_path)
+        self.make_image(os.path.join(result_dir, 'RUN-AI-01-CK02.jpg'))
+        self.make_image(os.path.join(result_dir, 'RUN-AI-01-CK03.jpg'))
+        batch = {
+            'id': 'marked-with-remaining', 'name': '保留图加标记',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 3},
+            'template': {'actions': [{'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target, 'prompt': '测试'}]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a1', 'action_order': 0, 'action_name': '正面', 'state': 'accepted', 'attempts': []}],
+            'marked_redo': [{'id': 'm1', 'garment_id': 'g1', 'action_order': 1, 'result_path': marked_path}],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': []})
+        payload = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']}).get_json()
+        self.assertEqual(len(payload['items']), 1)
+        self.assertTrue(payload['items'][0]['marked_redo'])
+        self.assertEqual(payload['incomplete_total'], 0)
+
+    def test_deleted_scan_ignores_corrupt_result_file_and_reports_generation_gap(self):
+        target = os.path.join(self.user_temp.name, 'corrupt-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'corrupt-reference.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'corrupt-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(reference)
+        self.make_image(os.path.join(result_dir, 'RUN-AI-01-CK01.jpg'))
+        self.make_image(os.path.join(result_dir, 'RUN-AI-01-CK02.jpg'))
+        with open(os.path.join(result_dir, 'RUN-AI-01-CK03.jpg'), 'wb') as handle:
+            handle.write(b'not an image')
+        batch = {
+            'id': 'corrupt-result-gap', 'name': '损坏返回',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 3},
+            'template': {'actions': [{'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target, 'prompt': '测试'}]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a1', 'action_order': 0, 'action_name': '正面', 'state': 'accepted', 'attempts': []}],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': []})
+        payload = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']}).get_json()
+        self.assertEqual(payload['items'], [])
+        self.assertEqual(payload['incomplete_items'][0]['actual_count'], 2)
+        self.assertEqual(payload['incomplete_items'][0]['missing_count'], 1)
+
+    def test_deleted_scan_requires_all_configured_draws_before_waste_rerun(self):
+        """抽卡数量可为1/2/5/10，少删一张不能进入废片重做。"""
+        for samples in (1, 2, 5, 10):
+            target = os.path.join(self.user_temp.name, f'guard-target-{samples}.jpg')
+            reference = os.path.join(self.user_temp.name, f'guard-reference-{samples}.jpg')
+            result_dir = os.path.join(self.user_temp.name, f'guard-results-{samples}')
+            os.makedirs(result_dir)
+            self.make_image(target)
+            self.make_image(reference)
+            outputs = []
+            for index in range(1, samples + 1):
+                path = os.path.join(result_dir, f'RUN-AI-01-CK{index:02d}.jpg')
+                self.make_image(path, color=(40 + index, 80, 120))
+                outputs.append(path)
+            batch = {
+                'id': f'full-draw-guard-{samples}', 'name': f'完整抽卡保护-{samples}',
+                'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+                'settings': {'samples_per_action': samples, 'qc_enabled': False},
+                'template': {'actions': [{
+                    'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                    'prompt': '测试', 'platform': 'runninghub', 'model_key': 'nano/2k',
+                }]},
+                'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+                'tasks': [{
+                    'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1',
+                    'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                    'state': 'accepted', 'attempts': [],
+                }],
+                'usage': {},
+            }
+            app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+                'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+            })
+
+            if samples > 1:
+                deleted = self.client.post('/api/ecommerce/delete-sample', json={
+                    'batch_id': batch['id'], 'garment_id': 'g1', 'path': outputs[0],
+                })
+                self.assertEqual(deleted.status_code, 200, deleted.get_json())
+                partial = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+                self.assertEqual(partial.get_json()['items'], [])
+                self.assertEqual(partial.get_json()['incomplete_total'], 0)
+
+            for path in outputs[1 if samples > 1 else 0:]:
+                deleted = self.client.post('/api/ecommerce/delete-sample', json={
+                    'batch_id': batch['id'], 'garment_id': 'g1', 'path': path,
+                })
+                self.assertEqual(deleted.status_code, 200, deleted.get_json())
+            complete = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+            payload = complete.get_json()
+            self.assertEqual(len(payload['items']), 1)
+            self.assertEqual(payload['items'][0]['missing_count'], samples)
+            self.assertEqual(payload['items'][0]['deleted_record_count'], samples)
+
+    def test_deleted_scan_reports_generation_gap_without_making_waste_item(self):
+        target = os.path.join(self.user_temp.name, 'gap-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'gap-reference.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'gap-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(reference)
+        self.make_image(os.path.join(result_dir, 'RUN-AI-01-CK01.jpg'))
+        batch = {
+            'id': 'generation-gap-scan', 'name': '生成缺口扫描',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 5, 'qc_enabled': False},
+            'template': {'actions': [{
+                'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                'prompt': '测试', 'platform': 'runninghub', 'model_key': 'nano/2k',
+            }]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{
+                'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1',
+                'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                'state': 'accepted', 'attempts': [],
+            }],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+        response = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+        payload = response.get_json()
+        self.assertEqual(payload['items'], [])
+        self.assertEqual(payload['incomplete_total'], 1)
+        self.assertEqual(payload['incomplete_items'][0]['actual_count'], 1)
+        self.assertEqual(payload['incomplete_items'][0]['missing_count'], 4)
 
     def test_deleted_scan_ledger_survives_another_model_result_and_repeated_refresh(self):
         target = os.path.join(self.user_temp.name, 'ledger-target.jpg')
@@ -2675,92 +2909,6 @@ class EcommerceBatchTest(unittest.TestCase):
         saved = app_module._ecommerce_batch_snapshot(batch["id"])
         self.assertEqual(saved["usage"]["runninghub_billed_cny"], 0.3)
         self.assertEqual(saved["tasks"][0]["attempts"][0]["billed_cny"], 0.3)
-
-    def test_scheduler_finishes_one_garment_wave_before_next(self):
-        self.make_garment("波次A")
-        self.make_garment("波次B")
-        action_image = os.path.join(self.user_temp.name, "wave-action.jpg")
-        self.make_image(action_image)
-        actions = [{"name": f"动作{i}", "action_image": action_image, "prompt": "测试", "platform": "oaihk", "model_key": "fal-ai/banana/v3.1/flash/2k"} for i in range(1, 4)]
-        template_id = self.client.post("/api/ecommerce/templates", json={"name": "三动作", "actions": actions}).get_json()["template"]["id"]
-        batch = self.client.post("/api/ecommerce/batches", json={"template_id": template_id, "clothing_root": self.user_temp.name, "output_path": self.user_temp.name, "concurrency": 20}).get_json()["batch"]
-        app_module._ecommerce_mutate_batch(batch["id"], lambda b: b.update({"status": "running"}))
-        events = []
-        starts_lock = threading.Lock()
-
-        def fake_generate(batch_id, task_id, number):
-            snapshot = app_module._ecommerce_batch_snapshot(batch_id)
-            task = app_module._ecommerce_find_task(snapshot, task_id)
-            with starts_lock:
-                events.append(f"gen:{task['garment_name']}:{number}")
-            attempt = {"number": number, "status": "awaiting_qc", "candidate_path": action_image, "qc": None}
-            app_module._ecommerce_mutate_batch(batch_id, lambda b: (app_module._ecommerce_sync_attempt(b, task_id, attempt), app_module._ecommerce_set_task_state(b, task_id, "awaiting_qc")))
-            return True
-
-        def fake_qc(batch_id, task_id, number):
-            snapshot = app_module._ecommerce_batch_snapshot(batch_id)
-            task = app_module._ecommerce_find_task(snapshot, task_id)
-            with starts_lock:
-                events.append(f"qc:{task['garment_name']}:{number}")
-            app_module._ecommerce_mutate_batch(batch_id, lambda b: app_module._ecommerce_accept_task(b, task_id, "fake.jpg"))
-            return True
-
-        with patch.object(app_module, "_ecommerce_generate_task_attempt", side_effect=fake_generate), \
-             patch.object(app_module, "_ecommerce_qc_task_attempt", side_effect=fake_qc), \
-             patch.object(app_module, "_ecommerce_finalize_garment_outputs"):
-            app_module._ecommerce_run_batch(batch["id"])
-
-        first_qc_a = min(i for i, event in enumerate(events) if event.startswith("qc:波次A"))
-        last_gen_a = max(i for i, event in enumerate(events) if event.startswith("gen:波次A"))
-        first_gen_b = min(i for i, event in enumerate(events) if event.startswith("gen:波次B"))
-        last_qc_a = max(i for i, event in enumerate(events) if event.startswith("qc:波次A"))
-        self.assertLess(last_gen_a, first_qc_a)
-        self.assertLess(last_qc_a, first_gen_b)
-        saved = app_module._ecommerce_batch_snapshot(batch["id"])
-        self.assertEqual(saved["settings"]["concurrency"], 20)
-        self.assertEqual(saved["status"], "completed")
-
-    def test_round_scheduler_generates_all_then_qcs_and_only_retries_failures(self):
-        self.make_garment("分轮款")
-        action_image = os.path.join(self.user_temp.name, "round-action.jpg")
-        self.make_image(action_image)
-        actions = [{"name": f"动作{i}", "action_image": action_image, "prompt": "测试", "platform": "oaihk", "model_key": "fal-ai/banana/v3.1/flash/2k"} for i in range(1, 4)]
-        template_id = self.client.post("/api/ecommerce/templates", json={"name": "分轮三动作", "actions": actions}).get_json()["template"]["id"]
-        batch = self.client.post("/api/ecommerce/batches", json={"template_id": template_id, "clothing_root": self.user_temp.name, "output_path": self.user_temp.name, "concurrency": 3}).get_json()["batch"]
-        app_module._ecommerce_mutate_batch(batch["id"], lambda b: b.update({"status": "running"}))
-        events = []
-        event_lock = threading.Lock()
-        qc_counts = {}
-
-        def fake_generate(batch, task, garment, action, prompt, attempt):
-            with event_lock:
-                events.append(("gen", attempt["number"], action["name"]))
-            return action_image
-
-        def fake_qc(batch, garment, action, candidate):
-            with event_lock:
-                qc_counts[action["name"]] = qc_counts.get(action["name"], 0) + 1
-                round_number = qc_counts[action["name"]]
-                events.append(("qc", round_number, action["name"]))
-            passed = not (action["name"] == "动作2" and round_number == 1)
-            return {"passed": passed, "overall_score": 96 if passed else 70, "critical_errors": [] if passed else ["盘扣不一致"], "correction_prompt": "修正盘扣"}
-
-        with patch.object(app_module, "_ecommerce_generate_candidate", side_effect=fake_generate), \
-             patch.object(app_module, "_ecommerce_qc_candidate", side_effect=fake_qc), \
-             patch.object(app_module, "_ecommerce_candidate_output_spec", return_value={"passed": True, "errors": []}), \
-             patch.object(app_module, "_ecommerce_archive_accepted", side_effect=lambda b, t, p: p), \
-             patch.object(app_module, "_ecommerce_archive_mismatch", side_effect=lambda b, t, a: a.get("candidate_path", "")), \
-             patch.object(app_module, "_ecommerce_finalize_garment_outputs"):
-            app_module._ecommerce_run_batch(batch["id"])
-
-        first_qc = min(i for i, event in enumerate(events) if event[0] == "qc")
-        last_first_round_gen = max(i for i, event in enumerate(events) if event[0] == "gen" and event[1] == 1)
-        self.assertLess(last_first_round_gen, first_qc)
-        self.assertEqual(sorted(event[2] for event in events if event[0] == "gen" and event[1] == 1), ["动作1", "动作2", "动作3"])
-        self.assertEqual([event[2] for event in events if event[0] == "gen" and event[1] == 2], ["动作2"])
-        saved = app_module._ecommerce_batch_snapshot(batch["id"])
-        self.assertEqual(saved["status"], "completed")
-        self.assertTrue(all(task["state"] == "accepted" for task in saved["tasks"]))
 
     def test_image_generation_uses_platform_then_platform_specific_model(self):
         response = self.client.get("/")

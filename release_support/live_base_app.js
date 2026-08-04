@@ -10799,7 +10799,7 @@ const ecommerceState = {
 };
 
 const ECOMMERCE_DRAFT_KEY = 'ecommerce_generation_draft_v2';
-const ECOMMERCE_DRAFT_FIELD_IDS = new Set(['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-qc-model','ecommerce-profile-mode','ecommerce-qc-threshold','ecommerce-samples-per-action','ecommerce-precision-matching']);
+const ECOMMERCE_DRAFT_FIELD_IDS = new Set(['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-samples-per-action','ecommerce-precision-matching']);
 function saveEcommerceDraft() {
     try {
         const ids = [...ECOMMERCE_DRAFT_FIELD_IDS];
@@ -10866,9 +10866,7 @@ function clearEcommercePrecisionMatching(message = '') {
 function updateEcommercePrecisionUi() {
     const enabled = !!document.getElementById('ecommerce-precision-matching')?.checked;
     const panel = document.getElementById('ecommerce-precision-panel');
-    const qcControls = document.querySelectorAll('#ecommerce-qc-enabled, #ecommerce-qc-model, #ecommerce-profile-mode, #ecommerce-qc-threshold');
     if (panel) panel.hidden = !enabled;
-    qcControls.forEach(el => { el.disabled = enabled; });
     const status = document.getElementById('ecommerce-precision-status');
     const count = ecommerceState.precisionMatching?.mapping?.length || 0;
     if (status) status.textContent = enabled && count ? `已匹配 ${count} 张目标图` : (enabled ? '请打开匹配界面' : '未启用');
@@ -11068,7 +11066,7 @@ async function loadEcommerceModeData(force = false) {
 }
 
 // 电商批量工作台是长表单，输入、模型、比例、并发和已上传参考图都持续保存。
-['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-qc-model','ecommerce-profile-mode','ecommerce-qc-threshold','ecommerce-samples-per-action'].forEach(id => {
+['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-samples-per-action'].forEach(id => {
     document.getElementById(id)?.addEventListener('input', saveEcommerceDraft);
     document.getElementById(id)?.addEventListener('change', saveEcommerceDraft);
 });
@@ -11701,22 +11699,11 @@ function renderEcommerceBatchList() {
 }
 
 function ecommerceStatusText(status) {
-    return ({draft:'待开始',running:'运行中',resuming:'恢复中',cancelling:'取消收尾中',paused:'已暂停',completed:'已完成',interrupted:'有任务中断',cancelled:'已取消',pending:'等待',preparing:'生成中',configuration_required:'需要配置',submitted:'平台排队',awaiting_qc:'等待集中质检',qc:'质检中',retry_pending:'下一轮重生成',accepted:'已生成并归档',manual_review:'人工复核'})[status] || status || '未知';
-}
-
-function ecommerceTaskPassedAiQc(task) {
-    return task?.state === 'accepted' && (task.attempts || []).some(attempt => attempt?.qc?.passed === true || attempt?.qc?.verdict === 'pass');
-}
-
-function ecommerceTaskHadAiQc(task) {
-    return (task?.attempts || []).some(attempt => attempt?.qc && typeof attempt.qc === 'object');
+    return ({draft:'待开始',running:'运行中',resuming:'恢复中',cancelling:'取消收尾中',paused:'已暂停',completed:'已完成',interrupted:'有任务中断',cancelled:'已取消',pending:'等待',preparing:'生成中',configuration_required:'需要配置',submitted:'平台排队',retry_pending:'下一轮重生成',accepted:'已生成并归档',manual_review:'人工复核'})[status] || status || '未知';
 }
 
 function ecommerceTaskDisplayStatus(task) {
-    if (task?.state === 'accepted') {
-        if (ecommerceTaskPassedAiQc(task)) return 'AI质检通过';
-        return ecommerceTaskHadAiQc(task) ? 'AI未通过·已归档' : '未质检·已归档';
-    }
+    if (task?.state === 'accepted') return '已生成并归档';
     return ecommerceStatusText(task?.state);
 }
 
@@ -11772,9 +11759,6 @@ function renderEcommerceBatchDetail() {
     }
     const counts = b.task_counts || {};
     const acceptedTasks = (b.tasks || []).filter(task => task.state === 'accepted');
-    const aiQcPassedCount = acceptedTasks.filter(ecommerceTaskPassedAiQc).length;
-    const aiQcFailedArchivedCount = acceptedTasks.filter(task => ecommerceTaskHadAiQc(task) && !ecommerceTaskPassedAiQc(task)).length;
-    const archivedWithoutQcCount = acceptedTasks.length - aiQcPassedCount - aiQcFailedArchivedCount;
     const usage = b.usage || {};
     const isRunning = b.status === 'running' || b.status === 'resuming';
     const isCancelling = b.status === 'cancelling';
@@ -11788,7 +11772,7 @@ function renderEcommerceBatchDetail() {
     const billingSummary = Number.isFinite(Number(usage.runninghub_billed_cny))
         ? `｜RunningHub回传费用 ¥${Number(usage.runninghub_billed_cny).toFixed(2)}`
         : '';
-    const acceptanceSummary = `AI质检通过 ${aiQcPassedCount}，AI未通过但归档 ${aiQcFailedArchivedCount}，未质检归档 ${archivedWithoutQcCount}，人工复核 ${counts.manual_review || 0}`;
+    const acceptanceSummary = `已归档 ${acceptedTasks.length}，人工复核 ${counts.manual_review || 0}`;
     if (summary) summary.textContent = `${b.name}｜${ecommerceStatusText(b.status)}｜完成 ${b.done_total || 0}/${b.task_total || 0}（${acceptanceSummary}）${billingSummary}｜${archiveSummary}`;
     const bar = document.getElementById('ecommerce-progress-bar');
     if (bar) bar.style.width = `${percent}%`;
@@ -11808,12 +11792,12 @@ function renderEcommerceBatchDetail() {
             statusHtml += ` ｜ 已完成 ${b.done_total || 0}/${b.task_total || 0}`;
             if (preparingCount > 0) statusHtml += ` ｜ 生成中 ${preparingCount} 张`;
             if (samplesSetting > 1) statusHtml += `（每张抽${samplesSetting}次）`;
-            if (b.settings && !b.settings.qc_enabled) statusHtml += ` ｜ 滑动窗口并发 ${b.settings.concurrency || 10}（上传4 / 下载6限流）`;
+            statusHtml += ` ｜ 滑动窗口并发 ${b.settings?.concurrency || 10}（按任务身份归档）`;
             progressStatus.innerHTML = statusHtml;
         } else if (isCancelling) {
             progressStatus.innerHTML = `<span class="status-running">正在取消</span> ｜ 已提交任务会继续返回，未提交任务已停止`;
         } else if (b.status === 'completed') {
-            let statusHtml = `已完成 ｜ AI质检通过 ${aiQcPassedCount}，AI未通过但归档 ${aiQcFailedArchivedCount}，未质检归档 ${archivedWithoutQcCount}，失败 ${failedCount}`;
+            let statusHtml = `已完成 ｜ 已归档 ${acceptedTasks.length}，失败 ${failedCount}`;
             if (failedCount > 0) statusHtml += ` ｜ <span class="status-error">${failedCount} 张需要处理，请检查具体错误；不要在确认API任务状态前直接重跑</span>`;
             if (archiveFallback) statusHtml += ` ｜ <span class="status-running">外置盘不可写，结果已转存应用缓存</span>`;
             if (b.settings?.final_output_fallback) statusHtml += ` ｜ <span class="status-running">指定成品目录不可写，本批次按确认保存到本地成品目录</span>`;
@@ -11866,8 +11850,7 @@ function renderEcommerceBatchDetail() {
     ecommerceState.renderCache.tasks = taskSignature;
     const rows = tasks.slice(0, 500).map((t, index) => {
         const last = (t.attempts || []).at(-1) || {};
-        const qc = last.qc || {};
-        const detail = t.last_error || (qc.critical_errors || []).join('；') || (t.state === 'accepted' ? t.accepted_path : t.manual_review_path) || '';
+        const detail = t.last_error || (t.state === 'accepted' ? t.accepted_path : t.manual_review_path) || '';
         const resultPath = t.accepted_path || last.archived_path || last.candidate_path || t.manual_review_path || '';
         const resultSrcRaw = resultPath
             ? (/^(?:https?:|data:|\/static\/)/.test(resultPath) ? resultPath : `/api/ecommerce/local-image?path=${encodeURIComponent(resultPath)}`)
@@ -11875,7 +11858,7 @@ function renderEcommerceBatchDetail() {
         const resultSrc = ecommerceThumbnailUrl(resultSrcRaw, 160);
         const sampleCount = (t.attempts || []).filter(a => a.candidate_path || a.archived_path).length;
         const samplesSetting = (b.settings || {}).samples_per_action || 1;
-        const candidateText = b.settings && !b.settings.qc_enabled ? `${sampleCount}/${samplesSetting}` : `${sampleCount}/3`;
+        const candidateText = `${sampleCount}/${samplesSetting}`;
         return `<div class="ecommerce-task-row">
             <span>${index + 1}</span><span title="${ecommerceEscape(t.garment_name)}">${ecommerceEscape(t.garment_name)}</span>
             <span>${ecommerceEscape(t.action_name)}</span><span class="ecommerce-result-thumb">${resultSrc ? `<img src="${ecommerceEscape(resultSrc)}" alt="${ecommerceEscape(t.garment_name)}-${ecommerceEscape(t.action_name)}" loading="lazy" decoding="async">` : '—'}</span><span class="ecommerce-state ${ecommerceEscape(t.state)}">${ecommerceTaskDisplayStatus(t)}</span>
@@ -11986,15 +11969,12 @@ function renderEcommerceResultFolders() {
         const total = tasks.length;
         const done = tasks.filter(t => ['accepted', 'manual_review', 'skipped', 'cancelled'].includes(t.state)).length;
         const acceptedTasks = tasks.filter(t => t.state === 'accepted');
-        const qcPassed = acceptedTasks.filter(ecommerceTaskPassedAiQc).length;
-        const qcFailedArchived = acceptedTasks.filter(task => ecommerceTaskHadAiQc(task) && !ecommerceTaskPassedAiQc(task)).length;
-        const archivedOnly = acceptedTasks.length - qcPassed - qcFailedArchived;
         const resultPath = b.result_dirs?.[g.id]
             || b.settings?.archive_fallback_garments?.[g.name]
             || (b.settings?.archive_fallback ? `${b.settings.archive_fallback_root}/${g.name}` : (b.output_path ? `${b.output_path}/_生成样本备份/${g.name}` : ''));
         // 进度显示：初始用任务状态，稍后异步扫描实际文件数量更新
         const statusText = total ? `${done}/${total}` : '—';
-        const statusDetail = total ? `AI质检通过${qcPassed}；AI未通过但归档${qcFailedArchived}；未质检归档${archivedOnly}` : '暂无任务';
+        const statusDetail = total ? `已归档${acceptedTasks.length}；人工逐验请到第4栏处理` : '暂无任务';
         const groupAction = b.generation_mode === 'garment_prompt'
             ? (b.template?.actions || []).find(action => action.garment_id === g.id)
             : null;
@@ -12146,11 +12126,7 @@ async function createAndStartEcommerceBatch() {
             concurrency: Number(document.getElementById('ecommerce-concurrency')?.value || 10),
             garment_limit: 0,
             action_limit: 0,
-            max_attempts: 3,
-            qc_enabled: !precisionEnabled && generationMode === 'garment_reference' && !!document.getElementById('ecommerce-qc-enabled')?.checked,
-            qc_model: document.getElementById('ecommerce-qc-model')?.value.trim() || 'gemini-2.5-pro',
-            profile_mode: document.getElementById('ecommerce-profile-mode')?.value || 'visual_sheets',
-            qc_threshold: Number(document.getElementById('ecommerce-qc-threshold')?.value || 85),
+            max_attempts: 5,
             samples_per_action: Number(document.getElementById('ecommerce-samples-per-action')?.value || 1)
         });
         ecommerceState.currentBatchId = data.batch.id;
@@ -12591,63 +12567,7 @@ document.getElementById('ecommerce-batch-select')?.addEventListener('change', as
     await refreshEcommerceBatch();
 });
 
-const ECOMMERCE_QC_PREF_KEY = 'ecommerce_qc_enabled';
-
-// 质检开关：开→显示质检说明；关→启用抽卡数量并切换提示
-function updateEcommerceQcToggleUi() {
-    const enabled = !!document.getElementById('ecommerce-qc-enabled')?.checked;
-    const offHint = document.getElementById('ecommerce-qc-off-hint');
-    const onHint = document.getElementById('ecommerce-qc-on-hint');
-    const samplesLabel = document.getElementById('ecommerce-samples-label');
-    const samplesSelect = document.getElementById('ecommerce-samples-per-action');
-    if (offHint) offHint.style.display = enabled ? 'none' : '';
-    if (onHint) onHint.style.display = enabled ? '' : 'none';
-    if (samplesLabel) samplesLabel.classList.toggle('ecommerce-disabled', enabled);
-    if (samplesSelect) samplesSelect.disabled = enabled;
-    const samplesValue = Number(samplesSelect?.value || 1);
-    const samplesStrong = document.getElementById('ecommerce-qc-off-samples');
-    if (samplesStrong) samplesStrong.textContent = String(samplesValue);
-    const qcHelp = document.getElementById('ecommerce-qc-help');
-    if (qcHelp) {
-        qcHelp.dataset.tip = enabled
-            ? 'AI质检已开启：按当前模型和通过分数检查服装细节，失败最多重试3张；默认视觉证据缓存不会额外调用一次建档AI。'
-            : `AI质检已关闭：每张目标图生成 ${samplesValue} 张并直接归档，不调用视觉质检；废片可在第4栏人工筛选和重做。`;
-    }
-}
-document.getElementById('ecommerce-qc-enabled')?.addEventListener('change', async e => {
-    const checkbox = e.currentTarget;
-    const enabled = !!checkbox.checked;
-    const batch = ecommerceState.detail;
-    // 已有批次的开关属于批次快照，运行中禁止悄悄改变；暂停后可以安全切换并续跑。
-    if (batch && batch.task_total > 0 && batch.status === 'running' && enabled !== !!batch.settings?.qc_enabled) {
-        checkbox.checked = !!batch.settings?.qc_enabled;
-        updateEcommerceQcToggleUi();
-        return showToast('当前批次正在运行，请先暂停，再切换质检开关', 'error');
-    }
-    try { localStorage.setItem(ECOMMERCE_QC_PREF_KEY, enabled ? '1' : '0'); } catch (_e) {}
-    updateEcommerceQcToggleUi();
-    if (batch && batch.task_total > 0 && batch.status === 'paused' && enabled !== !!batch.settings?.qc_enabled) {
-        checkbox.disabled = true;
-        try {
-            const data = await ecommerceApi('PATCH', `/api/ecommerce/batches/${encodeURIComponent(batch.id)}/settings`, { qc_enabled: enabled });
-            ecommerceState.detail = data.batch;
-            renderEcommerceBatchDetail();
-            showToast(enabled ? '当前批次已开启质检，可继续运行' : `当前批次已关闭质检；已保留${data.recovered_candidates || 0}张已生成图片`, 'success');
-        } catch (error) {
-            checkbox.checked = !!batch.settings?.qc_enabled;
-            updateEcommerceQcToggleUi();
-            showToast(`切换失败：${error.message}`, 'error');
-        } finally {
-            checkbox.disabled = false;
-        }
-    }
-});
 document.getElementById('ecommerce-precision-matching')?.addEventListener('change', e => {
-    if (e.currentTarget.checked) {
-        const qc = document.getElementById('ecommerce-qc-enabled');
-        if (qc) qc.checked = false;
-        updateEcommerceQcToggleUi();
-    }
     updateEcommercePrecisionUi();
     saveEcommerceDraft();
     if (e.currentTarget.checked && document.getElementById('ecommerce-clothing-root')?.value.trim()) {
@@ -12658,12 +12578,7 @@ document.getElementById('btn-ecommerce-open-precision-matching')?.addEventListen
 document.getElementById('btn-ecommerce-clear-precision')?.addEventListener('click', () => {
     clearEcommercePrecisionMatching('人工精准匹配已清空，请重新匹配');
 });
-document.getElementById('ecommerce-samples-per-action')?.addEventListener('change', updateEcommerceQcToggleUi);
-try {
-    const savedQcPreference = localStorage.getItem(ECOMMERCE_QC_PREF_KEY);
-    if (savedQcPreference !== null) document.getElementById('ecommerce-qc-enabled').checked = savedQcPreference === '1';
-} catch (_e) {}
-updateEcommerceQcToggleUi();
+document.getElementById('ecommerce-samples-per-action')?.addEventListener('change', updateEcommerceGenerateButton);
 updateEcommercePrecisionUi();
 
 function updateEcommerceAutoConcurrency(apply = false) {
@@ -12858,7 +12773,11 @@ function ecommerceBuildRerunQueuePayload(item, config = {}) {
         .filter(reference => reference.selected !== false)
         .map(reference => reference.override_url || reference.url)
         .filter(Boolean);
-    const drawCount = Math.max(1, Math.min(5, Number(config.drawCount) || 1));
+    const drawCount = Math.max(1, Math.min(10, Number(config.drawCount) || 1));
+    // 全废动作要补回原抽卡合约；人工标记则只按用户选择的数量重做。
+    const requestedCount = item.marked_redo
+        ? drawCount
+        : Math.max(drawCount, Math.min(10, Number(item.recommended_count) || 1));
     return {
         item_id: item.id, result_path: item.result_path || '',
         deletion_ids: Array.isArray(item.deletion_ids) ? item.deletion_ids.filter(Boolean) : [],
@@ -12868,8 +12787,7 @@ function ecommerceBuildRerunQueuePayload(item, config = {}) {
         // 未临时替换时也必须把扫描时冻结的原始动作参考图传给后端。
         // 留空会触发后端 fallback，误把生成结果/废片备份当成动作参考图。
         target_action_image: String(item.target_action_override_url || item.target_action_url || '').trim(),
-        // 抽卡数是用户对每个待重做动作设置的候选数，不与缺口数取最大值。
-        count: drawCount,
+        count: requestedCount,
         model_override: {
             platform: config.platform || ecommerceRerunState.bulkPlatform || 'runninghub',
             model_key: config.modelKey || ecommerceRerunState.bulkModelKey,
@@ -14559,7 +14477,16 @@ async function scanEcommerceRerun() {
         ecommerceRerunState.bulkModelKey = bulkKeys.includes(firstModel.model_key) ? firstModel.model_key : bulkKeys[0];
         ecommerceRerunState.bulkRatio = firstModel.aspect_ratio || 'auto';
         const total = ecommerceRerunState.items.length;
-        if (summary) summary.textContent = total ? `${resultPath ? '所选单组' : '整批'}共扫描到 ${total} 张废片待重做` : `${resultPath ? '所选单组' : '整批'}没有废片`;
+        const incompleteTotal = Number(data.incomplete_total || 0);
+        const scopeLabel = resultPath ? '所选单组' : '整批';
+        if (summary) {
+            summary.textContent = total
+                ? `${scopeLabel}共扫描到 ${total} 张废片待重做${incompleteTotal ? `；另有${incompleteTotal}个动作结果不足，未加入废片重做` : ''}`
+                : `${scopeLabel}没有人工废片${incompleteTotal ? `；另有${incompleteTotal}个动作结果不足，未加入废片重做` : ''}`;
+        }
+        if (incompleteTotal) {
+            showToast(`检测到${incompleteTotal}个动作结果数量不足，已单独保留为生成不完整状态，不会自动重复提交扣费`, 'warning');
+        }
         renderEcommerceRerunList();
         // “缺失废片”与“已经重做成功的图片”是两类数据。扫描完缺失项后，
         // 单独加载持久化重做批次，让已完成图片即使刷新页面也仍可验片。
@@ -14668,7 +14595,7 @@ function renderEcommerceRerunList() {
         </div>
         <div class="ecommerce-rerun-bulk-execution">
             <label>并发 <input id="ecommerce-rerun-concurrency" type="number" min="1" max="100" value="${Math.max(1, Math.min(100, Number(ecommerceRerunState.bulkConcurrency) || 10))}"></label>
-            <label>每项生成 <select id="ecommerce-rerun-draw-count">${[1, 2, 3, 4, 5].map(count => `<option value="${count}" ${count === (Number(ecommerceRerunState.bulkDrawCount) || 1) ? 'selected' : ''}>${count}张</option>`).join('')}</select></label>
+            <label>每项生成 <select id="ecommerce-rerun-draw-count">${Array.from({length: 10}, (_, i) => i + 1).map(count => `<option value="${count}" ${count === (Number(ecommerceRerunState.bulkDrawCount) || 1) ? 'selected' : ''}>${count}张</option>`).join('')}</select></label>
             <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-auto-concurrency">按已选自动</button>
             <small id="ecommerce-rerun-concurrency-hint">1–100；每张按批次/服装/动作身份归档，不按返回顺序归属</small>
         </div>
@@ -14746,7 +14673,7 @@ function renderEcommerceRerunList() {
     list.querySelector('#ecommerce-rerun-bulk-model')?.addEventListener('change', event => { ecommerceRerunState.bulkModelKey = event.target.value; });
     list.querySelector('#ecommerce-rerun-bulk-ratio')?.addEventListener('change', event => { ecommerceRerunState.bulkRatio = event.target.value; });
     list.querySelector('#ecommerce-rerun-draw-count')?.addEventListener('change', event => {
-        ecommerceRerunState.bulkDrawCount = Math.max(1, Math.min(5, Number(event.target.value) || 1));
+        ecommerceRerunState.bulkDrawCount = Math.max(1, Math.min(10, Number(event.target.value) || 1));
         updateRerunConcurrencyHint();
     });
     const updateRerunConcurrencyHint = () => {
@@ -14754,8 +14681,8 @@ function renderEcommerceRerunList() {
         const currentSelected = selectedEntries.length;
         const inputVal = Math.max(1, Math.min(100, Number(list.querySelector('#ecommerce-rerun-concurrency')?.value) || 1));
         const effective = Math.min(inputVal, Math.max(1, currentSelected));
-        const drawCount = Math.max(1, Math.min(5, Number(list.querySelector('#ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
-        const paidCount = selectedEntries.length * drawCount;
+        const drawCount = Math.max(1, Math.min(10, Number(list.querySelector('#ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
+        const paidCount = selectedEntries.reduce((total, entry) => total + (entry.item.marked_redo ? drawCount : Math.max(drawCount, Number(entry.item.recommended_count) || 1)), 0);
         const hint = list.querySelector('#ecommerce-rerun-concurrency-hint');
         if (hint) hint.textContent = currentSelected
             ? `实际并发${effective}；已选${currentSelected}项 × 每项${drawCount}张，预计付费${paidCount}张；${ecommerceRerunState.bulkPlatform === 'runninghub' ? 'RH企业线路官方上限100' : 'HK未公布固定上限，限流时自动重试'}`
@@ -15066,10 +14993,10 @@ async function bulkRegenerateEcommerceSelected() {
     const modelKey = ecommerceRerunState.bulkModelKey;
     const ratio = ecommerceRerunState.bulkRatio || 'auto';
     const concurrency = Math.max(1, Math.min(100, Number(document.getElementById('ecommerce-rerun-concurrency')?.value) || ecommerceRerunState.bulkConcurrency || 10));
-    const drawCount = Math.max(1, Math.min(5, Number(document.getElementById('ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
+    const drawCount = Math.max(1, Math.min(10, Number(document.getElementById('ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
     if (!modelKey) return showToast('请选择批量重做模型', 'error');
     const modelLabel = document.getElementById('ecommerce-rerun-bulk-model')?.selectedOptions?.[0]?.textContent || modelKey;
-    const paidCallTotal = selectedItems.length * drawCount;
+    const paidCallTotal = selectedItems.reduce((total, item) => total + (item.marked_redo ? drawCount : Math.max(drawCount, Number(item.recommended_count) || 1)), 0);
     if (!confirm(`确定批量重做 ${selectedItems.length} 项？\n\n平台/模型：${platform === 'runninghub' ? 'RH' : 'HK'} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${Math.min(concurrency, selectedItems.length)}\n每项生成：${drawCount}张\n\n预计付费生图 ${paidCallTotal} 张。刷新页面后也可以继续或验片。`)) return;
     const config = { prompt, platform, modelKey, ratio, drawCount };
     const queueItems = selectedItems.map(item => ecommerceBuildRerunQueuePayload(item, config));
