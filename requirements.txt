@@ -13,4 +13,5 @@ onnxruntime-silicon>=1.16.3; platform_system == "Darwin" and platform_machine ==
 onnxruntime>=1.16.3; platform_system != "Darwin" or platform_machine != "arm64"
 pywebview>=5.3
 pyinstaller>=6.0
+setuptools<81
 send2trash>=1.8

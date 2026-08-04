@@ -15,7 +15,9 @@ import base64
 import subprocess
 import socket
 import errno
+import ntpath
 import platform
+import posixpath
 import sys
 from pathlib import Path
 try:
@@ -38,32 +40,38 @@ def _resolve_runtime_paths(*, frozen=None, system=None, environ=None, home=None,
     """Resolve immutable resources and mutable per-user storage on every OS."""
     frozen = getattr(sys, 'frozen', False) if frozen is None else bool(frozen)
     system = platform.system() if system is None else system
+    path_module = ntpath if system == 'Windows' else posixpath if system == 'Darwin' else os.path
     environ = os.environ if environ is None else environ
     home = os.path.expanduser('~') if home is None else home
     module_file = __file__ if module_file is None else module_file
     resource_dir = (
-        (meipass or getattr(sys, '_MEIPASS', os.path.dirname(sys.executable)))
-        if frozen else os.path.dirname(os.path.abspath(module_file))
+        (meipass or getattr(sys, '_MEIPASS', path_module.dirname(sys.executable)))
+        if frozen else path_module.dirname(path_module.abspath(module_file))
     )
 
     if not frozen:
         user_root = resource_dir
     elif system == 'Windows':
-        user_root = os.path.join(
+        user_root = path_module.join(
             environ.get('LOCALAPPDATA') or environ.get('APPDATA') or home,
             APP_NAME,
         )
     elif system == 'Darwin':
-        user_root = os.path.join(home, 'Library', 'Application Support', APP_NAME)
+        user_root = path_module.join(home, 'Library', 'Application Support', APP_NAME)
     else:
-        user_root = os.path.join(
-            environ.get('XDG_DATA_HOME') or os.path.join(home, '.local', 'share'),
+        user_root = path_module.join(
+            environ.get('XDG_DATA_HOME') or path_module.join(home, '.local', 'share'),
             APP_NAME,
         )
 
+    resource_abspath = (
+        os.path.abspath(resource_dir)
+        if frozen and system == 'Windows'
+        else path_module.abspath(resource_dir)
+    )
     return {
-        'resource_dir': os.path.abspath(resource_dir),
-        'user_root': os.path.abspath(user_root),
+        'resource_dir': resource_abspath,
+        'user_root': path_module.abspath(user_root),
     }
 
 
@@ -5788,6 +5796,14 @@ ECOMMERCE_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 ECOMMERCE_FINAL_TASK_STATES = {'accepted', 'manual_review', 'cancelled'}
 
 
+def _ecommerce_realpath(path):
+    """Return a comparable absolute path without Windows extended prefix."""
+    real = os.path.realpath(os.path.expanduser(str(path or '')))
+    if os.name == 'nt' and real.startswith('\\\\?\\'):
+        return real[4:]
+    return real
+
+
 def _is_allowed_user_storage_path(path):
     """检查路径是否位于允许用户存储数据的位置。
 
@@ -5807,13 +5823,23 @@ def _is_allowed_user_storage_path(path):
           /private/etc、/private/var、/dev、/proc、/sys）、/Library 根目录的直接子目录
           （/Library/Application Support 例外）。
     """
-    real = os.path.realpath(os.path.expanduser(str(path or '')))
+    real = _ecommerce_realpath(path)
     if not real or not os.path.isabs(real):
         return False
 
-    home = os.path.realpath(os.path.expanduser('~'))
+    home = _ecommerce_realpath('~')
     if real == home or real.startswith(home + os.sep):
         return True
+
+    if platform.system() == 'Windows':
+        # CI and portable/source installs may keep mutable data below the
+        # checkout directory.  Production users still remain covered by the
+        # home-directory rule above, while unrelated drives stay rejected.
+        for allowed_root in (BASE_DIR, tempfile.gettempdir()):
+            root = _ecommerce_realpath(allowed_root)
+            if real == root or real.startswith(root + os.sep):
+                return True
+        return False
 
     volumes = os.path.realpath('/Volumes')
     if real.startswith(volumes + os.sep):
@@ -8229,8 +8255,8 @@ def _ecommerce_sample_result_dir(batch, garment):
     mapped = (batch.get('result_dirs') or {}).get(garment.get('id'))
     fallback = ((batch.get('settings') or {}).get('archive_fallback_garments') or {}).get(garment.get('name'))
     if mapped or fallback:
-        return os.path.realpath(os.path.expanduser(mapped or fallback))
-    cache_root = os.path.realpath(os.path.expanduser(batch.get('output_path') or os.path.join(BASE_DIR, '_运行缓存')))
+        return _ecommerce_realpath(mapped or fallback)
+    cache_root = _ecommerce_realpath(batch.get('output_path') or os.path.join(BASE_DIR, '_运行缓存'))
     garment_name = _ecommerce_safe_name(garment.get('name') or garment.get('id'), garment.get('id') or '服装')
     return os.path.join(cache_root, '_生成样本备份', garment_name)
 
