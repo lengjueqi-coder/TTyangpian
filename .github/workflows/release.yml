@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '要发布的版本标签，例如 v1.5.2'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -12,6 +17,8 @@ permissions:
 jobs:
   source:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,15 +28,16 @@ jobs:
         run: |
           python scripts/validate_release_tree.py
           APP_VERSION="$(python -c 'import json; print(json.load(open("version.json"))["version"])')"
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" != "v${APP_VERSION}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match version.json ${APP_VERSION}" >&2
+          EXPECTED_TAG="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" || -n "${RELEASE_TAG}" ]] && [[ "$EXPECTED_TAG" != "v${APP_VERSION}" ]]; then
+            echo "Tag $EXPECTED_TAG does not match version.json ${APP_VERSION}" >&2
             exit 1
           fi
       - name: Build clean source package
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME:-manual}"
+          VERSION="${RELEASE_TAG:-${GITHUB_REF_NAME:-manual}}"
           ROOT="sample-factory-${VERSION}"
           mkdir -p "release-assets/${ROOT}/static"
           cp app.py desktop_app.py requirements.txt requirements-web.txt version.json start.sh 启动.command 启动样片工厂.command 使用说明.md "release-assets/${ROOT}/"
@@ -47,7 +55,8 @@ jobs:
   windows:
     runs-on: windows-latest
     env:
-      ECOMMERCE_TEST_TMP: ${{ runner.temp }}
+      ECOMMERCE_TEST_TMP: ${{ github.workspace }}
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -60,8 +69,9 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content version.json | ConvertFrom-Json).version
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
-            throw "Tag $env:GITHUB_REF_NAME does not match version.json $version"
+          $expectedTag = if ([string]::IsNullOrWhiteSpace($env:RELEASE_TAG)) { $env:GITHUB_REF_NAME } else { $env:RELEASE_TAG }
+          if (($env:GITHUB_REF_TYPE -eq 'tag' -or -not [string]::IsNullOrWhiteSpace($env:RELEASE_TAG)) -and $expectedTag -ne "v$version") {
+            throw "Tag $expectedTag does not match version.json $version"
           }
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Test on Windows
@@ -91,7 +101,8 @@ jobs:
   macos:
     runs-on: macos-14
     env:
-      ECOMMERCE_TEST_TMP: ${{ runner.temp }}
+      ECOMMERCE_TEST_TMP: ${{ github.workspace }}
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -105,8 +116,9 @@ jobs:
         run: |
           set -euo pipefail
           APP_VERSION="$(python -c 'import json; print(json.load(open("version.json"))["version"])')"
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" != "v${APP_VERSION}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match version.json ${APP_VERSION}" >&2
+          EXPECTED_TAG="${RELEASE_TAG:-${GITHUB_REF_NAME}}"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" || -n "${RELEASE_TAG}" ]] && [[ "$EXPECTED_TAG" != "v${APP_VERSION}" ]]; then
+            echo "Tag $EXPECTED_TAG does not match version.json ${APP_VERSION}" >&2
             exit 1
           fi
           echo "APP_VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
@@ -135,7 +147,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
     needs: [source, windows, macos]
     runs-on: ubuntu-latest
     steps:
@@ -148,6 +160,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: 样片工厂 ${{ github.ref_name }}
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           body: |
             本版本同步当前样片工厂功能，并新增 Windows x64 安装包与真实 Windows CI 验证。
@@ -160,4 +173,3 @@ jobs:
             Windows 与 macOS 安装包未使用商业代码签名证书，系统可能显示未知发布者警告。
           files: release-assets/*
           fail_on_unmatched_files: true
-
