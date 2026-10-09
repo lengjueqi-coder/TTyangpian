@@ -15,6 +15,7 @@ import base64
 import subprocess
 import socket
 import errno
+import struct
 from pathlib import Path
 try:
     from send2trash import send2trash as _trash_send
@@ -25,7 +26,7 @@ from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from urllib.parse import urlparse, parse_qs, quote
 import requests
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageFilter
 from flask import Flask, jsonify, request, render_template, send_from_directory, send_file
 
 # 防止解压炸弹：限制PIL最大像素数（1亿像素≈10K×10K）
@@ -215,6 +216,10 @@ ALLOWED_IMAGE_DOMAINS = {
     'oss.filenest.top',
     'webstatic.aiproxy.vip',
     'aiproxy.vip',
+    'pptoken.cc', 'api.pptoken.cc',
+    # API易：图片默认以 b64_json 返回，这里只放行官方网关主机，
+    # 防止上游改成 CDN 直链后下载被 SSRF 白名单拦掉。
+    'apiyi.com', 'api.apiyi.com', 'b.apiyi.com', 'vip.apiyi.com', 'api-cf.apiyi.com',
 }
 
 # 允许代理 API 的 base_url 域名白名单
@@ -223,9 +228,13 @@ ALLOWED_API_DOMAINS = {
     'openai-hk.com', 'api.openai-hk.com',
     'deepseek.com', 'api.deepseek.com',
     'bigmodel.cn', 'open.bigmodel.cn',
+    'pptoken.cc', 'api.pptoken.cc',
+    'apiyi.com', 'api.apiyi.com', 'b.apiyi.com', 'vip.apiyi.com', 'api-cf.apiyi.com',
 }
 
 DEFAULT_RH_BASE_URL = 'https://www.runninghub.ai/openapi/v2'
+DEFAULT_PPTOKEN_BASE_URL = 'https://api.pptoken.cc/v1'
+DEFAULT_APIYI_BASE_URL = 'https://api.apiyi.com'
 DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-flash'
 
 
@@ -244,6 +253,25 @@ def _normalize_runninghub_base_url(value):
     if hostname in {'runninghub.cn', 'www.runninghub.cn'}:
         return DEFAULT_RH_BASE_URL
     return base_url
+
+
+def _normalize_pptoken_base_url(value):
+    """Keep PPT Token on its OpenAI-compatible v1 endpoint."""
+    base_url = str(value or DEFAULT_PPTOKEN_BASE_URL).strip().rstrip('/')
+    return base_url or DEFAULT_PPTOKEN_BASE_URL
+
+
+def _normalize_apiyi_base_url(value):
+    """API易 只用「不带 /v1 的站点根地址」。
+
+    同一个 Key 既要走 Gemini 原生 `/v1beta/models/...:generateContent`，也要走
+    OpenAI 兼容 `/v1/images/edits`，所以内部统一保存根地址，由各协议自己拼前缀。
+    用户在设置里贴了带 `/v1` 的地址时自动剥掉，避免拼出 `/v1/v1/...`。
+    """
+    base_url = str(value or DEFAULT_APIYI_BASE_URL).strip().rstrip('/')
+    if base_url.endswith('/v1'):
+        base_url = base_url[:-3].rstrip('/')
+    return base_url or DEFAULT_APIYI_BASE_URL
 
 
 def _normalize_prompt_model(provider, value):
@@ -1290,6 +1318,17 @@ def _parse_size_text(size_text):
         return None
 
 
+# GPT 图片模型清单：这些模型走 OpenAI 兼容接口，需做真实尺寸核对（禁止本地放大冒充 4K）
+_GPT_IMAGE_MODELS = (
+    'gpt-image-2',
+    'gpt-image-2-vip',
+    'gpt-image-2.5',
+    'gpt-image-2.5-all',
+    'gpt-image-2.5-flare',
+    'gpt-image-2.5-sunburst',
+)
+
+
 def _inspect_gpt_result_size(result, target_size_text):
     """记录 GPT 上游返回图的真实尺寸，不用本地放大伪装成请求尺寸。"""
     target = _parse_size_text(target_size_text)
@@ -1593,6 +1632,21 @@ def _mask_api_key(key):
     return key[:2] + '****' + key[-2:]
 
 
+# 需要遮蔽显示的敏感字段（API Key 类）。新增平台 Key 时必须同步登记，
+# 否则 GET/PUT 会把明文密钥回传给前端。
+MASKED_MODEL_CONFIG_FIELDS = (
+    'api_key', 'rh_api_key', 'oaihk_api_key', 'pptoken_api_key',
+    'apiyi_api_key', 'apiyi_proxy_api_key',
+)
+
+
+def mask_sensitive_model_config_fields(config):
+    """就地遮蔽配置里的敏感 Key 字段（保留其它字段不变）。"""
+    for key_field in MASKED_MODEL_CONFIG_FIELDS:
+        if config.get(key_field):
+            config[key_field] = _mask_api_key(config[key_field])
+
+
 @app.route('/api/model-config', methods=['GET'])
 def get_model_config():
     data = load_json('model_config.json')
@@ -1645,9 +1699,7 @@ def get_model_config():
 - 只输出英文翻译结果，不要输出任何解释"""
     # 遮蔽API密钥，前端只显示遮蔽版
     masked = dict(data)
-    for key_field in ['api_key', 'rh_api_key', 'oaihk_api_key']:
-        if masked.get(key_field):
-            masked[key_field] = _mask_api_key(masked[key_field])
+    mask_sensitive_model_config_fields(masked)
     return jsonify(masked)
 
 
@@ -1661,16 +1713,22 @@ def update_model_config():
         'system_prompt_prompt', 'system_prompt_translate', 'system_prompt_bilingual',
         'rh_api_key', 'rh_base_url', 'rh_model', 'rh_aspect_ratio', 'rh_resolution', 'rh_count', 'rh_seed_mode', 'rh_seed',
         'oaihk_api_key', 'oaihk_base_url', 'oaihk_model', 'oaihk_aspect_ratio', 'oaihk_gpt_quality',
+        'pptoken_api_key', 'pptoken_base_url', 'pptoken_default_resolution', 'pptoken_model',
+        'apiyi_api_key', 'apiyi_proxy_api_key', 'apiyi_base_url', 'apiyi_default_resolution', 'apiyi_model',
         'api_platform', 'rh_download_path', 'upload_short_edge', 'upload_mode',
         'image_counter', 'image_prefix', 'defaultCropPreset', 'oaihk_image_timeout_sec',
     }
     body = {k: v for k, v in body.items() if k in ALLOWED_FIELDS}
     # 自动去除关键字段的空格
-    for key in ['api_key', 'base_url', 'model_name']:
+    for key in ['api_key', 'rh_api_key', 'oaihk_api_key', 'pptoken_api_key', 'apiyi_api_key', 'apiyi_proxy_api_key', 'base_url', 'rh_base_url', 'oaihk_base_url', 'pptoken_base_url', 'apiyi_base_url', 'model_name']:
         if key in body and isinstance(body[key], str):
             body[key] = body[key].strip()
     if 'rh_base_url' in body:
         body['rh_base_url'] = _normalize_runninghub_base_url(body.get('rh_base_url'))
+    if 'pptoken_base_url' in body:
+        body['pptoken_base_url'] = _normalize_pptoken_base_url(body.get('pptoken_base_url'))
+    if 'apiyi_base_url' in body:
+        body['apiyi_base_url'] = _normalize_apiyi_base_url(body.get('apiyi_base_url'))
     if 'provider' in body or 'model_name' in body:
         current = load_json('model_config.json') or {}
         body['model_name'] = _normalize_prompt_model(
@@ -1683,7 +1741,7 @@ def update_model_config():
         if existing is None:
             existing = {}
         # 遮蔽的密钥值（含****）不应覆盖真实密钥
-        for key_field in ['api_key', 'rh_api_key', 'oaihk_api_key']:
+        for key_field in MASKED_MODEL_CONFIG_FIELDS:
             if key_field in body and '****' in str(body.get(key_field, '')):
                 del body[key_field]  # 保留原有密钥
         existing.update(body)
@@ -1691,9 +1749,7 @@ def update_model_config():
     logger.info(f"更新模型配置: provider={existing.get('provider')}")
     # 返回遮蔽后的配置，避免泄露 API 密钥
     masked = dict(existing)
-    for key_field in ['api_key', 'rh_api_key', 'oaihk_api_key']:
-        if key_field in masked and masked[key_field]:
-            masked[key_field] = _mask_api_key(masked[key_field])
+    mask_sensitive_model_config_fields(masked)
     return jsonify(masked)
 
 
@@ -1742,6 +1798,63 @@ def test_connection():
         return jsonify({"success": False, "message": "连接超时"})
     except Exception as e:
         return jsonify({"success": False, "message": f"连接失败: {str(e)}"})
+
+
+@app.route('/api/test-image-connection', methods=['POST'])
+@_local_only
+def test_image_connection():
+    """Check an OpenAI-compatible image gateway without creating an image task."""
+    body = request.get_json(silent=True) or {}
+    provider = str(body.get('provider') or '').strip().lower()
+    if provider not in {'oaihk', 'pptoken', 'apiyi'}:
+        return jsonify({'success': False, 'message': '不支持的图片接口类型'}), 400
+
+    config = load_json('model_config.json') or {}
+    key_field = {'pptoken': 'pptoken_api_key', 'apiyi': 'apiyi_api_key'}.get(provider, 'oaihk_api_key')
+    base_field = {'pptoken': 'pptoken_base_url', 'apiyi': 'apiyi_base_url'}.get(provider, 'oaihk_base_url')
+    api_key = str(body.get('api_key') or '').strip()
+    # 前端传来可用明文 Key 时直接用；否则回退到设置里保存的 Key。
+    # API易 官转（proxy 通道）另有「按量优先」专用 Key，回退时优先取它，再退回通用 Key。
+    if not api_key or '****' in api_key:
+        api_key = ''
+        if provider == 'apiyi' and _apiyi_gpt_channel(body.get('model')) == 'proxy':
+            api_key = str(config.get('apiyi_proxy_api_key') or '').strip()
+        if not api_key:
+            api_key = str(config.get(key_field) or '').strip()
+    if not api_key:
+        return jsonify({'success': False, 'message': '请先填写 API Key'}), 400
+
+    default_base = {
+        'pptoken': DEFAULT_PPTOKEN_BASE_URL,
+        'apiyi': DEFAULT_APIYI_BASE_URL,
+    }.get(provider, 'https://api.openai-hk.com')
+    base_url = str(body.get('base_url') or config.get(base_field) or default_base).strip().rstrip('/')
+    allowed = _validate_url(base_url + '/', ALLOWED_API_DOMAINS)
+    if not allowed[0]:
+        return jsonify({'success': False, 'message': f'接口地址无效：{allowed[1]}'}), 400
+    models_url = f'{base_url}/models' if base_url.endswith('/v1') else f'{base_url}/v1/models'
+    try:
+        response = requests.get(
+            models_url,
+            headers={'Authorization': f'Bearer {api_key}', 'Accept': 'application/json'},
+            timeout=30,
+        )
+    except requests.exceptions.Timeout:
+        return jsonify({'success': False, 'message': '图片接口连接超时'}), 504
+    except requests.RequestException:
+        return jsonify({'success': False, 'message': '图片接口网络连接失败'}), 502
+
+    if response.status_code == 200:
+        try:
+            payload = response.json()
+            models = payload.get('data') if isinstance(payload, dict) else None
+            model_count = len(models) if isinstance(models, list) else None
+        except ValueError:
+            model_count = None
+        suffix = f'，返回模型 {model_count} 个' if model_count is not None else ''
+        return jsonify({'success': True, 'message': f'{provider.upper()} 图片接口连接成功{suffix}；本次未生成图片。'})
+
+    return jsonify({'success': False, 'message': f'图片接口连接失败：HTTP {response.status_code}'}), 400 if response.status_code < 500 else 502
 
 
 # ========== 最近选择 API ==========
@@ -3608,7 +3721,7 @@ def rh_preflight():
     if not re.fullmatch(r'[a-zA-Z0-9_.\-/]+', model_id):
         return jsonify({'success': False, 'message': 'RunningHub 模型地址无效'}), 400
     resolution = str(body.get('resolution') or '4k').lower()
-    if resolution not in {'2k', '4k'}:
+    if resolution not in {'1k', '2k', '4k'}:
         resolution = '4k'
 
     # A schema-valid neutral image lets price-preview verify the image-to-image
@@ -3978,8 +4091,13 @@ def oaihk_gpt_image():
     action = body.get('action', 'generations')  # generations 或 edits
 
     config = load_json('model_config.json') or {}
-    api_key = config.get('oaihk_api_key', '').strip()
-    base_url = (config.get('oaihk_base_url') or 'https://api.openai-hk.com').rstrip('/')
+    provider = str(body.get('provider') or 'oaihk').strip().lower()
+    is_pptoken = provider == 'pptoken'
+    api_key = str(config.get('pptoken_api_key' if is_pptoken else 'oaihk_api_key') or '').strip()
+    base_url = str(
+        config.get('pptoken_base_url' if is_pptoken else 'oaihk_base_url')
+        or (DEFAULT_PPTOKEN_BASE_URL if is_pptoken else 'https://api.openai-hk.com')
+    ).rstrip('/')
     if body.get('base_url', '').strip():
         custom_base = body['base_url'].strip().rstrip('/')
         ok, err, _ = _validate_url(custom_base + '/', ALLOWED_API_DOMAINS)
@@ -3992,7 +4110,7 @@ def oaihk_gpt_image():
     disable_system_proxy = not use_system_proxy
 
     if not api_key:
-        return jsonify({"error": "OpenAI-HK API Key 未配置"}), 400
+        return jsonify({"error": "PPT Token API Key 未配置" if is_pptoken else "OpenAI-HK API Key 未配置"}), 400
 
     prompt = body.get('prompt', '')
     model = body.get('model', 'gpt-image-2')
@@ -4002,8 +4120,25 @@ def oaihk_gpt_image():
     image_base64_list = body.get('image_base64_list', [])
     timeout_sec = int(body.get('timeout_sec') or config.get('oaihk_image_timeout_sec') or 240)
 
+    # PPToken 的 gpt-image 2/2.5 为 OpenAI 兼容接口，实测无法输出真 4K：
+    # 请求 2048px 短边时上游只返回 ≤1536px（2K），size=auto 时甚至直接返回 1K。
+    # 因此 4K 请求一律按比例钳制到短边 1536px，避免静默降级为 1K。
+    resolution_note = ''
+    if is_pptoken and size:
+        parsed = _parse_size_text(size)
+        if parsed:
+            w, h = parsed
+            short = min(w, h)
+            if short > 1536:
+                scale = 1536.0 / short
+                nw = max(1, int(round(w * scale)))
+                nh = max(1, int(round(h * scale)))
+                size = f'{nw}x{nh}'
+                resolution_note = '模型上限 2K，已按 2K 出图（4K 请求会被上游静默降级到 1K/2K）'
+                logger.warning(f'[gpt-image] PPToken 4K 请求钳制到 2K: 原始 {w}x{h} -> 请求 {size}')
+
     logger.info(f'[gpt-image] action={action}, model={model}, prompt={prompt[:80]}..., images={len(image_base64_list)}, size={size}, quality={quality}, use_system_proxy={use_system_proxy}')
-    if model in ('gpt-image-2-vip', 'gpt-image-2') and str(size).startswith('1024'):
+    if model in _GPT_IMAGE_MODELS and str(size).startswith('1024'):
         logger.warning(f'[gpt-image] 检测到GPT模型使用1K尺寸: model={model}, size={size}，请检查前端模型/比例映射')
 
     try:
@@ -4020,15 +4155,13 @@ def oaihk_gpt_image():
                 'size': size,
                 'quality': quality
             }
-            resp = _oaihk_request_with_fallback(
-                'POST',
-                base_url,
-                'v1/images/generations',
-                headers=headers,
-                json=payload,
-                timeout=timeout_sec,
-                disable_system_proxy=disable_system_proxy
-            )
+            request_fn = _http_request if is_pptoken else _oaihk_request_with_fallback
+            if is_pptoken:
+                resp = request_fn('POST', f'{base_url}/images/generations', headers=headers, json=payload,
+                                  timeout=timeout_sec, disable_system_proxy=disable_system_proxy)
+            else:
+                resp = request_fn('POST', base_url, 'v1/images/generations', headers=headers, json=payload,
+                                  timeout=timeout_sec, disable_system_proxy=disable_system_proxy)
         else:
             # 图生图：multipart/form-data POST
             files = []
@@ -4064,16 +4197,13 @@ def oaihk_gpt_image():
                 files.append((field_name, (f'reference_{idx}.{ext}', open(tmp.name, 'rb'), mime)))
 
             headers = {'Authorization': f'Bearer {api_key}'}
-            resp = _oaihk_request_with_fallback(
-                'POST',
-                base_url,
-                'v1/images/edits',
-                headers=headers,
-                data=form_data,
-                files=files,
-                timeout=timeout_sec,
-                disable_system_proxy=disable_system_proxy
-            )
+            request_fn = _http_request if is_pptoken else _oaihk_request_with_fallback
+            if is_pptoken:
+                resp = request_fn('POST', f'{base_url}/images/edits', headers=headers, data=form_data,
+                                  files=files, timeout=timeout_sec, disable_system_proxy=disable_system_proxy)
+            else:
+                resp = request_fn('POST', base_url, 'v1/images/edits', headers=headers, data=form_data,
+                                  files=files, timeout=timeout_sec, disable_system_proxy=disable_system_proxy)
 
             # 清理临时文件和文件句柄
             for f_tuple in files:
@@ -4102,17 +4232,670 @@ def oaihk_gpt_image():
                 result['error'] = err['message']
 
         # 只记录上游真实返图尺寸。禁止本地拉伸冒充原生 4K。
-        if resp.status_code == 200 and model in ('gpt-image-2-vip', 'gpt-image-2'):
+        if resp.status_code == 200 and model in _GPT_IMAGE_MODELS:
             result = _inspect_gpt_result_size(result, size)
+        if resp.status_code == 200 and resolution_note:
+            result['resolution_note'] = resolution_note
         return jsonify(result), resp.status_code
 
     except requests.exceptions.Timeout:
-        msg = f'OpenAI-HK GPT同步接口超时（已等待{timeout_sec}s仍未返回，通常是上游排队/网关卡住）'
+        label = 'PPT Token' if is_pptoken else 'OpenAI-HK'
+        msg = f'{label} GPT同步接口超时（已等待{timeout_sec}s仍未返回，通常是上游排队/网关卡住）'
         logger.error('[gpt-image] %s', msg)
         return jsonify({"error": msg, "code": "oaihk_gpt_timeout", "timeout_sec": timeout_sec}), 504
     except Exception as e:
         logger.error(f'[gpt-image] 异常: {e}', exc_info=True)
         return jsonify({"error": "服务内部错误"}), 500
+
+
+@app.route('/api/pptoken-gpt-image', methods=['POST'])
+def pptoken_gpt_image():
+    """PPT Token OpenAI Images-compatible image generation/edit endpoint."""
+    body = request.get_json(silent=True) or {}
+    body['provider'] = 'pptoken'
+    with app.test_request_context('/api/oaihk-gpt-image', method='POST', json=body):
+        return oaihk_gpt_image()
+
+
+# ========== API易（apiyi.com）同步生图代理 ==========
+# 官方文档：https://docs.apiyi.com/api-capabilities/
+# 图片接口全部是同步调用，没有任务 ID：客户端一断连结果就丢了、但这次请求照样
+# 计费，所以超时宁可给足也不要过早掐断（Nano Banana 4K 按 600 秒兜底）。
+
+# Nano Banana（Gemini 原生）支持的 10 个宽高比，其余比例不要传。
+APIYI_GEMINI_ASPECT_RATIOS = (
+    '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9',
+)
+
+# 官逆 -vip 系列的 30 档 size（10 比例 × 1K Fast / 2K Recommended / 4K Detail）。
+# 表外尺寸不会报错但会被上游按 16 倍数对齐改写，所以只允许这张表里的值。
+APIYI_GPT_SIZES = {
+    '1:1': {'1k': '1280x1280', '2k': '2048x2048', '4k': '2880x2880'},
+    '2:3': {'1k': '848x1280', '2k': '1360x2048', '4k': '2336x3520'},
+    '3:2': {'1k': '1280x848', '2k': '2048x1360', '4k': '3520x2336'},
+    '3:4': {'1k': '960x1280', '2k': '1536x2048', '4k': '2480x3312'},
+    '4:3': {'1k': '1280x960', '2k': '2048x1536', '4k': '3312x2480'},
+    '4:5': {'1k': '1024x1280', '2k': '1632x2048', '4k': '2560x3216'},
+    '5:4': {'1k': '1280x1024', '2k': '2048x1632', '4k': '3216x2560'},
+    '9:16': {'1k': '720x1280', '2k': '1152x2048', '4k': '2160x3840'},
+    '16:9': {'1k': '1280x720', '2k': '2048x1152', '4k': '3840x2160'},
+    '21:9': {'1k': '1280x544', '2k': '2048x864', '4k': '3840x1632'},
+}
+
+APIYI_REFERENCE_COMPRESS_THRESHOLD = 1_500_000
+APIYI_REFERENCE_MAX_LONG_EDGE = 2048
+APIYI_REFERENCE_TOTAL_BUDGET = 6 * 1024 * 1024
+APIYI_MAX_REFERENCES = 14
+
+# Seedream 走 /v1/images/generations（没有 edits 端点），size 只认档位、不接受像素，
+# 宽高比由参考图决定，所以不能用「比例 × 分辨率」拼 size。
+# 5.0 Lite 官方档位写的是 2K/3K（无 1K），这里按 1K→2K 兜底，避免用户选了 1K 直接 400。
+APIYI_SEEDREAM_SIZES = {'1k': '1K', '2k': '2K', '3k': '3K', '4k': '4K'}
+APIYI_SEEDREAM_NO_1K = ('seedream-5-0-260128',)
+
+
+def _apiyi_seedream_size(resolution, model=''):
+    """把界面上的「几K」翻成 Seedream 的 size 档位。"""
+    tier = APIYI_SEEDREAM_SIZES.get(str(resolution or '').lower(), '2K')
+    if tier == '1K' and any(str(model or '').startswith(prefix) for prefix in APIYI_SEEDREAM_NO_1K):
+        tier = '2K'
+    return tier
+
+
+def _apiyi_timeout_seconds(protocol, resolution):
+    """按协议 + 分辨率给客户端超时。4K 生成明显更慢，必须单独放宽。"""
+    protocol = str(protocol or '')
+    is_4k = str(resolution or '').lower() == '4k'
+    if protocol == 'seedream':
+        return 480 if is_4k else 300
+    if protocol == 'gemini-native':
+        return 600 if is_4k else 300
+    return 360
+
+
+def _apiyi_split_data_uri(data_uri):
+    """把 data URI 拆成 (mime, 纯 base64)；传入裸 base64 时按 PNG 处理。"""
+    text = str(data_uri or '')
+    if text.startswith('data:'):
+        header, _, payload = text.partition(',')
+        mime = header[5:].split(';')[0] or 'image/png'
+        return mime, payload
+    return 'image/png', text
+
+
+def _apiyi_compress_reference(data_uri, max_long_edge=APIYI_REFERENCE_MAX_LONG_EDGE, force=False):
+    """按官方建议压缩一张参考图。
+
+    超过 1.5MB 才处理：长边等比缩到 2048px 以内（不放大小图）、以质量 0.9
+    重编码、保持原格式。官方硬限制是单图 7MB / 每次最多 14 张 / 单次总量
+    <100MB，而 base64 编码后体积还会再涨约三分之一，所以这里留足余量。
+    任何一张压缩失败都回退用原图继续，绝不因为压缩失败中断整个请求。
+    """
+    mime, payload = _apiyi_split_data_uri(data_uri)
+    try:
+        raw = base64.b64decode(payload)
+    except Exception:
+        return data_uri
+    if not raw or (not force and len(raw) <= APIYI_REFERENCE_COMPRESS_THRESHOLD):
+        return data_uri
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            fmt = str(img.format or '').upper()
+            if fmt in ('JPG', 'JPEG'):
+                image = img.convert('RGB')
+                out_format, out_mime = 'JPEG', 'image/jpeg'
+            elif fmt == 'WEBP':
+                image = img.copy()
+                out_format, out_mime = 'WEBP', 'image/webp'
+            else:
+                image = img.copy()
+                out_format, out_mime = 'PNG', 'image/png'
+        long_edge = max(image.size)
+        if long_edge > max_long_edge:
+            scale = max_long_edge / float(long_edge)
+            image = image.resize(
+                (max(1, int(round(image.size[0] * scale))), max(1, int(round(image.size[1] * scale)))),
+                Image.LANCZOS,
+            )
+        buf = io.BytesIO()
+        if out_format in ('JPEG', 'WEBP'):
+            image.save(buf, format=out_format, quality=90, optimize=True)
+        else:
+            image.save(buf, format=out_format, optimize=True)
+        compressed = buf.getvalue()
+    except Exception as exc:
+        logger.warning('[apiyi] 参考图压缩失败，回退原图: %s', exc)
+        return data_uri
+    # 压缩后反而变大（例如原本就是高压缩率小图）时保留原图，避免白涨体积。
+    if not compressed or len(compressed) >= len(raw):
+        return data_uri
+    return f'data:{out_mime};base64,' + base64.b64encode(compressed).decode('ascii')
+
+
+def _apiyi_prepare_references(data_uris):
+    """压缩参考图，并在压缩后仍超预算时逐级收小，保证多图合计不超过 6MB。"""
+    prepared = [_apiyi_compress_reference(uri) for uri in data_uris]
+    for long_edge in (1600, 1280, 1024):
+        if sum(len(str(uri)) for uri in prepared) <= APIYI_REFERENCE_TOTAL_BUDGET:
+            break
+        prepared = [
+            _apiyi_compress_reference(uri, max_long_edge=long_edge, force=True)
+            for uri in prepared
+        ]
+    return prepared
+
+
+def _apiyi_gemini_payload(prompt, references, resolution, aspect_ratio):
+    """构造 Gemini 原生请求体。
+
+    同一个 part 里只能放 ``text`` 或 ``inlineData`` 其中一个，不能两个字段并存，
+    所以正确结构是 1 个文本段 + N 个图片段。本模型不支持 thinkingConfig，也不
+    支持 Google 搜索接地（tools 里的 google_search），一律不传。
+    """
+    parts = [{'text': prompt}]
+    for data_uri in references:
+        mime, payload = _apiyi_split_data_uri(data_uri)
+        parts.append({'inlineData': {'mimeType': mime, 'data': payload}})
+    image_config = {'imageSize': str(resolution or '1k').upper()}
+    ratio = str(aspect_ratio or '').strip()
+    if ratio in APIYI_GEMINI_ASPECT_RATIOS:
+        image_config['aspectRatio'] = ratio
+    return {
+        'contents': [{'parts': parts}],
+        'generationConfig': {'imageConfig': image_config},
+    }
+
+
+def _apiyi_extract_gemini_image(payload):
+    """取出 Gemini 响应里的终稿图片。
+
+    ``parts`` 是异构数组，段数和顺序都不保证（前面可能挂一个文本段，图片就落到
+    下标 1），所以绝不能写死 parts[0] / parts[1]：这里筛出所有含 ``inlineData``
+    的段并取最后一张——复杂任务会返回多张中间稿，最后一张才是终稿。``mimeType``
+    也从响应里读，不写死 image/png。
+
+    返回 ``(base64, mime, error, blocked)``。
+    """
+    candidates = payload.get('candidates') if isinstance(payload, dict) else None
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    parts = ((candidate.get('content') or {}).get('parts')) or []
+    images = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        inline = part.get('inlineData') or part.get('inline_data')
+        if isinstance(inline, dict) and inline.get('data'):
+            mime = inline.get('mimeType') or inline.get('mime_type') or 'image/png'
+            images.append((inline['data'], mime))
+    if images:
+        data, mime = images[-1]
+        return data, mime, None, False
+    # 审核拦截时 HTTP 仍然是 200，但 parts 为空。判断顺序：先看
+    # candidatesTokenCount 是否为 0，再看 finishReason 是否非 STOP。
+    token_count = candidate.get('candidatesTokenCount')
+    finish_reason = str(candidate.get('finishReason') or '').strip().upper()
+    if token_count == 0 or (finish_reason and finish_reason != 'STOP'):
+        return None, None, f'内容被上游安全审核拦截（finishReason={finish_reason or "UNKNOWN"}）', True
+    return None, None, 'API易响应里没有图片数据', False
+
+
+def _apiyi_gpt_size(resolution, aspect_ratio):
+    """按「分辨率 + 比例」查 30 档表，查不到就交给上游 auto 决定。"""
+    ratio = str(aspect_ratio or '').strip()
+    if ratio not in APIYI_GPT_SIZES:
+        return 'auto'
+    return APIYI_GPT_SIZES[ratio].get(str(resolution or '4k').lower(), 'auto')
+
+
+def _apiyi_nearest_ratio(path):
+    """把参考图的实际宽高比吸附到 30 档表里最接近的比例。
+
+    用户把「比例」留成「自动」时，用它按目标参考图的构图比例换取具体
+    ``size``——否则只能发 ``size=auto``，尺寸由上游随机决定，拿不到 4K。
+    """
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+    except Exception:
+        return ''
+    if not width or not height:
+        return ''
+    target = width / height
+    best, best_diff = '', None
+    for ratio in APIYI_GPT_SIZES:
+        try:
+            left, right = ratio.split(':')
+            value = float(left) / float(right)
+        except (ValueError, ZeroDivisionError):
+            continue
+        diff = abs(value - target)
+        if best_diff is None or diff < best_diff:
+            best, best_diff = ratio, diff
+    return best
+
+
+def _apiyi_gpt_channel(model):
+    """按模型名判断 API易 GPT-Image 走的是哪条通道。
+
+    - ``proxy``：官转（``gpt-image-2.5-flare`` / ``gpt-image-2.5-sunburst`` /
+      ``gpt-image-2``），OpenAI 官方直连，支持任意合法 ``size``、``quality`` 与 mask；
+    - ``all``：官逆 ChatGPT 网页线（``gpt-image-2-all`` / ``gpt-image-2.5-all``），
+      按次 $0.03，**不接受 ``size`` 与 ``quality``**，画幅只能写进提示词；
+    - ``vip``：官逆 Adobe 线（``gpt-image-2-vip`` / ``-vip`` 系列），按次 $0.03，
+      支持 30 档 ``size``（含 4K）和原生 mask；``quality`` 属渠道行为不承诺，统一不传。
+    """
+    name = str(model or '').lower()
+    if name.endswith('-vip'):
+        return 'vip'
+    if name.endswith('-all'):
+        return 'all'
+    return 'proxy'
+
+
+def _apiyi_build_gpt_form(prompt, model, resolution, aspect_ratio, size_override=None, quality=None):
+    """OpenAI 兼容 /v1/images/edits 的表单字段。
+
+    官转禁止传 ``response_format``，传了直接 400；官逆两款默认就返回纯 base64，
+    这里显式指定 ``b64_json``，避免 CDN 链接 24 小时后失效。三款都不要传 ``n``：
+    传 n=3 会按 3 张扣费但仍然只返回 1 张图。
+    """
+    form = {'model': model, 'prompt': prompt}
+    channel = _apiyi_gpt_channel(model)
+    if channel != 'proxy':
+        form['response_format'] = 'b64_json'
+    if channel in ('proxy', 'vip'):
+        # 官转支持任意尺寸、-vip 支持 30 档；只有 -all 不接受 size，画幅交给提示词。
+        requested_size = str(size_override or '').strip() or _apiyi_gpt_size(resolution, aspect_ratio)
+        if requested_size:
+            form['size'] = requested_size
+    if channel == 'proxy' and quality:
+        # 官转按 token 计费，quality 必传，且不要用 auto（费用和耗时都会漂移）。
+        form['quality'] = quality
+    return form
+
+
+def _apiyi_align_mask(mask_data_uri, reference_data_uri):
+    """把蒙版对齐到第一张参考图的尺寸，输出 OpenAI 规范的 RGBA PNG。
+
+    API 易官转 Images Edits 当前要求蒙版必须带 alpha 通道；透明区域才是
+    可重绘区域，完全不透明区域保持原图。前端/内部蒙版仍使用「白=可重绘、
+    黑=保持」的亮度约定，因此这里会把白色转换成 alpha=0、黑色转换成
+    alpha=255。前端画笔在原图上绘制，而送给上游的参考图会压到 2048 长边，
+    蒙版必须跟着缩放到同一尺寸，否则网关会报尺寸不匹配。
+    返回 None 表示蒙版不可用（此时按不带蒙版继续，不打断整次请求）。
+    """
+    _, image_payload = _apiyi_split_data_uri(reference_data_uri)
+    _, mask_payload = _apiyi_split_data_uri(mask_data_uri)
+    try:
+        with Image.open(io.BytesIO(base64.b64decode(image_payload))) as ref:
+            target_size = ref.size
+        with Image.open(io.BytesIO(base64.b64decode(mask_payload))) as mask_img:
+            # 只按亮度判断：白=可重绘。不能看 alpha——浏览器把画布导成 PNG 时，
+            # 即便全不透明也可能带上 A 通道，按 alpha 判断会把整张图当成可重绘区。
+            gray = mask_img.convert('L')
+            if gray.size != target_size:
+                gray = gray.resize(target_size, Image.LANCZOS)
+            gray = gray.point(lambda value: 255 if value >= 110 else 0)
+            # OpenAI Images Edits uses alpha semantics: transparent=edit,
+            # opaque=preserve. Keep RGB aligned with the legacy white/black
+            # convention so gateways that inspect both channels remain sane.
+            alpha = gray.point(lambda value: 0 if value >= 110 else 255)
+            buf = io.BytesIO()
+            Image.merge('RGBA', (gray, gray, gray, alpha)).save(buf, format='PNG')
+            return buf.getvalue()
+    except Exception as exc:
+        logger.warning('[apiyi] 局部重绘蒙版处理失败，本次按普通重绘提交: %s', exc)
+        return None
+
+
+def _apiyi_normalize_image_items(payload):
+    """把上游 ``data[]`` 统一成 ``[{b64_json} | {url}]``。
+
+    同一条 data[] 里只会有 url 和 b64_json 其中一个，gpt-image-2-all 历史版本还会
+    给 b64 带上 ``data:image/...;base64,`` 前缀，必须剥掉，否则前端再拼 data URI
+    会拿到损坏的图。Gemini 原生与 Seedream 都复用这套归一化。
+    """
+    normalized = []
+    for item in (payload.get('data') or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get('b64_json'):
+            b64 = item['b64_json']
+            if isinstance(b64, str) and b64.startswith('data:'):
+                b64 = b64.split(',', 1)[-1]
+            normalized.append({'b64_json': b64})
+        elif item.get('url'):
+            normalized.append({'url': item['url']})
+    return normalized
+
+
+def _apiyi_result_item_bytes(item):
+    """读取 API 易 返回项的图片字节，供带 mask 的本地合成使用。"""
+    if not isinstance(item, dict):
+        return None
+    if item.get('b64_json'):
+        value = str(item['b64_json'])
+        return base64.b64decode(value.split(',', 1)[-1])
+    if item.get('url'):
+        ok, err, _ = _validate_url(item['url'], ALLOWED_IMAGE_DOMAINS)
+        if not ok:
+            raise ValueError(f'结果地址不允许：{err}')
+        response = requests.get(item['url'], timeout=180)
+        response.raise_for_status()
+        return response.content
+    return None
+
+
+def _apiyi_composite_masked_result(source_data_uri, mask_data_uri, generated_bytes):
+    """把上游整图结果裁成「原图底 + 蒙版内生成」的最终图。
+
+    OpenAI Images Edits 的 mask 是编辑提示，不是 Photoshop 补丁；上游仍可能
+    改动衣服、背景或构图。因此最终交付必须由本地把生成图限制在白色蒙版区域，
+    确保蒙版外内容来自原图。返回 PNG 字节，保留生成图的目标尺寸。
+    """
+    _, source_payload = _apiyi_split_data_uri(source_data_uri)
+    _, mask_payload = _apiyi_split_data_uri(mask_data_uri)
+    with Image.open(io.BytesIO(base64.b64decode(source_payload))) as source_image, \
+            Image.open(io.BytesIO(base64.b64decode(mask_payload))) as mask_image, \
+            Image.open(io.BytesIO(generated_bytes)) as generated_image:
+        generated = ImageOps.exif_transpose(generated_image).convert('RGB')
+        target_size = generated.size
+        base = ImageOps.exif_transpose(source_image).convert('RGB').resize(target_size, Image.Resampling.LANCZOS)
+        edit_mask = mask_image.convert('L').resize(target_size, Image.Resampling.LANCZOS)
+
+        # GPT2 裸模型在「两张参考图 + mask」组合下会返回黑色占位圆；
+        # 这种结果必须拒绝，不能让坏图进入批量输出。
+        generated_gray = generated.convert('L')
+        active = [pixel for pixel, weight in zip(generated_gray.getdata(), edit_mask.getdata()) if weight >= 220]
+        if len(active) >= 100 and sum(pixel <= 12 for pixel in active) / len(active) > 0.35:
+            raise ValueError('上游返回了蒙版区域黑色占位图，已拒绝保存')
+
+        base.paste(generated, (0, 0), edit_mask)
+        output = io.BytesIO()
+        base.save(output, format='PNG', optimize=True)
+        return output.getvalue()
+
+
+def _apiyi_error_payload(data, status_code):
+    """把上游错误整理成前端可直接展示的 {error, code}。"""
+    message, code = '', ''
+    if isinstance(data, dict):
+        err = data.get('error')
+        if isinstance(err, dict):
+            message = str(err.get('message') or '')
+            code = str(err.get('code') or err.get('type') or '')
+        elif isinstance(err, str):
+            message = err
+        if not message:
+            message = str(data.get('message') or data.get('detail') or '')
+        code = code or str(data.get('code') or '')
+    return {
+        'error': message or f'API易 返回 HTTP {status_code}',
+        'code': code or 'apiyi_upstream_error',
+        'upstream_status': status_code,
+    }
+
+
+@app.route('/api/apiyi-image', methods=['POST'])
+def apiyi_image():
+    """API易 同步图生图代理：Gemini 原生 generateContent + OpenAI 兼容 images/edits。"""
+    body = request.get_json(silent=True) or {}
+    config = load_json('model_config.json') or {}
+    # Key 优先级：显式传入 > 通道专属 Key > 环境变量 APIYI_API_KEY > 设置里保存的通用 Key。
+    # 官转三款（proxy 通道）必须使用「按量优先」令牌，因此优先取官转专用 Key，
+    # 未配置时回退通用 Key；官逆（all / vip）继续使用通用 Key。
+    _apiyi_is_proxy = _apiyi_gpt_channel(body.get('model')) == 'proxy'
+    api_key = str(
+        body.get('api_key')
+        or (_apiyi_is_proxy and (os.environ.get('APIYI_PROXY_API_KEY') or config.get('apiyi_proxy_api_key')))
+        or os.environ.get('APIYI_API_KEY')
+        or config.get('apiyi_api_key')
+        or ''
+    ).strip()
+    if not api_key:
+        return jsonify({'error': 'API易 API Key 未配置', 'code': 'apiyi_missing_key'}), 400
+
+    base_url = _normalize_apiyi_base_url(
+        body.get('base_url') or config.get('apiyi_base_url') or DEFAULT_APIYI_BASE_URL
+    )
+    allowed = _validate_url(base_url + '/', ALLOWED_API_DOMAINS)
+    if not allowed[0]:
+        return jsonify({'error': f'API易 接口地址无效：{allowed[1]}', 'code': 'apiyi_bad_base_url'}), 400
+
+    model = str(body.get('model') or '').strip()
+    if not model:
+        return jsonify({'error': 'API易 缺少模型名', 'code': 'apiyi_missing_model'}), 400
+    protocol = str(body.get('protocol') or '').strip().lower()
+    if protocol not in ('gemini-native', 'openai-edits', 'seedream'):
+        if model.startswith('seedream'):
+            protocol = 'seedream'
+        elif model.startswith('gemini'):
+            protocol = 'gemini-native'
+        else:
+            protocol = 'openai-edits'
+
+    prompt = str(body.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'error': '提示词不能为空', 'code': 'apiyi_missing_prompt'}), 400
+
+    resolution = str(body.get('resolution') or config.get('apiyi_default_resolution') or '4k').strip().lower()
+    aspect_ratio = str(body.get('aspect_ratio') or 'auto').strip()
+    image_list = [uri for uri in (body.get('image_base64_list') or []) if uri]
+    if not image_list:
+        return jsonify({'error': 'API易 只接入图生图，请先提供参考图', 'code': 'apiyi_no_reference'}), 400
+    if len(image_list) > APIYI_MAX_REFERENCES:
+        return jsonify({
+            'error': f'API易 单次最多 {APIYI_MAX_REFERENCES} 张参考图',
+            'code': 'apiyi_too_many_images',
+        }), 400
+
+    timeout_sec = int(body.get('timeout_sec') or _apiyi_timeout_seconds(protocol, resolution))
+    references = _apiyi_prepare_references(image_list)
+    # 局部重绘（mask）：OpenAI edits 的 proxy/vip 通道认 mask；
+    # -all、Gemini 与 Seedream 不提供同等语义，-all 直接拒绝避免静默整图重绘。
+    mask_uri = str(body.get('mask_base64') or '').strip()
+    if mask_uri and protocol == 'openai-edits' and _apiyi_gpt_channel(model) == 'all':
+        return jsonify({
+            'error': '当前 ChatGPT 网页线模型不支持原生 mask 局部重绘，请改用 GPT2.5 Flare、Sunburst 或 GPT2 VIP',
+            'code': 'apiyi_mask_unsupported_model',
+        }), 400
+    started = time.time()
+    logger.info(
+        '[apiyi] protocol=%s model=%s resolution=%s ratio=%s images=%s timeout=%ss',
+        protocol, model, resolution, aspect_ratio, len(references), timeout_sec,
+    )
+
+    try:
+        if protocol == 'gemini-native':
+            url = f'{base_url}/v1beta/models/{model}:generateContent'
+            headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+            payload = _apiyi_gemini_payload(prompt, references, resolution, aspect_ratio)
+            last_error, last_blocked = 'API易响应里没有图片数据', False
+            # IMAGE_SAFETY 这类拦截不计费，原样重试 1-2 次往往就成功了。
+            for attempt in range(3):
+                resp = _http_request('POST', url, headers=headers, json=payload, timeout=timeout_sec)
+                try:
+                    data = resp.json()
+                except ValueError:
+                    logger.error('[apiyi] Gemini 响应非JSON: %s', resp.text[:300])
+                    return jsonify({
+                        'error': f'API易返回非JSON响应 (HTTP {resp.status_code})',
+                        'detail': resp.text[:300],
+                    }), resp.status_code
+                if resp.status_code != 200:
+                    return jsonify(_apiyi_error_payload(data, resp.status_code)), resp.status_code
+                image_b64, mime, error, blocked = _apiyi_extract_gemini_image(data)
+                if image_b64:
+                    return jsonify({
+                        'data': [{'b64_json': image_b64, 'mime_type': mime}],
+                        'model': model,
+                        'protocol': protocol,
+                        'resolution': resolution,
+                        'elapsed_sec': round(time.time() - started, 2),
+                        'usage': data.get('usageMetadata') or {},
+                    })
+                last_error, last_blocked = error or last_error, blocked
+                if not blocked:
+                    break
+                logger.warning('[apiyi] 第%s次被安全审核拦截，原样重试：%s', attempt + 1, error)
+            return jsonify({
+                'error': last_error,
+                'code': 'apiyi_content_blocked' if last_blocked else 'apiyi_empty_result',
+            }), 502
+
+        if protocol == 'seedream':
+            # Seedream 没有 /v1/images/edits：文生图、单图编辑、多图融合都走同一个
+            # /v1/images/generations，靠 image 数组区分。size 只认 1K/2K/3K/4K 档位
+            # （传像素会 400），宽高比由参考图决定，所以这里不拼 size。
+            # 只有 5.0-pro / 5.0-flash 禁止 sequential_image_generation，
+            # 已接入的 5.0 Lite 与 4.0 都支持，固定 disabled 保证只出 1 张。
+            size_tier = _apiyi_seedream_size(resolution, model)
+            if mask_uri:
+                logger.warning('[apiyi] Seedream 不支持 mask 局部重绘，已忽略蒙版（模型 %s）', model)
+            payload = {
+                'model': model,
+                'prompt': prompt,
+                'image': references,
+                'sequential_image_generation': 'disabled',
+                'size': size_tier,
+                # 上游 url 是 24 小时过期的临时链接，交由上游返回后由调用方立即转存。
+                'response_format': 'url',
+                # 商用必须关水印，默认值各版本不一致，这里显式声明。
+                'watermark': False,
+            }
+            resp = _http_request(
+                'POST', f'{base_url}/v1/images/generations',
+                headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+                json=payload, timeout=timeout_sec,
+            )
+            try:
+                data = resp.json()
+            except ValueError:
+                logger.error('[apiyi] Seedream 响应非JSON: %s', resp.text[:300])
+                return jsonify({
+                    'error': f'API易返回非JSON响应 (HTTP {resp.status_code})',
+                    'detail': resp.text[:300],
+                }), resp.status_code
+            if resp.status_code != 200:
+                return jsonify(_apiyi_error_payload(data, resp.status_code)), resp.status_code
+            normalized = _apiyi_normalize_image_items(data)
+            if not normalized:
+                return jsonify({'error': 'API易没有返回图片', 'code': 'apiyi_empty_result'}), 502
+            return jsonify({
+                'data': normalized,
+                'model': model,
+                'protocol': protocol,
+                'resolution': resolution,
+                'size': size_tier,
+                'elapsed_sec': round(time.time() - started, 2),
+                'usage': data.get('usage') or {},
+            })
+
+        form = _apiyi_build_gpt_form(
+            prompt, model, resolution, aspect_ratio,
+            size_override=body.get('size'), quality=body.get('quality'),
+        )
+        temp_files = []
+        files = []
+        try:
+            for idx, data_uri in enumerate(references):
+                mime, payload_b64 = _apiyi_split_data_uri(data_uri)
+                ext = {'image/jpeg': 'jpg', 'image/webp': 'webp'}.get(mime, 'png')
+                tmp = tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False)
+                tmp.write(base64.b64decode(payload_b64))
+                tmp.close()
+                temp_files.append(tmp)
+                field_name = 'image' if len(references) == 1 else 'image[]'
+                files.append((field_name, (f'reference_{idx}.{ext}', open(tmp.name, 'rb'), mime)))
+            if mask_uri:
+                # API 易 的官转 proxy 与官逆 vip 都已实测支持 OpenAI 原生 mask。
+                # -all 仍不支持，不能静默把局部重绘降级为整图重绘。
+                if _apiyi_gpt_channel(model) not in ('proxy', 'vip'):
+                    logger.warning('[apiyi] 模型 %s 不支持 mask，已忽略蒙版', model)
+                else:
+                    mask_bytes = _apiyi_align_mask(mask_uri, references[0])
+                    if mask_bytes:
+                        tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                        tmp.write(mask_bytes)
+                        tmp.close()
+                        temp_files.append(tmp)
+                        files.append(('mask', ('mask.png', open(tmp.name, 'rb'), 'image/png')))
+            resp = _http_request(
+                'POST', f'{base_url}/v1/images/edits',
+                headers={'Authorization': f'Bearer {api_key}'},
+                data=form, files=files, timeout=timeout_sec,
+            )
+        finally:
+            for entry in files:
+                try:
+                    entry[1][1].close()
+                except Exception:
+                    pass
+            for tmp in temp_files:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.error('[apiyi] GPT 响应非JSON: %s', resp.text[:300])
+            return jsonify({
+                'error': f'API易返回非JSON响应 (HTTP {resp.status_code})',
+                'detail': resp.text[:300],
+            }), resp.status_code
+        if resp.status_code != 200:
+            return jsonify(_apiyi_error_payload(data, resp.status_code)), resp.status_code
+
+        normalized = _apiyi_normalize_image_items(data)
+        if not normalized:
+            return jsonify({'error': 'API易没有返回图片', 'code': 'apiyi_empty_result'}), 502
+        mask_composited = False
+        if mask_uri and not body.get('defer_mask_composite') and _apiyi_gpt_channel(model) in ('proxy', 'vip'):
+            try:
+                composited = []
+                for item in normalized:
+                    generated_bytes = _apiyi_result_item_bytes(item)
+                    if not generated_bytes:
+                        continue
+                    composited.append({
+                        'b64_json': base64.b64encode(
+                            _apiyi_composite_masked_result(image_list[0], mask_uri, generated_bytes)
+                        ).decode('ascii')
+                    })
+                if composited:
+                    normalized = composited
+                    mask_composited = True
+            except (OSError, ValueError, requests.RequestException) as exc:
+                logger.error('[apiyi] 原生 mask 结果本地合成失败: %s', exc)
+                return jsonify({
+                    'error': f'API易局部重绘结果无效，未保存：{exc}',
+                    'code': 'apiyi_mask_result_invalid',
+                }), 502
+        return jsonify({
+            'data': normalized,
+            'model': model,
+            'protocol': protocol,
+            'resolution': resolution,
+            'size': form.get('size'),
+            'mask_composited': mask_composited,
+            'elapsed_sec': round(time.time() - started, 2),
+            'usage': data.get('usage') or {},
+        })
+
+    except requests.exceptions.Timeout:
+        msg = f'API易 同步接口超时（已等待 {timeout_sec}s 仍未返回，上游排队/网关卡住）'
+        logger.error('[apiyi] %s', msg)
+        return jsonify({'error': msg, 'code': 'apiyi_timeout', 'timeout_sec': timeout_sec}), 504
+    except requests.RequestException as exc:
+        logger.error('[apiyi] 网络异常: %s', exc)
+        return jsonify({'error': f'API易 网络请求失败：{exc}', 'code': 'apiyi_network_error'}), 502
+    except Exception as exc:
+        logger.error('[apiyi] 异常: %s', exc, exc_info=True)
+        return jsonify({'error': f'API易 服务内部错误：{exc}', 'code': 'apiyi_internal_error'}), 500
 
 
 def _jsonify_route_result_to_data(result):
@@ -5552,23 +6335,83 @@ def open_download_folder():
         return jsonify({"error": "服务内部错误"}), 500
 
 
+UI_LAST_DIRS_FILE = 'ui_last_dirs.json'
+
+
+def _load_ui_last_dirs():
+    """读取「上次使用过的目录」记忆。
+
+    ``dirs`` 按入口（memory_key）分别记；``last`` 是全局兜底，
+    用于某个入口还没有自己的记录时，仍能打开最近一次用过的目录。
+    """
+    data = load_json(UI_LAST_DIRS_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    dirs = data.get('dirs')
+    if not isinstance(dirs, dict):
+        dirs = {}
+    return {'dirs': dirs, 'last': str(data.get('last') or '')}
+
+
+def _remember_ui_last_dir(memory_key, path):
+    """记住本次选择的目录：本入口 + 全局兜底一起更新。"""
+    if not path:
+        return
+    data = _load_ui_last_dirs()
+    key = str(memory_key or '').strip()
+    if key:
+        data['dirs'][key] = path
+    data['last'] = path
+    try:
+        save_json(UI_LAST_DIRS_FILE, data)
+    except Exception as exc:
+        logger.warning(f'[select-folder] 记录目录记忆失败: {exc}')
+
+
+def _first_existing_dir(path):
+    """返回 path 或其最近的、真实存在的上级目录；都不存在时返回空串。
+
+    台账里的老位置常常已经被搬走，往上找最近一个还在的目录当起点，
+    比直接掉回主目录更容易让用户看到内容搬去哪了。
+    """
+    probe = os.path.expanduser(str(path or '').strip())
+    if not probe:
+        return ''
+    while probe and probe != os.sep and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    # 一路退到文件系统根目录说明这条路径整体已失效，返回空串让调用方继续兜底，
+    # 否则选择器会停在“/”，比停在主目录更让人困惑。
+    if probe == os.sep or not os.path.isdir(probe):
+        return ''
+    return probe
+
+
 @app.route('/api/select-folder', methods=['POST'])
 def select_folder():
     """打开 macOS 原生文件夹选择器，返回用户选择的路径
-    使用 AppleScript choose folder 对话框（系统自带 Tcl/Tk 8.5 与 macOS 15.7 不兼容会崩溃，不能用 tkinter）"""
+    使用 AppleScript choose folder 对话框（系统自带 Tcl/Tk 8.5 与 macOS 15.7 不兼容会崩溃，不能用 tkinter）
+
+    memory_key：每个入口自己的记忆键。打开顺序为「本入口上次目录 → 全局最近目录 →
+    前端传入的 initial_dir → 全局配置 → 主目录」，选完后把结果写回记忆。
+    """
     try:
         body = request.get_json(silent=True) or {}
-        # 优先使用前端传入的路径，否则回退到全局配置
-        initial_dir = body.get('initial_dir', '').strip()
+        memory_key = str(body.get('memory_key') or '').strip()
+        initial_dir = str(body.get('initial_dir') or '').strip()
+
+        # 记忆优先：先本入口，再全局兜底，最后才用前端传入的默认值。
+        memory = _load_ui_last_dirs()
+        remembered = str(memory['dirs'].get(memory_key) or '') if memory_key else ''
+        if not remembered:
+            remembered = str(memory.get('last') or '')
+        initial_dir = _first_existing_dir(remembered) or initial_dir
         if not initial_dir:
             config = load_json('model_config.json') or {}
             initial_dir = config.get('rh_download_path', '').strip()
-        if initial_dir:
-            initial_dir = os.path.expanduser(initial_dir)
-            if not os.path.isdir(initial_dir):
-                initial_dir = os.path.expanduser('~')
-        else:
-            initial_dir = os.path.expanduser('~')
+        initial_dir = _first_existing_dir(initial_dir) or os.path.expanduser('~')
 
         # 使用 AppleScript 的 choose folder 对话框，不依赖 tkinter
         # 需要转义路径中的特殊字符以防 AppleScript 语法错误
@@ -5592,6 +6435,7 @@ def select_folder():
             real_selected = os.path.realpath(selected)
             if not _is_allowed_user_storage_path(real_selected):
                 return jsonify({"error": "该路径不在允许的存储位置内。允许：用户主目录、/Volumes/盘名（外置盘/U盘，含盘根目录）、/Users/Shared、/Applications、/Library/Application Support、/tmp"}), 400
+            _remember_ui_last_dir(memory_key, real_selected)
             return jsonify({"ok": True, "path": selected})
         else:
             return jsonify({"ok": False, "path": None})
@@ -5602,10 +6446,71 @@ def select_folder():
         return jsonify({"error": "服务内部错误"}), 500
 
 
+@app.route('/api/select-path', methods=['POST'])
+def select_path():
+    """Open a remembered native picker for an image file or a directory."""
+    try:
+        body = request.get_json(silent=True) or {}
+        memory_key = str(body.get('memory_key') or '').strip()
+        path_kind = str(body.get('kind') or 'folder').strip().lower()
+        if path_kind not in {'folder', 'image'}:
+            return jsonify({'error': '路径选择类型无效'}), 400
+        initial_value = str(body.get('initial_path') or '').strip()
+        if initial_value and os.path.isfile(os.path.expanduser(initial_value)):
+            initial_value = os.path.dirname(os.path.expanduser(initial_value))
+        memory = _load_ui_last_dirs()
+        remembered = str(memory['dirs'].get(memory_key) or '') if memory_key else ''
+        if not remembered:
+            remembered = str(memory.get('last') or '')
+        initial_dir = _first_existing_dir(remembered) or _first_existing_dir(initial_value) or os.path.expanduser('~')
+        escaped_dir = initial_dir.replace('\\', '\\\\').replace('"', '\\"')
+        if path_kind == 'folder':
+            picker = 'choose folder with prompt "选择文件夹" default location defaultLocation'
+        else:
+            picker = 'choose file with prompt "选择图片" default location defaultLocation of type {"public.jpeg", "public.png", "org.webmproject.webp"}'
+        applescript = f'''
+        set defaultLocation to POSIX file "{escaped_dir}"
+        try
+            set chosenPath to {picker}
+            return POSIX path of chosenPath
+        on error number -128
+            return ""
+        end try
+        '''
+        result = subprocess.run(['osascript', '-e', applescript], capture_output=True, text=True, timeout=120)
+        selected = result.stdout.strip()
+        if not selected:
+            return jsonify({'ok': False, 'path': None})
+        real_selected = os.path.realpath(selected)
+        if not _is_allowed_user_storage_path(real_selected):
+            return jsonify({'error': '该路径不在允许的本地存储位置内'}), 400
+        remembered_dir = real_selected if os.path.isdir(real_selected) else os.path.dirname(real_selected)
+        _remember_ui_last_dir(memory_key, remembered_dir)
+        return jsonify({'ok': True, 'path': real_selected})
+    except subprocess.TimeoutExpired:
+        return jsonify({'ok': False, 'path': None})
+    except Exception as exc:
+        logger.error('[select-path] 异常: %s', exc, exc_info=True)
+        return jsonify({'error': '服务内部错误'}), 500
+
+
 # ========== 电商批量生图 ==========
 
 ECOMMERCE_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
 ECOMMERCE_FINAL_TASK_STATES = {'accepted', 'manual_review', 'cancelled'}
+ECOMMERCE_SUCCESS_TASK_STATES = {'accepted'}
+
+
+def _ecommerce_terminal_batch_status(batch):
+    """Return a truthful terminal status without treating missing images as success."""
+    tasks = batch.get('tasks') or []
+    if batch.get('status') == 'cancelling':
+        return 'cancelled'
+    if any(task.get('state') == 'manual_review' for task in tasks):
+        return 'interrupted'
+    if tasks and all(task.get('state') in ECOMMERCE_FINAL_TASK_STATES for task in tasks):
+        return 'completed'
+    return 'interrupted'
 
 
 def _is_allowed_user_storage_path(path):
@@ -5815,6 +6720,27 @@ def _ecommerce_target_reference(action):
     }
 
 
+def _ecommerce_references_with_used_mark(garment_references, action, precision_matching):
+    """把“这次生成实际用了哪张服装参考图”写进 references。
+
+    精准匹配模式下每个动作只从服装图里挑一张送进模型
+    （见 _ecommerce_generate_candidate 的 garment_reference_index），
+    因此重做界面默认应当只勾选这一张——否则用户每次调整都要先“全不选”
+    再单独勾上对应的那张，凭空多一步。非精准模式本来就是整套一起送，
+    保持默认全选。
+    """
+    references = [dict(reference) for reference in garment_references]
+    if not precision_matching or not references:
+        return references
+    used_index = int((action or {}).get('garment_reference_index') if (action or {}).get('garment_reference_index') is not None else -1)
+    if not 0 <= used_index < len(references):
+        # 没记录到有效序号时保留全选，避免用户失去可用的默认参考图。
+        return references
+    for position, reference in enumerate(references):
+        reference['selected'] = position == used_index
+    return references
+
+
 def _ecommerce_mutate_batch(batch_id, mutator):
     with ecommerce_lock:
         store = _ecommerce_load_store()
@@ -5855,19 +6781,53 @@ def _ecommerce_mutate_rerun_batch(rerun_batch_id, mutator):
         return result if result is not None else row
 
 
+def _ecommerce_fail_rerun_item(rerun_batch_id, item_id, message):
+    """把重做队列里的一项直接标成失败。
+
+    校验类错误（如二次调整没换提示词）在进入生成循环前就 return，若不同步写回
+    台账，该项会永远停在 pending，前端会一直显示“已回填 0/N 张”。这里补上失败
+    状态，让用户能明确看到原因并在改好提示词后重试。
+    """
+    if not rerun_batch_id or not item_id:
+        return
+
+    def mutator(row):
+        entry = next((item for item in row.get('items') or [] if item.get('item_id') == item_id), None)
+        if entry and entry.get('status') != 'running':
+            entry.update({
+                'status': 'failed',
+                'error': message,
+                'finished_at': datetime.now().isoformat(timespec='seconds'),
+            })
+        _ecommerce_refresh_rerun_batch_counts(row)
+
+    _ecommerce_mutate_rerun_batch(rerun_batch_id, mutator)
+
+
 def _ecommerce_refresh_rerun_batch_counts(row):
     items = row.get('items') or []
     counts = {state: 0 for state in ('pending', 'running', 'partial', 'accepted', 'failed')}
     for item in items:
         state = item.get('status') or 'pending'
         requested = max(1, int((item.get('payload') or {}).get('count') or item.get('requested_count') or 1))
-        live_archived = list(dict.fromkeys(
-            path for path in item.get('archived_paths') or []
-            if _ecommerce_is_readable_image_file(path)
+        live_archived = []
+        stale_archived = list(dict.fromkeys(
+            path for path in item.get('stale_archived_paths') or [] if path
         ))
+        for path in item.get('archived_paths') or []:
+            if not path:
+                continue
+            if _ecommerce_is_readable_image_file(path):
+                if path not in live_archived:
+                    live_archived.append(path)
+            elif path not in stale_archived:
+                stale_archived.append(path)
         # 只保留真实存在且可解码的回填结果。否则“已回填3张”的旧台账
         # 会在第二次/第三次继续时挡住补齐，前端也会虚报完成。
         item['archived_paths'] = live_archived
+        # 被删掉（已移入回收站）的成品不再计入完成度，但要在「验片」里仍能看到，
+        # 所以单独留档，供重做批次对比界面把它标成“已删除”。
+        item['stale_archived_paths'] = stale_archived
         archived_count = len(live_archived)
         item['requested_count'] = requested
         item['success_count'] = archived_count
@@ -5880,6 +6840,9 @@ def _ecommerce_refresh_rerun_batch_counts(row):
     row['counts'] = counts
     row['completed_count'] = counts['accepted']
     row['total_count'] = len(items)
+    if row.get('status') == 'finalized':
+        # 用户点过「完成」的会话永远沉底，不再被重新算成 completed/partial 回到列表。
+        return counts
     if items and counts['accepted'] == len(items):
         row['status'] = 'completed'
         row['finished_at'] = row.get('finished_at') or datetime.now().isoformat(timespec='seconds')
@@ -5901,6 +6864,19 @@ def _ecommerce_rerun_batch_summary(row, include_items=False):
             seen.add(garment_id)
             garments.append({'id': garment_id, 'name': item.get('garment_name') or garment_id})
     snapshot['accepted_garments'] = garments
+    # 「验片」要能在本批涉及的所有服装之间切换，而不是只列“已全部完成”的那几套。
+    # 只要这套还有回填过的成品（含已被删除的），就允许进去对比。
+    verifiable_garments = []
+    seen_verifiable = set()
+    for item in snapshot.get('items') or []:
+        garment_id = item.get('garment_id')
+        if not garment_id or garment_id in seen_verifiable:
+            continue
+        if not (item.get('archived_paths') or item.get('stale_archived_paths')):
+            continue
+        seen_verifiable.add(garment_id)
+        verifiable_garments.append({'id': garment_id, 'name': item.get('garment_name') or garment_id})
+    snapshot['verifiable_garments'] = verifiable_garments
     all_items = snapshot.get('items') or []
     snapshot['accepted_image_count'] = sum(
         len([path for path in item.get('archived_paths') or [] if path]) for item in accepted
@@ -6202,9 +7178,11 @@ def _ecommerce_safe_relative_parts(value, fallback='根目录'):
 
 def _ecommerce_run_code_parts(action):
     platform = str(action.get('platform') or '').lower()
-    platform_code = {'runninghub': 'RH', 'oaihk': 'HK', 'google': 'GO', 'openai': 'OAI'}.get(platform, re.sub(r'\W+', '', platform.upper())[:4] or 'API')
+    platform_code = {'runninghub': 'RH', 'oaihk': 'HK', 'pptoken': 'PPT', 'apiyi': 'APY', 'google': 'GO', 'openai': 'OAI'}.get(platform, re.sub(r'\W+', '', platform.upper())[:4] or 'API')
     raw_model = str(action.get('model_key') or action.get('model_id') or action.get('endpoint') or '').lower()
-    if ('n-pro' in raw_model or 'banana' in raw_model and 'pro' in raw_model or 'g3-pro' in raw_model): model_code = 'NBP'
+    if 'banana/v3' in raw_model: model_code = 'NB2'
+    elif 'banana/v2' in raw_model: model_code = 'NBP'
+    elif ('n-pro' in raw_model or 'banana' in raw_model and 'pro' in raw_model or 'g3-pro' in raw_model): model_code = 'NBP'
     elif 'g31' in raw_model or 'banana-2' in raw_model or 'banana2' in raw_model: model_code = 'NB2'
     elif ('gpt' in raw_model and ('2' in raw_model or 'image' in raw_model)) or 'rhart-image-g-2' in raw_model: model_code = 'GPT2'
     elif 'seedream' in raw_model: model_code = 'SD' + (re.search(r'(\d)', raw_model).group(1) if re.search(r'(\d)', raw_model) else '')
@@ -6244,6 +7222,87 @@ def _ecommerce_write_run_manifest(batch, garment, result_dir):
     return _ecommerce_write_json_file(manifest_path, manifest)
 
 
+ECOMMERCE_GARMENT_CROP_DIRNAME = '_裁剪参考图'
+# 「替换」裁剪时原图的备份目录。放在应用 _运行缓存 下，服装文件夹里绝不留任何子目录，
+# 这样用户把整个服装文件夹递交出去时，目录里始终只有参考图本身。
+ECOMMERCE_GARMENT_BACKUP_ROOT_DIRNAME = '_服装原图备份'
+ECOMMERCE_GARMENT_ADDED_LEDGER_NAME = 'added-crops.json'
+
+# 裁剪结果写回原文件时要沿用原图的格式，避免把 JPEG 字节塞进 .png 里。
+ECOMMERCE_CROP_SAVE_FORMATS = {'.jpg': 'JPEG', '.jpeg': 'JPEG', '.png': 'PNG', '.webp': 'WEBP'}
+
+
+def _ecommerce_save_cropped_image(image, target):
+    """按目标文件的后缀把裁剪图写回磁盘；后缀不认识时退回 JPEG。"""
+    fmt = ECOMMERCE_CROP_SAVE_FORMATS.get(os.path.splitext(target)[1].lower(), 'JPEG')
+    if fmt == 'PNG':
+        image.save(target, 'PNG', optimize=True)
+    elif fmt == 'WEBP':
+        image.save(target, 'WEBP', quality=95, method=6)
+    else:
+        image.save(target, 'JPEG', quality=95, optimize=True)
+    return target
+
+
+def _ecommerce_garment_crop_dir(folder):
+    return os.path.join(folder, ECOMMERCE_GARMENT_CROP_DIRNAME)
+
+
+# 备份根目录做成模块级变量，测试可以整体重定向，绝不写进真实运行缓存。
+ECOMMERCE_GARMENT_BACKUP_ROOT = os.path.join(BASE_DIR, '_运行缓存', ECOMMERCE_GARMENT_BACKUP_ROOT_DIRNAME)
+
+
+def _ecommerce_garment_backup_dir(folder):
+    """某套服装的原图备份目录（在应用 _运行缓存 下，服装文件夹内不受影响）。"""
+    real = os.path.realpath(folder)
+    digest = hashlib.md5(real.encode('utf-8')).hexdigest()[:10]
+    name = re.sub(r'[^\w\u4e00-\u9fff-]+', '_', os.path.basename(real.rstrip(os.sep)))[:40] or 'garment'
+    return os.path.join(ECOMMERCE_GARMENT_BACKUP_ROOT, f'{name}-{digest}')
+
+
+def _ecommerce_read_garment_added_crops(folder):
+    """读「新增裁剪」台账：记录哪些文件是裁剪新增出来的，恢复原图时才敢删。"""
+    path = os.path.join(_ecommerce_garment_backup_dir(folder), ECOMMERCE_GARMENT_ADDED_LEDGER_NAME)
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [os.path.basename(str(name or '').strip()) for name in raw if str(name or '').strip()]
+
+
+def _ecommerce_write_garment_added_crops(folder, names):
+    backup_dir = _ecommerce_garment_backup_dir(folder)
+    _ecommerce_ensure_directory(backup_dir)
+    path = os.path.join(backup_dir, ECOMMERCE_GARMENT_ADDED_LEDGER_NAME)
+    with open(path, 'w', encoding='utf-8') as handle:
+        json.dump(sorted(set(names)), handle, ensure_ascii=False, indent=2)
+    return path
+
+
+def _ecommerce_archive_legacy_crop_dir(garment_real):
+    """把旧版 _裁剪参考图/ 整包挪进 _运行缓存 归档。
+
+    旧版的 crop-map 虚拟覆盖已经不再生效，里面的图只是历史产物。挪走而不是删除，
+    既能让服装文件夹恢复成「只有参考图」的干净结构，用户也不会丢东西。
+    """
+    crop_dir = _ecommerce_garment_crop_dir(garment_real)
+    if not os.path.isdir(crop_dir):
+        return False
+    target = os.path.join(_ecommerce_garment_backup_dir(garment_real), ECOMMERCE_GARMENT_CROP_DIRNAME)
+    try:
+        if os.path.isdir(target):
+            shutil.rmtree(target, ignore_errors=True)
+        _ecommerce_ensure_directory(os.path.dirname(target))
+        _ecommerce_copytree(crop_dir, target)
+        shutil.rmtree(crop_dir, ignore_errors=True)
+        return True
+    except OSError:
+        return False
+
+
 def _ecommerce_numbered_images(folder):
     found = {}
     try:
@@ -6261,6 +7320,15 @@ def _ecommerce_numbered_images(folder):
 
 
 def _ecommerce_ordered_six_images(folder, keyword='', max_images=6):
+    """服装文件夹里的参考图顺序。
+
+    裁剪已经直接改写文件夹里的真实文件（替换就覆盖同名文件、新增就真的多一张），
+    所以这里读到的就是磁盘实况，不再有任何虚拟覆盖层。
+    """
+    return _ecommerce_ordered_six_images_base(folder, keyword, max_images=max_images)
+
+
+def _ecommerce_ordered_six_images_base(folder, keyword='', max_images=6):
     keyword = str(keyword or '').strip().casefold()
     # 01～10 / 1～10 永远是最高优先级；关键词只是补充识别，不能让合法编号图失效。
     numbered = _ecommerce_numbered_images(folder)
@@ -6278,15 +7346,70 @@ def _ecommerce_ordered_six_images(folder, keyword='', max_images=6):
         ]
     except OSError:
         return numbered
-    # 单套文件夹允许1～10张；自然顺序就是提交顺序。
-    # 已排除 AI- 前缀的生成图，防止批量跑完后误把生成图当参考图重新跑一遍。
-    if 1 <= len(all_images) <= max_images:
-        return {str(index + 1): path for index, path in enumerate(all_images)}
+    # 关键词一旦提供，优先按关键词筛选（联机素材常混入大量花絮/废片）；
+    # 匹配 1～max_images 张才接受，超过上限视为歧义拒绝。
+    # 编号图仍保持最高优先级，关键词只是补充识别，不能让合法编号图失效。
     if keyword:
         matched = [path for path in all_images if keyword in os.path.splitext(os.path.basename(path))[0].casefold()]
         if 1 <= len(matched) <= max_images:
             return {str(index + 1): path for index, path in enumerate(matched)}
+    # 单套文件夹允许1～10张；自然顺序就是提交顺序。
+    # 已排除 AI- 前缀的生成图，防止批量跑完后误把生成图当参考图重新跑一遍。
+    if 1 <= len(all_images) <= max_images:
+        return {str(index + 1): path for index, path in enumerate(all_images)}
     return numbered
+
+
+def _ecommerce_garment_crop_base_source(garment_real, source_path):
+    """把「已经裁剪过的图」回溯成它的原图，避免连续裁剪叠加画质损失。
+
+    - source 在服装文件夹内：_运行缓存 里有同名原图备份就用备份，否则它本身就是原图；
+    - source 在备份目录内：它本身就是原图；
+    - 其它位置：报错，拒绝写回。
+    返回 (base_path, error)。
+    """
+    garment_real = os.path.realpath(garment_real)
+    source_real = os.path.realpath(source_path)
+    backup_dir = os.path.realpath(_ecommerce_garment_backup_dir(garment_real))
+    source_dir = os.path.dirname(source_real)
+    if source_dir == backup_dir:
+        return source_real, None
+    if source_dir != garment_real:
+        return None, '源图不属于该服装文件夹，无法写回裁剪结果'
+    backup = os.path.join(backup_dir, os.path.basename(source_real))
+    if os.path.isfile(backup):
+        return os.path.realpath(backup), None
+    return source_real, None
+
+
+def _ecommerce_restore_garment_reference(garment_real, source_real):
+    """把一张服装参考图恢复成原图；返回 (是否发生还原, 该位置现在应该显示的路径)。
+
+    - 服装文件夹里、且 _运行缓存 有同名备份（被「替换」覆盖过）→ 用备份盖回去并删掉备份；
+    - 服装文件夹里由「新增」产生的图（台账里有记录）→ 直接删掉；
+    - 其它情况（本来就是原图）→ 什么都没做。
+    """
+    garment_real = os.path.realpath(garment_real)
+    name = os.path.basename(source_real)
+    if os.path.dirname(source_real) != garment_real:
+        return False, ''
+    backup_path = os.path.join(_ecommerce_garment_backup_dir(garment_real), name)
+    if os.path.isfile(backup_path):
+        _ecommerce_copy_file(backup_path, source_real)
+        try:
+            os.remove(backup_path)
+        except OSError:
+            pass
+        return True, source_real
+    added = _ecommerce_read_garment_added_crops(garment_real)
+    if name in added:
+        try:
+            os.remove(source_real)
+        except OSError:
+            return False, ''
+        _ecommerce_write_garment_added_crops(garment_real, [item for item in added if item != name])
+        return True, ''
+    return False, ''
 
 
 def _ecommerce_scan_clothing_root(root, keyword='', max_images=6, require_complete=True):
@@ -6297,20 +7420,30 @@ def _ecommerce_scan_clothing_root(root, keyword='', max_images=6, require_comple
     invalid = []
 
     direct = _ecommerce_ordered_six_images(real_root, keyword, max_images=max_images)
+    scan_skip_names = {
+        '_运行缓存', '_生成样本备份', 'AI换装结果', '__MACOSX',
+        ECOMMERCE_GARMENT_CROP_DIRNAME,
+    }
     try:
         has_child_directories = any(
-            os.path.isdir(os.path.join(real_root, name)) and not name.startswith('.')
+            os.path.isdir(os.path.join(real_root, name))
+            and not name.startswith('.')
+            and name not in scan_skip_names
+            and not name.startswith('AI换装结果-')
             for name in os.listdir(real_root)
         )
     except OSError:
         has_child_directories = False
     # 用户直接选择的单套文件夹可以是1～10张；递归批量要求每个子文件夹有1～10张，防止误分组。
     candidates = [(os.path.basename(real_root.rstrip(os.sep)) or '服装1', real_root, direct)] if not has_child_directories and 1 <= len(direct) <= max_images else []
-    if not candidates:
+    # 扫描时顺手清掉旧版遗留在服装文件夹里的 _裁剪参考图/，服装文件夹里永远只留参考图。
+    if candidates:
+        _ecommerce_archive_legacy_crop_dir(candidates[0][1])
+    else:
         # 联机拍摄素材经常是“根目录/批量/款号/6张图”。递归最多3层，既支持这种
         # 分组目录，又避免误扫整块硬盘。找到完整服装目录后不再进入它的子目录。
         root_depth = real_root.rstrip(os.sep).count(os.sep)
-        skip_names = {'_运行缓存', '_生成样本备份', 'AI换装结果', '__MACOSX'}
+        skip_names = scan_skip_names
         for current, dirs, _files in os.walk(real_root, topdown=True):
             depth = current.rstrip(os.sep).count(os.sep) - root_depth
             dirs[:] = sorted(
@@ -6326,6 +7459,7 @@ def _ecommerce_scan_clothing_root(root, keyword='', max_images=6, require_comple
             if (1 <= len(images) <= max_images) and (not require_complete or len(images) == max_images):
                 relative_name = os.path.relpath(current, real_root)
                 candidates.append((relative_name, os.path.realpath(current), images))
+                _ecommerce_archive_legacy_crop_dir(os.path.realpath(current))
                 dirs[:] = []
             elif images:
                 invalid.append({'name': os.path.relpath(current, real_root), 'path': current, 'found': sorted(int(k) for k in images)})
@@ -6356,6 +7490,7 @@ def _ecommerce_scan_prompt_image_root(root, max_images=10000):
     skip_names = {
         '_运行缓存', '_生成样本备份', '_废片预览备份', '_重做历史',
         '_重做临时参考图', '_质检缓存', '_成品输出', '__MACOSX',
+        ECOMMERCE_GARMENT_CROP_DIRNAME,
     }
     groups = []
     total = 0
@@ -6403,6 +7538,25 @@ def _ecommerce_scan_prompt_image_root(root, max_images=10000):
     return real_root, groups, [], total
 
 
+def _ecommerce_garment_reference_stats(garment):
+    """统计一套服装的实拍参考图还有几张读得到。
+
+    服装文件夹被移动或改名后这些路径会全部失效，逐套验片的「对比」就打不开；
+    把这个数字带给前端，让行上的「链实拍图」按钮能高亮提示。
+    """
+    images = garment.get('images') or []
+    readable = 0
+    for value in images:
+        text = str(value or '')
+        if not text:
+            continue
+        if text.startswith(('http://', 'https://', '/api/', '/static/')):
+            readable += 1
+        elif os.path.isfile(os.path.expanduser(text)):
+            readable += 1
+    return len(images), readable
+
+
 def _ecommerce_summarize_batch(batch, include_tasks=False):
     tasks = batch.get('tasks', [])
     counts = {}
@@ -6412,15 +7566,32 @@ def _ecommerce_summarize_batch(batch, include_tasks=False):
     payload = {k: v for k, v in batch.items() if k not in ('tasks', 'reference_cache')}
     payload['task_counts'] = counts
     payload['task_total'] = len(tasks)
-    payload['done_total'] = sum(counts.get(s, 0) for s in ECOMMERCE_FINAL_TASK_STATES)
+    # Only a task with a real archived result is complete. manual_review means
+    # generation/configuration failed or needs human handling and must remain
+    # visible as 0 completed in the progress UI.
+    payload['done_total'] = sum(counts.get(s, 0) for s in ECOMMERCE_SUCCESS_TASK_STATES)
     if include_tasks:
         payload['tasks'] = tasks
+        for garment in payload.get('garments') or []:
+            if not isinstance(garment, dict):
+                continue
+            total, readable = _ecommerce_garment_reference_stats(garment)
+            garment['reference_total'] = total
+            garment['reference_readable'] = readable
+            garment['reference_missing'] = max(0, total - readable)
     return payload
 
 
 def _ecommerce_reconcile_batch_status(batch):
     """修正“任务已100%归档、批次仍显示运行中”的短暂或遗留状态。"""
     tasks = batch.get('tasks') or []
+    repaired_terminal = False
+    # 旧版本把 API/配置失败的 manual_review 也算作完成。读取历史批次时
+    # 自动恢复为可继续状态，用户补好 API Key 后可以直接继续而不是新建批次。
+    if batch.get('status') == 'completed' and any(task.get('state') == 'manual_review' for task in tasks):
+        batch['status'] = 'interrupted'
+        batch['finished_at'] = ''
+        repaired_terminal = True
     # 修复旧版本“抽卡少返仍标记 accepted”的历史数据：任务只有在
     # 实际归档数达到批次抽卡数时才算完成，否则恢复为 partial，进度不会虚报100%。
     expected = max(1, min(int((batch.get('settings') or {}).get('samples_per_action') or 1), 10))
@@ -6447,11 +7618,15 @@ def _ecommerce_reconcile_batch_status(batch):
         and batch.get('status') in ('running', 'resuming')
         and all(task.get('state') in ECOMMERCE_FINAL_TASK_STATES for task in tasks)
     ):
-        batch['status'] = 'completed'
-        batch['finished_at'] = batch.get('finished_at') or datetime.now().isoformat(timespec='seconds')
+        batch['status'] = _ecommerce_terminal_batch_status(batch)
+        batch['finished_at'] = (
+            batch.get('finished_at')
+            if batch['status'] == 'completed'
+            else ''
+        )
         batch['updated_at'] = datetime.now().isoformat(timespec='seconds')
         return True
-    return repaired_partial
+    return repaired_partial or repaired_terminal
 
 
 def _ecommerce_list_batch_summary(batch):
@@ -6482,6 +7657,7 @@ def _ecommerce_clean_target_actions(actions):
             'action_image': image_url,
             'prompt': prompt,
             'platform': str(action.get('platform') or 'oaihk'),
+            'provider': str(action.get('provider') or action.get('platform') or 'oaihk'),
             'model_key': str(action.get('model_key') or ''),
             'model_id': str(action.get('model_id') or ''),
             'endpoint': str(action.get('endpoint') or ''),
@@ -6496,6 +7672,8 @@ def _ecommerce_clean_target_actions(actions):
             'size': str(action.get('size') or ''),
             'quality': str(action.get('quality') or 'medium'),
             'short_edge': int(action.get('short_edge') or 1536),
+            'pptoken_resolution': str(action.get('pptoken_resolution') or action.get('resolution') or ''),
+            'protocol': str(action.get('protocol') or ''),
             'garment_reference_index': max(-1, min(int(action.get('garment_reference_index') if action.get('garment_reference_index') is not None else -1), 9)),
         })
     if not cleaned:
@@ -6613,6 +7791,22 @@ def ecommerce_delete_template(template_id):
     return jsonify({'ok': True})
 
 
+def _ecommerce_group_image_consistency(garments):
+    """多组批量时统计各组参考图张数：组数>1 且各组张数不一致时返回 (counts, False)。
+
+    用户选择母文件夹批量建任务时，要求所有子文件夹的参考图张数相同：
+    相同才允许入队，不相同由前端红字提示并阻止创建批次。
+    """
+    if not garments or len(garments) <= 1:
+        return [], True
+    group_image_counts = [
+        {'name': g.get('name') or f'组{index + 1}', 'count': len(g.get('images') or [])}
+        for index, g in enumerate(garments)
+    ]
+    consistent = len({item['count'] for item in group_image_counts}) == 1
+    return group_image_counts, consistent
+
+
 @app.route('/api/ecommerce/scan-clothing-root', methods=['POST'])
 def ecommerce_scan_clothing_root():
     body = request.get_json(silent=True) or {}
@@ -6622,12 +7816,15 @@ def ecommerce_scan_clothing_root():
         if mode == 'garment_prompt':
             root, garments, invalid, image_total = _ecommerce_scan_prompt_image_root(body.get('path', ''))
         else:
+            # 每组服装素材允许 1～10 张，不再要求恰好 6 张：8 张/组的素材
+            # 也能直接走普通批量，与精准匹配模式保持一致。
             root, garments, invalid = _ecommerce_scan_clothing_root(
                 body.get('path', ''), keyword,
-                max_images=10 if bool(body.get('precision_matching')) else 6,
-                require_complete=not bool(body.get('precision_matching')),
+                max_images=10,
+                require_complete=False,
             )
             image_total = sum(len(garment.get('images') or []) for garment in garments)
+        group_image_counts, image_counts_consistent = _ecommerce_group_image_consistency(garments)
         return jsonify({
             'ok': True,
             'path': root,
@@ -6635,6 +7832,8 @@ def ecommerce_scan_clothing_root():
             'invalid': invalid,
             'garment_count': len(garments),
             'image_total': image_total,
+            'group_image_counts': group_image_counts,
+            'image_counts_consistent': image_counts_consistent,
             'generation_mode': mode or 'garment_reference',
             'keyword': keyword,
         })
@@ -6720,7 +7919,7 @@ def ecommerce_batches():
     inline_images = body.get('garment_images') or []
     inline_sources = body.get('garment_sources') or []
     clothing_root = str(body.get('clothing_root') or '').strip()
-    if generation_mode == 'garment_prompt' and inline_sources:
+    if inline_sources:
         if not isinstance(inline_sources, list) or not (1 <= len(inline_sources) <= 10000):
             return jsonify({'error': '拖入的文件夹最多处理10000张图片，请分批运行'}), 400
         grouped_sources = {}
@@ -6767,6 +7966,11 @@ def ecommerce_batches():
                 'uploaded_directory_group': bool('/' in group_key),
             })
         invalid = []
+        if generation_mode != 'garment_prompt' and len(garments) > 1:
+            group_image_counts, image_counts_consistent = _ecommerce_group_image_consistency(garments)
+            if not image_counts_consistent:
+                detail = '、'.join(f"{item['name']} {item['count']}张" for item in group_image_counts)
+                return jsonify({'error': f'子文件夹图片数量不一致：{detail}。请确保各子文件夹参考图张数相同后再创建批次'}), 400
     elif inline_images:
         inline_limit = 10000 if generation_mode == 'garment_prompt' else 10
         if not isinstance(inline_images, list) or not (1 <= len(inline_images) <= inline_limit):
@@ -6794,15 +7998,21 @@ def ecommerce_batches():
             if generation_mode == 'garment_prompt':
                 root, garments, invalid, _image_total = _ecommerce_scan_prompt_image_root(clothing_root)
             else:
+                # 与 scan-clothing-root 保持一致：每组素材允许 1～10 张，不再要求恰好 6 张
                 root, garments, invalid = _ecommerce_scan_clothing_root(
                     clothing_root, garment_keyword,
-                    max_images=10 if bool(body.get('precision_matching')) else 6,
-                    require_complete=not bool(body.get('precision_matching')),
+                    max_images=10,
+                    require_complete=False,
                 )
         except ValueError as exc:
             return jsonify({'error': str(exc)}), 400
         if not garments:
             return jsonify({'error': '没有找到有效服装参考图；单套或批量子文件夹需1～10张'}), 400
+        if generation_mode != 'garment_prompt' and len(garments) > 1:
+            group_image_counts, image_counts_consistent = _ecommerce_group_image_consistency(garments)
+            if not image_counts_consistent:
+                detail = '、'.join(f"{item['name']} {item['count']}张" for item in group_image_counts)
+                return jsonify({'error': f'子文件夹图片数量不一致：{detail}。请确保各子文件夹参考图张数相同后再创建批次'}), 400
     else:
         return jsonify({'error': '请选择服装图片，或选择包含服装图的文件夹'}), 400
     garment_limit = max(0, min(int(body.get('garment_limit') or 0), 500))
@@ -7100,6 +8310,486 @@ def ecommerce_rebind_action_references(batch_id):
             }
             for action in frozen
         ],
+    })
+
+
+# ===== 成品目录重新链接（用户把成品图片挪到别处后，把台账重新指向新位置） =====
+
+# 递归改路径时要跳过的子树：garments 是服装原图、template 是动作参考图，
+# 它们都不是成品，绝不能被重新链接逻辑改写。
+ECOMMERCE_RELINK_SKIP_KEYS = {'garments', 'template'}
+ECOMMERCE_RELINK_MAX_DIRS = 6000
+ECOMMERCE_RELINK_MAX_FILES = 40000
+ECOMMERCE_RELINK_MAX_DEPTH = 10
+
+
+def _ecommerce_relink_is_broad_root(path):
+    """判断是否为文件系统大根目录（从这些目录递归会扫整块盘）。"""
+    real = os.path.realpath(os.path.expanduser(str(path or '')))
+    if not real:
+        return True
+    broad = {
+        os.path.realpath('/'),
+        os.path.realpath('/Volumes'),
+        os.path.realpath('/Users'),
+        os.path.realpath('/private'),
+        os.path.realpath(os.path.expanduser('~')),
+        os.path.realpath(os.path.dirname(os.path.expanduser('~'))),
+    }
+    return real in broad
+
+
+def _ecommerce_relink_scan(roots):
+    """递归扫描候选根目录，返回「直接包含图片的目录 -> 该目录里的图片名列表」。
+
+    隐藏目录（含 .样片工厂废片回收站）不参与匹配，避免把回收站里的废片
+    当成正经成品重新接回来。
+    """
+    dirs = {}
+    total_files = 0
+    visited = 0
+    truncated = False
+    for root in roots:
+        root_real = os.path.realpath(os.path.expanduser(root))
+        if not os.path.isdir(root_real):
+            continue
+        for current, subdirs, files in os.walk(root_real):
+            relative = os.path.relpath(current, root_real)
+            depth = 0 if relative == '.' else relative.count(os.sep) + 1
+            if depth > ECOMMERCE_RELINK_MAX_DEPTH:
+                subdirs[:] = []
+                continue
+            subdirs[:] = [name for name in subdirs if not name.startswith('.')]
+            visited += 1
+            if visited > ECOMMERCE_RELINK_MAX_DIRS:
+                truncated = True
+                break
+            images = [
+                name for name in files
+                if not name.startswith('.')
+                and os.path.splitext(name)[1].lower() in ECOMMERCE_IMAGE_EXTS
+            ]
+            if images:
+                dirs[os.path.realpath(current)] = images
+                total_files += len(images)
+                if total_files > ECOMMERCE_RELINK_MAX_FILES:
+                    truncated = True
+                    break
+        if truncated:
+            break
+    return {'dirs': dirs, 'truncated': truncated, 'scanned_dirs': visited}
+
+
+def _ecommerce_relink_dir_has_image(directory):
+    """目录里是否还有可解码的成品图（有就不动它，避免把好数据改乱）。"""
+    try:
+        for name in os.listdir(directory):
+            if name.startswith('.') or os.path.splitext(name)[1].lower() not in ECOMMERCE_IMAGE_EXTS:
+                continue
+            if _ecommerce_is_readable_image_file(os.path.join(directory, name)):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _ecommerce_relink_expected_tokens(batch, garment):
+    """收集某套服装「应该在成品目录里出现」的线索。
+
+    返回 (names, paths, prefixes)：
+    - names   台账里记录过的成品文件名（精确匹配用）
+    - paths   台账里记录过的成品绝对路径（被单独挪走的文件按名补配用）
+    - prefixes 运行代号 + 动作号拼出的文件名前缀（台账不全时兜底）
+    """
+    names = set()
+    paths = set()
+    prefixes = set()
+
+    def add(value):
+        text = str(value or '').strip()
+        if not text:
+            return
+        base = os.path.basename(text.replace('\\', '/'))
+        if not base or os.path.splitext(base)[1].lower() not in ECOMMERCE_IMAGE_EXTS:
+            return
+        names.add(base)
+        if text.startswith(os.sep):
+            paths.add(text)
+
+    garment_id = garment.get('id')
+    for task in batch.get('tasks') or []:
+        if task.get('garment_id') != garment_id:
+            continue
+        add(task.get('accepted_path'))
+        add(task.get('manual_review_path'))
+        for attempt in task.get('attempts') or []:
+            add(attempt.get('archived_path'))
+    for record in batch.get('deleted_samples') or []:
+        if record.get('garment_id') != garment_id:
+            continue
+        add(record.get('original_name'))
+        add(record.get('original_path'))
+        add(record.get('recycle_path'))
+    for record in batch.get('marked_redo') or []:
+        if record.get('garment_id') == garment_id:
+            add(record.get('result_path'))
+    for record in batch.get('refine_redo') or []:
+        if record.get('garment_id') == garment_id:
+            add(record.get('source_path'))
+    for asset in batch.get('result_assets') or []:
+        if asset.get('garment_id') == garment_id:
+            add(asset.get('path'))
+    for value in ((batch.get('final_selections') or {}).get(garment_id) or {}).values():
+        add(value)
+
+    run_code = str(batch.get('run_code') or '').strip()
+    for action in _ecommerce_actions_for_garment(batch, garment):
+        order = int(action.get('order') or 0) + 1
+        prefixes.add(f'AI-{order:02d}')
+        prefixes.add(f'目标图{order:02d}')
+        if run_code:
+            prefixes.add(f'{run_code}-AI-{order:02d}')
+    return names, paths, prefixes
+
+
+def _ecommerce_relink_dir_match_count(files, names, prefixes):
+    """统计某个候选目录里有多少个文件属于这套服装。"""
+    count = 0
+    for name in files:
+        if name in names or any(name.startswith(prefix) for prefix in prefixes):
+            count += 1
+    return count
+
+
+def _ecommerce_relink_suffix_score(old_dir, new_dir):
+    """比较两个目录从末尾起连续相同的路径组件数。
+
+    「3组测试/1/RH-XXXX」被整棵树搬走后，尾部组件仍然相同；这是区分多套服装
+    最可靠的信号（同一批的三套服装文件名完全一样，只能靠目录结构区分）。
+    """
+    old_parts = [part for part in os.path.realpath(str(old_dir or '')).split(os.sep) if part]
+    new_parts = [part for part in os.path.realpath(str(new_dir or '')).split(os.sep) if part]
+    score = 0
+    for old_part, new_part in zip(reversed(old_parts), reversed(new_parts)):
+        if old_part == new_part:
+            score += 1
+        else:
+            break
+    return score
+
+
+def _ecommerce_relink_convert(value, dir_map, file_map):
+    """把一条台账路径换算成新位置；换算不了就原样返回。"""
+    if not isinstance(value, str) or not value:
+        return value, False
+    if value.startswith(('http://', 'https://', '/api/', '/static/')):
+        return value, False
+    real = os.path.realpath(os.path.expanduser(value))
+    mapped = file_map.get(real)
+    if mapped:
+        return mapped, True
+    # 长目录优先，避免父目录规则抢在子目录前面把路径接错。
+    for old_dir, new_dir in sorted(dir_map.items(), key=lambda item: -len(item[0])):
+        if real == old_dir:
+            return new_dir, True
+        if real.startswith(old_dir + os.sep):
+            return os.path.join(new_dir, real[len(old_dir) + 1:]), True
+    return value, False
+
+
+def _ecommerce_relink_rewrite(node, dir_map, file_map, counter):
+    """递归改写台账里所有指向旧成品目录的路径。"""
+    if isinstance(node, dict):
+        for key in list(node.keys()):
+            if key in ECOMMERCE_RELINK_SKIP_KEYS:
+                continue
+            value = node[key]
+            if isinstance(value, str):
+                new_value, changed = _ecommerce_relink_convert(value, dir_map, file_map)
+                if changed:
+                    node[key] = new_value
+                    counter['count'] += 1
+            elif isinstance(value, (dict, list)):
+                _ecommerce_relink_rewrite(value, dir_map, file_map, counter)
+    elif isinstance(node, list):
+        for index in range(len(node)):
+            value = node[index]
+            if isinstance(value, str):
+                new_value, changed = _ecommerce_relink_convert(value, dir_map, file_map)
+                if changed:
+                    node[index] = new_value
+                    counter['count'] += 1
+            elif isinstance(value, (dict, list)):
+                _ecommerce_relink_rewrite(value, dir_map, file_map, counter)
+
+
+def _ecommerce_relink_garment_refs(batch, scan, only_ids=None):
+    """把服装实拍参考图接回新位置（成品目录之外的另一类路径）。
+
+    实拍图不靠运行代号推断，而是按台账里记录过的**原始文件名**精确匹配：
+    每套服装的 ``garment.images`` 存的就是拍摄文件名，只要在扫描到的新目录里
+    找到这些同名的图，就认定那一套搬到了那里。匹配后再用「目录尾部同名」
+    打分，避免同名文件在不同套之间串位。
+
+    原位置仍能读到全部实拍图的整套不动，防止把好数据改乱。
+    """
+    entries = []
+    used = set()
+    garments = sorted(batch.get('garments') or [], key=lambda g: int(g.get('order') or 0))
+    for garment in garments:
+        garment_id = garment.get('id')
+        if only_ids is not None and garment_id not in only_ids:
+            continue
+        old_dir = os.path.realpath(os.path.expanduser(str(garment.get('path') or '')))
+        names = set()
+        for value in garment.get('images') or []:
+            base = os.path.basename(str(value or '').replace('\\', '/'))
+            if base and os.path.splitext(base)[1].lower() in ECOMMERCE_IMAGE_EXTS:
+                names.add(base)
+        entry = {
+            'garment_id': garment_id,
+            'garment_name': garment.get('name') or garment_id,
+            'old_dir': old_dir,
+            'new_dir': '',
+            'found': 0,
+            'expected': len(names),
+            'status': 'not_found',
+        }
+        if not names:
+            entry['reason'] = '台账里没有记录这一套的实拍图文件名'
+            entries.append(entry)
+            continue
+        if old_dir and os.path.isdir(old_dir):
+            present = sum(1 for name in names if os.path.isfile(os.path.join(old_dir, name)))
+            if present == len(names):
+                entry.update({'status': 'skipped', 'reason': '原实拍图目录仍可用，未改动'})
+                entries.append(entry)
+                continue
+        best = None
+        for candidate, files in scan['dirs'].items():
+            if candidate in used:
+                continue
+            overlap = len(names & set(files))
+            if overlap <= 0:
+                continue
+            score = (
+                _ecommerce_relink_suffix_score(old_dir, candidate),
+                overlap,
+                1 if os.path.basename(candidate) == os.path.basename(old_dir) else 0,
+            )
+            if best is None or score > best[0]:
+                best = (score, candidate, overlap)
+        if not best:
+            entry['reason'] = '新位置里没有匹配到这一套的实拍图'
+            entries.append(entry)
+            continue
+        used.add(best[1])
+        new_images = []
+        for value in garment.get('images') or []:
+            base = os.path.basename(str(value or '').replace('\\', '/'))
+            candidate = os.path.join(best[1], base)
+            new_images.append(candidate if base and os.path.isfile(candidate) else value)
+        garment['path'] = best[1]
+        garment['images'] = new_images
+        entry.update({
+            'status': 'relinked',
+            'new_dir': best[1],
+            'found': best[2],
+            'missing': max(0, len(names) - best[2]),
+        })
+        entries.append(entry)
+    # 全部套都接回同一个新父目录时，顺手把批次的服装根目录也改过去，
+    # 方便后续“重新扫描服装目录”和精准匹配直接可用。
+    relinked = [row for row in entries if row['status'] == 'relinked']
+    if relinked and len(relinked) == len(entries):
+        parents = {os.path.dirname(row['new_dir']) for row in relinked}
+        if len(parents) == 1:
+            batch['clothing_root'] = parents.pop()
+    return entries
+
+
+@app.route('/api/ecommerce/batches/<batch_id>/relink-results', methods=['POST'])
+@_local_only
+def ecommerce_relink_results(batch_id):
+    """成品图片被挪到别处后，把批次台账重新指向新位置。
+
+    用户选中移动后的任意一张图片、某一个子文件夹，或它们的上一层文件夹，
+    软件就扫描「所选目录 + 上一层目录」（含所有子文件夹），按「目录尾部同名」
+    加「台账里记录过的文件名」为每套服装找到新的成品目录，然后把整批台账
+    —— 成品目录映射、任务归档路径、废片回收记录、重做会话 —— 一次性改好。
+    只改台账指向，不复制、不删除任何文件。
+
+    请求体：
+    - path        新位置（任意一张图、某个子文件夹，或它们的上一层文件夹）
+    - target      results / garments / both（默认 both，即成品图 + 实拍参考图一起接）
+    - garment_id  可选，只重新链接这一套（逐套验片行内的按钮用）
+    """
+    body = request.get_json(silent=True) or {}
+    target = str(body.get('target') or 'both').strip().lower()
+    if target not in {'results', 'garments', 'both'}:
+        return jsonify({'error': '重新链接目标无效，只能是 results / garments / both'}), 400
+    garment_id = str(body.get('garment_id') or '').strip()
+    only_ids = {garment_id} if garment_id else None
+    selected, err = _ecommerce_safe_user_path(
+        str(body.get('path') or '').strip(), must_exist=True
+    )
+    if err:
+        return jsonify({'error': f'所选位置无效：{err}'}), 400
+    if os.path.isdir(selected):
+        roots = [selected, os.path.dirname(selected)]
+    else:
+        parent = os.path.dirname(selected)
+        roots = [parent, os.path.dirname(parent)]
+    roots = [
+        root for root in dict.fromkeys(roots)
+        if root and os.path.isdir(root) and not _ecommerce_relink_is_broad_root(root)
+    ]
+    if not roots:
+        return jsonify({'error': '请选择更具体的位置（成品所在的那一套或它的上一层文件夹）'}), 400
+
+    scan = _ecommerce_relink_scan(roots)
+    if not scan['dirs']:
+        return jsonify({'error': '所选位置及其上一层里没有找到任何图片'}), 404
+
+    # 目录 -> 该目录里所有文件名，用于把「被单独挪走的文件」按名字唯一补配。
+    files_by_name = {}
+    for directory, files in scan['dirs'].items():
+        for name in files:
+            files_by_name.setdefault(name, []).append(directory)
+
+    with ecommerce_lock:
+        store = _ecommerce_load_store()
+        batch = _ecommerce_find_batch(store, batch_id)
+        if not batch:
+            return jsonify({'error': '批次不存在'}), 404
+        if batch.get('status') in {'running', 'resuming'}:
+            return jsonify({'error': '批次正在运行，请先暂停后再重新链接成品位置'}), 409
+
+        samples = max(1, min(int((batch.get('settings') or {}).get('samples_per_action') or 1), 10))
+        # target=garments 时只接实拍参考图，不动成品目录。
+        garments = sorted(batch.get('garments') or [], key=lambda g: int(g.get('order') or 0))
+        results_garments = garments if target in {'results', 'both'} else []
+        dir_map = {}
+        file_map = {}
+        used_dirs = set()
+        relinked = []
+        skipped = []
+        not_found = []
+
+        for garment in results_garments:
+            garment_id = garment.get('id')
+            if only_ids is not None and garment_id not in only_ids:
+                continue
+            old_dir = os.path.realpath(
+                os.path.expanduser(_ecommerce_sample_result_dir(batch, garment) or '')
+            )
+            entry = {
+                'garment_id': garment_id,
+                'garment_name': garment.get('name') or garment_id,
+                'old_dir': old_dir,
+                'new_dir': '',
+                'found': 0,
+                'expected': max(1, len(_ecommerce_actions_for_garment(batch, garment)) * samples),
+            }
+            if old_dir and os.path.isdir(old_dir) and _ecommerce_relink_dir_has_image(old_dir):
+                entry['reason'] = '原成品目录仍可用，未改动'
+                skipped.append(entry)
+                continue
+            names, expected_paths, prefixes = _ecommerce_relink_expected_tokens(batch, garment)
+            if names:
+                entry['expected'] = max(entry['expected'], len(names))
+            best = None
+            for candidate, files in scan['dirs'].items():
+                if candidate in used_dirs:
+                    continue
+                overlap = _ecommerce_relink_dir_match_count(files, names, prefixes)
+                if overlap <= 0:
+                    continue
+                score = (
+                    _ecommerce_relink_suffix_score(old_dir, candidate),
+                    overlap,
+                    1 if os.path.basename(candidate) == os.path.basename(old_dir) else 0,
+                )
+                if best is None or score > best[0]:
+                    best = (score, candidate, overlap)
+            if not best:
+                entry['reason'] = '新位置里没有匹配到这一套的文件'
+                not_found.append(entry)
+                continue
+            used_dirs.add(best[1])
+            entry['new_dir'] = best[1]
+            entry['found'] = best[2]
+            entry['missing'] = max(0, entry['expected'] - best[2])
+            relinked.append(entry)
+            dir_map[old_dir] = best[1]
+            # 回收站目录跟着成品目录一起搬：dirname(成品目录)/.样片工厂废片回收站
+            dir_map.setdefault(
+                os.path.join(os.path.dirname(old_dir), '.样片工厂废片回收站'),
+                os.path.join(os.path.dirname(best[1]), '.样片工厂废片回收站'),
+            )
+            # 台账里记录过、但被单独挪到别处的文件，按文件名唯一匹配补上。
+            for old_path in expected_paths:
+                candidates = files_by_name.get(os.path.basename(old_path)) or []
+                if len(candidates) == 1:
+                    file_map[os.path.realpath(os.path.expanduser(old_path))] = os.path.join(
+                        candidates[0], os.path.basename(old_path)
+                    )
+
+        garment_refs = (
+            _ecommerce_relink_garment_refs(batch, scan, only_ids)
+            if target in {'garments', 'both'} else []
+        )
+        ref_relinked = [row for row in garment_refs if row.get('status') == 'relinked']
+
+        if not relinked and not ref_relinked:
+            return jsonify({
+                'ok': False,
+                'batch_id': batch_id,
+                'selected': selected,
+                'scanned_roots': roots,
+                'scanned_dirs': scan['scanned_dirs'],
+                'relinked': [],
+                'skipped': skipped,
+                'not_found': not_found,
+                'garment_refs': garment_refs,
+                'updated_paths': 0,
+                'message': '没有找到可以重新链接的位置，台账未改动',
+            }), 409
+
+        counter = {'count': 0}
+        _ecommerce_relink_rewrite(batch, dir_map, file_map, counter)
+        for row in store.get('rerun_batches') or []:
+            if row.get('batch_id') != batch_id:
+                continue
+            _ecommerce_relink_rewrite(row, dir_map, file_map, counter)
+            _ecommerce_refresh_rerun_batch_counts(row)
+
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        data_path = os.path.join(DATA_DIR, ECOMMERCE_DATA_FILE)
+        backup_path = os.path.join(
+            DATA_DIR, f'ecommerce_batches.before-result-relink-{timestamp}.json'
+        )
+        if os.path.isfile(data_path):
+            shutil.copy2(data_path, backup_path)
+        now = datetime.now().isoformat(timespec='seconds')
+        batch['result_relinked_at'] = now
+        batch['updated_at'] = now
+        _ecommerce_save_store(store)
+
+    return jsonify({
+        'ok': True,
+        'batch_id': batch_id,
+        'selected': selected,
+        'target': target,
+        'scanned_roots': roots,
+        'scanned_dirs': scan['scanned_dirs'],
+        'truncated': scan['truncated'],
+        'relinked': relinked,
+        'skipped': skipped,
+        'not_found': not_found,
+        'garment_refs': garment_refs,
+        'updated_paths': counter['count'],
+        'backup_path': backup_path,
     })
 
 
@@ -7830,6 +9520,17 @@ def _ecommerce_task_has_inflight_request(task):
     return any(_ecommerce_attempt_is_submitted(attempt) for attempt in (task or {}).get('attempts') or [])
 
 
+def _ecommerce_task_has_local_inflight_request(task):
+    """A synchronous provider call can be in flight before it has a task id."""
+    if (task or {}).get('state') in {'preparing', 'submitted'}:
+        return True
+    return any(
+        attempt.get('status') in {'preparing', 'submitted'}
+        and not attempt.get('archived_path')
+        for attempt in (task or {}).get('attempts') or []
+    )
+
+
 def _ecommerce_task_has_unarchived_candidate(task):
     return any(
         bool(attempt.get('candidate_path')) and not bool(attempt.get('archived_path'))
@@ -7863,6 +9564,12 @@ def _ecommerce_generate_candidate(batch, task, garment, action, prompt, attempt)
             sources = [action_image, garment_images[reference_index]]
     else:
         sources = [action_image, *garment_images]
+    # 二次调整：用户在「调整细节」里临时添加的参考图（最多6张）追加在源图之后，
+    # 这样 target_only / garment_prompt / 精准匹配三种模式的 sources 都能带上它们。
+    for extra in (action.get('refine_reference_images') or []):
+        extra_real = str(extra or '').strip()
+        if extra_real and extra_real not in sources:
+            sources.append(extra_real)
     attempt['mode'] = (
         'garment-prompt-edit' if generation_mode == 'garment_prompt'
         else 'target-only-edit' if generation_mode == 'target_only'
@@ -7933,6 +9640,67 @@ def _ecommerce_generate_candidate(batch, task, garment, action, prompt, attempt)
             time.sleep(delay + (int(task.get('order') or 0) % 5) * 0.35)
             delay = min(15, delay + 2)
         raise TimeoutError('RunningHub任务轮询超过60分钟')
+
+    if platform == 'pptoken':
+        requested_size = action.get('size') or 'auto'
+        if requested_size == 'auto':
+            requested_size = _ecommerce_gpt_auto_size(action)
+        image_data = [_ecommerce_image_data_uri(s, max_long_edge=max(1024, int(action.get('short_edge') or 1536))) for s in sources]
+        data, status = _ecommerce_internal_route_data(pptoken_gpt_image, '/api/pptoken-gpt-image', {
+            'action': 'edits',
+            'model': action.get('model_id') or action.get('model_key'),
+            'prompt': prompt,
+            'size': requested_size,
+            'quality': action.get('quality') or 'medium',
+            'n': 1,
+            'image_base64_list': image_data,
+        })
+        _ecommerce_increment_usage(batch['id'], 'generation_requests')
+        if not (200 <= status < 300):
+            raise RuntimeError(data.get('error') or f'PPT Token生成HTTP {status}')
+        items = data.get('data') or []
+        if not items:
+            raise RuntimeError('PPT Token没有返回图片')
+        return _ecommerce_download_candidate(batch, task, attempt['number'], items[0])
+
+    if platform == 'apiyi':
+        # API易 是同步接口：没有任务 ID，一次请求就要拿到图，超时由后端按
+        # (协议, 分辨率) 分档决定（4K 走 600 秒），前端不传 timeout。
+        image_data = [_ecommerce_image_data_uri(s, max_long_edge=max(1024, int(action.get('short_edge') or 1536))) for s in sources]
+        requested_size = str(action.get('size') or '').strip()
+        # 比例留「自动」时，按目标参考图（sources[0]，即人物姿势那张）的构图比例吸附到
+        # 30 档表里最近的一档；否则只能发 size=auto，选了 4K 也拿不到 4K。
+        aspect_ratio = str(action.get('aspect_ratio') or 'auto')
+        if aspect_ratio == 'auto':
+            aspect_ratio = _apiyi_nearest_ratio(sources[0] if sources else '') or 'auto'
+        # 二次调整的局部重绘蒙版：白=可重绘、黑=保持；只有 API易 官转会真正使用。
+        mask_uri = ''
+        mask_image_path = str(action.get('mask_image') or '').strip()
+        if mask_image_path and os.path.isfile(mask_image_path):
+            try:
+                with open(mask_image_path, 'rb') as mask_handle:
+                    mask_uri = 'data:image/png;base64,' + base64.b64encode(mask_handle.read()).decode('ascii')
+            except OSError as exc:
+                logger.warning('[ecommerce-regenerate] 读取局部重绘蒙版失败，按普通重做提交: %s', exc)
+        data, status = _ecommerce_internal_route_data(apiyi_image, '/api/apiyi-image', {
+            'protocol': action.get('protocol') or '',
+            'model': action.get('model_id') or action.get('model_key'),
+            'prompt': prompt,
+            'resolution': str(action.get('resolution') or '4k').lower(),
+            'aspect_ratio': aspect_ratio,
+            # 留空交给后端按「比例 × 分辨率」查 30 档表，避免前端拼出表外尺寸。
+            'size': '' if requested_size in ('', 'auto') else requested_size,
+            'quality': action.get('quality') or '',
+            'image_base64_list': image_data,
+            'mask_base64': mask_uri,
+        })
+        _ecommerce_increment_usage(batch['id'], 'generation_requests')
+        if not (200 <= status < 300):
+            raise RuntimeError(data.get('error') or f'API易生成HTTP {status}')
+        items = data.get('data') or []
+        if not items:
+            raise RuntimeError('API易没有返回图片')
+        return _ecommerce_download_candidate(batch, task, attempt['number'], items[0])
 
     if action.get('is_gpt_image'):
         requested_size = action.get('size') or 'auto'
@@ -8039,6 +9807,25 @@ def _ecommerce_generation_needs_configuration(error):
     return any(marker in message for marker in markers)
 
 
+def _ecommerce_error_needs_recharge(error):
+    """判断错误是否属于“充值/恢复额度后即可继续”的类型。
+
+    这类错误重试不会好转（反复提交只会空耗等待），应在批量运行中立即
+    暂停批次并把失败任务留在 pending，等用户充值后点击「开始/继续」
+    自动重跑失败任务。不能归入 _ecommerce_generation_needs_configuration，
+    因为充值后错误会消失，不是永久配置问题。
+    """
+    message = str(error or '').lower()
+    markers = (
+        '余额不足', '欠费', '额度不足', '充值',
+        'insufficient', 'insufficient balance', 'no balance',
+        'no enough balance', 'payment required', 'account balance',
+        'quota exceeded', 'quota insufficient', 'credit',
+        '402', 'billing',
+    )
+    return any(marker in message for marker in markers)
+
+
 def _ecommerce_sample_result_dir(batch, garment):
     """Return the only directory where generated samples may be archived.
 
@@ -8096,7 +9883,23 @@ def _ecommerce_archive_accepted(batch, task, candidate_path):
     return _ecommerce_unique_copy(candidate_path, target)
 
 
-def _ecommerce_reserve_sample_target(target_dir, action_order, gen_type, ext, run_prefix='', fp_round=None):
+def _ecommerce_next_refine_index(target_dir, base_stem):
+    """二次调整下一个序号：扫描 <源文件名>_RF{NN} 取最大值 +1。"""
+    max_index = 0
+    pattern = re.compile(re.escape(base_stem) + r'_RF(\d+)$', re.IGNORECASE)
+    if target_dir and os.path.isdir(target_dir):
+        try:
+            for name in os.listdir(target_dir):
+                stem = os.path.splitext(name)[0]
+                matched = pattern.match(stem)
+                if matched:
+                    max_index = max(max_index, int(matched.group(1)))
+        except OSError:
+            pass
+    return max_index + 1
+
+
+def _ecommerce_reserve_sample_target(target_dir, action_order, gen_type, ext, run_prefix='', fp_round=None, source_stem=''):
     """Atomically reserve a parseable archive name before copying bytes.
 
     Sequence discovery and reservation must share one lock. Otherwise concurrent
@@ -8105,7 +9908,12 @@ def _ecommerce_reserve_sample_target(target_dir, action_order, gen_type, ext, ru
     """
     _ecommerce_ensure_directory(target_dir)
     with ecommerce_archive_lock:
-        if gen_type == 'first':
+        if gen_type == 'rf':
+            base_stem = str(source_stem or '').strip() or f"{run_prefix}AI-{action_order:02d}"
+            idx = _ecommerce_next_refine_index(target_dir, base_stem)
+            round_num = 0
+            make_name = lambda value: f"{base_stem}_RF{value:02d}{ext}"
+        elif gen_type == 'first':
             idx = _ecommerce_next_sample_index(target_dir, action_order, 'first')
             round_num = 0
             make_name = lambda value: f"{run_prefix}AI-{action_order:02d}-{value:02d}{ext}"
@@ -8219,7 +10027,7 @@ def _ecommerce_set_result_asset_status(batch_id, garment_id, path, status):
         logger.warning('[ecommerce-assets] 更新资产清单失败: %s', exc)
 
 
-def _ecommerce_archive_sample(batch, task, candidate_path, sample_number, total_samples, run_code_override=None, gen_type=None, fp_round=None):
+def _ecommerce_archive_sample(batch, task, candidate_path, sample_number, total_samples, run_code_override=None, gen_type=None, fp_round=None, source_stem=''):
     """把生成样本归档到结果目录。
 
     新命名规则（gen_type 参数控制）：
@@ -8228,6 +10036,7 @@ def _ecommerce_archive_sample(batch, task, candidate_path, sample_number, total_
       - 'fp'(废片重做单张)：<run_code>-AI-XX-FPN-01.jpg（N=轮次1,2,3...）
       - 'fp_ck'(废片重做抽卡)：<run_code>-AI-XX-FPN-CKNN.jpg
       - 'bj'(标记重做)：<run_code>-AI-XX-BJNN.jpg
+      - 'rf'(二次调整)：<源图文件名>_RFNN.jpg（紧跟源图之后排序）
     未指定 gen_type 时，根据 total_samples 自动判断：
       total_samples=1 → 'first'（新格式 -01）
       total_samples>1 → 'ck'（新格式 -CKNN）
@@ -8254,6 +10063,7 @@ def _ecommerce_archive_sample(batch, task, candidate_path, sample_number, total_
 
     target, idx, round_num = _ecommerce_reserve_sample_target(
         target_dir, action_order, gen_type, ext, run_prefix=run_prefix, fp_round=fp_round,
+        source_stem=source_stem,
     )
     filename = os.path.basename(target)
 
@@ -8299,6 +10109,7 @@ def _ecommerce_archive_sample(batch, task, candidate_path, sample_number, total_
         os.makedirs(backup_dir, exist_ok=True)
         backup_path, idx, round_num = _ecommerce_reserve_sample_target(
             backup_dir, action_order, gen_type, ext, run_prefix=run_prefix, fp_round=fp_round,
+            source_stem=source_stem,
         )
         try:
             backup_archived = _ecommerce_copy_file(candidate_path, backup_path)
@@ -8826,7 +10637,7 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
                     return task_id, None, '批次已暂停/取消'
                 except Exception as exc:
                     error = str(exc)
-                    if _ecommerce_generation_needs_configuration(error) or isinstance(exc, PermissionError):
+                    if _ecommerce_generation_needs_configuration(error) or _ecommerce_error_needs_recharge(error) or isinstance(exc, PermissionError):
                         break
                     if attempt.get('submission_uncertain'):
                         break
@@ -8865,6 +10676,7 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
         _ecommerce_mutate_batch(batch_id, save_archived)
         return task_id, archived, None
 
+    recharge_blocked = {'value': False}
     current = _ecommerce_batch_snapshot(batch_id)
     if current and current.get('status') not in ('paused', 'cancelled'):
         # 一个“任务×抽卡序号”就是独立远端请求。同一张源图需要3张且并发为3时，
@@ -8898,6 +10710,8 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
                             task_obj['last_error'] = message
                             task_obj['state'] = 'pending'
                     _ecommerce_mutate_batch(batch_id, save_error)
+                    if _ecommerce_error_needs_recharge(error):
+                        recharge_blocked['value'] = True
             except Exception as exc:
                 logger.error(f'[ecommerce global] worker异常: {exc}', exc_info=True)
 
@@ -8916,9 +10730,23 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
                 completed, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
                 for future in completed:
                     handle_future(future)
+                    if recharge_blocked['value']:
+                        # API 余额/额度不足：不再提交新的远端请求，等待在途任务
+                        # 自然收尾后暂停批次，让用户充值后一键续跑失败任务。
+                        continue
                     item = next(iterator, None)
                     if item is not None:
                         in_flight.add(pool.submit(run_one, *item))
+
+    # 余额/额度不足时立即暂停，而不是把剩余任务全部标记为人工复核失败。
+    # 任务保留 pending + last_error，充值后点「开始/继续」会自动重跑。
+    if recharge_blocked['value']:
+        def _pause_for_recharge(b):
+            b['status'] = 'paused'
+            b['needs_recharge'] = True
+            b['recharge_hint'] = '部分任务因API余额不足/额度耗尽中断，充值后可点击「开始/继续」自动重跑失败任务'
+        _ecommerce_mutate_batch(batch_id, _pause_for_recharge)
+        return
 
     current = _ecommerce_batch_snapshot(batch_id)
     if not current:
@@ -8944,7 +10772,7 @@ def _ecommerce_run_batch_no_qc_global(batch_id):
     current = _ecommerce_batch_snapshot(batch_id)
     if current and current.get('status') not in ('paused', 'cancelled'):
         unfinished = [t for t in current.get('tasks', []) if t.get('state') not in ECOMMERCE_FINAL_TASK_STATES]
-        final_status = 'cancelled' if current.get('status') == 'cancelling' else ('completed' if not unfinished else 'interrupted')
+        final_status = _ecommerce_terminal_batch_status(current) if not unfinished else 'interrupted'
         _ecommerce_mutate_batch(batch_id, lambda b, status=final_status: b.update({'status': status, 'finished_at': datetime.now().isoformat(timespec='seconds') if status in {'completed', 'cancelled'} else ''}))
 
 
@@ -9157,7 +10985,7 @@ def _ecommerce_run_batch_no_qc(batch_id):
     current = _ecommerce_batch_snapshot(batch_id)
     if current and current.get('status') not in ('paused', 'cancelled'):
         unfinished = [t for t in current.get('tasks', []) if t.get('state') not in ECOMMERCE_FINAL_TASK_STATES]
-        final_status = 'cancelled' if current.get('status') == 'cancelling' else ('completed' if not unfinished else 'interrupted')
+        final_status = _ecommerce_terminal_batch_status(current) if not unfinished else 'interrupted'
         _ecommerce_mutate_batch(batch_id, lambda b, status=final_status: b.update({
             'status': status,
             'finished_at': datetime.now().isoformat(timespec='seconds') if status in {'completed', 'cancelled'} else '',
@@ -9245,7 +11073,7 @@ def _ecommerce_run_batch(batch_id):
         current = _ecommerce_batch_snapshot(batch_id)
         if current and current.get('status') not in ('paused', 'cancelled'):
             unfinished = [t for t in current.get('tasks', []) if t.get('state') not in ECOMMERCE_FINAL_TASK_STATES]
-            final_status = 'cancelled' if current.get('status') == 'cancelling' else ('completed' if not unfinished else 'interrupted')
+            final_status = _ecommerce_terminal_batch_status(current) if not unfinished else 'interrupted'
             _ecommerce_mutate_batch(batch_id, lambda b, status=final_status: b.update({
                 'status': status,
                 'finished_at': datetime.now().isoformat(timespec='seconds') if status in {'completed', 'cancelled'} else '',
@@ -9322,6 +11150,46 @@ def _ecommerce_resume_running_batches():
         _ecommerce_launch_batch(batch_id)
 
 
+def _ecommerce_switch_batch_model(batch_id, model_override):
+    """把批次剩余任务切换到服务端白名单内的另一个平台/模型。
+
+    只替换模型元数据：已生成的图片在续跑时仍按 archived_path 跳过，不会被重新生成。
+    新图改用新模型前缀命名，结果目录保持不变，避免已完成图片脱离批次视野。
+    """
+    batch = _ecommerce_batch_snapshot(batch_id)
+    if not batch:
+        raise ValueError('批次不存在')
+    actions = list(((batch.get('template') or {}).get('actions') or []))
+    if not actions:
+        raise ValueError('批次没有可切换的目标参考图')
+    # 复用废片重做的服务端白名单校验，客户端提交的模型元数据一律不信任。
+    sample = _ecommerce_apply_rerun_model(actions[0], model_override)
+    patch = {
+        key: sample[key] for key in (
+            'platform', 'model_key', 'model_id', 'endpoint', 'resolution', 'channel',
+            'price', 'quality', 'max_images', 'is_gpt_image', 'poll_endpoint',
+            'short_edge', 'size', 'provider',
+        ) if key in sample
+    }
+    with ecommerce_lock:
+        existing_batches = list(_ecommerce_load_store().get('batches', []))
+    new_run_code = _ecommerce_next_run_code(sample, existing_batches)
+
+    def apply_switch(b):
+        for item in ((b.get('template') or {}).get('actions') or []):
+            item.update(patch)
+        b['run_code'] = new_run_code
+        b['model_override'] = patch
+        b['model_switched_at'] = datetime.now().isoformat(timespec='seconds')
+
+    _ecommerce_mutate_batch(batch_id, apply_switch)
+    logger.info(
+        f'[ecommerce-switch] 批次 {batch_id} 剩余任务改用 '
+        f"{patch.get('platform')}/{patch.get('model_key')}，新运行前缀 {new_run_code}"
+    )
+    return new_run_code
+
+
 @app.route('/api/ecommerce/batches/<batch_id>/action', methods=['POST'])
 def ecommerce_batch_action(batch_id):
     body = request.get_json(silent=True) or {}
@@ -9335,6 +11203,13 @@ def ecommerce_batch_action(batch_id):
             if batch.get('status') in {'running'}:
                 return jsonify({'ok': True, 'status': 'running', 'launched': False, 'already_running': True})
             return jsonify({'error': f"批次当前状态为“{batch.get('status') or '未知'}”，不能再次启动"}), 409
+        model_override = body.get('model_override')
+        if isinstance(model_override, dict) and model_override:
+            # 「继续」时可选换平台/模型；只影响剩余未生成任务，已完成图片不动。
+            try:
+                _ecommerce_switch_batch_model(batch_id, model_override)
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 400
         settings = batch.get('settings') or {}
         action_count = len(((batch.get('template') or {}).get('actions') or []))
         concurrency_val = int(settings.get('concurrency') or 10)
@@ -9344,7 +11219,7 @@ def ecommerce_batch_action(batch_id):
             def align_concurrency(b):
                 b.setdefault('settings', {})['concurrency'] = aligned
             _ecommerce_mutate_batch(batch_id, align_concurrency)
-        _ecommerce_mutate_batch(batch_id, lambda b: b.update({'status': 'running', 'started_at': b.get('started_at') or datetime.now().isoformat(timespec='seconds')}))
+        _ecommerce_mutate_batch(batch_id, lambda b: b.update({'status': 'running', 'needs_recharge': False, 'recharge_hint': '', 'started_at': b.get('started_at') or datetime.now().isoformat(timespec='seconds')}))
         launched = _ecommerce_launch_batch(batch_id)
         return jsonify({'ok': True, 'status': 'running', 'launched': launched})
     if action == 'pause':
@@ -9365,9 +11240,16 @@ def ecommerce_batch_action(batch_id):
         if batch.get('status') in {'completed', 'cancelled'}:
             return jsonify({'error': f"批次已经是“{batch.get('status')}”，不能重复取消"}), 409
         inflight = []
+        with ecommerce_lock:
+            has_local_runner = batch_id in ecommerce_active_runners
         def cancel_batch(b):
             nonlocal inflight
-            inflight = [task.get('id') for task in b.get('tasks', []) if _ecommerce_task_has_inflight_request(task) or _ecommerce_task_has_unarchived_candidate(task)]
+            inflight = [
+                task.get('id') for task in b.get('tasks', [])
+                if _ecommerce_task_has_inflight_request(task)
+                or _ecommerce_task_has_unarchived_candidate(task)
+                or (has_local_runner and _ecommerce_task_has_local_inflight_request(task))
+            ]
             b['status'] = 'cancelling' if inflight else 'cancelled'
             for task in b.get('tasks', []):
                 if task.get('id') not in inflight and task.get('state') not in ECOMMERCE_FINAL_TASK_STATES:
@@ -9443,17 +11325,43 @@ def ecommerce_local_image():
     if err or not os.path.isfile(real) or os.path.splitext(real)[1].lower() not in ECOMMERCE_IMAGE_EXTS:
         return jsonify({'error': err or '图片无效'}), 400
     if request.args.get('thumb') == '1':
-        max_edge = max(96, min(int(request.args.get('max') or 320), 1200))
+        max_edge = max(96, min(int(request.args.get('max') or 320), 2400))
+        # 4K PNG 缩到 180px 每次都要重新解码+重采样，实测单张 0.26s；一个验片界面
+        # 几十张缩略图就是好几秒。按「路径+修改时间+大小+尺寸」落盘缓存，之后直接发文件。
+        cached = _ecommerce_thumb_cache_path(real, max_edge)
+        if cached and os.path.isfile(cached):
+            return send_file(cached, mimetype='image/jpeg', max_age=86400, conditional=True)
         with Image.open(real) as source:
             image = ImageOps.exif_transpose(source).convert('RGB')
             image.thumbnail((max_edge, max_edge), Image.LANCZOS)
-            buffer = io.BytesIO()
-            image.save(buffer, 'JPEG', quality=82, optimize=True)
-            buffer.seek(0)
+        if cached:
+            try:
+                os.makedirs(os.path.dirname(cached), exist_ok=True)
+                temp_path = f'{cached}.{os.getpid()}.tmp'
+                image.save(temp_path, 'JPEG', quality=82, optimize=True)
+                os.replace(temp_path, cached)
+                return send_file(cached, mimetype='image/jpeg', max_age=86400, conditional=True)
+            except OSError:
+                pass
+        buffer = io.BytesIO()
+        image.save(buffer, 'JPEG', quality=82, optimize=True)
+        buffer.seek(0)
         response = send_file(buffer, mimetype='image/jpeg', max_age=86400)
         response.headers['Cache-Control'] = 'public, max-age=86400, immutable'
         return response
     return send_file(real, conditional=True, max_age=3600)
+
+
+def _ecommerce_thumb_cache_path(real_path, max_edge):
+    """缩略图磁盘缓存路径；文件内容变了（mtime/大小）就自然换一个键。"""
+    try:
+        stat = os.stat(real_path)
+    except OSError:
+        return ''
+    digest = hashlib.md5(
+        f'{real_path}|{stat.st_mtime_ns}|{stat.st_size}|{max_edge}'.encode('utf-8')
+    ).hexdigest()
+    return os.path.join(BASE_DIR, '_运行缓存', '_缩略图', f'{digest}.jpg')
 
 
 @app.route('/api/ecommerce/open-preview', methods=['POST'])
@@ -9497,15 +11405,9 @@ def ecommerce_crop_reference():
         height = float(body.get('height'))
     except (ValueError, TypeError) as exc:
         return jsonify({'error': f'裁剪参数无效: {exc}'}), 400
-    # 相同的归一化宽高表示裁剪后保持原图宽高比；不允许自由改变比例。
-    if not (0 <= x < 1 and 0 <= y < 1 and 0.08 <= width <= 1 and 0.08 <= height <= 1):
+    # 归一化坐标只做范围校验：允许非等比例裁剪（用户可以只裁某一边）。
+    if not (0 <= x <= 1 and 0 <= y <= 1 and 0.02 <= width <= 1 and 0.02 <= height <= 1):
         return jsonify({'error': '裁剪区域超出图片范围'}), 400
-    # 归一化坐标下 width == height 即可保持原图比例（数学上等价）
-    if abs(width - height) > 0.015:
-        return jsonify({'error': '参考图裁剪必须保持原图比例'}), 400
-    scale = min(width, height, 1 - x, 1 - y)
-    if scale < 0.08:
-        return jsonify({'error': '裁剪区域太小'}), 400
     batch = _ecommerce_batch_snapshot(batch_id) if batch_id else None
     cache_root = os.path.expanduser((batch or {}).get('output_path') or os.path.join(BASE_DIR, '_运行缓存'))
     target_dir = os.path.join(cache_root, '_重做临时参考图')
@@ -9515,11 +11417,124 @@ def ecommerce_crop_reference():
         image = ImageOps.exif_transpose(source).convert('RGB')
         left = max(0, min(image.width - 1, round(x * image.width)))
         top = max(0, min(image.height - 1, round(y * image.height)))
-        right = max(left + 1, min(image.width, round((x + scale) * image.width)))
-        bottom = max(top + 1, min(image.height, round((y + scale) * image.height)))
+        right = max(left + 1, min(image.width, round((x + width) * image.width)))
+        bottom = max(top + 1, min(image.height, round((y + height) * image.height)))
+        if right - left < 1 or bottom - top < 1:
+            return jsonify({'error': '裁剪区域太小'}), 400
         cropped = image.crop((left, top, right, bottom))
         cropped.save(target, 'JPEG', quality=95, optimize=True)
     return jsonify({'ok': True, 'url': _ecommerce_local_image_url(target), 'path': target})
+
+
+@app.route('/api/ecommerce/crop-garment-reference', methods=['POST'])
+def ecommerce_crop_garment_reference():
+    """把一张服装参考图裁剪后直接写回服装文件夹本身。
+
+    服装文件夹里永远只有参考图，不新建任何子目录：
+    - replace：原图先备份到 _运行缓存/_服装原图备份/，再用同名、同格式覆盖文件夹里那一张；
+    - add：在文件夹里真实新增一张 crop-*.jpg，张数真的 +1，文件名记进新增台账；
+    - reset：有备份就从备份盖回原图，是新增出来的就删掉。
+
+    这样用户把整个服装文件夹递交上去时，读到的就是最新实况，不需要任何虚拟覆盖层。
+    裁剪允许非等比例（用户可以只裁某一边）。
+    """
+    body = request.get_json(silent=True) or {}
+    mode = str(body.get('mode') or '').strip().lower()
+    if mode not in ('replace', 'add', 'reset'):
+        return jsonify({'error': '裁剪方式无效，只能是 replace、add 或 reset'}), 400
+    garment_real, garment_error = _ecommerce_safe_user_path(
+        body.get('garment_path'), must_exist=True, directory=True)
+    if garment_error:
+        return jsonify({'error': garment_error}), 400
+    try:
+        source_path = _ecommerce_resolve_image_source(body.get('source'))
+    except (ValueError, TypeError) as exc:
+        return jsonify({'error': f'裁剪参数无效: {exc}'}), 400
+    # 旧版会把裁剪结果放进 _裁剪参考图/ 子目录。这里顺手整包挪去备份区，
+    # 让服装文件夹恢复干净（数据不丢），旧版虚拟覆盖也随之失效。
+    _ecommerce_archive_legacy_crop_dir(garment_real)
+
+    if mode == 'reset':
+        restored, restored_path = _ecommerce_restore_garment_reference(garment_real, source_path)
+        restored_images = _ecommerce_ordered_six_images(garment_real, max_images=10)
+        return jsonify({
+            'ok': True,
+            'restored': restored,
+            'path': restored_path,
+            'image_count': len(restored_images),
+        })
+
+    try:
+        slot = int(body.get('slot'))
+        x = float(body.get('x'))
+        y = float(body.get('y'))
+        width = float(body.get('width'))
+        height = float(body.get('height'))
+    except (ValueError, TypeError) as exc:
+        return jsonify({'error': f'裁剪参数无效: {exc}'}), 400
+    # 源图可能是上一轮裁剪出来的图：回溯成备份里的原图再裁，避免叠加画质损失。
+    base_source, source_error = _ecommerce_garment_crop_base_source(garment_real, source_path)
+    if source_error:
+        return jsonify({'error': source_error}), 400
+    # 与 /api/ecommerce/crop-reference 一致的校验：允许非等比例，只做范围校验。
+    if not (0 <= x <= 1 and 0 <= y <= 1 and 0.02 <= width <= 1 and 0.02 <= height <= 1):
+        return jsonify({'error': '裁剪区域超出图片范围'}), 400
+
+    current = _ecommerce_ordered_six_images(garment_real, max_images=10)
+    if mode == 'replace':
+        if not (1 <= slot <= len(current)):
+            return jsonify({'error': f'要替换的参考图序号 {slot} 不存在（该套共 {len(current)} 张）'}), 400
+        target = current[str(slot)]
+    else:
+        if len(current) >= 10:
+            return jsonify({'error': '该服装已有10张参考图，无法再新增；请改用「替换原来那一张」'}), 400
+        target = os.path.join(
+            garment_real,
+            f"crop-{datetime.now().strftime('%Y%m%d%H%M%S')}-{gen_id('crop')}.jpg",
+        )
+
+    staging_dir = os.path.join(BASE_DIR, '_运行缓存', '_重做临时参考图')
+    _ecommerce_ensure_directory(staging_dir)
+    staging = os.path.join(
+        staging_dir,
+        f"crop-stage-{datetime.now().strftime('%Y%m%d%H%M%S')}-{gen_id('crop')}{os.path.splitext(target)[1] or '.jpg'}",
+    )
+    with Image.open(base_source) as source:
+        image = ImageOps.exif_transpose(source).convert('RGB')
+        left = max(0, min(image.width - 1, round(x * image.width)))
+        top = max(0, min(image.height - 1, round(y * image.height)))
+        right = max(left + 1, min(image.width, round((x + width) * image.width)))
+        bottom = max(top + 1, min(image.height, round((y + height) * image.height)))
+        if right - left < 1 or bottom - top < 1:
+            return jsonify({'error': '裁剪区域太小'}), 400
+        _ecommerce_save_cropped_image(image.crop((left, top, right, bottom)), staging)
+    # 覆盖前先把原图存进备份区，用户点「恢复原图」才有东西可还原。
+    if mode == 'replace':
+        backup_dir = _ecommerce_garment_backup_dir(garment_real)
+        backup_path = os.path.join(backup_dir, os.path.basename(target))
+        if not os.path.isfile(backup_path):
+            _ecommerce_ensure_directory(backup_dir)
+            _ecommerce_copy_file(target, backup_path)
+    _ecommerce_copy_file(staging, target)
+    try:
+        os.remove(staging)
+    except OSError:
+        pass
+
+    if mode == 'add':
+        added = _ecommerce_read_garment_added_crops(garment_real)
+        _ecommerce_write_garment_added_crops(
+            garment_real, added + [os.path.basename(target)])
+    image_count = len(_ecommerce_ordered_six_images(garment_real, max_images=10))
+    return jsonify({
+        'ok': True,
+        'url': _ecommerce_local_image_url(target),
+        'path': target,
+        'filename': os.path.basename(target),
+        'mode': mode,
+        'slot': slot,
+        'image_count': image_count,
+    })
 
 
 @app.route('/api/ecommerce/open-folder', methods=['POST'])
@@ -9583,11 +11598,24 @@ def _ecommerce_local_image_url(path):
     return f"/api/ecommerce/local-image?path={quote(path, safe='')}"
 
 
-def _ecommerce_rerun_prompt(original_prompt, correction):
-    """重做提示词二选一：本轮有输入就完整替换，否则复用原提示词。"""
+def _ecommerce_rerun_prompt(original_prompt, correction, append=True):
+    """重做提示词：留空复用原提示词；填了就按 append 决定追加还是整条替换。
+
+    普通废片/标记重做的输入仍是「动作参考图+服装参考图」，原提示词里的
+    “把图2的服装替换到图1人物身上”是必须保留的换装指令。用户这次只写
+    “改成七分裙长”时若整条替换，模型收不到换装指令，就会原样吐回动作参考图。
+    所以默认（append=True）把新要求追加在原提示词之后。
+
+    二次调整（append=False）基于已经穿好这件衣服的成品图，且只送这一张 AI 图，
+    必须整条替换：追加换装指令会让模型去找并不存在的图2。
+    """
     original = str(original_prompt or '').strip()
-    replacement = str(correction or '').strip()
-    return replacement or original
+    correction = str(correction or '').strip()
+    if not correction:
+        return original
+    if not append or not original:
+        return correction
+    return f'{original}\n\n本次重做额外要求：\n{correction}'
 
 
 ECOMMERCE_DETAIL_REPAIR_PROMPT = """请对图1进行局部服装细节修复。图2起均为图1所穿同一件服装的权威实拍参考证据。
@@ -9611,15 +11639,19 @@ ECOMMERCE_RERUN_RH_MODELS = {
     # RunningHub 官方文档：官方中档使用 official endpoint + quality=medium。
     'rhart-image-g-2-medium/image-to-image-2k': ('rhart-image-g-2-official/image-to-image', '2k', 'official-medium', '¥1.13/张'),
     'rhart-image-g-2-medium/image-to-image-4k': ('rhart-image-g-2-official/image-to-image', '4k', 'official-medium', '¥1.13/张'),
-    'rhart-image-n-g31-flash/image-to-image-2k': ('rhart-image-n-g31-flash/image-to-image', '2k', 'low-cost', '¥0.19/张'),
-    'rhart-image-n-g31-flash/image-to-image-4k': ('rhart-image-n-g31-flash/image-to-image', '4k', 'low-cost', '¥0.30/张'),
-    'rhart-image-n-g31-flash-official/image-to-image-2k': ('rhart-image-n-g31-flash-official/image-to-image', '2k', 'official', '¥0.74/张'),
-    'rhart-image-n-g31-flash-official/image-to-image-4k': ('rhart-image-n-g31-flash-official/image-to-image', '4k', 'official', '¥0.99/张'),
-    'rhart-image-n-pro/edit-2k': ('rhart-image-n-pro/edit', '2k', 'low-cost', '¥0.40/张'),
-    'rhart-image-n-pro/edit-4k': ('rhart-image-n-pro/edit', '4k', 'low-cost', '¥0.50/张'),
-    'rhart-image-n-pro-official/edit-ultra-4k': ('rhart-image-n-pro-official/edit-ultra', '4k', 'official', '¥1.50/张'),
+    # Nano Banana（Gemini）仅保留经济版两个模型：Nano Banana 2 与 Nano Banana Pro。
+    # 官方稳定版暂不接入；废片重做固定按 4K 出图。
+    'rhart-image-n-g31-flash/image-to-image': ('rhart-image-n-g31-flash/image-to-image', '4k', 'low-cost', '¥0.19/张'),
+    'rhart-image-n-pro/edit': ('rhart-image-n-pro/edit', '4k', 'low-cost', '¥0.43/张'),
     'seedream-v5-pro/image-to-image-1k': ('seedream-v5-pro/image-to-image', '1k', 'official', '约¥0.30/张'),
     'seedream-v5-pro/image-to-image-2k': ('seedream-v5-pro/image-to-image', '2k', 'official', '约¥0.60/张'),
+    # RunningHub ChatGPT Image 2.5 标准模型 API：与主出图面板同步。
+    # 仅企业级-共享 API Key 可调用；权限不足时服务端返回 Access Denied。
+    'rhart-image-g-2.5-official-token/flare/edit': ('rhart-image-g-2.5-official-token/flare/edit', '2k', 'official', '¥1.00/张（企业Key）'),
+    'rhart-image-g-2.5-official-token/sunburst/edit': ('rhart-image-g-2.5-official-token/sunburst/edit', '2k', 'official', '¥1.00/张（企业Key）'),
+    # ChatGPT Image 2.5 经济版（图生图）：官方标准模型，固定 $0.03/次，1K/2K/4K 同价，故默认按 4K 出图。
+    'rhart-image-g-2.5/flare/image-to-image': ('rhart-image-g-2.5/flare/image-to-image', '4k', 'low-cost', '约$0.03≈¥0.22/张'),
+    'rhart-image-g-2.5/sunburst/image-to-image': ('rhart-image-g-2.5/sunburst/image-to-image', '4k', 'low-cost', '约$0.03≈¥0.22/张'),
 }
 ECOMMERCE_RERUN_HK_MODELS = {
     'fal-ai/banana/v2': ('fal-ai/banana/v2', '1k', 1024, False, '¥0.48/张'),
@@ -9630,9 +11662,88 @@ ECOMMERCE_RERUN_HK_MODELS = {
     'fal-ai/banana/v3.1/flash/4k': ('fal-ai/banana/v3.1/flash/4k', '4k', 2048, False, '¥0.48/张'),
     'gpt-image-2': ('gpt-image-2', '1k', 1024, True, '¥0.04/张'),
     'gpt-image-2/2k': ('gpt-image-2', '2k', 1536, True, '¥0.08/张'),
-    'gpt-image-2/4k': ('gpt-image-2', '4k', 2048, True, '¥0.16/张'),
+    'gpt-image-2/4k': ('gpt-image-2', '2k', 1536, True, '¥0.16/张（HK实测最高仅返2K，已钳制）'),
+    'gpt-image-2.5/4k': ('gpt-image-2.5', '4k', 2048, True, '4K按实际Token计费（800积分≈1K low参考）'),
+    'gpt-image-2.5-flare/4k': ('gpt-image-2.5-flare', '4k', 2048, True, '4K按实际Token计费（800积分≈1K low参考）'),
+    'gpt-image-2.5-sunburst/4k': ('gpt-image-2.5-sunburst', '4k', 2048, True, '4K按实际Token计费（800积分≈1K low参考）'),
+}
+# 废片重做只接入 API易 的图生图 6 款模型，统一按 4K 出图（重做固定 4K）。
+# spec = (model_id, protocol, resolution, quality, price)
+# - gemini-native 只用 aspect_ratio + imageSize，不传 size；
+# - openai-edits 需要官方 size（由 resolution + 比例换算），官转两款还要 quality。
+ECOMMERCE_RERUN_APIYI_MODELS = {
+    'gemini-3-pro-image': ('gemini-3-pro-image', 'gemini-native', '4k', '', '$0.09/张 ≈ ¥0.52（1K/2K/4K 同价）'),
+    'gemini-3.1-flash-image-preview': ('gemini-3.1-flash-image-preview', 'gemini-native', '4k', '', '$0.025/张 ≈ ¥0.18'),
+    'gpt-image-2.5-flare': ('gpt-image-2.5-flare', 'openai-edits', '4k', 'medium', '官转按量计费｜2K+medium 约 $0.08 ≈ ¥0.58（充值85折约 ¥0.49）'),
+    'gpt-image-2.5-sunburst': ('gpt-image-2.5-sunburst', 'openai-edits', '4k', 'medium', '官转按量计费｜2K+medium 约 $0.08 ≈ ¥0.58（充值85折约 ¥0.49）'),
+    'gpt-image-2.5-all': ('gpt-image-2.5-all', 'openai-edits', '4k', '', '$0.03/张 ≈ ¥0.22（1K/2K/4K 同价，最快约 90s）'),
+    'gpt-image-2-vip': ('gpt-image-2-vip', 'openai-edits', '4k', '', '$0.03/张 ≈ ¥0.22（1K/2K/4K 同价，可锁 30 档尺寸）'),
+    # Seedream：走 /v1/images/generations，按张计费，与分辨率无关，统一按 4K 出图。
+    'seedream-5-0-260128': ('seedream-5-0-260128', 'seedream', '4k', '', '$0.035/张 ≈ ¥0.245（2K/4K 同价）'),
+    'seedream-4-0-250828': ('seedream-4-0-250828', 'seedream', '4k', '', '$0.03/张 ≈ ¥0.21（2K/4K 同价）'),
 }
 ECOMMERCE_RERUN_RATIOS = {'auto', '1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3', '5:4', '4:5', '21:9'}
+
+
+def _ecommerce_infer_rerun_model(action, platform, model_key, ratio, override):
+    """重做面板选了第一栏（主出图）目录里的模型时，按平台语义推断参数。
+
+    重做面板的模型下拉现在就是主出图的模型目录，因此这里只做端点形状校验，
+    不再维护第二份模型白名单——两家面板共用同一套模型语义。
+    """
+    resolution = str(override.get('resolution') or action.get('resolution') or '4k').lower()
+    if resolution not in ('1k', '2k', '4k'):
+        resolution = '4k'
+    allowed_prefixes = {
+        'runninghub': ('rhart-', 'seedream-', 'flux-', 'wan-'),
+        'oaihk': ('fal-ai/', 'gpt-image-', 'google/'),
+        'pptoken': ('gpt-image-',),
+        'apiyi': ('gpt-image-', 'gemini-', 'seedream-'),
+    }.get(platform)
+    if not allowed_prefixes or not model_key.startswith(allowed_prefixes):
+        raise ValueError('不支持的重做模型')
+    short_edge = {'1k': 1024, '2k': 1536, '4k': 2048}[resolution]
+    updated = dict(action)
+    updated.update({
+        'platform': platform, 'model_key': model_key, 'model_id': model_key,
+        'endpoint': model_key, 'resolution': resolution, 'aspect_ratio': ratio,
+        'price': '', 'max_images': 10,
+    })
+    if platform == 'runninghub':
+        official = 'official' in model_key.lower()
+        updated.update({
+            'channel': 'official' if official else 'low-cost',
+            'quality': 'high' if official else '',
+            'is_gpt_image': False, 'poll_endpoint': '', 'provider': 'runninghub',
+        })
+    elif platform == 'oaihk':
+        is_gpt = 'gpt-image' in model_key.lower()
+        size = 'auto'
+        if is_gpt and ratio != 'auto':
+            size = (ECOMMERCE_GPT_SIZES.get(resolution) or {}).get(ratio, 'auto')
+        updated.update({
+            'channel': 'provider', 'quality': 'medium', 'is_gpt_image': is_gpt,
+            'poll_endpoint': '' if is_gpt else 'fal-ai/nano-banana/requests',
+            'short_edge': short_edge, 'size': size, 'provider': 'oaihk',
+        })
+    elif platform == 'pptoken':
+        updated.update({
+            'channel': 'provider', 'quality': 'high', 'is_gpt_image': True, 'poll_endpoint': '',
+            'short_edge': short_edge, 'pptoken_resolution': resolution, 'provider': 'pptoken',
+        })
+    else:  # apiyi
+        protocol = 'gemini-native' if model_key.startswith('gemini') else ('seedream' if model_key.startswith('seedream') else 'openai-edits')
+        channel = _apiyi_gpt_channel(model_key)
+        # Seedream 只认档位、不拼 30 档像素表，size 留空由后端按「几K」翻档位；
+        # 它也不接受 quality，因此只有官转的 gpt-image 才给 medium。
+        size = _apiyi_gpt_size(resolution, ratio) if protocol == 'openai-edits' and channel in ('proxy', 'vip') else ''
+        quality = 'medium' if protocol == 'openai-edits' and channel == 'proxy' else ''
+        updated.update({
+            'channel': 'provider', 'protocol': protocol, 'is_gpt_image': False, 'poll_endpoint': '',
+            'quality': quality, 'size': size,
+            'short_edge': 1536, 'provider': 'apiyi',
+        })
+    return updated
 
 
 def _ecommerce_apply_rerun_model(action, override):
@@ -9645,6 +11756,16 @@ def _ecommerce_apply_rerun_model(action, override):
     if ratio not in ECOMMERCE_RERUN_RATIOS:
         raise ValueError('不支持的生图比例')
     updated = dict(action)
+    # 重做面板的模型下拉现在就是第一栏（主出图）的模型目录。
+    # 带了显式 resolution（新增的几K下拉）时一律以用户的几K 为准，避免被白名单里
+    # 固化的分辨率覆盖；没带时回落到白名单（历史批次、以及按模型名固化分辨率的调用）。
+    known = (
+        (platform == 'runninghub' and model_key in ECOMMERCE_RERUN_RH_MODELS)
+        or (platform == 'oaihk' and model_key in ECOMMERCE_RERUN_HK_MODELS)
+        or (platform == 'apiyi' and model_key in ECOMMERCE_RERUN_APIYI_MODELS)
+    )
+    if model_key and (str(override.get('resolution') or '').strip() or not known):
+        return _ecommerce_infer_rerun_model(updated, platform, model_key, ratio, override)
     if platform == 'runninghub':
         spec = ECOMMERCE_RERUN_RH_MODELS.get(model_key)
         if not spec:
@@ -9669,6 +11790,24 @@ def _ecommerce_apply_rerun_model(action, override):
             'resolution': resolution, 'channel': 'provider', 'price': price, 'aspect_ratio': ratio,
             'is_gpt_image': is_gpt, 'poll_endpoint': '' if is_gpt else 'fal-ai/nano-banana/requests',
             'short_edge': short_edge, 'size': size, 'quality': 'medium', 'max_images': 10,
+        })
+    elif platform == 'apiyi':
+        spec = ECOMMERCE_RERUN_APIYI_MODELS.get(model_key)
+        if not spec:
+            raise ValueError('不支持的API易重做模型')
+        endpoint, protocol, resolution, quality, price = spec
+        # openai-edits 需要官方 size（按 resolution + 比例换算）；gemini-native 只用
+        # aspect_ratio；seedream 由后端按「几K」翻档位；-all 通道不接受 size，
+        # 画幅交给提示词，一律留空。
+        if protocol == 'openai-edits' and _apiyi_gpt_channel(endpoint) in ('proxy', 'vip'):
+            size = _apiyi_gpt_size(resolution, ratio)
+        else:
+            size = ''
+        updated.update({
+            'platform': platform, 'model_key': model_key, 'model_id': endpoint, 'endpoint': endpoint,
+            'provider': 'apiyi', 'protocol': protocol, 'resolution': resolution, 'channel': 'provider',
+            'price': price, 'aspect_ratio': ratio, 'quality': quality, 'size': size,
+            'is_gpt_image': False, 'poll_endpoint': '', 'short_edge': 1536, 'max_images': 10,
         })
     else:
         raise ValueError('不支持的重做平台')
@@ -9829,6 +11968,20 @@ def _ecommerce_sample_identity(path_or_name):
     # Strip -recovered suffix (from recycle bin recovery) before identity parsing
     stem = re.sub(r'-recovered(?:-\d+)?$', '', stem, flags=re.IGNORECASE)
 
+    # 0) 二次调整：<源文件名>_RF{序号}（在源图后紧跟显示，故用 _ 分隔，
+    # 字典序上 '_' > '.'，排序一定落在源图后面）
+    m = re.search(r'(?:^|-)AI-(\d+)-.+?_RF(\d+)$', stem, re.IGNORECASE)
+    if m:
+        return {
+            'action_order': int(m.group(1)),
+            'sample_index': int(m.group(2)),
+            'fp_round': 0,
+            'type': 'rf',
+            'is_marked_redo': False,
+            'is_marked_rerun': False,
+            'is_valid_result': True,
+        }
+
     # 按从最具体到最通用的顺序匹配
 
     # 1) 废片重做·抽卡：-FP{轮次}-CK{序号}
@@ -9978,16 +12131,44 @@ def _ecommerce_result_identity(batch, garment, path_or_name):
     return identity
 
 
-def _ecommerce_is_readable_image_file(path):
-    """Only count a complete, decodable image as a generated result."""
+_IMAGE_READABLE_CACHE = {}
+_IMAGE_READABLE_CACHE_LIMIT = 4000
+
+
+def _ecommerce_probe_readable_image(real_path):
     try:
-        if not path or not os.path.isfile(path) or os.path.getsize(path) <= 0:
-            return False
-        with Image.open(path) as image:
+        with Image.open(real_path) as image:
             image.verify()
         return True
     except (OSError, ValueError, TypeError):
         return False
+
+
+def _ecommerce_is_readable_image_file(path):
+    """Only count a complete, decodable image as a generated result.
+
+    这里必须真的解码校验一次（损坏的半截文件要被判为无效），但 4K PNG 单张就要
+    几毫秒到几十毫秒，而逐套验片会对同一个文件反复问几十次。所以用
+    「路径 + 修改时间 + 大小」做缓存键：文件没变就直接命中，变了自动失效。
+    """
+    real = os.path.realpath(os.path.expanduser(path or ''))
+    if not real:
+        return False
+    try:
+        stat = os.stat(real)
+    except OSError:
+        return False
+    if stat.st_size <= 0:
+        return False
+    cache_key = (real, stat.st_mtime_ns, stat.st_size)
+    cached = _IMAGE_READABLE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    readable = _ecommerce_probe_readable_image(real)
+    if len(_IMAGE_READABLE_CACHE) >= _IMAGE_READABLE_CACHE_LIMIT:
+        _IMAGE_READABLE_CACHE.clear()
+    _IMAGE_READABLE_CACHE[cache_key] = readable
+    return readable
 
 
 def _ecommerce_collect_action_inventory(batch, garment, action_order, active_deletions=None):
@@ -10486,6 +12667,7 @@ def _ecommerce_group_compare_payload(batch, garment, show_deleted=False):
     marked_redo_actions = set()
     marked_redo_paths = set()
     marked_redo_by_path = {}
+    refine_redo_by_path = {}
     garment_id = garment.get('id')
     for mark in (batch.get('marked_redo') or []):
         if mark.get('garment_id') == garment_id:
@@ -10496,6 +12678,15 @@ def _ecommerce_group_compare_payload(batch, garment, show_deleted=False):
                     marked_redo_by_path[real] = mark
                 else:
                     marked_redo_actions.add(int(mark.get('action_order') or 0))
+            except (ValueError, TypeError):
+                pass
+    # 二次调整标记：源图仍算正常候选，只是被加进了二次调整队列。
+    for record in (batch.get('refine_redo') or []):
+        if record.get('garment_id') == garment_id and record.get('source_path'):
+            try:
+                refine_redo_by_path[
+                    os.path.realpath(os.path.expanduser(record.get('source_path') or ''))
+                ] = record
             except (ValueError, TypeError):
                 pass
     # Build a map of soft-deleted paths for this garment. Soft-deleted files
@@ -10516,6 +12707,25 @@ def _ecommerce_group_compare_payload(batch, garment, show_deleted=False):
         [task for task in batch.get('tasks', []) if task.get('garment_id') == garment.get('id')],
         key=lambda task: int(task.get('action_order') or 0),
     )
+    # 成品目录只扫一次并按动作归档。原实现是每个动作都 listdir 一遍、还对目录里
+    # 每个文件解码校验一次：10 个动作 × 24 个文件 = 240 次重复校验，单次请求要 1 秒以上。
+    result_dir = _ecommerce_sample_result_dir(batch, garment)
+    scanned_by_action = {}
+    if result_dir and os.path.isdir(result_dir):
+        try:
+            for name in sorted(os.listdir(result_dir)):
+                stem, ext = os.path.splitext(name)
+                if ext.lower() not in ECOMMERCE_IMAGE_EXTS or stem.endswith('.deleted'):
+                    continue
+                full_path = os.path.join(result_dir, name)
+                if not _ecommerce_is_readable_image_file(full_path):
+                    continue
+                identity = _ecommerce_result_identity(batch, garment, full_path)
+                if not identity:
+                    continue
+                scanned_by_action.setdefault(int(identity.get('action_order') or 0), []).append((full_path, identity))
+        except OSError:
+            pass
     results = []
     for task in tasks:
         current_paths = []
@@ -10536,26 +12746,12 @@ def _ecommerce_group_compare_payload(batch, garment, show_deleted=False):
                     identity = _ecommerce_result_identity(batch, garment, path)
                     current_paths.append((path, identity))
         action_order = int(task.get('action_order') or 0) + 1
-        result_dir = _ecommerce_sample_result_dir(batch, garment)
-        if result_dir and os.path.isdir(result_dir):
-            try:
-                for name in sorted(os.listdir(result_dir)):
-                    if not _ecommerce_is_readable_image_file(os.path.join(result_dir, name)):
-                        continue
-                    stem, ext = os.path.splitext(name)
-                    if ext.lower() not in ECOMMERCE_IMAGE_EXTS:
-                        continue
-                    if stem.endswith('.deleted'):
-                        continue
-                    identity = _ecommerce_result_identity(batch, garment, os.path.join(result_dir, name))
-                    if identity and identity['action_order'] == action_order:
-                        full = os.path.realpath(os.path.join(result_dir, name))
-                        if full not in seen_paths:
-                            seen_paths.add(full)
-                            # 把identity信息附加到路径元组，后面构建result_entry时使用
-                            current_paths.append((os.path.join(result_dir, name), identity))
-            except OSError:
-                pass
+        for path, identity in scanned_by_action.get(action_order, []):
+            full = os.path.realpath(path)
+            if full not in seen_paths:
+                seen_paths.add(full)
+                # 把identity信息附加到路径元组，后面构建result_entry时使用
+                current_paths.append((path, identity))
         if current_paths:
             for sample_index, (path, path_identity) in enumerate(current_paths, 1):
                 path_real = os.path.realpath(os.path.expanduser(path))
@@ -10575,6 +12771,8 @@ def _ecommerce_group_compare_payload(batch, garment, show_deleted=False):
                     'deleted': is_soft_deleted,
                     'marked_redo': is_marked,
                     'mark_id': marked_record.get('id') or '',
+                    'refine_redo': path_real in refine_redo_by_path,
+                    'refine_id': (refine_redo_by_path.get(path_real) or {}).get('id') or '',
                     'source': 'final_output',
                     'model_signature': (task.get('result_model') or {}),
                     'gen_type': path_identity.get('type', 'first') if path_identity else 'first',
@@ -11225,6 +13423,7 @@ def ecommerce_export_final_products():
     copied = []
     copied_references = []
     manifest_entries = []
+    missing_references = []
     for garment in export_garments:
         relative_parts = _ecommerce_safe_relative_parts(
             garment.get('relative_path') or garment.get('garment_name') or garment.get('garment_id'),
@@ -11264,11 +13463,18 @@ def ecommerce_export_final_products():
                 for action in _ecommerce_actions_for_garment(batch, source_garment)
             )
         seen_reference_sources = set()
+        missing_reference_paths = []
         for reference_index, source in enumerate(reference_sources, 1):
-            source = os.path.realpath(os.path.expanduser(str(source or '')))
-            if not source or source in seen_reference_sources or not os.path.isfile(source):
+            raw_source = str(source or '').strip()
+            if not raw_source:
+                continue
+            source = os.path.realpath(os.path.expanduser(raw_source))
+            if not source or source in seen_reference_sources:
                 continue
             seen_reference_sources.add(source)
+            if not os.path.isfile(source):
+                missing_reference_paths.append(raw_source)
+                continue
             source_name = os.path.basename(source)
             target_name = f'{reference_index:02d}-{_ecommerce_safe_name(os.path.splitext(source_name)[0], "reference")}{os.path.splitext(source_name)[1] or ".jpg"}'
             target = os.path.join(reference_dir, target_name)
@@ -11283,6 +13489,14 @@ def ecommerce_export_final_products():
                 'source_filename': source_name,
                 'confirmed': garment_confirmed,
             })
+        if missing_reference_paths:
+            missing_references.append({
+                'garment_id': garment.get('garment_id') or '',
+                'garment_name': garment.get('garment_name') or garment.get('garment_id') or '未命名',
+                'expected': len(seen_reference_sources),
+                'missing': len(missing_reference_paths),
+                'paths': missing_reference_paths,
+            })
 
     # 写入 manifest.json，记录每张图片的来源信息
     import json as _json
@@ -11295,6 +13509,7 @@ def ecommerce_export_final_products():
                 'exported_at': datetime.now().isoformat(timespec='seconds'),
                 'file_count': len(copied),
                 'reference_file_count': len(copied_references),
+                'missing_reference_garments': missing_references,
                 'garment_count': len(export_garments),
                 'confirmed_count': len(batch.get('confirmed_groups') or {}),
                 'files': manifest_entries,
@@ -11303,20 +13518,35 @@ def ecommerce_export_final_products():
         logger.warning(f'[ecommerce-export] manifest.json 写入失败: {exc}')
 
     exported_at = datetime.now().isoformat(timespec='seconds')
+    missing_reference_total = sum(row['missing'] for row in missing_references)
     def record_export(stored_batch):
         stored_batch.setdefault('final_exports', []).append({
             'path': export_root, 'file_count': len(copied),
             'reference_file_count': len(copied_references), 'exported_at': exported_at,
+            'missing_reference_garments': missing_references,
         })
         stored_batch['final_exports'] = stored_batch['final_exports'][-20:]
     _ecommerce_mutate_batch(batch_id, record_export)
+    if missing_references:
+        missing_names = '、'.join(
+            f"{row['garment_name']}（缺{row['missing']}张）" for row in missing_references
+        )
+        message = (
+            f'已导出{len(copied)}张最终成品；但{len(missing_references)}套的服装参考图找不到、未导出：'
+            f'{missing_names}。请用「🔗 链接新位置」重链后再导出'
+        )
+        logger.warning(f'[ecommerce-export] 服装参考图缺失 {missing_reference_total} 张：{missing_names}')
+    else:
+        message = f'已导出{len(copied)}张最终成品和{len(copied_references)}张服装参考图'
     return jsonify({
         'ok': True,
         'path': export_root,
         'file_count': len(copied),
         'reference_file_count': len(copied_references),
+        'missing_reference_count': missing_reference_total,
+        'missing_reference_garments': missing_references,
         'garment_count': len(export_garments),
-        'message': f'已导出{len(copied)}张最终成品和{len(copied_references)}张服装参考图',
+        'message': message,
     })
 
 
@@ -11722,6 +13952,20 @@ def ecommerce_cancel_rerun_items():
                     else:
                         kept.append(mark)
                 stored_batch['marked_redo'] = kept
+                # 二次调整复用同一套 mark_id/marked_result_path 定位，这里一并撤销。
+                kept_refine = []
+                for record in stored_batch.get('refine_redo') or []:
+                    same_scope = (
+                        record.get('garment_id') == garment_id
+                        and int(record.get('action_order') or 0) == action_order
+                    )
+                    record_real = os.path.realpath(os.path.expanduser(record.get('source_path') or '')) if record.get('source_path') else ''
+                    exact = (record.get('id') in mark_ids) or (marked_result_real and record_real == marked_result_real)
+                    if same_scope and exact:
+                        removed_holder['count'] += 1
+                    else:
+                        kept_refine.append(record)
+                stored_batch['refine_redo'] = kept_refine
             _ecommerce_mutate_batch(batch_id, _remove_marks)
             unmarked = removed_holder['count']
 
@@ -11814,9 +14058,11 @@ def ecommerce_scan_deleted():
             for order in range(1, action_count + 1)
         }
 
-        # 每个动作组都按“具体候选路径”去重后判断，不能只看动作是否缺图。
-        # 抽卡 N 张时，只有 N 张候选全部被人工删除，才是人工废片重做。
-        # 少删一张必须保留整组，不得把剩余好图重复提交并再次扣费。
+        # 每个动作组都按“具体候选路径”去重后判断。
+        # 抽卡 N 张时，只要人工删除后现存好图不足预期数量，就按缺口补足
+        # （删了几张就补几张），不再要求“全部删除才算废片”。如果删除后
+        # 现存好图仍然满足预期数量（例如多模型各产出一张、只删掉冗余那张），
+        # 则不需要重做，避免重复提交剩余好图再次扣费。
         scan_orders = set()
         for order in range(1, action_count + 1):
             inventory = inventory_by_order[order]
@@ -11836,7 +14082,7 @@ def ecommerce_scan_deleted():
                         'status': 'api_incomplete',
                         'reason': '结果文件数量不足，或存在无法识别的结果文件；未自动加入废片重做。',
                     })
-            if inventory['needs_waste_rerun']:
+            if inventory['deleted_count'] > 0 and inventory['kept_count'] < expected_samples:
                 scan_orders.add(order)
 
         if not scan_orders:
@@ -11844,6 +14090,7 @@ def ecommerce_scan_deleted():
         # 使用创建批次时冻结的实际参考图，不能重新扫描后误选到别的照片。
         frozen_images = list(garment.get('images') or [])
         garment_references = [{'url': _ecommerce_local_image_url(path), 'path': path, 'override_url': '', 'override_path': '', 'role': 'garment'} for path in frozen_images[:10]]
+        precision_matching = bool((batch.get('settings') or {}).get('precision_matching'))
         # 备份目录
         backup_dir = os.path.join(cache_root, '_生成样本备份', _ecommerce_safe_name(garment_name, garment_name)) if cache_root else ''
         for action_order in scan_orders:
@@ -11857,7 +14104,7 @@ def ecommerce_scan_deleted():
                 if generation_mode == 'garment_prompt':
                     references[0]['role'] = 'source_garment'
             else:
-                references = list(garment_references)
+                references = _ecommerce_references_with_used_mark(garment_references, action, precision_matching)
             # 废片备份路径（单张 AI-01.jpg 或多张 AI-01-1.jpg 等，取第一张）
             related_task = next((
                 t for t in batch.get('tasks', [])
@@ -11949,8 +14196,8 @@ def ecommerce_scan_deleted():
                 'samples_per_action': expected_samples,
                 'expected_count': expected_samples,
                 'actual_count': inventory['kept_count'],
-                'missing_count': expected_samples,
-                'recommended_count': expected_samples,
+                'missing_count': max(1, expected_samples - inventory['kept_count']),
+                'recommended_count': max(1, expected_samples - inventory['kept_count']),
                 'deletion_ids': [row.get('id') for row in deleted_records if row.get('id')],
                 'deleted_record_count': len(deleted_records),
                 'also_marked_redo': bool(overlapping_marks),
@@ -12004,7 +14251,11 @@ def ecommerce_scan_deleted():
             if references and generation_mode == 'garment_prompt':
                 references[0]['role'] = 'source_garment'
         else:
-            references = [{'url': _ecommerce_local_image_url(path), 'path': path, 'override_url': '', 'override_path': '', 'role': 'garment'} for path in frozen_images[:10]]
+            references = _ecommerce_references_with_used_mark(
+                [{'url': _ecommerce_local_image_url(path), 'path': path, 'override_url': '', 'override_path': '', 'role': 'garment'} for path in frozen_images[:10]],
+                action,
+                bool((batch.get('settings') or {}).get('precision_matching')),
+            )
         # 精确标记优先使用原图；旧数据才按动作号回退查找。
         bad_photo_path = marked_result_path if marked_result_path and os.path.isfile(marked_result_path) else ''
         if not bad_photo_path and result_path and os.path.isdir(result_path):
@@ -12053,11 +14304,70 @@ def ecommerce_scan_deleted():
             'missing_count': 1,
         })
     items.extend(marked_items)
+
+    # 额外返回“二次调整”的项：与标记重做共用同一套重做链路，区别是
+    # 递交时只送这一张 AI 图本身作为唯一参考图，不送模特/服装参考图。
+    refine_items = []
+    for record in batch.get('refine_redo') or []:
+        r_garment_id = record.get('garment_id')
+        r_action_order = int(record.get('action_order') or 0)
+        garment = next((g for g in garments if g.get('id') == r_garment_id), None)
+        if not garment or r_garment_id in confirmed_groups:
+            continue
+        source_real = os.path.realpath(os.path.expanduser(record.get('source_path') or '')) if record.get('source_path') else ''
+        # 源图被删/被移走时自动忽略这条标记，避免留下无法递交的僵尸项。
+        if not source_real or not _ecommerce_is_readable_image_file(source_real):
+            continue
+        idx = r_action_order - 1
+        garment_actions = _ecommerce_actions_for_garment(batch, garment)
+        action = next((a for a in garment_actions if int(a.get('order') or 0) == idx), None)
+        if not action:
+            continue
+        result_path = _ecommerce_sample_result_dir(batch, garment)
+        related_task = next((
+            t for t in batch.get('tasks', [])
+            if t.get('garment_id') == r_garment_id and int(t.get('action_order') or 0) == idx
+        ), None)
+        current_model = (related_task or {}).get('result_model') or _ecommerce_action_model_signature(action)
+        refine_token = record.get('id') or hashlib.sha256(source_real.encode('utf-8')).hexdigest()[:12]
+        refine_items.append({
+            'id': f"{r_garment_id}-{r_action_order}-refine-{refine_token}",
+            'garment_id': r_garment_id,
+            'garment_name': garment.get('name') or garment.get('id') or '未命名',
+            'garment_path': garment.get('path') or '',
+            'result_path': result_path,
+            'action_order': r_action_order,
+            'action_name': action.get('name') or f'目标图{r_action_order}',
+            'action_id': action.get('id'),
+            # 二次调整：参考图就是这张 AI 图本身，不再给服装参考图。
+            'bad_photo_url': _ecommerce_local_image_url(source_real),
+            'bad_photo_path': source_real,
+            'target_action_url': _ecommerce_local_image_url(source_real),
+            'target_action_path': source_real,
+            'references': [],
+            'generation_mode': 'target_only',
+            'original_prompt': action.get('prompt') or '',
+            'original_model': {
+                'platform': current_model.get('platform') or action.get('platform') or 'runninghub',
+                'model_key': current_model.get('model_key') or action.get('model_key') or action.get('model_id') or '',
+                'aspect_ratio': current_model.get('aspect_ratio') or action.get('aspect_ratio') or 'auto',
+            },
+            'model_signature': current_model,
+            'marked_redo': False,
+            'refine_redo': True,
+            # 复用标记重做的续传/撤销链路：这两个字段承载二次调整台账的ID与源图。
+            'mark_id': record.get('id') or '',
+            'marked_result_path': source_real,
+            'recommended_count': 1,
+            'missing_count': 1,
+        })
+    items.extend(refine_items)
     return jsonify({
         'items': items, 'total': len(items), 'stats': stats,
         'incomplete_items': incomplete_items,
         'incomplete_total': len(incomplete_items),
-        'marked_count': len(marked_items), 'generation_mode': generation_mode,
+        'marked_count': len(marked_items), 'refine_count': len(refine_items),
+        'generation_mode': generation_mode,
         'confirmed_groups': confirmed_groups,
         'confirmed_count': len(confirmed_groups),
     })
@@ -12083,9 +14393,48 @@ def ecommerce_upload_temp_image():
     return jsonify({'url': _ecommerce_local_image_url(target), 'path': target})
 
 
+def _ecommerce_rerun_mask_dir(batch):
+    """二次调整「局部重绘」蒙版的落盘目录（跟随批次输出目录，随批次一起管理）。"""
+    root = os.path.expanduser((batch or {}).get('output_path') or '~/Downloads/电商批量生图')
+    return os.path.join(root, '_局部重绘蒙版')
+
+
+def _ecommerce_save_rerun_mask(batch, item_id, data_uri):
+    """把前端画笔涂抹的蒙版统一转成「白=可重绘、黑=保持」的 RGB PNG 并落盘。
+
+    落盘而不塞进 JSON：蒙版是 4K 尺寸的 PNG，base64 后体积很大，写进台账会拖慢整个批次。
+    返回空字符串表示没有蒙版或蒙版不可用（此时按普通整图重做提交）。
+    """
+    text = str(data_uri or '').strip()
+    if not text:
+        return ''
+    _, payload = _apiyi_split_data_uri(text)
+    try:
+        raw = base64.b64decode(payload)
+    except Exception:
+        return ''
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            # 只按亮度判断：白=可重绘。不能看 alpha——浏览器把画布导成 PNG 时，
+            # 即便全不透明也可能带上 A 通道，按 alpha 判断会把整张图当成可重绘区。
+            gray = img.convert('L').point(lambda value: 255 if value >= 128 else 0)
+            mask_dir = _ecommerce_rerun_mask_dir(batch)
+            os.makedirs(mask_dir, exist_ok=True)
+            token = hashlib.sha256(str(item_id or '').encode('utf-8')).hexdigest()[:12]
+            path = os.path.join(mask_dir, f'mask-{token}-{gen_id("mk")}.png')
+            Image.merge('RGB', (gray, gray, gray)).save(path, format='PNG')
+        return path
+    except Exception as exc:
+        logger.warning('[ecommerce-rerun] 保存局部重绘蒙版失败: %s', exc)
+        return ''
+
+
 def _ecommerce_validate_rerun_queue_item(batch, raw):
     item_id = str((raw or {}).get('item_id') or (raw or {}).get('id') or '').strip()
     clean_item_id = item_id.split('-marked', 1)[0] if '-marked' in item_id else item_id
+    # 二次调整项编号形如 <服装>-<动作>-refine-<台账ID>，解析前同样要剥掉后缀。
+    if '-refine' in clean_item_id:
+        clean_item_id = clean_item_id.split('-refine', 1)[0]
     try:
         garment_id, action_order_text = clean_item_id.rsplit('-', 1)
         action_order = int(action_order_text)
@@ -12118,6 +14467,8 @@ def _ecommerce_validate_rerun_queue_item(batch, raw):
         # 仅覆盖这一项废片重做所使用的动作参考图；不修改原批次模板，
         # 也不能被“同步本套”误用到其他动作。
         'target_action_image': str((raw or {}).get('target_action_image') or '').strip(),
+        # 二次调整的局部重绘蒙版：只在创建队列时落盘一次，worker 复用同一份文件。
+        'mask_path': _ecommerce_save_rerun_mask(batch, item_id, (raw or {}).get('mask_base64')),
         'count': max(1, min(int((raw or {}).get('count') or 1), 10)),
         'model_override': dict((raw or {}).get('model_override') or {}),
     }
@@ -12222,6 +14573,8 @@ def ecommerce_rerun_batches():
             rows = list(_ecommerce_load_store().get('rerun_batches') or [])
         if batch_id:
             rows = [row for row in rows if row.get('batch_id') == batch_id]
+        # 用户点过「完成」的会话直接沉底，不再占用列表名额（也不占这20条上限）。
+        rows = [row for row in rows if str(row.get('status') or '') != 'finalized']
         rows.sort(key=lambda row: row.get('created_at') or '', reverse=True)
         return jsonify({'rerun_batches': [_ecommerce_rerun_batch_summary(row) for row in rows[:20]]})
     body = request.get_json(silent=True) or {}
@@ -12281,6 +14634,9 @@ def ecommerce_rerun_batches():
     recycled_by_garment = {}  # (garment_id, action_order) -> count
     for item in items:
         if item.get('status') != 'pending':
+            continue
+        # 二次调整不涉及废片删除，不能顺带把同动作的软删除废片移进回收站。
+        if _ecommerce_item_is_refine(item.get('item_id')):
             continue
         gid = item.get('garment_id')
         action_order = int(item.get('action_order') or 0)
@@ -12480,14 +14836,44 @@ def ecommerce_rerun_batch_action(rerun_batch_id):
                 if recycled_total > 0:
                     logger.info(f'[ecommerce-rerun-resume] 恢复批次时移走软删除文件: {recycled_total}个')
     elif action == 'finalize':
-        _ecommerce_mutate_rerun_batch(rerun_batch_id, lambda item: item.update({
-            'status': 'partial' if int(item.get('completed_count') or 0) < int(item.get('total_count') or 0) else 'completed',
-            'finished_at': datetime.now().isoformat(timespec='seconds'),
-        }))
+        def finalize(item):
+            # 「完成」= 用户确认这一轮到此为止：先按真实落盘刷新完成度，再把它标成
+            # finalized 沉底。前端列表只隐藏 finalized，所以这一行会立刻消失；
+            # 还没补的废片仍留在废片列表里，可以重新扫描后另开一批重做。
+            _ecommerce_refresh_rerun_batch_counts(item)
+            item['status'] = 'finalized'
+            item['finished_at'] = datetime.now().isoformat(timespec='seconds')
+        _ecommerce_mutate_rerun_batch(rerun_batch_id, finalize)
     else:
         return jsonify({'error': '不支持的重做批次操作'}), 400
     updated = _ecommerce_rerun_batch_snapshot(rerun_batch_id)
     return jsonify({'ok': True, 'rerun_batch': _ecommerce_rerun_batch_summary(updated, include_items=True)})
+
+
+def _ecommerce_rerun_stale_preview(batch, garment_id, original_path):
+    """给“已不在成品目录”的成品找一个还能展示的预览图（回收站或轻量预览）。
+
+    优先返回仍处于 deleted/pending 的删除记录；被后续重做替换掉（replaced）的
+    记录作为兜底，保证用户点「验片」时至少能看到那张图真的存在过。
+    """
+    target = os.path.realpath(os.path.expanduser(original_path or ''))
+    if not target:
+        return None
+    fallback = None
+    for record in batch.get('deleted_samples') or []:
+        if record.get('garment_id') != garment_id:
+            continue
+        if os.path.realpath(os.path.expanduser(record.get('original_path') or '')) != target:
+            continue
+        is_active = record.get('status') in {'deleted', 'pending'}
+        for candidate in (record.get('preview_path') or '', record.get('recycle_path') or ''):
+            if not candidate or not os.path.isfile(candidate):
+                continue
+            if is_active:
+                return record, candidate
+            if fallback is None:
+                fallback = (record, candidate)
+    return fallback
 
 
 @app.route('/api/ecommerce/rerun-batches/<rerun_batch_id>/garments/<garment_id>/compare', methods=['GET'])
@@ -12495,36 +14881,74 @@ def ecommerce_rerun_batch_compare(rerun_batch_id, garment_id):
     row = _ecommerce_rerun_batch_snapshot(rerun_batch_id)
     if not row:
         return jsonify({'error': '找不到重做批次'}), 404
+    # 刷新一次（只作用于这份内存副本），让“已被删掉的成品”落到 stale_archived_paths。
+    _ecommerce_refresh_rerun_batch_counts(row)
     batch = _ecommerce_batch_snapshot(row.get('batch_id'))
     garment = _ecommerce_find_garment(batch, garment_id) if batch else None
     if not garment:
         return jsonify({'error': '找不到服装'}), 404
-    payload = _ecommerce_group_compare_payload(batch, garment)
+    # show_deleted=True：本批生成后被删掉的图也要显示出来（标红“已删除”），
+    # 否则用户点「验片」会看到空白，以为图片丢了。
+    payload = _ecommerce_group_compare_payload(batch, garment, show_deleted=True)
     allowed = {
         os.path.realpath(path)
-        for item in row.get('items') or [] if item.get('status') in {'accepted', 'partial'} and item.get('garment_id') == garment_id
-        for path in item.get('archived_paths') or [] if path
+        for item in row.get('items') or [] if item.get('garment_id') == garment_id
+        for path in list(item.get('archived_paths') or []) + list(item.get('stale_archived_paths') or [])
+        if path
     }
     payload['results'] = [
         result for result in payload.get('results') or []
         if os.path.realpath(result.get('path') or '') in allowed
         or os.path.realpath(result.get('original_path') or '') in allowed
     ]
-    allowed_result_paths = {
-        os.path.realpath(result.get('path') or result.get('original_path') or '')
+    # 台账里“已回填”但文件已不在成品目录的（被删掉或被下一轮重做替换掉）也要能看到，
+    # 否则用户点「验片」会发现少图，却不知道少在哪。这里用删除记录里的预览图补一条“已删除”。
+    shown = {
+        os.path.realpath(result.get('original_path') or result.get('path') or '')
         for result in payload['results']
     }
+    for item in row.get('items') or []:
+        if item.get('garment_id') != garment_id:
+            continue
+        for stale_path in item.get('stale_archived_paths') or []:
+            stale_real = os.path.realpath(os.path.expanduser(stale_path or ''))
+            if not stale_real or stale_real in shown:
+                continue
+            found = _ecommerce_rerun_stale_preview(batch, garment_id, stale_path)
+            if not found:
+                continue
+            record, preview = found
+            shown.add(stale_real)
+            identity = _ecommerce_result_identity(batch, garment, stale_path) or {}
+            action_order = int(record.get('action_order') or 0) or int(identity.get('action_order') or 0)
+            payload['results'].append({
+                'task_id': record.get('task_id') or '',
+                'action_order': action_order,
+                'action_name': record.get('action_name') or f'目标图{action_order}',
+                'sample_index': int(record.get('sample_index') or 0) or 1,
+                'path': preview,
+                'url': _ecommerce_local_image_url(preview),
+                'deleted': True,
+                'recoverable': bool(record.get('recycle_path') and os.path.isfile(record.get('recycle_path'))),
+                'recycle_path': record.get('recycle_path') or '',
+                'marked_redo': False,
+                'mark_id': '',
+                'source': 'deleted_preview',
+                'deletion_id': record.get('id') or '',
+                'original_path': stale_path,
+            })
     filtered_action_groups = []
     for action_group in payload.get('action_groups') or []:
+        action_order = int(action_group.get('action_order') or 0)
         action_group['results'] = [
-            result for result in action_group.get('results') or []
-            if os.path.realpath(result.get('path') or result.get('original_path') or '') in allowed_result_paths
+            result for result in payload['results']
+            if int(result.get('action_order') or 0) == action_order
         ]
         if action_group['results']:
             action_group['original_count'] = len(action_group['results'])
-            action_group['kept_count'] = len([result for result in action_group['results'] if not result.get('is_deleted')])
-            action_group['deleted_count'] = len([result for result in action_group['results'] if result.get('is_deleted')])
-            action_group['marked_count'] = len([result for result in action_group['results'] if result.get('is_marked_redo')])
+            action_group['kept_count'] = len([result for result in action_group['results'] if not result.get('deleted')])
+            action_group['deleted_count'] = len([result for result in action_group['results'] if result.get('deleted')])
+            action_group['marked_count'] = len([result for result in action_group['results'] if result.get('marked_redo')])
             filtered_action_groups.append(action_group)
     payload['action_groups'] = filtered_action_groups
     payload['rerun_batch_id'] = rerun_batch_id
@@ -12568,6 +14992,94 @@ def _ecommerce_resumable_rerun_attempt(
     return None
 
 
+def _ecommerce_item_is_refine(item_id):
+    """判断废片任务编号是否来自“二次调整”。"""
+    text = str(item_id or '')
+    return '-refine-' in text or text.endswith('-refine')
+
+
+@app.route('/api/ecommerce/refine-redo', methods=['POST'])
+def ecommerce_refine_redo():
+    """二次调整标记：把成品目录里已存在的一张 AI 图加入二次调整队列。
+
+    与“标记重做”共用同一套废片扫描与废片重做链路；唯一区别是递交时只送
+    这一张 AI 图本身作为唯一参考图（普通废片重做要送模特参考图+服装参考图）。
+    新图按 <源图文件名>_RFNN 归档，字典序紧跟源图之后，便于左右切换对比。
+    请求体 action='remove' 时撤销该标记。
+    """
+    body = request.get_json(silent=True) or {}
+    mode = str(body.get('action') or 'add').strip().lower()
+    batch_id = str(body.get('batch_id') or '')
+    batch = _ecommerce_batch_snapshot(batch_id)
+    if not batch:
+        return jsonify({'error': '找不到批次'}), 404
+    garment_id = str(body.get('garment_id') or '')
+    try:
+        action_order = int(body.get('action_order') or 0)
+    except (TypeError, ValueError):
+        return jsonify({'error': '动作编号无效'}), 400
+    if not garment_id or action_order < 1:
+        return jsonify({'error': '缺少必要参数'}), 400
+    garment = _ecommerce_find_garment(batch, garment_id)
+    if not garment:
+        return jsonify({'error': '找不到服装'}), 404
+    # 源图必须是本套服装成品目录里的真实文件；前端可能传 local-image URL。
+    source_raw = str(body.get('source_path') or '').strip()
+    if 'path=' in source_raw:
+        parsed = parse_qs(urlparse(source_raw).query)
+        source_raw = (parsed.get('path') or [''])[0]
+    source_real = os.path.realpath(os.path.expanduser(source_raw)) if source_raw else ''
+    result_dir = os.path.realpath(_ecommerce_sample_result_dir(batch, garment) or '')
+    if mode != 'remove':
+        if (
+            not source_real
+            or not result_dir
+            or os.path.dirname(source_real) != result_dir
+            or not _ecommerce_is_readable_image_file(source_real)
+        ):
+            return jsonify({'error': '源图无效：二次调整只能用本套服装结果目录里已有的AI图'}), 400
+        identity = _ecommerce_result_identity(batch, garment, source_real)
+        if not identity or identity['action_order'] != action_order:
+            return jsonify({'error': '这张图不属于对应动作，请刷新后重试'}), 409
+
+    def _matches(row):
+        if row.get('garment_id') != garment_id or int(row.get('action_order') or 0) != action_order:
+            return False
+        if not source_real:
+            return True
+        return os.path.realpath(os.path.expanduser(row.get('source_path') or '')) == source_real
+
+    def _apply(b):
+        records = b.get('refine_redo') or []
+        existing = next((row for row in records if _matches(row)), None)
+        kept = [row for row in records if not _matches(row)]
+        if mode == 'remove':
+            b['refine_redo'] = kept
+            return None
+        if existing is not None:
+            b['refine_redo'] = kept + [existing]
+            return existing
+        row = {
+            'id': gen_id('ecrefine'),
+            'garment_id': garment_id,
+            'action_order': action_order,
+            'source_path': source_real,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+        }
+        b['refine_redo'] = kept + [row]
+        return row
+
+    record = _ecommerce_mutate_batch(batch_id, _apply)
+    if mode == 'remove':
+        logger.info(f'[ecommerce-refine-redo] 已撤销二次调整 batch={batch_id} garment={garment_id} action={action_order}')
+        return jsonify({'ok': True, 'refine_redo': False, 'message': '已从二次调整移除'})
+    logger.info(f'[ecommerce-refine-redo] 已加入二次调整 batch={batch_id} garment={garment_id} action={action_order}')
+    return jsonify({
+        'ok': True, 'refine_redo': True, 'refine_id': (record or {}).get('id', ''),
+        'message': '已加入二次调整；扫描废片后可在废片列表按平台/模型/提示词递交',
+    })
+
+
 @app.route('/api/ecommerce/regenerate', methods=['POST'])
 def ecommerce_regenerate():
     """废片重做：对指定服装+动作重新生成一张，归档回原 AI 结果目录。
@@ -12587,6 +15099,8 @@ def ecommerce_regenerate():
     marked_result_path = str(body.get('marked_result_path') or '').strip()
     marked_result_real = os.path.realpath(os.path.expanduser(marked_result_path)) if marked_result_path else ''
     marked_request = '-marked-' in item_id or item_id.endswith('-marked')
+    # 二次调整：只送这一张 AI 图作为唯一参考图，新图按 <源图>_RFNN 归档。
+    refine_request = _ecommerce_item_is_refine(item_id)
     prompt_override = str(body.get('prompt') or '').strip()
     rerun_mode = str(body.get('mode') or 'full').strip().lower()
     rerun_operation_id = gen_id('ecrerun')
@@ -12601,6 +15115,8 @@ def ecommerce_regenerate():
     # 解析 item_id: garment_id-action_order 或 garment_id-action_order-marked
     # （scan-deleted 对标记重做的项会加 -marked 后缀，这里统一去掉）
     clean_item_id = item_id.split('-marked', 1)[0] if '-marked' in item_id else item_id
+    if '-refine' in clean_item_id:
+        clean_item_id = clean_item_id.split('-refine', 1)[0]
     try:
         garment_id, action_order_str = clean_item_id.rsplit('-', 1)
         action_order = int(action_order_str)
@@ -12638,7 +15154,9 @@ def ecommerce_regenerate():
     )
     # 递交重做时软删除文件已在创建rerun-batch时移走（_ecommerce_recycle_soft_deleted_for_action）。
     # 这里作为双重保险，处理重试场景或直接调用regenerate API的情况，再次确保软删除文件已移走。
-    _ecommerce_recycle_soft_deleted_for_action(batch, garment, action_order)
+    # 二次调整与废片删除无关，不能误把同动作的软删除废片一并移走。
+    if not refine_request:
+        _ecommerce_recycle_soft_deleted_for_action(batch, garment, action_order)
     # 重新读取batch快照（移走文件后台账已更新）
     batch = _ecommerce_batch_snapshot(batch_id)
     rerun_queue_item = None
@@ -12683,9 +15201,11 @@ def ecommerce_regenerate():
     # 使用原批次冻结的动作参考图，绝不能退回生成结果/废片备份作为目标图。
     if generation_mode == 'garment_reference' and not target_action_image:
         target_action_image = str(action.get('action_image') or '').strip()
-    if generation_mode in {'target_only', 'garment_prompt'}:
+    if refine_request or generation_mode in {'target_only', 'garment_prompt'}:
         # scan-deleted 会把原目标图返回给前端作左右对比，但它不是
         # 第二张生图参考。重做仍只由 action_copy.action_image 提交一次。
+        # 二次调整同样只送这一张 AI 图，即使批次本身是换装模式也不能要求服装参考图，
+        # 否则 refine 项会被“请至少选择一张服装参考图”拦成 400，永远回填不了。
         garment_copy['images'] = []
     elif isinstance(reference_images, list):
         try:
@@ -12714,7 +15234,7 @@ def ecommerce_regenerate():
         action_copy = _ecommerce_apply_rerun_model(action, model_override)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
-    if (batch.get('settings') or {}).get('precision_matching') and generation_mode == 'garment_reference':
+    if (batch.get('settings') or {}).get('precision_matching') and generation_mode == 'garment_reference' and not refine_request:
         # 精准模式重做仍必须遵守原批次的动作→服装序号映射；不能因为重做界面
         # 传入整套参考图而退回“全部参考图提交”。如果用户明确选择了重做参考图，
         # 则把它视为本次唯一参考图并把序号归零。
@@ -12742,7 +15262,7 @@ def ecommerce_regenerate():
         action_copy['action_image'] = repair_source
         prompt = _ecommerce_detail_repair_prompt(prompt_override)
     else:
-        prompt = _ecommerce_rerun_prompt(action.get('prompt'), prompt_override)
+        prompt = _ecommerce_rerun_prompt(action.get('prompt'), prompt_override, append=not refine_request)
         # 旧版批次数据可能未持久化 action_image，导致 KeyError。
         # 从 task 的已接受结果或废片备份中恢复一张可用图片作为目标参考图。
         if not str(action_copy.get('action_image') or '').strip():
@@ -12751,6 +15271,60 @@ def ecommerce_regenerate():
                 return jsonify({'error': '找不到原始目标参考图，请改用细节修复模式重做'}), 409
             action_copy['action_image'] = fallback_source
             logger.info(f'[ecommerce-regenerate] action_image 缺失，使用 fallback: {fallback_source}')
+    refine_source_real = ''
+    if refine_request:
+        # 二次调整：只送这一张 AI 图作为唯一参考，服装参考图全部清空。
+        # 该图由 scan-deleted 冻结在 target_action_image 里，必须在成品目录内。
+        refine_raw = str(target_action_image or marked_result_path or '').strip()
+        try:
+            refine_source_real = _ecommerce_resolve_rerun_reference(refine_raw) if refine_raw else ''
+        except ValueError as exc:
+            return jsonify({'error': f'二次调整源图无效: {exc}'}), 400
+        if not refine_source_real or not _ecommerce_is_readable_image_file(refine_source_real):
+            return jsonify({'error': '二次调整缺少可用的源图，请重新在对比界面添加'}), 409
+        refine_source_real = os.path.realpath(refine_source_real)
+        result_dir_real = os.path.realpath(_ecommerce_sample_result_dir(batch, garment) or '')
+        if not result_dir_real or os.path.dirname(refine_source_real) != result_dir_real:
+            return jsonify({'error': '二次调整源图不属于本套服装结果目录'}), 409
+        # 二次调整必须换提示词：不能沿用原提示词，也不能和其他废片共用批量提示词。
+        original_refine_prompt = str(action.get('prompt') or '').strip()
+        batch_refine_prompt = str((rerun_batch.get('settings') or {}).get('prompt') or '').strip() if rerun_batch_id else ''
+        if not prompt_override:
+            refine_prompt_error = '二次调整必须填写新的提示词，不能沿用原来的提示词'
+        elif original_refine_prompt and prompt_override == original_refine_prompt:
+            refine_prompt_error = '二次调整的提示词与这张图原来的提示词相同，请改成新的提示词'
+        elif batch_refine_prompt and prompt_override == batch_refine_prompt:
+            refine_prompt_error = '二次调整不能与其他废片共用批量提示词，请单独填写这张的提示词'
+        else:
+            refine_prompt_error = ''
+        if refine_prompt_error:
+            _ecommerce_fail_rerun_item(rerun_batch_id, item_id, refine_prompt_error)
+            return jsonify({'error': refine_prompt_error}), 400
+        # 用户在二次调整界面用「＋ 添加参考图」补的图（最多6张），追加在源图之后一起送上去。
+        # 挂 action_copy 而不是 garment_copy：文生图/原图提示词模式的 sources 只取 action_image，
+        # 只有显式带上这一份才能三种模式都生效。
+        refine_reference_images = []
+        if isinstance(reference_images, list):
+            try:
+                refine_reference_images = [
+                    _ecommerce_resolve_rerun_reference(source)
+                    for source in reference_images[:6] if str(source or '').strip()
+                ]
+            except ValueError as exc:
+                return jsonify({'error': f'二次调整参考图无效: {exc}'}), 400
+        garment_copy['images'] = []
+        action_copy['garment_reference_index'] = -1
+        action_copy['refine_reference_images'] = refine_reference_images
+        # 局部重绘：蒙版由「二次调整」界面的画笔涂抹生成，创建重做批次时已落盘校验。
+        # 只有 API易 官转通道会真正使用它，其他平台会忽略（前端提交前会提示）。
+        mask_path_raw = str(body.get('mask_path') or '').strip()
+        if mask_path_raw:
+            mask_real = os.path.realpath(os.path.expanduser(mask_path_raw))
+            mask_dir_real = os.path.realpath(_ecommerce_rerun_mask_dir(batch))
+            if not mask_real.startswith(mask_dir_real + os.sep) or not os.path.isfile(mask_real):
+                return jsonify({'error': '局部重绘蒙版无效或已失效，请重新在二次调整界面涂抹'}), 400
+            action_copy['mask_image'] = mask_real
+        action_copy['action_image'] = refine_source_real
     if rerun_batch_id:
         def mark_rerun_running(row):
             entry = next((item for item in row.get('items') or [] if item.get('item_id') == item_id), None)
@@ -12782,7 +15356,11 @@ def ecommerce_regenerate():
     rerun_count = requested_count
     # 确定本次重做的文件命名类型和FP轮次
     result_dir = _ecommerce_sample_result_dir(batch, garment)
-    if marked_request:
+    if refine_request:
+        # 二次调整：归档为 <源图文件名>_RFNN，字典序紧跟源图之后。
+        archive_gen_type = 'rf'
+        archive_fp_round = 0
+    elif marked_request:
         # 标记重做：使用BJ类型，不需要FP轮次
         archive_gen_type = 'bj'
         archive_fp_round = 0
@@ -12894,7 +15472,8 @@ def ecommerce_regenerate():
             }), 503
         previous_source = _ecommerce_find_rerun_source(batch, task, garment, action_order)
         history_path = ''
-        if previous_source and os.path.isfile(previous_source):
+        # 二次调整不替换任何图，无需留“被替换前”的历史副本。
+        if previous_source and os.path.isfile(previous_source) and not refine_request:
             history_dir = os.path.join(
                 os.path.expanduser(batch.get('output_path') or ''), '_重做历史',
                 _ecommerce_safe_name(garment.get('name') or garment_id, garment_id),
@@ -12922,11 +15501,13 @@ def ecommerce_regenerate():
         # - 废片重做单张 → FP轮次-01
         # - 废片重做抽卡 → FP轮次-CK序号
         # - 标记重做 → BJ序号
+        # - 二次调整 → <源图文件名>_RF序号
         archived = _ecommerce_archive_sample(
             batch, task, candidate, sample_number, rerun_count,
             run_code_override=rerun_code,
             gen_type=archive_gen_type,
             fp_round=archive_fp_round,
+            source_stem=os.path.splitext(os.path.basename(refine_source_real))[0] if refine_request else '',
         )
         archived_list.append(archived)
         attempt['candidate_path'] = candidate
@@ -12940,11 +15521,22 @@ def ecommerce_regenerate():
                 stored_task['result_model'] = result_model
                 # 更新 accepted_path 为第一张新生成的图片，前端刷新后能看到最新结果。
                 # 抽卡模式后续样本（sample_number > 1）作为候选保留，不覆盖主结果。
-                if sample_number == 1 and archived and os.path.isfile(archived):
+                # 二次调整是“新增一张变体”，不能把源图顶掉成非候选。
+                if sample_number == 1 and archived and os.path.isfile(archived) and not refine_request:
                     stored_task['accepted_path'] = archived
                     stored_task['state'] = 'accepted'
                     stored_task['result_path'] = archived
                     stored_task['last_error'] = ''
+            # 二次调整是一次性任务：生成完成后从台账移除该标记。
+            if refine_request and sample_number == rerun_count:
+                stored_batch['refine_redo'] = [
+                    row for row in stored_batch.get('refine_redo') or []
+                    if not (
+                        row.get('garment_id') == garment_id
+                        and int(row.get('action_order') or 0) == action_order
+                        and os.path.realpath(os.path.expanduser(row.get('source_path') or '')) == refine_source_real
+                    )
+                ]
             # 只清理本次真正重做的那一张标记图。删除废片的补做
             # 不得顺带清除同动作的其他手动标记。
             marked = stored_batch.get('marked_redo') or []
@@ -13535,6 +16127,1159 @@ def check_existing_instance(start_port=5800, max_tries=20):
     return None
 
 
+# ========== 证件照批量生成 ==========
+IDPHOTO_EXTS = {'.jpg', '.jpeg', '.png', '.webp'}
+IDPHOTO_TEST_ROOT = os.path.join(BASE_DIR, '_测试输出', '证件照')
+IDPHOTO_INTAKE_ROOT = os.path.join(BASE_DIR, '_运行缓存', '证件照导入')
+IDPHOTO_APIYI_MODELS = {
+    'apiyi-nano-banana-2-2k': {
+        'model': 'gemini-3.1-flash-image-preview', 'protocol': 'gemini-native',
+        'resolution': '2k', 'price': '$0.025 ≈ ¥0.18/张',
+    },
+    'apiyi-nano-banana-2-4k': {
+        'model': 'gemini-3.1-flash-image-preview', 'protocol': 'gemini-native',
+        'resolution': '4k', 'price': '$0.025 ≈ ¥0.18/张',
+    },
+    'apiyi-nano-banana-pro-4k': {
+        'model': 'gemini-3-pro-image', 'protocol': 'gemini-native',
+        'resolution': '4k', 'price': '$0.09 ≈ ¥0.52/张',
+    },
+    'apiyi-chatgpt-2.5-flare-4k': {
+        'model': 'gpt-image-2.5-flare', 'protocol': 'openai-edits',
+        'resolution': '4k', 'price': '官转按量计费｜原生 Mask', 'native_mask': True,
+    },
+    'apiyi-chatgpt-2.5-sunburst-4k': {
+        'model': 'gpt-image-2.5-sunburst', 'protocol': 'openai-edits',
+        'resolution': '4k', 'price': '官转按量计费｜原生 Mask', 'native_mask': True,
+    },
+    'apiyi-chatgpt-2.5-4k': {
+        'model': 'gpt-image-2.5-all', 'protocol': 'openai-edits',
+        'resolution': '4k', 'price': '$0.03 ≈ ¥0.22/张',
+    },
+    'apiyi-chatgpt-2-4k': {
+        'model': 'gpt-image-2-vip', 'protocol': 'openai-edits',
+        'resolution': '4k', 'price': '$0.03 ≈ ¥0.22/张', 'native_mask': True,
+    },
+}
+IDPHOTO_MODEL_ALIASES = {
+    'apiyi-gemini-2k': 'apiyi-nano-banana-2-2k',
+    'apiyi-gemini-4k': 'apiyi-nano-banana-pro-4k',
+}
+idphoto_job_lock = threading.RLock()
+idphoto_job_executor = ThreadPoolExecutor(max_workers=1)
+idphoto_jobs = {}
+
+def _idphoto_safe_path(value, *, must_exist=False, directory=False):
+    raw = str(value or '').strip()
+    if not raw:
+        raise ValueError('路径不能为空')
+    path = os.path.realpath(os.path.expanduser(raw))
+    if must_exist and not os.path.exists(path):
+        raise ValueError(f'路径不存在：{path}')
+    if directory and os.path.exists(path) and not os.path.isdir(path):
+        raise ValueError(f'不是文件夹：{path}')
+    return path
+
+def _idphoto_detect_face(path):
+    try:
+        import cv2
+        image = cv2.imread(str(path))
+        if image is None:
+            return None, '无法读取图片'
+        # 证件照只需要脸框，不必在原始 4K/8K 尺寸上跑 Haar；缩到长边 1200
+        # 可把批量扫描从几十秒降到可接受范围，同时再把框坐标映射回原图。
+        original_height, original_width = image.shape[:2]
+        detect_scale = min(1.0, 1200.0 / max(original_width, original_height))
+        if detect_scale < 1.0:
+            image_for_detect = cv2.resize(image, (max(1, int(original_width * detect_scale)), max(1, int(original_height * detect_scale))), interpolation=cv2.INTER_AREA)
+        else:
+            image_for_detect = image
+        gray = cv2.cvtColor(image_for_detect, cv2.COLOR_BGR2GRAY)
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=5, minSize=(64, 64))
+        if len(faces) != 1:
+            return None, '多人或未检测到唯一正脸'
+        x, y, w, h = [int(v / detect_scale) for v in faces[0]]
+        if w * h < original_height * original_width * 0.008:
+            return None, '人脸区域过小'
+        return {'x': x, 'y': y, 'w': w, 'h': h, 'image_width': original_width, 'image_height': original_height}, ''
+    except Exception as exc:
+        return None, f'人脸检测失败：{exc}'
+
+def _idphoto_collect_source_files(root_path):
+    """Collect customer images without descending into customer subfolders.
+
+    A batch root is expected to contain one directory per customer. Only files
+    directly inside those customer directories are eligible. This deliberately
+    excludes 花絮 (and every other nested directory), plus videos, PSDs and
+    unsupported image formats.
+    """
+    customer_dirs = sorted(
+        (path for path in root_path.iterdir() if path.is_dir() and not path.name.startswith('.')),
+        key=lambda path: path.name.lower(),
+    )
+    groups = []
+    ignored_nested_folder_count = 0
+    ignored_non_image_count = 0
+    ignored_root_file_count = 0
+
+    for customer_dir in customer_dirs:
+        entries = list(customer_dir.iterdir())
+        images = sorted(
+            (path for path in entries if path.is_file() and path.suffix.lower() in IDPHOTO_EXTS),
+            key=lambda path: path.name.lower(),
+        )
+        ignored_nested_folder_count += sum(1 for path in entries if path.is_dir())
+        ignored_non_image_count += sum(
+            1 for path in entries
+            if path.is_file() and path.suffix.lower() not in IDPHOTO_EXTS and not path.name.startswith('.')
+        )
+        if images:
+            groups.append((customer_dir.name, images))
+
+    root_entries = list(root_path.iterdir())
+    ignored_root_file_count = sum(1 for path in root_entries if path.is_file() and not path.name.startswith('.'))
+
+    return groups, {
+        'ignored_nested_folder_count': ignored_nested_folder_count,
+        'ignored_non_image_count': ignored_non_image_count,
+        'ignored_root_file_count': ignored_root_file_count,
+    }
+
+def _idphoto_clean_relative_path(value):
+    parts = []
+    for part in str(value or '').replace('\\', '/').split('/'):
+        part = part.strip()
+        if not part or part in {'.', '..'} or part.startswith('.'):
+            continue
+        parts.append(part[:180])
+    return parts
+
+def _idphoto_is_staged_path(path):
+    real = os.path.realpath(os.path.expanduser(str(path or '')))
+    root = os.path.realpath(IDPHOTO_INTAKE_ROOT)
+    return real.startswith(root + os.sep) and os.path.isfile(real) and Path(real).suffix.lower() in IDPHOTO_EXTS
+
+def _idphoto_uploaded_source_groups(records, directory_mode=False):
+    """Turn browser uploads into customer groups without descending twice.
+
+    Folder input/drop paths normally look like root/customer/image.jpg. The
+    selected root name is removed only when a third path component exists.
+    Files below customer/nested are ignored, including 花絮.
+    """
+    clean = []
+    ignored_nested = 0
+    ignored_non_image = 0
+    ignored_root = 0
+    for raw in records or []:
+        path = os.path.realpath(os.path.expanduser(str((raw or {}).get('path') or '')))
+        relative = _idphoto_clean_relative_path((raw or {}).get('relative_path') or (raw or {}).get('name'))
+        if not _idphoto_is_staged_path(path) or not relative:
+            ignored_non_image += 1
+            continue
+        clean.append({'path': path, 'name': Path(path).name, 'parts': relative})
+    clean.sort(key=lambda item: '/'.join(item['parts']).lower())
+    if not directory_mode:
+        groups = []
+        used = set()
+        for index, item in enumerate(clean, 1):
+            stem = Path(item['parts'][-1]).stem or f'图片{index}'
+            name = stem
+            suffix = 2
+            while name in used:
+                name = f'{stem}-{suffix}'; suffix += 1
+            used.add(name)
+            groups.append((name, [(Path(item['path']), f'{name}/{item["parts"][-1]}')]))
+        return groups, {
+            'ignored_nested_folder_count': 0,
+            'ignored_non_image_count': ignored_non_image,
+            'ignored_root_file_count': 0,
+        }
+
+    # A selected/dropped root contributes one common leading directory. When
+    # users drop several customer folders directly, paths are customer/file and
+    # no root component is stripped.
+    first_parts = {item['parts'][0] for item in clean if item['parts']}
+    strip_root = len(first_parts) == 1 and any(len(item['parts']) >= 3 for item in clean)
+    grouped = {}
+    for item in clean:
+        parts = item['parts'][1:] if strip_root else item['parts']
+        if len(parts) == 1:
+            ignored_root += 1
+            continue
+        if len(parts) != 2:
+            ignored_nested += 1
+            continue
+        group_name, file_name = parts
+        if group_name == '花絮' or group_name.startswith('.'):
+            ignored_nested += 1
+            continue
+        grouped.setdefault(group_name, []).append((Path(item['path']), f'{group_name}/{file_name}'))
+    return [(name, files) for name, files in sorted(grouped.items(), key=lambda pair: pair[0].lower())], {
+        'ignored_nested_folder_count': ignored_nested,
+        'ignored_non_image_count': ignored_non_image,
+        'ignored_root_file_count': ignored_root,
+    }
+
+def _idphoto_scan_file_groups(source_groups, root='', ignored=None):
+    groups = {name: {'name': name, 'images': [], 'skipped': []} for name, _files in source_groups}
+    files = [(name, path, relative) for name, rows in source_groups for path, relative in rows]
+    def inspect(row):
+        name, path, relative = row
+        return name, path, relative, _idphoto_detect_face(path)
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(files)))) as pool:
+        inspected = list(pool.map(inspect, files))
+    for group_name, path, relative, inspection in inspected:
+        face, reason = inspection
+        item = {'path': str(path), 'name': Path(relative).name, 'relative_path': str(relative), 'face': face}
+        (groups[group_name]['images'] if face else groups[group_name]['skipped']).append(item)
+        if not face:
+            item['reason'] = reason
+    ignored = ignored or {}
+    return {
+        'root': root,
+        'groups': list(groups.values()),
+        'group_count': len(groups),
+        'valid_count': sum(len(group['images']) for group in groups.values()),
+        'skipped_count': sum(len(group['skipped']) for group in groups.values()),
+        'ignored_nested_folder_count': int(ignored.get('ignored_nested_folder_count') or 0),
+        'ignored_non_image_count': int(ignored.get('ignored_non_image_count') or 0),
+        'ignored_root_file_count': int(ignored.get('ignored_root_file_count') or 0),
+    }
+
+def _idphoto_scan(root):
+    root = _idphoto_safe_path(root, must_exist=True, directory=True)
+    root_path = Path(root)
+    source_groups, ignored = _idphoto_collect_source_files(root_path)
+    groups = {
+        name: {'name': name, 'images': [], 'skipped': []}
+        for name, _files in source_groups
+    }
+    files = [path for _name, paths in source_groups for path in paths]
+    file_groups = {path: name for name, paths in source_groups for path in paths}
+    def inspect(path):
+        return path, _idphoto_detect_face(path)
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(files)))) as pool:
+        inspected = list(pool.map(inspect, files))
+    for path, inspection in inspected:
+        relative = path.relative_to(root_path)
+        group = file_groups[path]
+        face, reason = inspection
+        item = {'path': str(path), 'name': path.name, 'relative_path': str(relative), 'face': face}
+        (groups[group]['images'] if face else groups[group]['skipped']).append(item)
+        if not face:
+            item['reason'] = reason
+    return {'root': root, 'groups': list(groups.values()), 'group_count': len(groups),
+            'valid_count': sum(len(g['images']) for g in groups.values()),
+            'skipped_count': sum(len(g['skipped']) for g in groups.values()),
+            **ignored}
+
+@app.route('/api/idphoto/intake/upload', methods=['POST'])
+def idphoto_intake_upload():
+    file = request.files.get('file')
+    kind = str(request.form.get('kind') or '').strip().lower()
+    if kind not in {'source', 'face', 'crop', 'upscale'}:
+        return jsonify({'error': '导入类型无效'}), 400
+    if not file or not file.filename:
+        return jsonify({'error': '没有收到图片'}), 400
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in IDPHOTO_EXTS:
+        return jsonify({'error': '只支持 JPG、PNG、WEBP 图片'}), 400
+    intake_id = str(request.form.get('intake_id') or '').strip().lower()
+    if not re.fullmatch(r'[a-f0-9]{32}', intake_id):
+        intake_id = uuid.uuid4().hex
+    target_dir = os.path.join(IDPHOTO_INTAKE_ROOT, intake_id, kind)
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, uuid.uuid4().hex + suffix)
+    try:
+        file.save(target)
+        with Image.open(target) as image:
+            image.verify()
+    except Exception as exc:
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        return jsonify({'error': f'图片无法读取：{exc}'}), 400
+    return jsonify({
+        'ok': True,
+        'intake_id': intake_id,
+        'record': {
+            'path': target,
+            'name': Path(file.filename).name,
+            'relative_path': '/'.join(_idphoto_clean_relative_path(request.form.get('relative_path') or file.filename)),
+        },
+    })
+
+@app.route('/api/idphoto/intake/finalize', methods=['POST'])
+def idphoto_intake_finalize():
+    body = request.get_json(silent=True) or {}
+    kind = str(body.get('kind') or '').strip().lower()
+    records = body.get('records') if isinstance(body.get('records'), list) else []
+    records = [record for record in records if isinstance(record, dict) and _idphoto_is_staged_path(record.get('path'))]
+    if not records:
+        return jsonify({'error': '没有找到可用的已导入图片'}), 400
+    if kind == 'source':
+        groups, ignored = _idphoto_uploaded_source_groups(records, bool(body.get('directory_mode')))
+        if not groups:
+            return jsonify({'error': '文件夹中没有找到客户子文件夹的直属图片；根目录图片、二级目录和花絮不会读取'}), 400
+        root = os.path.commonpath([record['path'] for record in records])
+        scan = _idphoto_scan_file_groups(groups, root=root, ignored=ignored)
+        return jsonify({'ok': True, 'kind': kind, 'scan': scan, 'source_groups': scan['groups']})
+    if kind == 'face':
+        face_files = sorted({record['path'] for record in records}, key=lambda path: str(path).lower())
+        return jsonify({'ok': True, 'kind': kind, 'face_files': face_files, 'count': len(face_files)})
+    return jsonify({'error': '导入类型无效'}), 400
+
+def _idphoto_data_uri(path, max_edge=2048):
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source).convert('RGB')
+        image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        buf = io.BytesIO(); image.save(buf, 'JPEG', quality=90, optimize=True)
+    return 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode('ascii')
+
+def _idphoto_detect_face_image(image):
+    """Detect the largest frontal face in an in-memory RGB image.
+
+    The source image already has a trusted face box from ``_idphoto_detect_face``;
+    this helper is only for registering the generated candidate before compositing.
+    It deliberately fails closed when no face is found, so a provider result is
+    never moved based on an unrelated background pattern.
+    """
+    try:
+        import cv2
+        import numpy as np
+        rgb = np.asarray(ImageOps.exif_transpose(image).convert('RGB'))
+        original_height, original_width = rgb.shape[:2]
+        detect_scale = min(1.0, 1200.0 / max(original_width, original_height))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        if detect_scale < 1.0:
+            gray = cv2.resize(
+                gray,
+                (max(1, int(original_width * detect_scale)), max(1, int(original_height * detect_scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=5, minSize=(64, 64))
+        if len(faces) == 0:
+            return None
+        x, y, w, h = max(faces, key=lambda row: int(row[2]) * int(row[3]))
+        return {
+            'x': int(x / detect_scale), 'y': int(y / detect_scale),
+            'w': int(w / detect_scale), 'h': int(h / detect_scale),
+            'image_width': original_width, 'image_height': original_height,
+        }
+    except Exception as exc:
+        logger.debug('[idphoto] 生成图人脸检测失败，跳过自动对齐: %s', exc)
+        return None
+
+def _idphoto_align_generated_face(generated, target_size, source_face):
+    """Register a generated full-image candidate to the source face box.
+
+    Image-edit providers often return the correct canvas size but move or resize
+    the face by a small amount. A face-box affine registration removes that coarse
+    translation/scale error before the conservative skin mask is applied. It does
+    not alter the source image or expand the final edit area; if detection is
+    uncertain, the unregistered candidate is returned and the source remains safe
+    because compositing still happens through the source-anchored mask.
+    """
+    generated = ImageOps.exif_transpose(generated).convert('RGB').resize(target_size, Image.Resampling.LANCZOS)
+    generated_face = _idphoto_detect_face_image(generated)
+    if not generated_face:
+        return generated
+    try:
+        import cv2
+        import numpy as np
+        sx, sy, sw, sh = (float(source_face[key]) for key in ('x', 'y', 'w', 'h'))
+        gx, gy, gw, gh = (float(generated_face[key]) for key in ('x', 'y', 'w', 'h'))
+        if min(sw, sh, gw, gh) <= 0:
+            return generated
+        scale_x, scale_y = sw / gw, sh / gh
+        # Haar boxes can jitter, but an extreme ratio means registration is not
+        # trustworthy; leave the candidate untouched in that case.
+        if not 0.78 <= scale_x <= 1.28 or not 0.78 <= scale_y <= 1.28:
+            return generated
+        scale = (scale_x + scale_y) / 2.0
+        source_center = (sx + sw / 2.0, sy + sh / 2.0)
+        generated_center = (gx + gw / 2.0, gy + gh / 2.0)
+        matrix = np.array([
+            [scale, 0.0, source_center[0] - scale * generated_center[0]],
+            [0.0, scale, source_center[1] - scale * generated_center[1]],
+        ], dtype=np.float32)
+        aligned = cv2.warpAffine(
+            np.asarray(generated), matrix, target_size,
+            flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REFLECT101,
+        )
+        return Image.fromarray(aligned, mode='RGB')
+    except Exception as exc:
+        logger.debug('[idphoto] 生成图人脸自动对齐失败，使用原候选图: %s', exc)
+        return generated
+
+def _idphoto_face_mask(size, face, expand=1.15, feather=18):
+    width, height = size
+    # Haar 给的是“检测框”，不是皮肤分割结果；直接把检测框画成椭圆会把
+    # 鬓角、耳朵、下颌外轮廓甚至脖子一起交给生成图，最终看起来就是整图重绘。
+    # 这里用一个收窄的面部皮肤多边形：眼睛、鼻子、嘴巴和中间脸颊可重绘，
+    # 发际线/鬓角、耳朵、下颌轮廓和脖子明确留在原图。最后只做小范围羽化，
+    # 因此羽化区仍然完全位于面部，不会把服装或背景混进来。
+    x, y, fw, fh = (float(face['x']), float(face['y']), float(face['w']), float(face['h']))
+    scale = min(max(float(expand), 1.05), 1.2)
+    spread = (scale - 1.05) / 0.15
+    side = 0.15 - 0.015 * spread
+    jaw = 0.23 - 0.015 * spread
+    top = 0.10 - 0.01 * spread
+    bottom = 0.91 + 0.015 * spread
+    points = [
+        (0.50, top), (0.30, top + 0.01), (side + 0.02, 0.25),
+        (side, 0.52), (jaw, 0.73), (0.34, 0.86), (0.50, bottom),
+        (0.66, 0.86), (1.0 - jaw, 0.73), (1.0 - side, 0.52),
+        (1.0 - side - 0.02, 0.25), (0.70, top + 0.01),
+    ]
+    polygon = [(x + px * fw, y + py * fh) for px, py in points]
+    mask = Image.new('L', (width, height), 0)
+    ImageDraw.Draw(mask).polygon(polygon, fill=255)
+    # Keep feathering proportional on small previews while avoiding a large halo
+    # on 4K images. The alpha ramp stays inside the skin polygon's boundary.
+    return mask.filter(ImageFilter.GaussianBlur(min(max(int(feather), 4), 18)))
+
+def _idphoto_prompt_text(instruction, face_context, reference=False):
+    if reference:
+        role = '使用第二张模特脸参考图建立稳定的模特身份'
+        references = '图一是原始实拍底图，图二是模特脸参考图。图二只提供脸型、五官和气质方向，不提供表情、头部角度、发型、服装、身体、背景或构图参考。'
+    else:
+        role = '只根据文字要求生成一张自然的模特脸'
+        references = '图一是原始实拍底图，没有第二张脸型参考图；只能依据用户文字要求生成新的模特脸，不得虚构或依赖第二张参考图。'
+    return f'''你是证件照局部换脸提示词编写器。任务：{role}。{references}只改变图一的人脸身份、五官气质和面部皮肤；必须保持图一原来的表情不变：眼睛睁闭、眉眼用力、嘴角弧度、嘴唇开合、笑容幅度和面部肌肉状态都要与图一一致；不要把图一的嘴巴贴回去。只改变面部皮肤区域，发际线、鬓角、耳朵、下颌外轮廓、脖子、发型、服装、身体、背景、光线方向、构图和画幅完全不变。脸部边缘要贴合原图头部姿态，皮肤纹理和发际线衔接自然，不要AI网红脸、塑料皮肤、过度磨皮、五官僵硬或抠图边缘。用户要求：{instruction}。检测上下文：{json.dumps(face_context or {}, ensure_ascii=False)}。只输出 JSON：{{"prompt_cn":"...","prompt_en":"...","variation_signature":["..."]}}'''
+
+def _idphoto_parse_prompt_response(response):
+    """接受中转站常见的纯 JSON、Markdown JSON 和带少量说明的 JSON。"""
+    payload = response.json()
+    content = payload
+    if isinstance(payload, dict) and payload.get('choices'):
+        message = (payload.get('choices') or [{}])[0].get('message') or {}
+        content = message.get('content') if isinstance(message, dict) else message
+    if isinstance(content, list):
+        content = ''.join(str(part.get('text') or part.get('content') or '') if isinstance(part, dict) else str(part) for part in content)
+    if isinstance(content, dict):
+        parsed = content
+    else:
+        text = str(content or '').strip()
+        if not text:
+            raise ValueError('DeepSeek 返回为空')
+        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.I | re.S).strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # 只取第一个完整 JSON 对象，避免贪婪正则吞掉多段说明中的花括号。
+            start = text.find('{')
+            parsed = None
+            if start >= 0:
+                depth = 0; quoted = False; escaped = False
+                for index in range(start, len(text)):
+                    char = text[index]
+                    if quoted:
+                        if escaped: escaped = False
+                        elif char == '\\': escaped = True
+                        elif char == '"': quoted = False
+                        continue
+                    if char == '"': quoted = True
+                    elif char == '{': depth += 1
+                    elif char == '}':
+                        depth -= 1
+                        if depth == 0:
+                            parsed = json.loads(text[start:index + 1])
+                            break
+            if parsed is None:
+                raise ValueError('DeepSeek 返回不是有效 JSON')
+    if not isinstance(parsed, dict):
+        raise ValueError('DeepSeek 返回 JSON 类型错误')
+    prompt_cn = str(parsed.get('prompt_cn') or parsed.get('prompt') or '').strip()
+    if not prompt_cn:
+        raise ValueError('DeepSeek 返回缺少 prompt_cn')
+    parsed['prompt_cn'] = prompt_cn
+    parsed.setdefault('prompt_en', prompt_cn)
+    parsed.setdefault('variation_signature', [])
+    return parsed
+
+def _idphoto_call_prompt(instruction, face_context, reference=False):
+    config = load_json('model_config.json') or {}
+    key = str(config.get('api_key') or os.environ.get('DEEPSEEK_API_KEY') or '').strip()
+    if not key:
+        return {'prompt_cn': instruction, 'prompt_en': instruction, 'variation_signature': []}, 'DeepSeek API Key 未配置'
+    try:
+        base = str(config.get('base_url') or 'https://api.deepseek.com').rstrip('/')
+        response = _http_request('POST', base + '/chat/completions', headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'}, json={
+            'model': config.get('model_name') or DEFAULT_DEEPSEEK_MODEL,
+            'messages': [{'role': 'system', 'content': _idphoto_prompt_text(instruction, face_context, reference)}, {'role': 'user', 'content': instruction}],
+            'temperature': 0.55, 'max_tokens': 1600,
+            'response_format': {'type': 'json_object'},
+        }, timeout=60)
+        parsed = _idphoto_parse_prompt_response(response)
+        return parsed, ''
+    except Exception as exc:
+        logger.warning('[idphoto] prompt fallback: %s', exc)
+        return {'prompt_cn': instruction, 'prompt_en': instruction, 'variation_signature': []}, str(exc)
+
+def _idphoto_grid_image_prompt(instruction, prompt, grid_mode=''):
+    """Keep numbered face assignments if DeepSeek summarizes them for either grid layout."""
+    base = str((prompt or {}).get('prompt_en') or (prompt or {}).get('prompt_cn') or instruction or '').strip()
+    assignments = []
+    instruction_text = str(instruction or '')
+    # 前端按行传入；同时兼容用户把多个“X号模特：”粘在同一行的情况。
+    matches = list(re.finditer(r'(?:(?<=^)|(?<=[\n。；;]))\s*([1-9]号模特：)', instruction_text))
+    if matches:
+        for index, match in enumerate(matches):
+            start = match.start(1)
+            end = matches[index + 1].start(1) if index + 1 < len(matches) else len(instruction_text)
+            value = instruction_text[start:end].strip(' \t\r\n。；;')
+            if value:
+                assignments.append(value)
+    else:
+        for line in instruction_text.splitlines():
+            line = line.strip()
+            if re.match(r'^[1-9]号模特：', line):
+                assignments.append(line)
+    requested_mode = str(grid_mode or '').strip().lower()
+    if requested_mode in {'4', '2x2', '2×2', 'quad'}:
+        target_count, grid_label, grid_shape = 4, '四宫格', '2×2'
+    elif requested_mode in {'9', '3x3', '3×3', 'nine'}:
+        target_count, grid_label, grid_shape = 9, '九宫格', '3×3'
+    else:
+        target_count = 4 if len(assignments) == 4 else 9
+        grid_label, grid_shape = ('四宫格', '2×2') if target_count == 4 else ('九宫格', '3×3')
+    assignments = assignments[:target_count]
+    if len(assignments) == target_count:
+        layout_guard = (
+            f'严格使用 {grid_shape} 排列：' + ('第一行放 1、2 号，第二行放 3、4 号；禁止四张图横向排成一行。' if target_count == 4 else '三行三列从左到右、从上到下对应 1 至 9 号。')
+        )
+        base = (
+            f'{base}\n\n{grid_label}编号映射（必须原样执行；每个编号只对应一个格子，不得合并或串位）：\n'
+            + '\n'.join(assignments)
+            + f'\n按从左到右、从上到下排列为 1 至 {target_count} 号；一次只生成这一张 {grid_shape} {grid_label}。\n{layout_guard}'
+        ).strip()
+    return base, len(assignments)
+
+def _idphoto_model_spec(model):
+    key = IDPHOTO_MODEL_ALIASES.get(str(model or '').strip(), str(model or '').strip())
+    key = key or 'apiyi-nano-banana-2-2k'
+    spec = IDPHOTO_APIYI_MODELS.get(key)
+    if not spec:
+        raise ValueError('证件照不支持所选 API易模型')
+    return key, spec
+
+def _idphoto_model_supports_native_mask(model):
+    _model_key, spec = _idphoto_model_spec(model)
+    return bool(spec.get('native_mask')) and spec.get('protocol') == 'openai-edits'
+
+def _idphoto_face_mask_data_uri(source_path, face, expand=1.15):
+    """Build the white=edit / black=preserve mask used by API易 OpenAI edits."""
+    with Image.open(source_path) as source:
+        image = ImageOps.exif_transpose(source).convert('RGB')
+        mask = _idphoto_face_mask(image.size, face, expand=expand)
+    buffer = io.BytesIO()
+    mask.save(buffer, format='PNG')
+    return 'data:image/png;base64,' + base64.b64encode(buffer.getvalue()).decode('ascii')
+
+def _idphoto_call_image(prompt, source_path, face_path=None, model='apiyi-nano-banana-2-2k', aspect_ratio='3:4', mask_base64='', defer_mask_composite=True):
+    _model_key, spec = _idphoto_model_spec(model)
+    references = [_idphoto_data_uri(source_path)]
+    if face_path:
+        references.append(_idphoto_data_uri(face_path))
+    body = {
+        'protocol': spec['protocol'], 'model': spec['model'], 'resolution': spec['resolution'],
+        'aspect_ratio': str(aspect_ratio or 'auto').strip().lower(), 'prompt': prompt,
+        'image_base64_list': references,
+    }
+    if mask_base64:
+        if not spec.get('native_mask'):
+            raise ValueError(f'所选模型 {model} 不支持原生 Mask，请改用 GPT2.5 Flare、Sunburst 或 GPT2 VIP')
+        body['mask_base64'] = mask_base64
+        # 证件照交付由本地 PSD 合成控制；不要让 /api/apiyi-image 先偷偷合成一次。
+        body['defer_mask_composite'] = bool(defer_mask_composite)
+    with app.test_request_context('/api/apiyi-image', method='POST', json=body):
+        result = apiyi_image()
+    response = result[0] if isinstance(result, tuple) else result
+    status = result[1] if isinstance(result, tuple) and len(result) > 1 else 200
+    payload = response.get_json(silent=True) or {}
+    if status >= 300:
+        raise RuntimeError(payload.get('error') or f'API易 HTTP {status}')
+    item = (payload.get('data') or [{}])[0]
+    if item.get('b64_json'):
+        raw = item['b64_json']; raw = raw.split(',', 1)[-1] if raw.startswith('data:') else raw
+        return Image.open(io.BytesIO(base64.b64decode(raw))).convert('RGB')
+    if item.get('url'):
+        ok, err, _ = _validate_url(item['url'], ALLOWED_IMAGE_DOMAINS)
+        if not ok: raise RuntimeError(f'结果地址不允许：{err}')
+        download = requests.get(item['url'], timeout=120); download.raise_for_status()
+        return Image.open(io.BytesIO(download.content)).convert('RGB')
+    raise RuntimeError('API易没有返回图片')
+
+def _idphoto_composite(source_path, generated, face, output_path, expand=1.15):
+    with Image.open(source_path) as source:
+        base = ImageOps.exif_transpose(source).convert('RGB')
+    # Providers may return a full canvas whose face is slightly shifted or scaled.
+    # Register that candidate to the source face before applying the source-anchored
+    # skin mask; otherwise even a correct mask can reveal a double-eye/double-jaw seam.
+    generated = _idphoto_align_generated_face(generated, base.size, face)
+    base.paste(generated, (0, 0), _idphoto_face_mask(base.size, face, expand=expand))
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    base.save(output_path, 'JPEG', quality=100, subsampling=0)
+    return output_path
+
+
+def _psd_pascal_name(value):
+    raw = str(value or '').encode('utf-8')[:255]
+    data = bytes([len(raw)]) + raw
+    return data + b'\x00' * ((4 - len(data) % 4) % 4)
+
+
+def _psd_channel(channel_id, pixels):
+    raw = bytes(pixels)
+    return struct.pack('>hI', int(channel_id), len(raw) + 2) + struct.pack('>H', 0) + raw
+
+
+def _psd_layer_record(width, height, name, channel_ids, mask_bounds):
+    channels = b''.join(struct.pack('>hI', int(channel_id), 2 + width * height) for channel_id in channel_ids)
+    top, left, bottom, right = 0, 0, height, width
+    # Layer mask data: black default, then the -2 channel carries the white face area.
+    mask_top, mask_left, mask_bottom, mask_right = mask_bounds
+    mask_data = struct.pack('>iiiiBB2x', mask_top, mask_left, mask_bottom, mask_right, 0, 0)
+    extra = struct.pack('>I', len(mask_data)) + mask_data
+    extra += struct.pack('>I', 0)  # blending ranges
+    extra += _psd_pascal_name(name)
+    return (
+        struct.pack('>iiiiH', top, left, bottom, right, len(channel_ids))
+        + channels
+        + b'8BIMnorm' + bytes([255, 0, 0, 0])
+        + struct.pack('>I', len(extra)) + extra
+    )
+
+
+def _idphoto_write_psd(source_path, generated, face, output_path, expand=1.15):
+    """Write a small, layered RGB PSD without requiring Photoshop or psd-tools.
+
+    The original is the bottom layer. The generated full image is the top layer,
+    with a Photoshop layer-mask channel that exposes only the detected face skin
+    polygon. The merged composite is also included so the file previews correctly.
+    """
+    with Image.open(source_path) as source_image:
+        source = ImageOps.exif_transpose(source_image).convert('RGB')
+    generated = _idphoto_align_generated_face(generated, source.size, face)
+    width, height = source.size
+    mask = _idphoto_face_mask(source.size, face, expand=expand).convert('L')
+    composite = source.copy()
+    composite.paste(generated, (0, 0), mask)
+    source_channels = [channel.tobytes() for channel in source.split()]
+    generated_channels = [channel.tobytes() for channel in generated.split()]
+    mask_bytes = mask.tobytes()
+    layer_records = [
+        _psd_layer_record(width, height, 'AI Generated (Face Mask)', [0, 1, 2, -2], (0, 0, height, width)),
+        _psd_layer_record(width, height, 'Original Photo', [0, 1, 2], (0, 0, height, width)),
+    ]
+    layer_info = struct.pack('>h', len(layer_records)) + b''.join(layer_records)
+    layer_data = b''.join(_psd_channel(cid, pixels) for cid, pixels in zip([0, 1, 2, -2], generated_channels + [mask_bytes]))
+    layer_data += b''.join(_psd_channel(cid, pixels) for cid, pixels in zip([0, 1, 2], source_channels))
+    layer_section = struct.pack('>I', len(layer_info)) + layer_info + layer_data
+    header = b'8BPS' + struct.pack('>H6xHIIHH', 1, 3, height, width, 8, 3)
+    payload = header + struct.pack('>I', 0) + struct.pack('>I', 0) + struct.pack('>I', len(layer_section)) + layer_section
+    payload += struct.pack('>H', 0) + b''.join(channel.tobytes() for channel in composite.split())
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    Path(output_path).write_bytes(payload)
+    return output_path
+
+@app.route('/api/idphoto/scan', methods=['POST'])
+def idphoto_scan():
+    try: return jsonify(_idphoto_scan((request.get_json(silent=True) or {}).get('root')))
+    except ValueError as exc: return jsonify({'error': str(exc)}), 400
+
+@app.route('/api/idphoto/scan-faces', methods=['POST'])
+def idphoto_scan_faces():
+    try:
+        root = _idphoto_safe_path((request.get_json(silent=True) or {}).get('root'), must_exist=True, directory=True)
+        files = sorted((str(path) for path in Path(root).rglob('*') if path.is_file() and path.suffix.lower() in IDPHOTO_EXTS), key=lambda value: value.lower())
+        return jsonify({'ok': True, 'root': root, 'face_files': files, 'count': len(files)})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+@app.route('/api/idphoto/prompt', methods=['POST'])
+def idphoto_prompt():
+    body = request.get_json(silent=True) or {}
+    parsed, warning = _idphoto_call_prompt(body.get('instruction') or '真实自然的漂亮模特脸', body.get('face_context') or {}, bool(body.get('reference')))
+    return jsonify({'prompt': parsed, 'warning': warning})
+
+@app.route('/api/idphoto/run-one', methods=['POST'])
+def idphoto_run_one():
+    body = request.get_json(silent=True) or {}
+    try:
+        source = _idphoto_safe_path(body.get('source'), must_exist=True)
+        face_value = str(body.get('face') or '').strip()
+        face = _idphoto_safe_path(face_value, must_exist=True) if face_value else None
+        detected, reason = _idphoto_detect_face(source)
+        if not detected: return jsonify({'error': reason}), 400
+        model = body.get('model') or 'apiyi-nano-banana-2-2k'
+        generation_mode = str(body.get('generation_mode') or 'local-composite').strip().lower()
+        if generation_mode not in {'local-composite', 'native-mask'}:
+            raise ValueError('不支持的换脸生成方式')
+        auto_composite = bool(body.get('auto_composite', True))
+        mask_uri = _idphoto_face_mask_data_uri(source, detected, float(body.get('expand') or 1.15)) if generation_mode == 'native-mask' else ''
+        prompt, warning = _idphoto_call_prompt(body.get('instruction') or '真实自然、漂亮、有特色的模特脸', detected, bool(face))
+        generated = _idphoto_call_image(
+            prompt.get('prompt_en') or prompt.get('prompt_cn'), source, face, model,
+            mask_base64=mask_uri, defer_mask_composite=True,
+        )
+        suffix = '.psd' if auto_composite else '.jpg'
+        output = _idphoto_safe_path(body.get('output') or os.path.join(IDPHOTO_TEST_ROOT, datetime.now().strftime('%Y%m%d-%H%M%S'), Path(source).stem + '_换脸' + suffix))
+        final = _idphoto_write_psd(source, generated, detected, output, float(body.get('expand') or 1.15)) if auto_composite else output
+        if not auto_composite:
+            os.makedirs(os.path.dirname(output), exist_ok=True)
+            generated.save(output, 'JPEG', quality=100, subsampling=0)
+        return jsonify({'ok': True, 'output': final, 'auto_composite': auto_composite, 'prompt': prompt, 'prompt_warning': warning, 'face': detected})
+    except (ValueError, RuntimeError) as exc: return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        logger.error('[idphoto] run-one failed', exc_info=True); return jsonify({'error': f'证件照生成失败：{exc}'}), 500
+
+def _idphoto_make_batch_plan(body):
+    explicit_groups = body.get('source_groups') if isinstance(body.get('source_groups'), list) else None
+    if explicit_groups:
+        source_groups = []
+        for raw_group in explicit_groups:
+            name = str((raw_group or {}).get('name') or '').strip()
+            rows = []
+            for item in (raw_group or {}).get('images') or []:
+                path = _idphoto_safe_path((item or {}).get('path'), must_exist=True)
+                if Path(path).suffix.lower() not in IDPHOTO_EXTS:
+                    continue
+                rows.append((Path(path), str((item or {}).get('relative_path') or f'{name}/{Path(path).name}')))
+            if name and rows:
+                source_groups.append((name, rows))
+        if not source_groups:
+            raise ValueError('没有可处理的实拍图片组')
+        scan = _idphoto_scan_file_groups(source_groups, root='已导入图片')
+    else:
+        scan = _idphoto_scan(body.get('root'))
+    explicit_faces = body.get('face_files') if isinstance(body.get('face_files'), list) else None
+    if explicit_faces is not None:
+        # 浏览器上传的缓存文件名是随机 UUID；显式脸型池必须保留用户在
+        # 预览栏里的顺序，否则“第 1 张脸配第 1 个客户组”会随机错位。
+        face_files = [
+            _idphoto_safe_path(path, must_exist=True)
+            for path in explicit_faces
+            if (_idphoto_is_staged_path(path) or os.path.isfile(os.path.expanduser(str(path))))
+            and Path(str(path)).suffix.lower() in IDPHOTO_EXTS
+        ]
+    else:
+        face_root_value = str(body.get('face_root') or '').strip()
+        if face_root_value:
+            face_root = _idphoto_safe_path(face_root_value, must_exist=True, directory=True)
+            face_files = sorted((p for p in Path(face_root).rglob('*') if p.is_file() and p.suffix.lower() in IDPHOTO_EXTS), key=lambda p: str(p).lower())
+        else:
+            face_files = []
+    usable_group_count = sum(1 for group in scan['groups'] if group.get('images'))
+    if face_files and len(face_files) < usable_group_count and not body.get('repeat_faces'):
+        raise ValueError(f'脸型图片只有 {len(face_files)} 张，不能少于可处理客户组 {usable_group_count} 组')
+    if explicit_groups:
+        # 浏览器拖入/多选文件没有可写回原位置的绝对路径，只能使用暂存目录；
+        # 原生选择的大文件夹走 scan.root，并在实拍目录旁建立固定输出目录。
+        staged_paths = [path for _name, rows in source_groups for path, _relative in rows]
+        if staged_paths and all(_idphoto_is_staged_path(path) for path in staged_paths):
+            default_output = os.path.join(IDPHOTO_TEST_ROOT, datetime.now().strftime('%Y%m%d-%H%M%S'))
+        else:
+            source_root_path = Path(scan['root']).expanduser()
+            default_output = str(source_root_path.parent / f'{source_root_path.name}_证件照输出')
+    else:
+        source_root_path = Path(scan['root']).expanduser()
+        default_output = str(source_root_path.parent / f'{source_root_path.name}_证件照输出')
+    output_root = _idphoto_safe_path(body.get('output_root') or default_output)
+    model, _model_spec = _idphoto_model_spec(body.get('model') or 'apiyi-nano-banana-2-2k')
+    generation_mode = str(body.get('generation_mode') or 'local-composite').strip().lower()
+    if generation_mode not in {'local-composite', 'native-mask'}:
+        raise ValueError('不支持的换脸生成方式')
+    if generation_mode == 'native-mask' and not _idphoto_model_supports_native_mask(model):
+        raise ValueError('当前模型不支持原生 Mask；请选择 GPT2.5 Flare、GPT2.5 Sunburst 或 GPT2 VIP')
+    auto_composite = bool(body.get('auto_composite', True))
+    expand = float(body.get('expand') or 1.15)
+    if not 1.05 <= expand <= 1.2:
+        raise ValueError('面部蒙版扩展必须在 1.05 到 1.2 之间')
+    plan, face_index = [], 0
+    for group in scan['groups']:
+        if not group['images']:
+            continue
+        face_path = str(face_files[face_index % len(face_files)]) if face_files else ''
+        if face_files:
+            face_index += 1
+        for item in group['images']:
+            relative = Path(item['relative_path'])
+            suffix = '.psd' if auto_composite else '.jpg'
+            plan.append({
+                'source': item['path'], 'output': str(Path(output_root) / relative.parent / (relative.stem + '_换脸' + suffix)),
+                'group': group['name'], 'face': face_path, 'face_context': item.get('face') or {},
+            })
+    return scan, plan, {'model': model, 'expand': expand, 'generation_mode': generation_mode, 'auto_composite': auto_composite, 'instruction': body.get('instruction') or '真实自然、漂亮、有特色的模特脸'}
+
+def _idphoto_save_jobs():
+    """批量任务只保存进度和结果，避免应用重启后页面完全失去状态。"""
+    try:
+        save_json('idphoto_jobs.json', {'jobs': list(idphoto_jobs.values())[-20:]})
+    except Exception as exc:
+        logger.warning('[idphoto] 保存批量任务状态失败: %s', exc)
+
+def _idphoto_public_job(job):
+    return {k: v for k, v in job.items() if k != 'plan'}
+
+def _idphoto_resume_jobs():
+    """启动时恢复上次中断的批量任务；已生成文件会在 worker 中直接复用。"""
+    persisted = load_json('idphoto_jobs.json') or {}
+    rows = persisted.get('jobs') if isinstance(persisted, dict) else []
+    if not isinstance(rows, list):
+        return
+    resumed = []
+    with idphoto_job_lock:
+        for raw in rows:
+            if not isinstance(raw, dict) or not raw.get('id') or not raw.get('plan'):
+                continue
+            status = raw.get('status')
+            if status in {'queued', 'running'}:
+                raw['status'] = 'queued'
+                raw['updated_at'] = datetime.now().isoformat(timespec='seconds')
+                idphoto_jobs[raw['id']] = raw
+                resumed.append(raw['id'])
+            elif status in {'paused', 'completed', 'completed_with_errors', 'cancelled'}:
+                idphoto_jobs[raw['id']] = raw
+        if resumed:
+            _idphoto_save_jobs()
+    for job_id in resumed:
+        idphoto_job_executor.submit(_idphoto_run_job, job_id)
+    if resumed:
+        logger.info('[idphoto] 启动恢复 %d 个中断批量任务', len(resumed))
+
+def _idphoto_run_job(job_id):
+    with idphoto_job_lock:
+        job = idphoto_jobs.get(job_id)
+        if not job:
+            return
+        job['status'] = 'running'; job['updated_at'] = datetime.now().isoformat(timespec='seconds'); _idphoto_save_jobs()
+    while True:
+        with idphoto_job_lock:
+            job = idphoto_jobs.get(job_id)
+            if not job or job.get('status') in {'cancelled', 'paused'}:
+                return
+            cursor = int(job.get('cursor', 0)); plan = job.get('plan') or []
+            if cursor >= len(plan):
+                job['status'] = 'completed_with_errors' if job.get('errors') else 'completed'
+                job['updated_at'] = datetime.now().isoformat(timespec='seconds'); _idphoto_save_jobs()
+                return
+            item = plan[cursor]; job['cursor'] = cursor + 1; job['current'] = item['source']; job['updated_at'] = datetime.now().isoformat(timespec='seconds'); _idphoto_save_jobs()
+        output = item['output']
+        try:
+            if os.path.isfile(output) and os.path.getsize(output) > 0:
+                result = {**item, 'reused': True, 'output': output}
+                with idphoto_job_lock:
+                    job = idphoto_jobs[job_id]; job['reused'] = int(job.get('reused', 0)) + 1; job['results'].append(result); job['done'] = int(job.get('done', 0)) + 1; _idphoto_save_jobs()
+                continue
+            prompt, warning = _idphoto_call_prompt(job['settings']['instruction'], item['face_context'], bool(item.get('face')))
+            mask_uri = ''
+            if job['settings'].get('generation_mode') == 'native-mask':
+                mask_uri = _idphoto_face_mask_data_uri(item['source'], item['face_context'], job['settings']['expand'])
+            generated = _idphoto_call_image(
+                prompt.get('prompt_en') or prompt.get('prompt_cn'), item['source'], item.get('face') or None,
+                job['settings']['model'], mask_base64=mask_uri, defer_mask_composite=True,
+            )
+            if job['settings'].get('auto_composite', True):
+                _idphoto_write_psd(item['source'], generated, item['face_context'], output, job['settings']['expand'])
+            else:
+                os.makedirs(os.path.dirname(output), exist_ok=True)
+                generated.save(output, 'JPEG', quality=100, subsampling=0)
+            result = {**item, 'prompt': prompt, 'prompt_warning': warning, 'reused': False}
+            with idphoto_job_lock:
+                job = idphoto_jobs[job_id]; job['results'].append(result); job['succeeded'] = int(job.get('succeeded', 0)) + 1; job['done'] = int(job.get('done', 0)) + 1; _idphoto_save_jobs()
+        except Exception as exc:
+            logger.error('[idphoto] batch item failed: %s', exc, exc_info=True)
+            with idphoto_job_lock:
+                job = idphoto_jobs[job_id]; job['errors'].append({'source': item['source'], 'error': str(exc), 'group': item['group']}); job['failed'] = int(job.get('failed', 0)) + 1; job['done'] = int(job.get('done', 0)) + 1; _idphoto_save_jobs()
+
+@app.route('/api/idphoto/run-batch', methods=['POST'])
+def idphoto_run_batch():
+    body = request.get_json(silent=True) or {}
+    try:
+        scan, plan, settings = _idphoto_make_batch_plan(body)
+        # wait=true 保留脚本/集成测试需要的同步契约；界面默认后台运行。
+        if body.get('wait') is True or body.get('background') is False:
+            job_id = uuid.uuid4().hex
+            with idphoto_job_lock:
+                idphoto_jobs[job_id] = {'id': job_id, 'status': 'queued', 'created_at': datetime.now().isoformat(timespec='seconds'), 'updated_at': datetime.now().isoformat(timespec='seconds'), 'total': len(plan), 'done': 0, 'succeeded': 0, 'reused': 0, 'failed': 0, 'cursor': 0, 'current': '', 'results': [], 'errors': [], 'plan': plan, 'settings': settings}
+            _idphoto_run_job(job_id)
+            with idphoto_job_lock:
+                job = idphoto_jobs[job_id]
+                return jsonify({'ok': not job['errors'], 'job_id': job_id, 'scanned': scan, 'results': job['results'], 'errors': job['errors']})
+        job_id = uuid.uuid4().hex
+        with idphoto_job_lock:
+            idphoto_jobs[job_id] = {'id': job_id, 'status': 'queued', 'created_at': datetime.now().isoformat(timespec='seconds'), 'updated_at': datetime.now().isoformat(timespec='seconds'), 'total': len(plan), 'done': 0, 'succeeded': 0, 'reused': 0, 'failed': 0, 'cursor': 0, 'current': '', 'results': [], 'errors': [], 'plan': plan, 'settings': settings, 'scanned': scan}
+            _idphoto_save_jobs()
+        idphoto_job_executor.submit(_idphoto_run_job, job_id)
+        return jsonify({'ok': True, 'job_id': job_id, 'status': 'queued', 'total': len(plan), 'scanned': scan}), 202
+    except (ValueError, RuntimeError) as exc:
+        return jsonify({'error': str(exc)}), 400
+
+@app.route('/api/idphoto/batch-status/<job_id>', methods=['GET'])
+def idphoto_batch_status(job_id):
+    with idphoto_job_lock:
+        job = idphoto_jobs.get(job_id)
+        if not job:
+            return jsonify({'error': '找不到证件照批量任务'}), 404
+        return jsonify(_idphoto_public_job(job))
+
+@app.route('/api/idphoto/batch-control/<job_id>', methods=['POST'])
+def idphoto_batch_control(job_id):
+    action = str((request.get_json(silent=True) or {}).get('action') or '').lower()
+    with idphoto_job_lock:
+        job = idphoto_jobs.get(job_id)
+        if not job:
+            return jsonify({'error': '找不到证件照批量任务'}), 404
+        if action == 'pause' and job['status'] in {'queued', 'running'}:
+            job['status'] = 'paused'
+        elif action == 'resume' and job['status'] == 'paused':
+            job['status'] = 'queued'; idphoto_job_executor.submit(_idphoto_run_job, job_id)
+        elif action == 'cancel' and job['status'] in {'queued', 'running', 'paused'}:
+            job['status'] = 'cancelled'
+        else:
+            return jsonify({'error': '当前状态不支持该操作'}), 400
+        job['updated_at'] = datetime.now().isoformat(timespec='seconds'); _idphoto_save_jobs()
+        return jsonify(_idphoto_public_job(job))
+
+@app.route('/api/idphoto/run-grid', methods=['POST'])
+def idphoto_run_grid():
+    body = request.get_json(silent=True) or {}
+    try:
+        grid_mode = str(body.get('grid_mode') or '9').strip().lower()
+        if grid_mode in {'4', '2x2', '2×2', 'quad'}:
+            grid_mode, default_instruction = '4', '生成真实自然、有特色、没有AI网红感的少女模特脸型；一次输出竖版2×2四宫格，四个格子都是独立正脸头像，不要文字和边框。'
+        elif grid_mode in {'9', '3x3', '3×3', 'nine', ''}:
+            grid_mode, default_instruction = '9', '生成真实自然、有特色、没有AI网红感的少女模特脸型；一次输出竖版3×3九宫格，九个格子都是独立正脸头像，不要文字和边框。'
+        else:
+            raise ValueError('网格模式只支持九宫格或四宫格')
+        instruction = body.get('instruction') or default_instruction
+        reference = body.get('reference')
+        if reference:
+            reference = _idphoto_safe_path(reference, must_exist=True)
+        else:
+            reference = os.path.join(IDPHOTO_TEST_ROOT, '_grid_reference.jpg'); os.makedirs(IDPHOTO_TEST_ROOT, exist_ok=True)
+            Image.new('RGB', (768, 1024), (235, 235, 235)).save(reference, 'JPEG', quality=90)
+        prompt, warning = _idphoto_call_prompt(instruction, {'grid': True})
+        image_prompt, assignment_count = _idphoto_grid_image_prompt(instruction, prompt, grid_mode)
+        grid_label = '四宫格' if grid_mode == '4' else '九宫格'
+        grid_shape = '2×2' if grid_mode == '4' else '3×3'
+        layout_guard = (
+            f'最终成图必须是竖版 {grid_shape} {grid_label}，画布保持竖向比例；'
+            + ('第一行放 1、2 号，第二行放 3、4 号，禁止四张图横向排成一行。' if grid_mode == '4' else '三行三列从左到右、从上到下对应 1 至 9 号。')
+        )
+        if layout_guard not in image_prompt:
+            image_prompt = f'{image_prompt}\n{layout_guard}'.strip()
+        prompt['grid_assignment_count'] = assignment_count
+        prompt['image_prompt_length'] = len(image_prompt)
+        prompt['grid_mode'] = grid_mode
+        aspect_ratio = str(body.get('aspect_ratio') or '3:4').strip().lower()
+        if aspect_ratio not in {'auto', '1:1', '3:4', '4:3', '2:3', '3:2', '4:5', '9:16', '16:9'}:
+            raise ValueError('不支持所选画面比例')
+        # 网格脸型统一竖版；“自动”也不能让模型自行返回横版画布。
+        if aspect_ratio == 'auto':
+            aspect_ratio = '3:4'
+        generated = _idphoto_call_image(image_prompt, reference, reference, body.get('model') or 'apiyi-nano-banana-2-2k', aspect_ratio)
+        exact_output = body.get('output')
+        if exact_output:
+            output = _idphoto_safe_path(exact_output)
+        else:
+            output_root = body.get('output_root')
+            if output_root:
+                output_root = _idphoto_safe_path(output_root)
+            else:
+                output_root = os.path.join(IDPHOTO_TEST_ROOT, datetime.now().strftime('%Y%m%d-%H%M%S'))
+            # 所选位置只是归档根目录；网格类型固定落入独立分类目录，重复运行直接追加。
+            if Path(output_root).name != grid_label:
+                output_root = os.path.join(output_root, grid_label)
+            index = max(1, int(body.get('index') or 1))
+            output = os.path.join(output_root, f'脸型{grid_label}_{index:03d}.jpg')
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        generated.save(output, 'JPEG', quality=100, subsampling=0)
+        return jsonify({'ok': True, 'output': output, 'output_root': os.path.dirname(output), 'grid_mode': grid_mode, 'prompt': prompt, 'prompt_warning': warning})
+    except (ValueError, RuntimeError) as exc: return jsonify({'error': str(exc)}), 400
+    except Exception as exc: logger.error('[idphoto] grid failed', exc_info=True); return jsonify({'error': str(exc)}), 500
+
+@app.route('/api/idphoto/crop-grid', methods=['POST'])
+def idphoto_crop_grid():
+    body = request.get_json(silent=True) or {}
+    try:
+        raw_items = body.get('items') if isinstance(body.get('items'), list) else [{'source': body.get('source'), 'numbers': body.get('numbers')}]
+        requested_root = body.get('output_root')
+        requested_mode = str(body.get('grid_mode') or '9').strip().lower()
+        results, selections, used_output_paths = [], [], set()
+        for raw_item in raw_items:
+            source = _idphoto_safe_path((raw_item or {}).get('source'), must_exist=True)
+            raw_mode = str((raw_item or {}).get('grid_mode') or requested_mode).strip().lower()
+            if raw_mode in {'4', '2x2', '2×2', 'quad'}:
+                grid_mode, grid_size = '4', 2
+            elif raw_mode in {'9', '3x3', '3×3', 'nine', ''}:
+                grid_mode, grid_size = '9', 3
+            else:
+                raise ValueError('裁剪网格只支持九宫格或四宫格')
+            raw_numbers = (raw_item or {}).get('numbers')
+            if isinstance(raw_numbers, list):
+                values = raw_numbers
+            else:
+                values = [v for v in re.split(r'[,，\s]+', str(raw_numbers or '')) if v.strip()]
+            numbers = sorted(set(int(value) for value in values if str(value).strip() and 1 <= int(value) <= grid_size * grid_size))
+            if not numbers:
+                continue
+            output_root = _idphoto_safe_path(requested_root) if requested_root else os.path.join(os.path.dirname(source), '_裁剪脸型')
+            os.makedirs(output_root, exist_ok=True)
+            with Image.open(source) as source_image:
+                image = ImageOps.exif_transpose(source_image).convert('RGB'); width, height = image.size
+                for number in numbers:
+                    row, col = divmod(number - 1, grid_size)
+                    box = (int(col * width / grid_size), int(row * height / grid_size), int((col + 1) * width / grid_size), int((row + 1) * height / grid_size))
+                    stem = f'{Path(source).stem}_{number}'
+                    path = os.path.join(output_root, stem + '.jpg')
+                    suffix = 2
+                    while path in used_output_paths:
+                        path = os.path.join(output_root, f'{stem}_{suffix}.jpg')
+                        suffix += 1
+                    image.crop(box).save(path, 'JPEG', quality=100, subsampling=0)
+                    used_output_paths.add(path)
+                    results.append(path)
+            selections.append({'source': source, 'numbers': numbers, 'grid_mode': grid_mode, 'grid_size': grid_size})
+        if not results:
+            raise ValueError('请至少为一张网格图选择有效编号')
+        return jsonify({'ok': True, 'images': results, 'selections': selections})
+    except (ValueError, OSError) as exc: return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/idphoto/prepare-upscale', methods=['POST'])
+def idphoto_prepare_upscale():
+    """Prepare balanced ZIP inputs for a RunningHub LoadImages(zip) workflow.
+
+    This step is intentionally local-only. It never mutates source images and
+    does not claim to submit a RunningHub task before the user's workflow and
+    node contract have been configured.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        input_value = str(body.get('input_root') or '').strip()
+        explicit_files = body.get('input_files') if isinstance(body.get('input_files'), list) else []
+        requested_packages = int(body.get('packages') or 6)
+        requested_concurrency = int(body.get('concurrency') or 6)
+        resolution = str(body.get('resolution') or '2k').strip().lower()
+        if not 1 <= requested_packages <= 100:
+            raise ValueError('分包数必须在 1 到 100 之间')
+        if not 1 <= requested_concurrency <= 100:
+            raise ValueError('计划并发必须在 1 到 100 之间')
+        if resolution not in {'2k', '4k'}:
+            raise ValueError('放大目标只支持 2K 或 4K')
+
+        excluded_roots = {'_SeedVR压缩包', '_SeedVR高清返回'}
+        images = []
+        if explicit_files:
+            images.extend(Path(_idphoto_safe_path(path, must_exist=True)) for path in explicit_files)
+        if input_value:
+            selected = Path(_idphoto_safe_path(input_value, must_exist=True))
+            if selected.is_file():
+                images.append(selected)
+            else:
+                images.extend(path for path in selected.rglob('*') if path.is_file() and path.suffix.lower() in IDPHOTO_EXTS and not any(part in excluded_roots for part in path.relative_to(selected).parts))
+        images = sorted({path.resolve() for path in images if path.is_file() and path.suffix.lower() in IDPHOTO_EXTS}, key=lambda path: str(path).lower())
+        if not images:
+            raise ValueError('输入目录没有找到 JPG、PNG 或 WEBP 图片')
+
+        common_root = Path(os.path.commonpath([str(path.parent) for path in images]))
+        if not common_root.is_dir():
+            common_root = images[0].parent
+
+        package_count = min(requested_packages, len(images))
+        groups = [[] for _ in range(package_count)]
+        for index, image_path in enumerate(images):
+            groups[index % package_count].append(image_path)
+
+        run_code = datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+        package_root = common_root / '_SeedVR压缩包' / run_code
+        return_root = common_root / '_SeedVR高清返回' / run_code
+        package_root.mkdir(parents=True, exist_ok=False)
+        return_root.mkdir(parents=True, exist_ok=False)
+        packages = []
+        for index, group in enumerate(groups, 1):
+            zip_path = package_root / f'SeedVR-{resolution.upper()}-{index:02d}-of-{package_count:02d}.zip'
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as archive:
+                for image_path in group:
+                    try:
+                        arcname = str(image_path.relative_to(common_root))
+                    except ValueError:
+                        arcname = image_path.name
+                    archive.write(image_path, arcname=arcname)
+            packages.append({
+                'index': index,
+                'path': str(zip_path),
+                'image_count': len(group),
+                'size_bytes': zip_path.stat().st_size,
+            })
+
+        source_dimensions = []
+        for path in images:
+            with Image.open(path) as source_image:
+                source_dimensions.append({'source': str(path), 'width': source_image.width, 'height': source_image.height})
+        manifest = {
+            'run_code': run_code,
+            'input_root': str(common_root),
+            'package_root': str(package_root),
+            'return_root': str(return_root),
+            'resolution': resolution,
+            'image_count': len(images),
+            'package_count': package_count,
+            'requested_packages': requested_packages,
+            'planned_concurrency': min(requested_concurrency, package_count),
+            'runninghub_status': 'workflow_configuration_required',
+            'output_format': 'jpg_quality_100_no_resize',
+            'planned_outputs': [str(path.parent / f'{path.stem}_放大.jpg') for path in images],
+            'source_dimensions': source_dimensions,
+            'required_configuration': ['workflow_id', 'zip_upload_node_id', 'output_contract'],
+            'packages': packages,
+        }
+        manifest_path = package_root / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        manifest['manifest_path'] = str(manifest_path)
+        return jsonify({'ok': True, **manifest})
+    except (ValueError, OSError, zipfile.BadZipFile) as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/idphoto/runninghub-queue', methods=['GET'])
+def idphoto_runninghub_queue():
+    """Read the account-specific RunningHub queue limit without creating a task."""
+    config = load_json('model_config.json') or {}
+    api_key = str(config.get('rh_api_key') or '').strip()
+    if not api_key:
+        return jsonify({'error': '请先在设置中填写 RunningHub API Key'}), 400
+    try:
+        response = requests.get(
+            'https://www.runninghub.cn/openapi/v2/queue/status',
+            headers={'Authorization': f'Bearer {api_key}'},
+            timeout=20,
+        )
+        payload = response.json()
+        data = payload.get('data') if isinstance(payload, dict) and isinstance(payload.get('data'), dict) else {}
+        if response.status_code != 200 or payload.get('code') not in (0, '0') or not data:
+            message = str(payload.get('msg') or payload.get('message') or f'HTTP {response.status_code}')
+            return jsonify({'error': f'RunningHub 队列查询失败：{message[:200]}'}), 502
+        return jsonify({
+            'ok': True,
+            'api_key_type': str(data.get('apiKeyType') or 'UNKNOWN'),
+            'concurrent_limit': int(data.get('concurrentLimit') or 0),
+            'running_count': int(data.get('runningCount') or 0),
+            'queued_count': int(data.get('queuedCount') or 0),
+            'total_current_tasks': int(data.get('totalCurrentTasks') or 0),
+        })
+    except requests.exceptions.Timeout:
+        return jsonify({'error': 'RunningHub 队列查询超时'}), 504
+    except (ValueError, TypeError, requests.RequestException) as exc:
+        logger.warning('[idphoto] RunningHub queue unavailable: %s', exc)
+        return jsonify({'error': 'RunningHub 队列响应无法读取'}), 502
+
 # ========== 启动 ==========
 
 if __name__ == '__main__':
@@ -13612,6 +17357,7 @@ if __name__ == '__main__':
     # Werkzeug 热重载父进程不执行任务；实际服务子进程恢复未完成的运行批次。
     if (not hot_reload) or (os.environ.get('WERKZEUG_RUN_MAIN') == 'true'):
         _ecommerce_resume_running_batches()
+        _idphoto_resume_jobs()
         # 启动时清理超过 30 天的临时目录文件（_重做临时参考图、_重做历史、_质检缓存等）
         try:
             _ecommerce_cleanup_temp_dirs(max_age_days=30)

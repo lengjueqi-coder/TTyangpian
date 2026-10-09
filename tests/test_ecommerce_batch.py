@@ -3,6 +3,7 @@ import errno
 import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -24,8 +25,11 @@ class EcommerceBatchTest(unittest.TestCase):
         self.user_temp = tempfile.TemporaryDirectory(dir=os.environ.get("ECOMMERCE_TEST_TMP") or "/private/tmp")
         self.old_data_dir = app_module.DATA_DIR
         self.old_images_dir = app_module.IMAGES_DIR
+        self.old_crop_backup_root = app_module.ECOMMERCE_GARMENT_BACKUP_ROOT
         app_module.DATA_DIR = os.path.join(self.data_temp.name, "data")
         app_module.IMAGES_DIR = os.path.join(self.data_temp.name, "images")
+        # 裁剪的原图备份默认落在应用 _运行缓存 下，测试必须整体重定向到临时目录。
+        app_module.ECOMMERCE_GARMENT_BACKUP_ROOT = os.path.join(self.data_temp.name, "garment-backups")
         # Safety check: ensure DATA_DIR is NOT pointing at the real data directory.
         # This prevents tests from overwriting production data if isolation fails.
         if os.path.realpath(app_module.DATA_DIR) == os.path.realpath(self._REAL_DATA_DIR):
@@ -40,6 +44,7 @@ class EcommerceBatchTest(unittest.TestCase):
     def tearDown(self):
         app_module.DATA_DIR = self.old_data_dir
         app_module.IMAGES_DIR = self.old_images_dir
+        app_module.ECOMMERCE_GARMENT_BACKUP_ROOT = self.old_crop_backup_root
         self.user_temp.cleanup()
         self.data_temp.cleanup()
 
@@ -67,10 +72,35 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertIn("String(item.rerun_prompt || '').trim() || String(config.prompt || '')", script)
         self.assertIn('预计付费生图 ${paidCallTotal} 张', script)
         self.assertIn('参考图支持1～9张', script)
-        self.assertIn('class="ecommerce-rerun-sync-select"', script)
-        self.assertIn('function ecommerceRerunAdjustmentTargets(item)', script)
-        self.assertIn('advanceEcommerceRerunWorkflow(index, syncEnabled)', script)
-        self.assertIn('保存当前并下一张', script)
+        # 第5栏三个保存按钮：下一张 / 下一套 / 同步全部二次调整。
+        self.assertIn('id="btn-ecommerce-rerun-save-next-item"', script)
+        self.assertIn('id="btn-ecommerce-rerun-save-next-garment"', script)
+        self.assertIn('id="btn-ecommerce-rerun-save-sync-all"', script)
+        self.assertIn('保存调整下一张 →', script)
+        self.assertIn('保存调整下一套 →', script)
+        self.assertIn('保存调整，同步全部二次调整', script)
+        self.assertIn("advanceEcommerceRerunWorkflow(index, 'item')", script)
+        self.assertIn("advanceEcommerceRerunWorkflow(index, 'garment')", script)
+        # 列表分组顺序与「下一张 / 下一套」共用一份定义，不能各自算一遍导致顺序漂移。
+        self.assertIn('function ecommerceRerunDisplayGroups()', script)
+        self.assertIn('function ecommerceRerunDisplayOrder()', script)
+        self.assertIn('const { normal: grouped, refine: refineGrouped } = ecommerceRerunDisplayGroups();', script)
+        # 「同步本套」下拉框与整套同步机制已移除，第5栏编辑只作用于当前这一张。
+        self.assertNotIn('ecommerce-rerun-sync-select', script)
+        self.assertNotIn('ecommerceRerunAdjustmentTargets', script)
+        self.assertNotIn('groupSyncByGarment', script)
+        self.assertNotIn('ecommerceRerunGroupSyncEnabled', script)
+        # 提示词优先级：二次调整只认自己的提示词，批次大提示词（含「统一使用批量提示词」）不覆盖它。
+        self.assertIn('prompt: item.refine_redo', script)
+        # 二次调整「＋ 添加参考图」：最多6张，与这一张的提示词配套送上去。
+        self.assertIn('ecommerce-rerun-add-refine-ref', script)
+        self.assertIn('＋ 添加参考图（${refineRefs.length}/6）', script)
+        self.assertIn('item.refine_references', script)
+        self.assertIn('refine_references: ecommerceCloneRerunReferences(item.refine_references)', script)
+        self.assertIn('function ecommerceRefineRerunItems()', script)
+        self.assertIn('function ecommerceRerunPromptProblem(item, promptValue, bulkPrompt)', script)
+        # 「清除单张提示词」必须排除二次调整，否则会把必填的二次调整提示词清掉导致整批递交失败。
+        self.assertIn("const targets = ecommerceRerunState.items.filter(item => !item.refine_redo && String(item.rerun_prompt || '').trim());", script)
         self.assertIn('id="ecommerce-rerun-adjust-panel"', template)
         self.assertIn('id="ecommerce-rerun-adjust-host"', template)
         self.assertIn("const host = document.getElementById('ecommerce-rerun-adjust-host')", script)
@@ -81,6 +111,13 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertIn("'/api/ecommerce/cancel-rerun-items'", script)
         self.assertIn("currentResult?.deleted ? '↶ 恢复此图' : '删除此图'", script)
         self.assertIn('await refreshEcommerceFolderStatusCounts(folderContainer, ecommerceState.detail)', script)
+        # 扫描废片（含二次调整）后必须刷新逐套验片进度数字：二次调整只写 refine_redo，
+        # 不进删除台账也不改任务状态，漏刷新会让该套一直停在 9/9。
+        self.assertIn('resultPath ? null : (data.items || [])', script)
+        self.assertIn('precomputedItems', script)
+        # refine_redo 数量必须进渲染签名，否则详情刷新后命中缓存不重算缺图数。
+        self.assertIn('const refineRedoCount = (b.refine_redo || []).length', script)
+        self.assertIn('${markedRedoCount}|${refineRedoCount}', script)
         self.assertIn('共保留 ${status.candidate_count} 张', script)
         self.assertIn("'/api/ecommerce/export-final-products'", script)
         self.assertIn('id="ecommerce-final-export-status"', template)
@@ -89,6 +126,64 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertIn('一键导出最终成品', template)
         self.assertNotIn('permanent: true', script)
         self.assertNotIn('list.appendChild(compare)', script)
+
+    def test_wastelist_rows_stay_compact_and_prompt_templates_can_collapse(self):
+        base = os.path.dirname(app_module.__file__)
+        with open(os.path.join(base, 'static', 'js', 'app.js'), encoding='utf-8') as handle:
+            script = handle.read()
+        with open(os.path.join(base, 'static', 'css', 'style.css'), encoding='utf-8') as handle:
+            style = handle.read()
+        with open(os.path.join(base, 'templates', 'index.html'), encoding='utf-8') as handle:
+            template = handle.read()
+        # 废片列表整行可点已直接进入第5栏，不再需要单独的「调整参考图」按钮。
+        self.assertNotIn('ecommerce-rerun-pick', script)
+        self.assertNotIn('ecommerce-rerun-pick', style)
+        self.assertIn("list.querySelectorAll('.ecommerce-rerun-item').forEach(row => {", script)
+        # 动作名与动作号合并到一列，不再重复占一列（动作名多数时候就等于动作号）。
+        self.assertNotIn('ecommerce-rerun-action"', script)
+        self.assertIn('const actionLabel = `动作${item.action_order}', script)
+        # 「打开文件夹」与分组头同一行，不再绝对定位留出 90px 空白。
+        self.assertIn('<div class="ecommerce-rerun-group-bar">', script)
+        self.assertIn('.ecommerce-rerun-group-bar { display: flex;', style)
+        self.assertNotIn('padding: 7px 90px 7px 8px', style)
+        # 行内保持「序号 / 动作N / 类型徽章 / 预览图」，宽度用 auto 自适应，不再按徽章数量切四套列宽。
+        self.assertIn('grid-template-columns: 16px 20px minmax(0,1fr) auto auto auto 46px', style)
+        self.assertNotIn('.ecommerce-rerun-item:has(.ecommerce-rerun-count-badge)', style)
+        self.assertNotIn('.ecommerce-rerun-item:has(.ecommerce-rerun-prompt-badge)', style)
+        # 第5栏标题必须能省略成一行，否则窄栏会把它挤成一个字一行（竖排）。
+        self.assertIn('.ecommerce-rerun-compare-head strong { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;', style)
+        self.assertNotIn('重新调整参考图重做 ·', script)
+        self.assertIn('const actionNameSuffix =', script)
+        # 共用提示词模板可折叠，且折叠状态跨刷新保留，把高度让给提示词输入框。
+        self.assertIn('class="ecommerce-shared-prompt-toggle"', script)
+        self.assertIn('class="ecommerce-shared-prompt-body"', script)
+        self.assertIn('.ecommerce-shared-prompt-templates.is-collapsed .ecommerce-shared-prompt-body { display: none; }', style)
+        self.assertIn("const ECOMMERCE_PROMPT_TEMPLATE_COLLAPSE_KEY = 'ecommerce_prompt_templates_collapsed';", script)
+        self.assertIn('toggle.onclick = () => ecommerceSetPromptTemplatesCollapsed(!collapsed);', script)
+        # 各栏改用权重制：宽度 = 权重占比，6栏总宽恒等于视口，数学上不可能把第6栏挤出屏幕。
+        # 同时换掉 localStorage key，否则旧的像素宽会盖掉新权重。
+        self.assertIn("const storageKey = 'ecommerce_workbench_widths_v5';", script)
+        self.assertIn('flex: var(--wb-weight, 1) 1 0;', style)
+        self.assertIn('min-width: var(--wb-floor, 0px);', style)
+        self.assertIn('#ecommerce-mode .ecommerce-card-wastelist {', style)
+        self.assertIn('--wb-weight: 15;', style)
+        # 像素制时代的顶部水平轨道整体删除（权重制下不会横向溢出）。
+        self.assertNotIn('ecommerce-scroll-track', script)
+        self.assertNotIn('ecommerce-scroll-track', style)
+        self.assertNotIn('ecommerce-scroll-track', template)
+        self.assertNotIn('updateScrollTrack', script)
+        # 第5栏AI成品图不再单独占一列（原第三列最小220px是最大空间黑洞），改走头部对比弹窗。
+        self.assertIn('grid-template-columns: minmax(0,1fr) minmax(0,1fr);', style)
+        self.assertNotIn('ecommerce-rerun-compare-img', script)
+        self.assertIn('ecommerce-preview-bad" title="打开大图对比', script)
+        # 第3栏验片行只常驻「对比 / 📁 打开 / ✓ 确认该组」，链成片/链实拍图收进「⋯ 更多」就地展开。
+        self.assertIn('ecommerce-folder-more-btn', script)
+        self.assertIn('class="ecommerce-folder-more-row" hidden', script)
+        self.assertIn('.ecommerce-folder-more-row[hidden] { display: none; }', style)
+        # 第2栏「人工精准匹配」建批时用一次，默认折叠成一行。
+        self.assertIn('id="ecommerce-precision-fold"', template)
+        self.assertIn('id="ecommerce-precision-fold-state"', template)
+        self.assertIn("document.getElementById('ecommerce-precision-fold-state')", script)
 
     def test_rerun_and_first_generation_share_one_prompt_template_library(self):
         script_path = os.path.join(os.path.dirname(app_module.__file__), 'static', 'js', 'app.js')
@@ -210,7 +305,7 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(action_two_old))
         self.assertTrue(os.path.isfile(action_two_new))
 
-    def test_scan_requires_all_six_numbered_images(self):
+    def test_scan_accepts_1_to_10_images_and_flags_inconsistent_subfolder_counts(self):
         self.make_garment("完整款")
         self.make_garment("缺图款", count=5)
         response = self.client.post(
@@ -219,10 +314,11 @@ class EcommerceBatchTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload["garment_count"], 1)
-        self.assertEqual(payload["garments"][0]["name"], "完整款")
-        self.assertEqual(len(payload["garments"][0]["images"]), 6)
-        self.assertEqual(payload["invalid"][0]["name"], "缺图款")
+        by_name = {garment["name"]: garment for garment in payload["garments"]}
+        self.assertEqual(payload["garment_count"], 2)
+        self.assertEqual(len(by_name["完整款"]["images"]), 6)
+        self.assertEqual(len(by_name["缺图款"]["images"]), 5)
+        self.assertEqual(payload["image_counts_consistent"], False)
 
     def test_exactly_six_camera_named_images_use_natural_order(self):
         folder = os.path.join(self.user_temp.name, "相机编号款")
@@ -256,6 +352,230 @@ class EcommerceBatchTest(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["garment_count"], 1)
         self.assertEqual(len(payload["garments"][0]["images"]), 3)
+
+    def test_legacy_crop_dir_is_archived_and_no_longer_overrides(self):
+        """旧版 _裁剪参考图/ 的虚拟覆盖已废弃：扫描时把目录挪走，显示的仍是真实文件。"""
+        folder = self.make_garment("替换裁剪款")
+        crop_dir = os.path.join(folder, "_裁剪参考图")
+        os.makedirs(crop_dir)
+        self.make_image(os.path.join(crop_dir, "crop-a.jpg"), color=(200, 10, 10))
+        with open(os.path.join(crop_dir, "crop-map.json"), "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "slots": {"3": "crop-a.jpg"}, "extras": []}, handle)
+
+        response = self.client.post("/api/ecommerce/scan-clothing-root", json={"path": folder})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        images = payload["garments"][0]["images"]
+        self.assertEqual(len(images), 6)
+        self.assertEqual(os.path.basename(images[2]), "3-参考.jpg")
+        self.assertEqual(os.path.basename(images[0]), "1-参考.jpg")
+        # 服装文件夹里不能再留子目录
+        self.assertFalse(os.path.exists(crop_dir))
+        self.assertEqual(
+            sorted(os.listdir(folder)),
+            [f"{number}-参考.jpg" for number in range(1, 7)],
+        )
+
+    def test_legacy_extra_is_not_appended_to_reference_list(self):
+        folder = self.make_garment("新增裁剪款")
+        crop_dir = os.path.join(folder, "_裁剪参考图")
+        os.makedirs(crop_dir)
+        self.make_image(os.path.join(crop_dir, "crop-b.jpg"), color=(10, 200, 10))
+        with open(os.path.join(crop_dir, "crop-map.json"), "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "slots": {}, "extras": ["crop-b.jpg"]}, handle)
+
+        response = self.client.post("/api/ecommerce/scan-clothing-root", json={"path": folder})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        images = response.get_json()["garments"][0]["images"]
+        self.assertEqual(len(images), 6)
+        self.assertFalse(os.path.exists(crop_dir))
+
+    def test_single_garment_folder_with_legacy_crop_dir_is_still_one_set(self):
+        folder = self.make_garment("单套带裁剪目录", count=3)
+        crop_dir = os.path.join(folder, "_裁剪参考图")
+        os.makedirs(crop_dir)
+        response = self.client.post("/api/ecommerce/scan-clothing-root", json={"path": folder})
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["garment_count"], 1)
+        self.assertEqual(len(payload["garments"][0]["images"]), 3)
+        self.assertFalse(os.path.exists(crop_dir))
+
+    def test_crop_garment_reference_overwrites_original_in_place(self):
+        folder = self.make_garment("裁剪写回款", count=4)
+        source = os.path.join(folder, "2-参考.jpg")
+        with open(source, "rb") as handle:
+            original_bytes = handle.read()
+        response = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": source,
+            "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5,
+            "mode": "replace",
+            "slot": 2,
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        # 覆盖的是同名原文件：路径不变、张数不变、内容变了
+        self.assertEqual(os.path.realpath(payload["path"]), os.path.realpath(source))
+        self.assertEqual(os.path.basename(payload["filename"]), "2-参考.jpg")
+        self.assertEqual(payload["image_count"], 4)
+        with open(source, "rb") as handle:
+            self.assertNotEqual(handle.read(), original_bytes)
+        with Image.open(source) as cropped:
+            self.assertEqual(cropped.size, (16, 24))
+        # 服装文件夹里不许出现任何子目录
+        self.assertEqual(
+            sorted(os.listdir(folder)),
+            [f"{number}-参考.jpg" for number in range(1, 5)],
+        )
+
+        scan = self.client.post("/api/ecommerce/scan-clothing-root", json={"path": folder})
+        images = scan.get_json()["garments"][0]["images"]
+        self.assertEqual(len(images), 4)
+        self.assertEqual(os.path.basename(images[1]), "2-参考.jpg")
+
+    def test_crop_garment_reference_adds_reference_and_rejects_overflow(self):
+        folder = self.make_garment("裁剪新增款", count=10)
+        source = os.path.join(folder, "1-参考.jpg")
+        blocked = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": source,
+            "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5,
+            "mode": "add",
+            "slot": 1,
+        })
+        self.assertEqual(blocked.status_code, 400, blocked.get_json())
+        self.assertIn("10", blocked.get_json()["error"])
+
+        os.remove(os.path.join(folder, "10-参考.jpg"))
+        added = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": source,
+            "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5,
+            "mode": "add",
+            "slot": 1,
+        })
+        self.assertEqual(added.status_code, 200, added.get_json())
+        payload = added.get_json()
+        self.assertEqual(payload["image_count"], 10)
+        # 新增是真实多一个文件（文件夹里现在正好 10 张），没有子目录
+        self.assertTrue(os.path.isfile(payload["path"]))
+        self.assertEqual(os.path.dirname(os.path.realpath(payload["path"])), os.path.realpath(folder))
+        self.assertEqual(len([n for n in os.listdir(folder) if n.lower().endswith('.jpg')]), 10)
+        self.assertEqual(
+            [n for n in os.listdir(folder) if os.path.isdir(os.path.join(folder, n))],
+            [],
+        )
+
+    def test_crop_garment_reference_rejects_bad_requests(self):
+        folder = self.make_garment("裁剪校验款", count=3)
+        source = os.path.join(folder, "1-参考.jpg")
+        outside = os.path.join(self.user_temp.name, "外部图.jpg")
+        self.make_image(outside)
+        base = {"garment_path": folder, "source": source, "mode": "replace", "slot": 1}
+        cases = [
+            {**base, "x": 0.1, "y": 0.1, "width": 1.5, "height": 0.5},
+            {**base, "x": 0.1, "y": 0.1, "width": 0.01, "height": 0.01},
+            {**base, "source": outside, "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5},
+            {**base, "slot": 9, "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5},
+            {**base, "mode": "delete", "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5},
+        ]
+        for payload in cases:
+            response = self.client.post("/api/ecommerce/crop-garment-reference", json=payload)
+            self.assertEqual(response.status_code, 400, (payload, response.get_json()))
+
+    def test_crop_garment_reference_allows_free_aspect_and_recrop_from_crop_file(self):
+        folder = self.make_garment("裁剪非等比款", count=4)
+        source = os.path.join(folder, "2-参考.jpg")
+        first = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": source,
+            "x": 0.1, "y": 0.1, "width": 0.6, "height": 0.25,
+            "mode": "replace",
+            "slot": 2,
+        })
+        self.assertEqual(first.status_code, 200, first.get_json())
+        first_payload = first.get_json()
+        # 重扫后第 2 格显示的就是这张裁剪图
+        scan = self.client.post("/api/ecommerce/scan-clothing-root", json={"path": folder})
+        images = scan.get_json()["garments"][0]["images"]
+        self.assertEqual(os.path.basename(images[1]), first_payload["filename"])
+        # 再拿这张裁剪图当 source 裁第二次：不能报「源图不属于该服装文件夹」
+        second = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": first_payload["path"],
+            "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5,
+            "mode": "replace",
+            "slot": 2,
+        })
+        self.assertEqual(second.status_code, 200, second.get_json())
+        # 第二次仍从 32x48 的原图裁，证明没有在裁剪图上叠加裁剪
+        with Image.open(second.get_json()["path"]) as cropped:
+            self.assertEqual(cropped.size, (16, 24))
+
+    def test_crop_garment_reference_reset_restores_original(self):
+        folder = self.make_garment("裁剪还原款", count=3)
+        source = os.path.join(folder, "2-参考.jpg")
+        with open(source, "rb") as handle:
+            original_bytes = handle.read()
+        replaced = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": source,
+            "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5,
+            "mode": "replace",
+            "slot": 2,
+        })
+        self.assertEqual(replaced.status_code, 200, replaced.get_json())
+        crop_path = replaced.get_json()["path"]
+        reset = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": crop_path,
+            "mode": "reset",
+        })
+        self.assertEqual(reset.status_code, 200, reset.get_json())
+        self.assertTrue(reset.get_json()["restored"])
+        self.assertEqual(os.path.basename(reset.get_json()["path"]), "2-参考.jpg")
+        # 恢复 = 用备份盖回同名原文件；文件夹里依旧只有 3 张图、没有子目录
+        with open(os.path.join(folder, "2-参考.jpg"), "rb") as handle:
+            self.assertEqual(handle.read(), original_bytes)
+        self.assertEqual(len(os.listdir(folder)), 3)
+        scan = self.client.post("/api/ecommerce/scan-clothing-root", json={"path": folder})
+        images = scan.get_json()["garments"][0]["images"]
+        self.assertEqual(os.path.basename(images[1]), "2-参考.jpg")
+        # 对已经是原图的 source 再 reset：不报错，restored=False
+        again = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": source,
+            "mode": "reset",
+        })
+        self.assertEqual(again.status_code, 200, again.get_json())
+        self.assertFalse(again.get_json()["restored"])
+
+    def test_crop_garment_reference_reset_removes_added_extra(self):
+        folder = self.make_garment("裁剪新增还原款", count=2)
+        source = os.path.join(folder, "1-参考.jpg")
+        added = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": source,
+            "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5,
+            "mode": "add",
+            "slot": 1,
+        })
+        self.assertEqual(added.status_code, 200, added.get_json())
+        self.assertEqual(added.get_json()["image_count"], 3)
+        added_path = added.get_json()["path"]
+        reset = self.client.post("/api/ecommerce/crop-garment-reference", json={
+            "garment_path": folder,
+            "source": added_path,
+            "mode": "reset",
+        })
+        self.assertEqual(reset.status_code, 200, reset.get_json())
+        self.assertTrue(reset.get_json()["restored"])
+        self.assertEqual(reset.get_json()["image_count"], 2)
+        # 新增出来的那张被真删掉，原图 1-参考.jpg 保持不动
+        self.assertFalse(os.path.isfile(added_path))
+        self.assertTrue(os.path.isfile(source))
+        self.assertEqual(sorted(os.listdir(folder)), ["1-参考.jpg", "2-参考.jpg"])
 
     def test_create_batch_accepts_inline_single_garment_images(self):
         folder = self.make_garment("拖入单套", count=2)
@@ -500,10 +820,11 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(payload["garment_count"], 1)
         self.assertEqual([os.path.basename(path) for path in payload["garments"][0]["images"]], wanted)
 
-    def test_keyword_with_more_than_six_matches_is_rejected_as_ambiguous(self):
+    def test_keyword_with_more_than_max_matches_is_rejected_as_ambiguous(self):
         folder = os.path.join(self.user_temp.name, "关键词过宽")
         os.makedirs(folder)
-        for i in range(1, 8):
+        # 超过 1～10 张的上限即视为歧义拒绝，避免从大量联机素材中选不出一组主序列
+        for i in range(1, 12):
             self.make_image(os.path.join(folder, f"旗袍拍摄{i}.jpg"))
         response = self.client.post("/api/ecommerce/scan-clothing-root", json={"path": folder, "keyword": "旗袍"})
         self.assertEqual(response.get_json()["garment_count"], 0)
@@ -530,10 +851,19 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual([g["name"] for g in payload["garments"]], ["批量/001", "批量/002", "批量/003"])
 
     def test_rerun_prompt_reuses_original_or_uses_replacement(self):
+        # 留空：复用原提示词（换装指令原样保留）
         self.assertEqual(app_module._ecommerce_rerun_prompt("原提示词", ""), "原提示词")
+        # 普通废片/标记重做（append=True 默认）：新要求追加在原提示词之后，
+        # 换装指令不丢；这是「只写改七分裙长也能正确换装」的关键。
+        combined = app_module._ecommerce_rerun_prompt("将服装参考图2中的衣服精准替换到图1人物身上", "将服装的裙长调整为七分身裙长")
+        self.assertIn("将服装参考图2中的衣服精准替换到图1人物身上", combined)
+        self.assertIn("将服装的裙长调整为七分身裙长", combined)
+        self.assertIn("本次重做额外要求", combined)
+        # 二次调整（append=False）：整条替换——它只送一张已生成的 AI 图，
+        # 追加换装指令会让模型去找并不存在的图2。
         self.assertEqual(
-            app_module._ecommerce_rerun_prompt("原提示词", "盘扣数量必须一致"),
-            "盘扣数量必须一致",
+            app_module._ecommerce_rerun_prompt("原提示词", "调整裙长为七分长", append=False),
+            "调整裙长为七分长",
         )
 
     def test_rerun_accepts_one_through_nine_selected_references(self):
@@ -657,7 +987,7 @@ class EcommerceBatchTest(unittest.TestCase):
         original = {'platform': 'runninghub', 'model_key': 'old', 'action_image': '/tmp/a.jpg'}
         changed = app_module._ecommerce_apply_rerun_model(original, {
             'platform': 'runninghub',
-            'model_key': 'rhart-image-n-pro/edit-4k',
+            'model_key': 'rhart-image-n-pro/edit',
             'aspect_ratio': '3:4',
             'endpoint': 'malicious-endpoint',
         })
@@ -674,7 +1004,69 @@ class EcommerceBatchTest(unittest.TestCase):
             'platform': 'oaihk', 'model_key': 'gpt-image-2/4k', 'aspect_ratio': '2:3'
         })
         self.assertTrue(changed['is_gpt_image'])
-        self.assertEqual(changed['size'], app_module.ECOMMERCE_GPT_SIZES['4k']['2:3'])
+        # gpt-image-2/4k 被钳制为 2K（HK实测最高仅返2K），尺寸按 2k 档映射
+        self.assertEqual(changed['size'], app_module.ECOMMERCE_GPT_SIZES['2k']['2:3'])
+        # 真正支持 4K 的 HK 模型仍映射到 4k 档尺寸
+        changed_4k = app_module._ecommerce_apply_rerun_model({}, {
+            'platform': 'oaihk', 'model_key': 'gpt-image-2.5/4k', 'aspect_ratio': '2:3'
+        })
+        self.assertEqual(changed_4k['size'], app_module.ECOMMERCE_GPT_SIZES['4k']['2:3'])
+
+    def test_rerun_apiyi_gemini_model_uses_aspect_ratio_without_size(self):
+        changed = app_module._ecommerce_apply_rerun_model({}, {
+            'platform': 'apiyi', 'model_key': 'gemini-3-pro-image', 'aspect_ratio': '3:4'
+        })
+        self.assertEqual(changed['platform'], 'apiyi')
+        self.assertEqual(changed['provider'], 'apiyi')
+        self.assertEqual(changed['protocol'], 'gemini-native')
+        self.assertEqual(changed['resolution'], '4k')
+        self.assertEqual(changed['aspect_ratio'], '3:4')
+        # gemini-native 只用 aspect_ratio + imageSize，不传官方 size
+        self.assertEqual(changed['size'], '')
+        self.assertEqual(changed['quality'], '')
+        self.assertFalse(changed['is_gpt_image'])
+
+    def test_rerun_apiyi_openai_edits_maps_ratio_to_official_size(self):
+        changed = app_module._ecommerce_apply_rerun_model({}, {
+            'platform': 'apiyi', 'model_key': 'gpt-image-2.5-flare', 'aspect_ratio': '2:3'
+        })
+        self.assertEqual(changed['protocol'], 'openai-edits')
+        # 官转（不带 -vip）需要官方 size + quality=medium
+        self.assertEqual(changed['size'], app_module.APIYI_GPT_SIZES['2:3']['4k'])
+        self.assertEqual(changed['quality'], 'medium')
+        self.assertFalse(changed['is_gpt_image'])
+
+        vip = app_module._ecommerce_apply_rerun_model({}, {
+            'platform': 'apiyi', 'model_key': 'gpt-image-2-vip', 'aspect_ratio': '2:3'
+        })
+        # 官逆 -vip 同样映射 30 档 size，但不带 quality
+        self.assertEqual(vip['size'], app_module.APIYI_GPT_SIZES['2:3']['4k'])
+        self.assertEqual(vip['quality'], '')
+
+        all_model = app_module._ecommerce_apply_rerun_model({}, {
+            'platform': 'apiyi', 'model_key': 'gpt-image-2.5-all', 'aspect_ratio': '2:3'
+        })
+        # 官逆 -all 不接受 size，画幅交给提示词，同样不带 quality
+        self.assertEqual(all_model['protocol'], 'openai-edits')
+        self.assertEqual(all_model['size'], '')
+        self.assertEqual(all_model['quality'], '')
+
+    def test_rerun_apiyi_auto_ratio_defers_size_to_upstream(self):
+        changed = app_module._ecommerce_apply_rerun_model({}, {
+            'platform': 'apiyi', 'model_key': 'gpt-image-2.5-sunburst', 'aspect_ratio': 'auto'
+        })
+        self.assertEqual(changed['aspect_ratio'], 'auto')
+        self.assertEqual(changed['size'], 'auto')
+
+    def test_rerun_apiyi_rejects_unknown_model_and_ratio(self):
+        with self.assertRaises(ValueError):
+            app_module._ecommerce_apply_rerun_model({}, {
+                'platform': 'apiyi', 'model_key': 'not-allowed', 'aspect_ratio': '3:4'
+            })
+        with self.assertRaises(ValueError):
+            app_module._ecommerce_apply_rerun_model({}, {
+                'platform': 'apiyi', 'model_key': 'gemini-3-pro-image', 'aspect_ratio': '7:5'
+            })
 
     def test_local_image_thumbnail_is_small_jpeg(self):
         source = os.path.join(self.user_temp.name, 'large-reference.jpg')
@@ -704,14 +1096,31 @@ class EcommerceBatchTest(unittest.TestCase):
         with Image.open(target) as cropped:
             self.assertEqual(cropped.size, (300, 450))
 
-    def test_rerun_reference_crop_rejects_changed_aspect_ratio(self):
+    def test_rerun_reference_crop_allows_free_aspect_ratio(self):
+        source = os.path.join(self.user_temp.name, 'free-crop.jpg')
+        Image.new('RGB', (600, 900), (40, 90, 140)).save(source, 'JPEG')
+        with patch.object(app_module, '_ecommerce_batch_snapshot', return_value={
+            'id': 'b1', 'output_path': self.user_temp.name
+        }):
+            response = self.client.post('/api/ecommerce/crop-reference', json={
+                'batch_id': 'b1', 'source': source,
+                'x': 0.1, 'y': 0.1, 'width': 0.6, 'height': 0.2,
+            })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        target = response.get_json()['path']
+        with Image.open(source) as original:
+            self.assertEqual(original.size, (600, 900))
+        with Image.open(target) as cropped:
+            self.assertEqual(cropped.size, (360, 180))
+
+    def test_rerun_reference_crop_rejects_too_small(self):
         source = os.path.join(self.user_temp.name, 'no-free-crop.jpg')
         self.make_image(source)
         response = self.client.post('/api/ecommerce/crop-reference', json={
-            'source': source, 'x': 0.1, 'y': 0.1, 'width': 0.5, 'height': 0.4,
+            'source': source, 'x': 0.1, 'y': 0.1, 'width': 0.01, 'height': 0.01,
         })
         self.assertEqual(response.status_code, 400)
-        self.assertIn('保持原图比例', response.get_json()['error'])
+        self.assertIn('裁剪区域超出图片范围', response.get_json()['error'])
 
     def test_system_preview_opens_validated_local_images_in_preview(self):
         first = os.path.join(self.user_temp.name, 'preview-1.jpg')
@@ -909,8 +1318,9 @@ class EcommerceBatchTest(unittest.TestCase):
             template = handle.read()
         self.assertIn('id="ecommerce-rerun-batches"', template)
         self.assertIn('继续剩余', script)
-        self.assertIn('结束本次', script)
-        self.assertIn('验片已完成', script)
+        self.assertIn('ecommerce-rerun-session-finalize', script)
+        self.assertIn('完成这次重做会话？', script)
+        self.assertIn('ecommerce-rerun-session-review', script)
         self.assertIn('/api/ecommerce/rerun-batches/recover-latest', script)
         self.assertIn('runEcommercePersistedRerunBatch', script)
         self.assertIn('/garments/${encodeURIComponent(garmentId)}/compare', script)
@@ -1435,6 +1845,27 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(called_body["quality"], "high")
         self.assertEqual(len(called_body["imageUrls"]), 1)
 
+    def test_runninghub_preflight_preserves_lite_model_1k_resolution(self):
+        price_response = Mock(status_code=200)
+        price_response.json.return_value = {
+            "errorCode": "", "errorMessage": "", "estimatedPrice": 0.01,
+            "currency": "USD", "isFreeThisCall": False,
+        }
+        account_response = Mock(status_code=200)
+        account_response.json.return_value = {"code": 0, "msg": "success", "data": {
+            "remainMoney": "88.50", "currentTaskCounts": "0", "currency": "USD", "apiType": "SHARED",
+        }}
+        with patch.object(app_module, "_validate_url", return_value=(True, None, "1.2.3.4")), \
+             patch.object(app_module.requests, "post", side_effect=[price_response, account_response]) as post:
+            result = self.client.post("/api/rh-preflight", json={
+                "api_key": "enterprise-test-key",
+                "base_url": "https://www.runninghub.ai/openapi/v2",
+                "model_id": "rhart-image-n-g31-flash-lite/image-to-image",
+                "resolution": "1k",
+            })
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(post.call_args_list[0].kwargs["json"]["resolution"], "1k")
+
     def test_runninghub_legacy_cn_base_is_migrated_and_persisted_as_ai(self):
         app_module.save_json("model_config.json", {
             "rh_api_key": "enterprise-key",
@@ -1695,7 +2126,7 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(batch['settings']['final_output_write_mode'], 'macos_helper')
         self.assertFalse(batch['settings']['final_output_fallback'])
 
-    def test_running_batch_with_all_tasks_archived_is_reconciled_to_completed(self):
+    def test_running_batch_with_manual_review_is_not_reconciled_to_completed(self):
         batch = {
             'id': 'ecbatch_reconcile',
             'status': 'running',
@@ -1705,8 +2136,226 @@ class EcommerceBatchTest(unittest.TestCase):
             ],
         }
         self.assertTrue(app_module._ecommerce_reconcile_batch_status(batch))
-        self.assertEqual(batch['status'], 'completed')
-        self.assertTrue(batch.get('finished_at'))
+        self.assertEqual(batch['status'], 'interrupted')
+        self.assertFalse(batch.get('finished_at'))
+
+    def test_manual_review_is_not_counted_as_completed_progress(self):
+        batch = {
+            'id': 'ecbatch_progress',
+            'status': 'interrupted',
+            'tasks': [
+                {'id': 'task-1', 'state': 'manual_review'},
+                {'id': 'task-2', 'state': 'accepted'},
+            ],
+        }
+        summary = app_module._ecommerce_summarize_batch(batch)
+        self.assertEqual(summary['task_total'], 2)
+        self.assertEqual(summary['done_total'], 1)
+
+    def test_cancel_keeps_synchronous_preparing_request_in_cancelling(self):
+        batch_id = 'ecbatch_cancel_preparing'
+        batch = {
+            'id': batch_id,
+            'status': 'running',
+            'tasks': [{
+                'id': 'task-preparing',
+                'state': 'preparing',
+                'attempts': [{'number': 1, 'status': 'preparing', 'request_id': '', 'candidate_path': ''}],
+            }],
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [], 'rerun_batches': [],
+        })
+        app_module.ecommerce_active_runners.add(batch_id)
+        try:
+            response = self.client.post(
+                f'/api/ecommerce/batches/{batch_id}/action',
+                json={'action': 'cancel'},
+            )
+        finally:
+            app_module.ecommerce_active_runners.discard(batch_id)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()['status'], 'cancelling')
+        self.assertEqual(response.get_json()['inflight_tasks'], 1)
+        saved = app_module._ecommerce_batch_snapshot(batch_id)
+        self.assertEqual(saved['status'], 'cancelling')
+        self.assertEqual(saved['tasks'][0]['state'], 'preparing')
+
+    def test_resume_can_switch_platform_and_model_for_remaining_tasks(self):
+        garment_folder = self.make_garment("换模型款")
+        archived = os.path.join(self.user_temp.name, "已生成-AI-01-01.jpg")
+        self.make_image(archived)
+        batch_id = "ecbatch_switch_model"
+        batch = {
+            "id": batch_id,
+            "name": "换模型批次",
+            "status": "paused",
+            "run_code": "RH-NB2-LC-4K-R01",
+            "output_path": self.user_temp.name,
+            "settings": {"max_attempts": 5, "concurrency": 9, "precision_matching": True},
+            "garments": [{
+                "id": "g1", "name": "换模型款", "path": garment_folder,
+                "images": [os.path.join(garment_folder, f"{i}-参考.jpg") for i in range(1, 7)],
+            }],
+            "template": {"actions": [{
+                "id": "a1", "name": "目标图1", "order": 0, "action_image": archived,
+                "prompt": "测试提示词", "platform": "runninghub",
+                "model_key": "rhart-image-n-g31-flash/image-to-image",
+                "model_id": "rhart-image-n-g31-flash/image-to-image",
+                "endpoint": "rhart-image-n-g31-flash/image-to-image",
+                "resolution": "4k", "channel": "low-cost", "aspect_ratio": "auto",
+                "max_images": 10, "garment_reference_index": 1,
+            }]},
+            "tasks": [
+                {
+                    "id": "t1", "garment_id": "g1", "garment_name": "换模型款", "action_id": "a1",
+                    "action_order": 0, "action_name": "目标图1", "state": "accepted",
+                    "accepted_path": archived, "last_error": "",
+                    "attempts": [{"number": 1, "status": "accepted", "request_id": "r1",
+                                  "candidate_path": archived, "archived_path": archived, "sample": True}],
+                },
+                {
+                    "id": "t2", "garment_id": "g1", "garment_name": "换模型款", "action_id": "a1",
+                    "action_order": 0, "action_name": "目标图1", "state": "pending",
+                    "accepted_path": "", "last_error": "", "attempts": [],
+                },
+            ],
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            "version": 2, "templates": [], "batches": [batch], "waste_scans": [], "rerun_batches": [],
+        })
+        with patch.object(app_module, "_ecommerce_launch_batch", return_value=False) as launch:
+            response = self.client.post(
+                f'/api/ecommerce/batches/{batch_id}/action',
+                json={"action": "resume", "model_override": {
+                    "platform": "oaihk", "model_key": "fal-ai/banana/v3.1/flash/4k",
+                }},
+            )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        launch.assert_called_once()
+        saved = app_module._ecommerce_batch_snapshot(batch_id)
+        self.assertEqual(saved["status"], "running")
+        action = saved["template"]["actions"][0]
+        self.assertEqual(action["platform"], "oaihk")
+        self.assertEqual(action["model_key"], "fal-ai/banana/v3.1/flash/4k")
+        self.assertEqual(action["endpoint"], "fal-ai/banana/v3.1/flash/4k")
+        self.assertEqual(action["is_gpt_image"], False)
+        self.assertEqual(action["short_edge"], 2048)
+        self.assertEqual(action["resolution"], "4k")
+        # 提示词和精准匹配序号属于原任务身份，切换模型不能动
+        self.assertEqual(action["prompt"], "测试提示词")
+        self.assertEqual(action["garment_reference_index"], 1)
+        # 新图改用新模型前缀命名，已生成的图片保持原样
+        self.assertEqual(saved["run_code"], "HK-NB2-STD-4K-R01")
+        self.assertEqual(saved["tasks"][0]["accepted_path"], archived)
+        self.assertEqual(saved["tasks"][0]["attempts"][0]["archived_path"], archived)
+
+    def test_resume_rejects_model_outside_server_whitelist(self):
+        batch_id = "ecbatch_switch_model_bad"
+        batch = {
+            "id": batch_id, "name": "非法模型", "status": "paused",
+            "settings": {"concurrency": 9}, "garments": [], "tasks": [],
+            "template": {"actions": [{
+                "id": "a1", "name": "目标图1", "order": 0,
+                "action_image": "/tmp/never-used.jpg", "prompt": "测试",
+                "platform": "runninghub",
+                "model_key": "rhart-image-n-g31-flash/image-to-image",
+                "aspect_ratio": "auto",
+            }]},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            "version": 2, "templates": [], "batches": [batch], "waste_scans": [], "rerun_batches": [],
+        })
+        response = self.client.post(
+            f'/api/ecommerce/batches/{batch_id}/action',
+            json={"action": "resume", "model_override": {"platform": "oaihk", "model_key": "evil/not-whitelisted"}},
+        )
+        self.assertEqual(response.status_code, 400)
+        saved = app_module._ecommerce_batch_snapshot(batch_id)
+        self.assertEqual(saved["status"], "paused")
+        self.assertEqual(saved["template"]["actions"][0]["platform"], "runninghub")
+        self.assertEqual(saved["template"]["actions"][0]["model_key"], "rhart-image-n-g31-flash/image-to-image")
+
+    def test_resume_prompts_for_optional_platform_switch(self):
+        project_dir = os.path.dirname(app_module.__file__)
+        with open(os.path.join(project_dir, 'static', 'js', 'app.js'), encoding='utf-8') as handle:
+            script = handle.read()
+        with open(os.path.join(project_dir, 'templates', 'index.html'), encoding='utf-8') as handle:
+            template = handle.read()
+        self.assertIn('function startOrResumeEcommerceBatch()', script)
+        self.assertIn('function ecommerceAskSwitchModel()', script)
+        self.assertIn('function ecommercePickModelOverride()', script)
+        self.assertIn("await controlEcommerceBatch('resume', override)", script)
+        self.assertIn('是否更换平台和模型继续？', script)
+        self.assertIn('id="ecommerce-switch-model-dialog"', template)
+        self.assertIn('id="ecommerce-switch-model-keep"', template)
+        self.assertIn('id="ecommerce-pick-platform"', template)
+        self.assertIn('id="ecommerce-pick-model"', template)
+
+    def test_folder_progress_signature_tracks_delete_and_mark_ledger(self):
+        project_dir = os.path.dirname(app_module.__file__)
+        with open(os.path.join(project_dir, 'static', 'js', 'app.js'), encoding='utf-8') as handle:
+            script = handle.read()
+        # 逐套验片的渲染缓存签名必须包含删除/标记台账，
+        # 否则标记重做或恢复废片后任务状态没变，数字不会刷新。
+        self.assertIn('const activeDeletions = (b.deleted_samples || []).filter(', script)
+        self.assertIn("['deleted', 'pending'].includes(String(record.status || ''))", script)
+        self.assertIn('const markedRedoCount = (b.marked_redo || []).length;', script)
+        self.assertIn('${activeDeletions}|${markedRedoCount}|', script)
+
+    def test_apiyi_keeps_resolution_only_and_backend_detects_ratio(self):
+        project_dir = os.path.dirname(app_module.__file__)
+        with open(os.path.join(project_dir, 'static', 'js', 'app.js'), encoding='utf-8') as handle:
+            script = handle.read()
+        with open(os.path.join(project_dir, 'templates', 'index.html'), encoding='utf-8') as handle:
+            template = handle.read()
+        with open(os.path.join(project_dir, 'app.py'), encoding='utf-8') as handle:
+            backend = handle.read()
+        # 面板只让用户选「几K」：30 档尺寸下拉会把比例栏重复一遍，不再暴露
+        self.assertIn('id="ecommerce-import-apiyi-resolution"', template)
+        self.assertNotIn('id="ecommerce-import-apiyi-size"', template)
+        self.assertIn('function syncEcommerceApiyiResolution()', script)
+        self.assertIn('action.size = getApiyiImageSize(resolution, ratio);', script)
+        # 比例留「自动」时由后端按目标参考图吸附出具体 size，否则选 4K 也拿不到 4K
+        self.assertIn('def _apiyi_nearest_ratio(path):', backend)
+        self.assertIn("aspect_ratio = _apiyi_nearest_ratio(sources[0] if sources else '') or 'auto'", backend)
+        # 说明文字必须挪出窄格子，否则 nowrap 长句会压到相邻的比例列
+        self.assertIn('id="ecommerce-model-note"', template)
+        self.assertIn('.ecommerce-model-stack .ecommerce-model-step > small { display: none; }', open(
+            os.path.join(project_dir, 'static', 'css', 'style.css'), encoding='utf-8').read())
+
+    def test_apiyi_nearest_ratio_snaps_reference_aspect(self):
+        landscape = os.path.join(self.user_temp.name, 'ref-3x2.jpg')
+        Image.new('RGB', (1200, 800), (10, 20, 30)).save(landscape, 'JPEG')
+        self.assertEqual(app_module._apiyi_nearest_ratio(landscape), '3:2')
+        portrait = os.path.join(self.user_temp.name, 'ref-2x3.jpg')
+        Image.new('RGB', (800, 1200), (10, 20, 30)).save(portrait, 'JPEG')
+        self.assertEqual(app_module._apiyi_nearest_ratio(portrait), '2:3')
+        # 读不到图时必须退回空串，让调用方继续走 size=auto，而不是抛错
+        self.assertEqual(app_module._apiyi_nearest_ratio('/tmp/definitely-missing-ref.jpg'), '')
+
+    def test_rerun_panel_hides_item_statuses_and_prioritizes_list(self):
+        project_dir = os.path.dirname(app_module.__file__)
+        with open(os.path.join(project_dir, 'static', 'js', 'app.js'), encoding='utf-8') as handle:
+            script = handle.read()
+        with open(os.path.join(project_dir, 'static', 'css', 'style.css'), encoding='utf-8') as handle:
+            css = handle.read()
+        with open(os.path.join(project_dir, 'templates', 'index.html'), encoding='utf-8') as handle:
+            index = handle.read()
+        # 重做批次区不再渲染"动作X回填成功/失败/部分回填"这类逐条状态噪音
+        self.assertNotIn('ecommerce-rerun-batch-item-statuses', script)
+        self.assertNotIn('部分回填', script)
+        self.assertNotIn('回填成功', script)
+        # 废片列表已拆为独立的第4栏：列表撑满该栏，右侧常驻自绘滚动条
+        self.assertIn('#ecommerce-mode .ecommerce-card-wastelist #ecommerce-rerun-list {', css)
+        self.assertIn('flex: 1 1 0;', css)
+        self.assertIn('.ecommerce-rerun-select-bar {', css)
+        self.assertIn('.ecommerce-vscroll-track {', css)
+        self.assertIn('max-height: 22vh;', css)
+        # 批量重做参数留在第3栏，不再和第4栏的列表混在一起
+        self.assertIn('#ecommerce-mode .ecommerce-card-rerun > #ecommerce-rerun-bulk-params { flex-shrink: 0; }', css)
+        self.assertIn("id=\"ecommerce-rerun-bulk-params\"", index)
+        self.assertIn("id=\"ecommerce-rerun-vscroll-track\"", index)
 
     def test_submitted_request_is_resumed_without_new_attempt(self):
         garment_folder = self.make_garment("断点款")
@@ -2120,7 +2769,13 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(response.get_json()['incomplete_items'][0]['actual_count'], 2)
         self.assertEqual(response.get_json()['incomplete_items'][0]['missing_count'], 1)
 
-    def test_deleted_scan_repeatedly_keeps_partial_kept_image_out_of_waste_queue(self):
+    def test_deleted_scan_repeatedly_detects_partial_kept_image_as_gap(self):
+        """抽卡5张删4留1：现存好图不足预期数，扫描必须按缺口补4张。
+
+        回归：用户删除抽卡多张后，只要现存好图仍不足预期数量，扫描就要
+        进入废片重做队列按 missing_count 补足，而不是因为“还剩一张”而
+        把整组排除在重做列表之外。
+        """
         target = os.path.join(self.user_temp.name, 'ledger-partial-target.jpg')
         reference = os.path.join(self.user_temp.name, 'ledger-partial-reference.jpg')
         result_dir = os.path.join(self.user_temp.name, 'ledger-partial-results')
@@ -2151,7 +2806,14 @@ class EcommerceBatchTest(unittest.TestCase):
         first = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']}).get_json()
         second = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']}).get_json()
         for payload in (first, second):
-            self.assertEqual(payload['items'], [])
+            items = payload['items']
+            self.assertEqual(len(items), 1, items)
+            item = items[0]
+            self.assertEqual(item['action_order'], 1)
+            self.assertEqual(item['actual_count'], 1)
+            self.assertEqual(item['missing_count'], 4)
+            self.assertEqual(item['recommended_count'], 4)
+            self.assertEqual(item['deleted_record_count'], 4)
             self.assertEqual(payload['incomplete_total'], 0)
         stored = app_module._ecommerce_batch_snapshot(batch['id'])
         self.assertEqual(len(app_module._ecommerce_active_deleted_samples(stored, 'g1', 1)), 4)
@@ -2210,7 +2872,7 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(payload['incomplete_items'][0]['missing_count'], 1)
 
     def test_deleted_scan_requires_all_configured_draws_before_waste_rerun(self):
-        """抽卡数量可为1/2/5/10，少删一张不能进入废片重做。"""
+        """抽卡数量可为1/2/5/10：删一张且现存好图不足预期数时按缺口补足，全部删除时按整组补足。"""
         for samples in (1, 2, 5, 10):
             target = os.path.join(self.user_temp.name, f'guard-target-{samples}.jpg')
             reference = os.path.join(self.user_temp.name, f'guard-reference-{samples}.jpg')
@@ -2249,8 +2911,15 @@ class EcommerceBatchTest(unittest.TestCase):
                 })
                 self.assertEqual(deleted.status_code, 200, deleted.get_json())
                 partial = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
-                self.assertEqual(partial.get_json()['items'], [])
-                self.assertEqual(partial.get_json()['incomplete_total'], 0)
+                payload = partial.get_json()
+                # 新行为：删一张且现存好图不足预期数时，按缺口补足（不再要求全部删除才算废片）
+                self.assertEqual(len(payload['items']), 1)
+                item = payload['items'][0]
+                self.assertEqual(item['actual_count'], samples - 1)
+                self.assertEqual(item['missing_count'], 1)
+                self.assertEqual(item['recommended_count'], 1)
+                self.assertEqual(item['deleted_record_count'], 1)
+                self.assertEqual(payload['incomplete_total'], 0)
 
             for path in outputs[1 if samples > 1 else 0:]:
                 deleted = self.client.post('/api/ecommerce/delete-sample', json={
@@ -2383,6 +3052,66 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(cancelled.get_json()['cancelled_item_ids'], [item['id']])
         # 软删除模式：文件始终在源目录
         self.assertTrue(os.path.isfile(deleted_output))
+        scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+        self.assertEqual(scan.get_json()['items'], [])
+
+    def test_partial_deletion_detected_as_redo_gap(self):
+        """抽卡模式删1张：现存好图不足预期数时，扫描必须按缺口补1张。
+
+        回归：用户删除抽卡多张中的一张后，废片重做扫描必须能扫出来，
+        按 missing_count=1 进入重做队列；撤销删除后立即消失。
+        """
+        target = os.path.join(self.user_temp.name, 'gap-target.jpg')
+        reference = os.path.join(self.user_temp.name, 'gap-reference.jpg')
+        result_dir = os.path.join(self.user_temp.name, 'gap-results')
+        os.makedirs(result_dir)
+        self.make_image(target)
+        self.make_image(reference)
+        for sample in ('CK01', 'CK02', 'CK03'):
+            self.make_image(os.path.join(result_dir, f'RUN-AI-01-{sample}.jpg'))
+        batch = {
+            'id': 'partial-deletion-scan', 'name': '抽卡删1张扫描',
+            'output_path': self.user_temp.name, 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 3, 'qc_enabled': False},
+            'template': {'actions': [{
+                'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                'prompt': '测试', 'platform': 'runninghub', 'model_key': 'nano/2k',
+            }]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{
+                'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1',
+                'action_id': 'a1', 'action_order': 0, 'action_name': '正面',
+                'state': 'accepted', 'attempts': [],
+            }],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+
+        deleted_output = os.path.join(result_dir, 'RUN-AI-01-CK01.jpg')
+        deleted = self.client.post('/api/ecommerce/delete-sample', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'path': deleted_output,
+        })
+        self.assertEqual(deleted.status_code, 200, deleted.get_json())
+        deletion_id = deleted.get_json()['deletion_id']
+
+        scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+        self.assertEqual(scan.status_code, 200, scan.get_json())
+        items = scan.get_json()['items']
+        self.assertEqual(len(items), 1, items)
+        item = items[0]
+        self.assertEqual(item['action_order'], 1)
+        self.assertEqual(item['actual_count'], 2)
+        self.assertEqual(item['missing_count'], 1)
+        self.assertEqual(item['recommended_count'], 1)
+        self.assertEqual(item['deleted_record_count'], 1)
+
+        # 撤销删除后，该动作不再进入重做队列。
+        undo = self.client.post('/api/ecommerce/undo-delete', json={
+            'batch_id': batch['id'], 'garment_id': 'g1', 'deletion_id': deletion_id,
+        })
+        self.assertEqual(undo.status_code, 200, undo.get_json())
         scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
         self.assertEqual(scan.get_json()['items'], [])
 
@@ -2687,6 +3416,168 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertEqual(captured['action_image'], target)
         self.assertEqual(captured['prompt'], '原提示词')
 
+    def _refine_rerun_fixture(self, batch_id):
+        target = os.path.join(self.user_temp.name, f'{batch_id}-动作.jpg')
+        reference = os.path.join(self.user_temp.name, f'{batch_id}-服装.jpg')
+        candidate = os.path.join(self.user_temp.name, f'{batch_id}-候选.jpg')
+        result_dir = os.path.join(self.user_temp.name, f'{batch_id}-成品')
+        os.makedirs(result_dir, exist_ok=True)
+        source = os.path.join(result_dir, 'RH-NB2-LC-2K-R01-AI-01.jpg')
+        for path in (target, reference, candidate, source):
+            self.make_image(path)
+        batch = {
+            'id': batch_id, 'name': '混批二次调整', 'output_path': self.user_temp.name,
+            'run_code': 'RH-NB2-LC-2K-R01', 'result_dirs': {'g1': result_dir},
+            'settings': {'samples_per_action': 1, 'qc_enabled': False, 'precision_matching': True},
+            'template': {'actions': [{
+                'id': 'a1', 'order': 0, 'name': '正面', 'action_image': target,
+                'prompt': '原提示词', 'platform': 'runninghub',
+                'model_key': 'rhart-image-n-g31-flash/image-to-image-2k',
+                'endpoint': 'rhart-image-n-g31-flash/image-to-image', 'resolution': '2k',
+                'garment_reference_index': 0,
+            }]},
+            'garments': [{'id': 'g1', 'name': '款式1', 'path': self.user_temp.name, 'images': [reference]}],
+            'tasks': [{
+                'id': 't1', 'garment_id': 'g1', 'garment_name': '款式1', 'action_id': 'a1',
+                'action_order': 0, 'action_name': '正面', 'state': 'accepted', 'attempts': [],
+            }],
+            'usage': {},
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [], 'rerun_batches': [],
+        })
+        return batch, result_dir, source, candidate
+
+    def _create_refine_rerun_batch(self, batch, result_dir, source, prompt):
+        created = self.client.post('/api/ecommerce/rerun-batches', json={
+            'batch_id': batch['id'],
+            'settings': {'concurrency': 1, 'prompt': '批量提示词'},
+            'items': [{
+                'item_id': 'g1-1-refine-ecrefine_abc123', 'result_path': result_dir,
+                'reference_images': [], 'count': 1, 'mode': 'full',
+                'prompt': prompt, 'target_action_image': source,
+                'marked_result_path': source, 'mark_id': 'ecrefine_abc123',
+            }],
+        })
+        self.assertEqual(created.status_code, 201, created.get_json())
+        rerun_batch = created.get_json()['rerun_batch']
+        request_body = dict(rerun_batch['items'][0]['payload'])
+        request_body['rerun_batch_id'] = rerun_batch['id']
+        return rerun_batch, request_body
+
+    def test_refine_redo_runs_in_garment_reference_batch_without_garment_images(self):
+        batch, result_dir, source, candidate = self._refine_rerun_fixture('refine-mixed-rerun')
+        rerun_batch, request_body = self._create_refine_rerun_batch(batch, result_dir, source, '二次调整专用提示词')
+        captured = {}
+
+        def fake_generate(_batch, _task, garment, action, prompt, _attempt):
+            captured['images'] = list(garment.get('images') or [])
+            captured['action_image'] = action.get('action_image')
+            captured['prompt'] = prompt
+            return candidate
+
+        with patch.object(app_module, '_ecommerce_generate_candidate', side_effect=fake_generate):
+            response = self.client.post('/api/ecommerce/regenerate', json=request_body)
+        # 换装批次里的二次调整项不能因为“没有服装参考图”被拦成 400，否则永远回填不了。
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(captured['images'], [])
+        self.assertEqual(captured['action_image'], os.path.realpath(source))
+        self.assertEqual(captured['prompt'], '二次调整专用提示词')
+        self.assertEqual(os.path.basename(response.get_json()['archived_list'][0]), 'RH-NB2-LC-2K-R01-AI-01_RF01.jpg')
+        detail = self.client.get(f"/api/ecommerce/rerun-batches/{rerun_batch['id']}").get_json()['rerun_batch']
+        self.assertEqual(detail['items'][0]['status'], 'accepted')
+        self.assertEqual(detail['items'][0]['success_count'], 1)
+
+    def test_refine_redo_attaches_extra_reference_images_up_to_six(self):
+        batch, result_dir, source, candidate = self._refine_rerun_fixture('refine-extra-refs')
+        extras = []
+        for index in range(7):
+            path = os.path.join(result_dir, f'extra-{index}.jpg')
+            self.make_image(path, color=(20 * index + 10, 40, 60))
+            extras.append(os.path.realpath(path))
+        rerun_batch, request_body = self._create_refine_rerun_batch(batch, result_dir, source, '二次调整专用提示词')
+        request_body['reference_images'] = list(extras)
+        captured = {}
+
+        def fake_generate(_batch, _task, garment, action, prompt, _attempt):
+            captured['refine'] = list(action.get('refine_reference_images') or [])
+            captured['garment_images'] = list(garment.get('images') or [])
+            return candidate
+
+        with patch.object(app_module, '_ecommerce_generate_candidate', side_effect=fake_generate):
+            response = self.client.post('/api/ecommerce/regenerate', json=request_body)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        # 「＋ 添加参考图」上限 6 张：多送的直接丢弃，不能撑爆供应商的参考图张数上限。
+        self.assertEqual(captured['refine'], extras[:6])
+        self.assertEqual(captured['garment_images'], [])
+
+    def test_generate_candidate_appends_refine_reference_images_to_sources(self):
+        action_image = os.path.join(self.user_temp.name, 'refine-sources-target.jpg')
+        extra_one = os.path.join(self.user_temp.name, 'refine-sources-extra-1.jpg')
+        extra_two = os.path.join(self.user_temp.name, 'refine-sources-extra-2.jpg')
+        for path, color in ((action_image, (10, 20, 30)), (extra_one, (40, 60, 80)), (extra_two, (80, 60, 40))):
+            self.make_image(path, color=color)
+        garment = {"id": "g1", "name": "二次调整", "images": []}
+        action = {
+            "id": "a1", "garment_id": "g1", "order": 0,
+            "platform": "runninghub", "action_image": action_image,
+            "endpoint": "rhart-image-n-g31-flash/image-to-image", "resolution": "2k",
+            "aspect_ratio": "auto", "max_images": 10,
+            "refine_reference_images": [extra_one, extra_two],
+        }
+        task = {"id": "t1", "garment_id": "g1", "garment_name": "二次调整", "action_order": 0}
+        batch = {
+            "id": "refine-sources", "generation_mode": "target_only", "status": "running",
+            "output_path": self.user_temp.name, "usage": {}, "tasks": [dict(task, attempts=[])],
+        }
+        app_module.save_json(app_module.ECOMMERCE_DATA_FILE, {"version": 2, "templates": [], "batches": [batch], "waste_scans": []})
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (64, 96), (10, 20, 30)).save(image_buffer, "PNG")
+        encoded = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+        uploads = []
+
+        def fake_upload(_batch_id, uploaded_source):
+            uploads.append(uploaded_source)
+            return f"https://rh-images.xiaoyaoyou.com/input/{len(uploads)}.jpg"
+
+        def fake_route(_route, _path, body):
+            if body["action"] == "submit":
+                return {"taskId": "refine-sources-task"}, 200
+            return {"status": "SUCCESS", "results": [{"b64_json": encoded}]}, 200
+
+        attempt = {"number": 1, "request_id": "", "status": "preparing"}
+        with patch.object(app_module, "_ecommerce_upload_runninghub_reference", side_effect=fake_upload), \
+             patch.object(app_module, "_ecommerce_internal_route_data", side_effect=fake_route):
+            candidate = app_module._ecommerce_generate_candidate(batch, task, garment, action, "测试", attempt)
+        self.assertTrue(os.path.isfile(candidate))
+        # target_only 模式原本只送 action_image，添加的参考图必须也一起送上去。
+        self.assertEqual(uploads, [action_image, extra_one, extra_two])
+        self.assertEqual(attempt["mode"], "target-only-edit")
+
+    def test_refine_redo_requires_a_new_prompt_and_marks_item_failed(self):
+        batch, result_dir, source, candidate = self._refine_rerun_fixture('refine-prompt-guard')
+        rerun_batch, request_body = self._create_refine_rerun_batch(batch, result_dir, source, '原提示词')
+        with patch.object(app_module, '_ecommerce_generate_candidate', return_value=candidate) as generate:
+            same_as_original = self.client.post('/api/ecommerce/regenerate', json=request_body)
+            request_body['prompt'] = '批量提示词'
+            same_as_batch = self.client.post('/api/ecommerce/regenerate', json=request_body)
+            request_body['prompt'] = ''
+            empty_prompt = self.client.post('/api/ecommerce/regenerate', json=request_body)
+        generate.assert_not_called()
+        self.assertEqual(same_as_original.status_code, 400, same_as_original.get_json())
+        self.assertIn('原来的提示词', same_as_original.get_json()['error'])
+        self.assertEqual(same_as_batch.status_code, 400, same_as_batch.get_json())
+        self.assertIn('批量提示词', same_as_batch.get_json()['error'])
+        self.assertEqual(empty_prompt.status_code, 400, empty_prompt.get_json())
+        # 校验失败必须写回失败状态，否则界面会永远停在“已回填 0/1 张”。
+        detail = self.client.get(f"/api/ecommerce/rerun-batches/{rerun_batch['id']}").get_json()['rerun_batch']
+        self.assertEqual(detail['items'][0]['status'], 'failed')
+        self.assertTrue(detail['items'][0]['error'])
+        script_path = os.path.join(os.path.dirname(app_module.__file__), 'static', 'js', 'app.js')
+        with open(script_path, encoding='utf-8') as handle:
+            script = handle.read()
+        self.assertIn('二次调整必须单独填写新提示词', script)
+
     def test_garment_prompt_compare_scan_and_rerun_stay_bound_to_the_same_subfolder(self):
         folder_one = os.path.join(self.user_temp.name, '来源', '第一组')
         folder_two = os.path.join(self.user_temp.name, '来源', '第二组')
@@ -2950,7 +3841,14 @@ class EcommerceBatchTest(unittest.TestCase):
         self.assertNotIn('id="ecommerce-import-model"', html)
         self.assertIn('<option value="runninghub" selected>RH</option>', html)
         self.assertIn('<option value="oaihk">HK</option>', html)
-        self.assertIn('Nano2-4K｜低价｜¥0.30', html)
+        self.assertIn('Nano Banana 2｜经济版｜$0.027 ≈ ¥0.19/张', html)
+        self.assertIn('Nano Banana Pro｜经济版｜$0.06 ≈ ¥0.43/张', html)
+        self.assertNotIn('Nano Banana Lite', html)
+        self.assertIn('ChatGPT Image 2｜$0.015 ≈ ¥0.11/张｜经济渠道多数返 1K', html)
+        self.assertIn('ChatGPT 稳定版 Flare｜¥1.00/张', html)
+        self.assertIn('ChatGPT 稳定版 Sunburst｜¥1.00/张', html)
+        self.assertIn('ChatGPT 经济版 Flare｜$0.03 ≈ ¥0.22/张｜1K/2K/4K 同价', html)
+        self.assertIn('ChatGPT 经济版 Sunburst｜$0.03 ≈ ¥0.22/张｜1K/2K/4K 同价', html)
         self.assertIn('GPT2-4K｜¥0.16', html)
 
     def test_frontend_folder_drop_keeps_recursive_relative_paths(self):
@@ -3352,6 +4250,244 @@ class EcommerceBatchTest(unittest.TestCase):
             'batch_id': batch['id'], 'garment_id': 'g1',
         })
         self.assertEqual(confirm.status_code, 200, confirm.get_json())
+
+    def _make_relink_batch(self, batch_id='relink1'):
+        """两套服装、各自一个成品目录，目录里放着台账记录过的成品图。"""
+        actions = []
+        garments = []
+        tasks = []
+        result_dirs = {}
+        names = {}
+        for index in range(2):
+            garment_name = str(index + 1)
+            action = {'id': f'a{index}', 'order': index, 'name': f'动作{index}', 'action_image': __file__}
+            garment = {
+                'id': f'g{index}', 'name': garment_name, 'path': self.user_temp.name,
+                'images': [__file__] * 6, 'order': index,
+            }
+            old_dir = os.path.join(self.user_temp.name, '3组测试', garment_name, 'RH-TEST-4K-R01')
+            os.makedirs(old_dir)
+            archived = os.path.join(old_dir, f'AI-{index + 1:02d}.jpg')
+            self.make_image(archived)
+            task = {
+                'id': f't{index}', 'order': index, 'garment_id': garment['id'],
+                'garment_name': garment_name, 'action_id': action['id'], 'action_order': index,
+                'action_name': action['name'], 'state': 'accepted', 'accepted_path': archived,
+                'attempts': [{'number': 1, 'archived_path': archived, 'status': 'accepted'}],
+            }
+            actions.append(action)
+            garments.append(garment)
+            tasks.append(task)
+            result_dirs[garment['id']] = old_dir
+            names[garment['id']] = archived
+        batch = {
+            'id': batch_id, 'name': '搬走了', 'status': 'completed',
+            'output_path': self.user_temp.name, 'run_code': 'RH-TEST-4K-R01',
+            'result_dirs': result_dirs, 'template': {'actions': actions},
+            'garments': garments, 'tasks': tasks,
+            'settings': {'samples_per_action': 1}, 'usage': {},
+        }
+        app_module._ecommerce_save_store({
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+        return batch, names, result_dirs
+
+    def test_relink_results_reattaches_moved_result_folders(self):
+        batch, names, old_dirs = self._make_relink_batch()
+        # 用户把整棵目录树搬到了新位置（结构保持不变）。
+        moved_root = os.path.join(self.user_temp.name, '搬走后', '3组测试')
+        shutil.move(os.path.join(self.user_temp.name, '3组测试'), moved_root)
+
+        response = self.client.post(
+            f"/api/ecommerce/batches/{batch['id']}/relink-results",
+            json={'path': moved_root},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertTrue(payload['ok'])
+        self.assertEqual(len(payload['relinked']), 2)
+        self.assertTrue(all(row['found'] == 1 for row in payload['relinked']))
+
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        garment_by_name = {g['name']: g['id'] for g in stored['garments']}
+        for name, garment_id in garment_by_name.items():
+            expected_dir = os.path.join(moved_root, name, 'RH-TEST-4K-R01')
+            self.assertEqual(
+                os.path.realpath(stored['result_dirs'][garment_id]), os.path.realpath(expected_dir)
+            )
+            task = next(t for t in stored['tasks'] if t['garment_id'] == garment_id)
+            self.assertEqual(
+                os.path.realpath(task['accepted_path']),
+                os.path.realpath(os.path.join(expected_dir, os.path.basename(names[garment_id]))),
+            )
+            self.assertTrue(app_module._ecommerce_is_readable_image_file(task['accepted_path']))
+        # 台账写入前必须先留下备份。
+        self.assertTrue(os.path.isfile(payload['backup_path']))
+
+        # 重新链接后，扫描接口不应再把这一批当成“目录不属于该批次”。
+        scan = self.client.post('/api/ecommerce/scan-deleted', json={'batch_id': batch['id']})
+        self.assertEqual(scan.status_code, 200, scan.get_json())
+
+    def test_relink_results_keeps_healthy_directories_untouched(self):
+        batch, _names, old_dirs = self._make_relink_batch(batch_id='relink2')
+        response = self.client.post(
+            f"/api/ecommerce/batches/{batch['id']}/relink-results",
+            json={'path': os.path.join(self.user_temp.name, '3组测试')},
+        )
+        # 原目录还好好的，没什么可接的，台账不能动。
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.get_json()['ok'])
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        for garment_id, old_dir in old_dirs.items():
+            self.assertEqual(os.path.realpath(stored['result_dirs'][garment_id]), os.path.realpath(old_dir))
+
+    def test_relink_results_ui_is_wired(self):
+        script_path = os.path.join(os.path.dirname(app_module.__file__), 'static', 'js', 'app.js')
+        template_path = os.path.join(os.path.dirname(app_module.__file__), 'templates', 'index.html')
+        with open(script_path, encoding='utf-8') as handle:
+            script = handle.read()
+        with open(template_path, encoding='utf-8') as handle:
+            template = handle.read()
+        self.assertIn('id="btn-ecommerce-relink-results"', template)
+        self.assertIn('链接新位置', template)
+        self.assertIn('btn-ecommerce-relink-results', script)
+        self.assertIn('/relink-results', script)
+        self.assertIn('ecommerce-folder-relink-garment', script)
+        self.assertIn('链实拍图', script)
+        self.assertIn('ecommerce-folder-relink-result', script)
+        self.assertIn('链成片', script)
+
+    def _make_garment_ref_relink_batch(self, batch_id='refrelink1'):
+        """实拍参考图与成品图分居两棵树，便于单独模拟实拍图被搬走。"""
+        garment_root = os.path.join(self.user_temp.name, '素材', '第一批')
+        result_root = os.path.join(self.user_temp.name, '成品')
+        action_image = os.path.join(self.user_temp.name, '动作01.jpg')
+        self.make_image(action_image)
+        garments = []
+        tasks = []
+        result_dirs = {}
+        for index in range(2):
+            name = str(index + 1)
+            ref_dir = os.path.join(garment_root, name)
+            os.makedirs(ref_dir)
+            images = []
+            for number in range(1, 4):
+                image = os.path.join(ref_dir, f'9.25旗袍{32366 + index * 20 + number}.jpg')
+                self.make_image(image)
+                images.append(image)
+            final_dir = os.path.join(result_root, name, 'RH-TEST-4K-R01')
+            os.makedirs(final_dir)
+            archived = os.path.join(final_dir, 'RH-TEST-4K-R01-AI-01.jpg')
+            self.make_image(archived, color=(150, 90, 70))
+            garments.append({
+                'id': f'g{index}', 'name': name, 'order': index,
+                'path': ref_dir, 'images': images,
+            })
+            result_dirs[f'g{index}'] = final_dir
+            tasks.append({
+                'id': f't{index}', 'order': index, 'garment_id': f'g{index}',
+                'garment_name': name, 'action_order': 0, 'action_name': '正面',
+                'state': 'accepted', 'accepted_path': archived,
+                'attempts': [{'number': 1, 'archived_path': archived, 'status': 'accepted'}],
+            })
+        batch = {
+            'id': batch_id, 'name': '实拍搬走了', 'status': 'completed',
+            'generation_mode': 'garment_reference',
+            'clothing_root': garment_root, 'output_path': self.user_temp.name,
+            'result_dirs': result_dirs,
+            'template': {'actions': [
+                {'id': 'a0', 'order': 0, 'name': '正面', 'action_image': action_image},
+            ]},
+            'garments': garments, 'tasks': tasks,
+            'settings': {'generation_mode': 'garment_reference', 'samples_per_action': 1},
+            'usage': {},
+        }
+        app_module._ecommerce_save_store({
+            'version': 2, 'templates': [], 'batches': [batch], 'waste_scans': [],
+        })
+        return batch, garment_root
+
+    def test_relink_garment_refs_reattaches_moved_reference_folder(self):
+        batch, garment_root = self._make_garment_ref_relink_batch('refrelink-a')
+        new_root = os.path.join(self.user_temp.name, '第一批')
+        shutil.move(garment_root, new_root)
+
+        response = self.client.post(
+            f"/api/ecommerce/batches/{batch['id']}/relink-results",
+            json={'path': new_root, 'target': 'garments'},
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload['target'], 'garments')
+        self.assertEqual(len(payload['garment_refs']), 2)
+        self.assertTrue(all(row['status'] == 'relinked' for row in payload['garment_refs']))
+
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        self.assertEqual(
+            os.path.realpath(stored['clothing_root']), os.path.realpath(new_root)
+        )
+        for garment in stored['garments']:
+            expected_dir = os.path.join(new_root, garment['name'])
+            self.assertEqual(os.path.realpath(garment['path']), os.path.realpath(expected_dir))
+            self.assertEqual(len(garment['images']), 3)
+            for path in garment['images']:
+                self.assertEqual(
+                    os.path.realpath(os.path.dirname(path)), os.path.realpath(expected_dir)
+                )
+                self.assertTrue(os.path.isfile(path))
+        # 成品目录没动，不能被这次实拍图重链改动。
+        for garment_id, result_dir in stored['result_dirs'].items():
+            self.assertTrue(os.path.isdir(result_dir))
+
+    def test_relink_garment_refs_skips_healthy_directory(self):
+        batch, garment_root = self._make_garment_ref_relink_batch('refrelink-b')
+        response = self.client.post(
+            f"/api/ecommerce/batches/{batch['id']}/relink-results",
+            json={'path': garment_root, 'target': 'garments'},
+        )
+        # 原实拍目录还好好的，没有可接的，台账不能动。
+        self.assertEqual(response.status_code, 409, response.get_json())
+        payload = response.get_json()
+        self.assertFalse(payload['ok'])
+        self.assertTrue(all(row['status'] == 'skipped' for row in payload['garment_refs']))
+        stored = app_module._ecommerce_batch_snapshot(batch['id'])
+        for garment in stored['garments']:
+            self.assertEqual(
+                os.path.realpath(garment['path']),
+                os.path.realpath(os.path.join(garment_root, garment['name'])),
+            )
+
+    def test_compare_recovers_after_relinking_garment_references(self):
+        batch, garment_root = self._make_garment_ref_relink_batch('refrelink-c')
+        url = f"/api/ecommerce/batches/{batch['id']}/garments/g0/compare"
+
+        before = self.client.get(url)
+        self.assertEqual(before.status_code, 200, before.get_json())
+        self.assertEqual(len(before.get_json()['references']), 3)
+
+        # 用户把实拍图整棵树搬走：对比立刻变成「实拍参考图」读不到。
+        new_root = os.path.join(self.user_temp.name, '第一批')
+        shutil.move(garment_root, new_root)
+        broken = self.client.get(url)
+        self.assertEqual(broken.status_code, 409, broken.get_json())
+        self.assertIn('实拍参考图', broken.get_json()['error'])
+
+        relink = self.client.post(
+            f"/api/ecommerce/batches/{batch['id']}/relink-results",
+            json={'path': new_root, 'target': 'garments'},
+        )
+        self.assertEqual(relink.status_code, 200, relink.get_json())
+
+        after = self.client.get(url)
+        self.assertEqual(after.status_code, 200, after.get_json())
+        references = after.get_json()['references']
+        self.assertEqual(len(references), 3)
+        expected_dir = os.path.join(new_root, '1')
+        for reference in references:
+            self.assertEqual(
+                os.path.realpath(os.path.dirname(reference['path'])),
+                os.path.realpath(expected_dir),
+            )
 
 
 if __name__ == "__main__":

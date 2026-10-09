@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="{{ csrf_token }}">
     <title>样片工厂</title>
+    <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/static/css/style.css?v={{ version }}">
 </head>
 <body>
@@ -23,6 +24,7 @@
                 <button class="mode-btn" data-mode="image">图生图</button>
                 <button class="mode-btn" data-mode="ecommerce">电商批量生图</button>
                 <button class="mode-btn" data-mode="split">拆图</button>
+                <button class="mode-btn" data-mode="idphoto">证件照批量</button>
             </div>
         </div>
         <div class="header-right">
@@ -79,9 +81,9 @@
         <section class="result-panel">
             <!-- 生成预览 -->
             <div class="generate-section">
-                <h2>生成预览</h2>
+                <h2>提示词</h2>
                 <div class="generate-preview">
-                    <textarea id="prompt-preview" rows="4" placeholder="选择左侧词库后，拼接预览将实时显示在这里，可直接编辑..."></textarea>
+                    <textarea id="prompt-preview" rows="8" placeholder="输入你要生成的画面描述..."></textarea>
                 </div>
                 <div class="prompt-result" id="prompt-result" style="display:none;">
                     <div class="prompt-result-label">生成结果</div>
@@ -345,22 +347,16 @@
                     </select>
                     <span style="font-size:10px;font-weight:500;color:var(--text-secondary);white-space:nowrap;">模型</span>
                     <select id="cfg-rh-model-inline" style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;max-width:330px;">
-                        <optgroup label="RunningHub 官方稳定版（实测高价，批量慎用）">
-                            <option value="rhart-image-g-2-official/image-to-image-2k">ChatGPT Image 2｜2K｜官方稳定｜¥2.77/张</option>
-                            <option value="rhart-image-g-2-official/image-to-image-4k">ChatGPT Image 2｜4K｜官方稳定｜¥4.16/张</option>
-                            <option value="rhart-image-g-2-medium/image-to-image-2k">ChatGPT Image 2｜2K｜官方稳定·中档｜¥1.13/张</option>
-                            <option value="rhart-image-g-2-medium/image-to-image-4k">ChatGPT Image 2｜4K｜官方稳定·中档｜¥1.13/张</option>
-                            <option value="rhart-image-n-g31-flash-official/image-to-image-2k">Nano Banana 2｜2K｜官方稳定｜¥0.74/张</option>
-                            <option value="rhart-image-n-g31-flash-official/image-to-image-4k">Nano Banana 2｜4K｜官方稳定｜¥0.99/张</option>
-                            <option value="rhart-image-n-pro-official/edit-ultra-4k">全能图片 Pro｜图生图 Ultra｜4K官方稳定｜¥1.50/张</option>
+                        <optgroup label="RunningHub 经济版（低价渠道，稳定性/分辨率以接口实测为准）">
+                            <option value="rhart-image-n-g31-flash/image-to-image" selected>Nano Banana 2｜经济版｜$0.027 ≈ ¥0.19/张</option>
+                            <option value="rhart-image-n-pro/edit">Nano Banana Pro｜经济版｜$0.06 ≈ ¥0.43/张</option>
+                            <option value="rhart-image-g-2/image-to-image">ChatGPT Image 2｜$0.015 ≈ ¥0.11/张｜多数返1K</option>
+                            <option value="rhart-image-g-2.5/flare/image-to-image">ChatGPT 经济版 Flare｜$0.03 ≈ ¥0.22/张｜1K/2K/4K 同价</option>
+                            <option value="rhart-image-g-2.5/sunburst/image-to-image">ChatGPT 经济版 Sunburst｜$0.03 ≈ ¥0.22/张｜1K/2K/4K 同价</option>
                         </optgroup>
-                        <optgroup label="RunningHub 低价渠道版（不稳定）">
-                            <option value="rhart-image-g-2/image-to-image-2k">ChatGPT Image 2｜2K请求｜低价｜¥0.10/张｜可能返1K</option>
-                            <option value="rhart-image-g-2/image-to-image-4k">ChatGPT Image 2｜4K请求｜低价｜¥0.10/张｜多数返1K</option>
-                            <option value="rhart-image-n-g31-flash/image-to-image-2k">Nano Banana 2｜2K｜低价｜¥0.19/张</option>
-                            <option value="rhart-image-n-g31-flash/image-to-image-4k" selected>Nano Banana 2｜4K｜低价｜¥0.30/张｜已实测真4K</option>
-                            <option value="rhart-image-n-pro/edit-2k">Nano Banana Pro｜2K｜低价｜¥0.40/张</option>
-                            <option value="rhart-image-n-pro/edit-4k">Nano Banana Pro｜4K｜低价｜¥0.50/张</option>
+                        <optgroup label="RunningHub 官方稳定版（海外 Token）">
+                            <option value="rhart-image-g-2.5-official-token/flare/edit">ChatGPT 稳定版 Flare｜¥1.00/张</option>
+                            <option value="rhart-image-g-2.5-official-token/sunburst/edit">ChatGPT 稳定版 Sunburst｜¥1.00/张</option>
                         </optgroup>
                     </select>
                     <span id="rh-price-tag" style="font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">¥0.30/张</span>
@@ -379,6 +375,11 @@
                             <option value="gpt-image-2">ChatGPT Image 2 1K｜¥0.04/张</option>
                             <option value="gpt-image-2/2k">ChatGPT Image 2 2K请求｜¥0.08/张</option>
                             <option value="gpt-image-2/4k">ChatGPT Image 2 4K请求｜¥0.16/张｜实测可能返1K</option>
+                        </optgroup>
+                        <optgroup label="HK｜ChatGPT Image 2.5（4K）">
+                            <option value="gpt-image-2.5/4k">GPT2.5 精细版 4K｜按实际Token计费</option>
+                            <option value="gpt-image-2.5-flare/4k">GPT2.5 Flare 快速版 4K｜按实际Token计费</option>
+                            <option value="gpt-image-2.5-sunburst/4k">GPT2.5 旭日精细版 4K｜按实际Token计费</option>
                         </optgroup>
                     </select>
                     <span id="oaihk-price-tag" style="display:none;font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">¥0.30/张</span>
@@ -665,17 +666,12 @@
                         <option value="rhart-image-g-2-official/image-to-image-4k">ChatGPT Image 2｜4K｜官方稳定｜¥4.16/张</option>
                         <option value="rhart-image-g-2-medium/image-to-image-2k">ChatGPT Image 2｜2K｜官方稳定·中档｜¥1.13/张</option>
                         <option value="rhart-image-g-2-medium/image-to-image-4k">ChatGPT Image 2｜4K｜官方稳定·中档｜¥1.13/张</option>
-                        <option value="rhart-image-n-g31-flash-official/image-to-image-2k">Nano Banana 2｜2K｜官方稳定｜¥0.74/张</option>
-                        <option value="rhart-image-n-g31-flash-official/image-to-image-4k">Nano Banana 2｜4K｜官方稳定｜¥0.99/张</option>
-                        <option value="rhart-image-n-pro-official/edit-ultra-4k">全能图片 Pro｜图生图 Ultra｜4K官方稳定｜¥1.50/张</option>
                     </optgroup>
                     <optgroup label="RunningHub 低价渠道版（不稳定）">
                         <option value="rhart-image-g-2/image-to-image-2k">ChatGPT Image 2｜2K请求｜低价｜¥0.10/张｜可能返1K</option>
                         <option value="rhart-image-g-2/image-to-image-4k">ChatGPT Image 2｜4K请求｜低价｜¥0.10/张｜多数返1K</option>
-                        <option value="rhart-image-n-g31-flash/image-to-image-2k">Nano Banana 2｜2K｜低价｜¥0.19/张</option>
-                        <option value="rhart-image-n-g31-flash/image-to-image-4k" selected>Nano Banana 2｜4K｜低价｜¥0.30/张｜已实测真4K</option>
-                        <option value="rhart-image-n-pro/edit-2k">Nano Banana Pro｜2K｜低价｜¥0.40/张</option>
-                        <option value="rhart-image-n-pro/edit-4k">Nano Banana Pro｜4K｜低价｜¥0.50/张</option>
+                        <option value="rhart-image-n-g31-flash/image-to-image" selected>Nano Banana 2｜经济版｜$0.027 ≈ ¥0.19/张</option>
+                        <option value="rhart-image-n-pro/edit">Nano Banana Pro｜经济版｜$0.06 ≈ ¥0.43/张</option>
                     </optgroup>
                 </select>
                 <select id="split-cfg-oaihk-model" style="display:none;font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:3px;max-width:360px;">
@@ -693,6 +689,11 @@
                         <option value="gpt-image-2">ChatGPT Image 2 1K｜¥0.04/张</option>
                         <option value="gpt-image-2/2k">ChatGPT Image 2 2K请求｜¥0.08/张</option>
                         <option value="gpt-image-2/4k">ChatGPT Image 2 4K请求｜¥0.16/张｜实测可能返1K</option>
+                    </optgroup>
+                    <optgroup label="HK｜ChatGPT Image 2.5（4K）">
+                        <option value="gpt-image-2.5/4k">GPT2.5 精细版 4K｜按实际Token计费</option>
+                        <option value="gpt-image-2.5-flare/4k">GPT2.5 Flare 快速版 4K｜按实际Token计费</option>
+                        <option value="gpt-image-2.5-sunburst/4k">GPT2.5 旭日精细版 4K｜按实际Token计费</option>
                     </optgroup>
                 </select>
                 <span id="split-oaihk-price-tag" style="display:none;font-size:10px;color:#2563eb;font-weight:600;white-space:nowrap;">¥0.30/张</span>
@@ -776,8 +777,6 @@
     <!-- 电商批量生图：目标替换参考图 × 服装文件夹，结果进入人工逐验 -->
     <div id="ecommerce-mode" class="main-content ecommerce-mode" style="display:none">
         <section class="ecommerce-shell">
-            <!-- 顶部水平滚动轨道：第5栏调整工作台展开后可左右滚动 -->
-            <div class="ecommerce-scroll-track" id="ecommerce-scroll-track" hidden><div class="ecommerce-scroll-thumb" id="ecommerce-scroll-thumb"></div></div>
             <div class="ecommerce-grid" id="ecommerce-grid-scroll">
                 <article class="ecommerce-card ecommerce-card-material" data-workbench-panel="material">
                     <div class="ecommerce-card-title">
@@ -819,7 +818,7 @@
                         <select id="ecommerce-prompt-templates-more" class="ecommerce-shared-prompt-more ecommerce-prompt-templates-more"><option value="">更多模板…</option></select>
                         <button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button>
                     </div>
-                    <label class="ecommerce-field-label" for="ecommerce-standard-prompt">换装提示词</label>
+                    <label class="ecommerce-field-label" for="ecommerce-standard-prompt">总提示词</label>
                     <textarea id="ecommerce-standard-prompt" rows="5">将服装参考图中的衣服精准替换到图1人物身上，并保持图1的背景、道具、动作、五官和发型完全不变。仅替换服装；图2起为同一套衣服本次提供的全部多角度、多景别参考，需综合学习并严格还原衣领、衣襟、盘扣数量与形状、开叉位置、拉链、袖口、材质和花纹。让服装自然贴合身体曲线，专业相机拍摄，写实、真实自然。</textarea>
                     <div class="ecommerce-prompt-actions">
                         <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-save-prompt-template">存储模板</button>
@@ -835,26 +834,20 @@
                             <select id="ecommerce-import-platform">
                                 <option value="runninghub" selected>RH</option>
                                 <option value="oaihk">HK</option>
+                                <option value="pptoken">PPT Token</option>
+                                <option value="apiyi">API易</option>
                             </select>
                         </label>
                         <label class="ecommerce-model-step ecommerce-model-step-main"><span>2 · 模型</span>
                             <select id="ecommerce-import-rh-model" style="max-width:470px">
-                                <optgroup label="RunningHub 官方稳定版（实测高价，批量慎用）">
-                                    <option value="rhart-image-g-2-official/image-to-image-2k">GPT2-2K｜官方｜¥2.77</option>
-                                    <option value="rhart-image-g-2-official/image-to-image-4k">GPT2-4K｜官方｜¥4.16</option>
-                                    <option value="rhart-image-g-2-medium/image-to-image-2k">GPT2-2K｜官方中档｜¥1.13</option>
-                                    <option value="rhart-image-g-2-medium/image-to-image-4k">GPT2-4K｜官方中档｜¥1.13</option>
-                                    <option value="rhart-image-n-g31-flash-official/image-to-image-2k">Nano2-2K｜官方｜¥0.74</option>
-                                    <option value="rhart-image-n-g31-flash-official/image-to-image-4k">Nano2-4K｜官方｜¥0.99</option>
-                                    <option value="rhart-image-n-pro-official/edit-ultra-4k">Pro Ultra-4K｜官方｜¥1.50</option>
-                                </optgroup>
-                                <optgroup label="RunningHub 低价渠道版（分辨率/稳定性有风险）">
-                                    <option value="rhart-image-g-2/image-to-image-2k">GPT2-2K｜低价｜¥0.10</option>
-                                    <option value="rhart-image-g-2/image-to-image-4k">GPT2-4K｜低价｜¥0.10</option>
-                                    <option value="rhart-image-n-g31-flash/image-to-image-2k">Nano2-2K｜低价｜¥0.19</option>
-                                    <option value="rhart-image-n-g31-flash/image-to-image-4k" selected>Nano2-4K｜低价｜¥0.30</option>
-                                    <option value="rhart-image-n-pro/edit-2k">NanoPro-2K｜低价｜¥0.40</option>
-                                    <option value="rhart-image-n-pro/edit-4k">NanoPro-4K｜低价｜¥0.50</option>
+                                <optgroup label="RunningHub 海外经济版（价格按 1 USD ≈ ¥7.2 估算）">
+                                    <option value="rhart-image-n-g31-flash/image-to-image" selected>Nano Banana 2｜经济版｜$0.027 ≈ ¥0.19/张</option>
+                                    <option value="rhart-image-n-pro/edit">Nano Banana Pro｜经济版｜$0.06 ≈ ¥0.43/张</option>
+                                    <option value="rhart-image-g-2/image-to-image">ChatGPT Image 2｜$0.015 ≈ ¥0.11/张｜经济渠道多数返 1K</option>
+                                    <option value="rhart-image-g-2.5-official-token/flare/edit">ChatGPT 稳定版 Flare｜¥1.00/张</option>
+                                    <option value="rhart-image-g-2.5-official-token/sunburst/edit">ChatGPT 稳定版 Sunburst｜¥1.00/张</option>
+                                    <option value="rhart-image-g-2.5/flare/image-to-image">ChatGPT 经济版 Flare｜$0.03 ≈ ¥0.22/张｜1K/2K/4K 同价</option>
+                                    <option value="rhart-image-g-2.5/sunburst/image-to-image">ChatGPT 经济版 Sunburst｜$0.03 ≈ ¥0.22/张｜1K/2K/4K 同价</option>
                                 </optgroup>
                             </select>
                             <select id="ecommerce-import-oaihk-model" style="display:none;max-width:470px">
@@ -870,7 +863,54 @@
                                     <option value="gpt-image-2/2k">GPT2-2K｜¥0.08</option>
                                     <option value="gpt-image-2/4k">GPT2-4K｜¥0.16</option>
                                 </optgroup>
+                                <optgroup label="HK｜ChatGPT Image 2.5（4K）">
+                                    <option value="gpt-image-2.5/4k">GPT2.5 精细版 4K｜按实际Token计费</option>
+                                    <option value="gpt-image-2.5-flare/4k">GPT2.5 Flare 快速版 4K｜按实际Token计费</option>
+                                    <option value="gpt-image-2.5-sunburst/4k">GPT2.5 旭日精细版 4K｜按实际Token计费</option>
+                                </optgroup>
                             </select>
+                            <select id="ecommerce-import-pptoken-model" style="display:none;max-width:470px">
+                                <optgroup label="PPT Token｜ChatGPT Image">
+                                    <option value="gpt-image-2">gpt-image-2｜1K ¥0.06/0.08 · 2K ¥0.08/0.09 · 4K ¥0.12/0.18</option>
+                                    <option value="gpt-image-2.5" selected>gpt-image-2.5｜1K ¥0.06/0.08 · 2K ¥0.08/0.09 · 4K ¥0.12/0.18</option>
+                                    <option value="gpt-image-2.5-flare">gpt-image-2.5-flare｜1K ¥0.06/0.08 · 2K ¥0.08/0.09 · 4K ¥0.12/0.18</option>
+                                    <option value="gpt-image-2.5-sunburst">gpt-image-2.5-sunburst｜1K ¥0.06/0.08 · 2K ¥0.08/0.09 · 4K ¥0.12/0.18</option>
+                                </optgroup>
+                            </select>
+                            <select id="ecommerce-import-apiyi-model" style="display:none;max-width:470px">
+                                <optgroup label="API易｜Nano Banana（Gemini 原生）">
+                                    <option value="gemini-3-pro-image" selected>Nano Banana Pro｜4K｜$0.09/张 ≈ ¥0.52（1K/2K/4K 同价）</option>
+                                    <option value="gemini-3.1-flash-image-preview">Nano Banana 2｜4K｜$0.025/张 ≈ ¥0.18</option>
+                                </optgroup>
+                                <optgroup label="API易｜ChatGPT Image 2.5 / 2">
+                                    <option value="gpt-image-2.5-flare">ChatGPT2.5 快速版·官转｜4K｜medium｜按 Token 计费（由 size × quality 决定）</option>
+                                    <option value="gpt-image-2.5-sunburst">ChatGPT2.5 精细版·官转｜4K｜medium｜按 Token 计费（由 size × quality 决定）</option>
+                                    <option value="gpt-image-2.5-all">ChatGPT2.5 官逆·最快｜画幅写提示词｜$0.03/张 ≈ ¥0.22（1K/2K/4K 同价，最快约 90s）</option>
+                                    <option value="gpt-image-2-vip">ChatGPT2 官逆·锁尺寸｜4K｜$0.03/张 ≈ ¥0.22（1K/2K/4K 同价，可锁 30 档尺寸）</option>
+                                </optgroup>
+                                <optgroup label="API易｜即梦 Seedream（按张计费）">
+                                    <option value="seedream-5-0-260128">即梦Seedream 5.0 Lite｜4K｜$0.035/张 ≈ ¥0.245（2K/4K 同价）</option>
+                                    <option value="seedream-4-0-250828">即梦Seedream 4.0｜4K｜$0.03/张 ≈ ¥0.21（2K/4K 同价）</option>
+                                </optgroup>
+                            </select>
+                        </label>
+                        <label class="ecommerce-model-step" id="ecommerce-pptoken-resolution-step" style="display:none"><span>3 · 分辨率</span>
+                            <select id="ecommerce-import-pptoken-resolution">
+                                <option value="1k">1K</option><option value="2k" selected>2K</option>
+                            </select>
+                            <small style="color:var(--text-muted);white-space:nowrap">该平台 gpt-image 模型最高 2K，4K 实测只返 1K</small>
+                        </label>
+                        <label class="ecommerce-model-step" id="ecommerce-apiyi-resolution-step" style="display:none"><span>3 · 分辨率</span>
+                            <select id="ecommerce-import-apiyi-resolution">
+                                <option value="1k">1K</option><option value="2k">2K</option><option value="4k" selected>4K</option>
+                            </select>
+                            <small id="ecommerce-apiyi-size-hint" style="color:var(--text-muted);white-space:nowrap">比例选「自动」时按目标参考图的比例出图</small>
+                        </label>
+                        <label class="ecommerce-model-step" id="ecommerce-rh-resolution-step" style="display:none"><span>3 · 分辨率</span>
+                            <select id="ecommerce-import-rh-resolution">
+                                <option value="1k">1K</option><option value="2k" selected>2K</option><option value="4k">4K</option>
+                            </select>
+                            <small id="ecommerce-rh-resolution-hint" style="color:var(--text-muted);white-space:nowrap"></small>
                         </label>
                         <label class="ecommerce-model-step"><span>3 · 比例</span>
                             <select id="ecommerce-import-ratio">
@@ -878,50 +918,51 @@
                             </select>
                         </label>
                     </div>
+                    <p class="ecommerce-model-note" id="ecommerce-model-note"></p>
                 </article>
 
                 <div class="ecommerce-column-resizer" data-left="material" data-right="qc" title="拖动调整两栏宽度"></div>
 
                 <article class="ecommerce-card ecommerce-card-qc ecommerce-card-precision" data-workbench-panel="qc">
-                    <div class="ecommerce-card-title"><span>2</span>人工精准匹配参考图</div>
-                    <p class="ecommerce-help">为第一套服装建立目标图与服装参考图的序号映射；后续服装按相同序号自动匹配。确认后，每次请求只提交一张动作图和一张服装图。</p>
-                    <label class="ecommerce-precision-toggle"><input id="ecommerce-precision-matching" type="checkbox" checked><span>人工精准匹配（默认开启）</span><small>主动关闭后使用原有默认模式</small></label>
-                    <!-- 保留 API 配置挂载点供已有初始化逻辑和旧批次兼容；不作为第二栏可见内容。 -->
-                    <details id="ecommerce-rh-api-switch" hidden>
-                        <input id="ecommerce-rh-api-key" type="password">
-                        <input id="ecommerce-rh-base-url" type="text">
-                        <button id="btn-ecommerce-save-rh-api" type="button"></button>
-                        <span id="ecommerce-rh-api-result"></span><span id="ecommerce-rh-account-status"></span>
+                    <div class="ecommerce-card-title"><span>2</span>人工精准匹配 · 运行设置</div>
+                    <!-- 精准匹配是建批时用一次的低频操作，默认折叠成一行，把高度让给下面的运行设置。 -->
+                    <details id="ecommerce-precision-fold" class="ecommerce-precision-fold">
+                        <summary><b>人工精准匹配</b><span id="ecommerce-precision-fold-state" class="ecommerce-summary">默认开启</span></summary>
+                        <p class="ecommerce-help">为第一套服装建立目标图与服装参考图的序号映射；后续服装按相同序号自动匹配。确认后，每次请求只提交一张动作图和一张服装图。</p>
+                        <label class="ecommerce-precision-toggle"><input id="ecommerce-precision-matching" type="checkbox" checked><span>人工精准匹配（默认开启）</span><small>主动关闭后使用原有默认模式</small></label>
+                        <!-- 保留 API 配置挂载点供已有初始化逻辑和旧批次兼容；不作为第二栏可见内容。 -->
+                        <details id="ecommerce-rh-api-switch" hidden>
+                            <input id="ecommerce-rh-api-key" type="password">
+                            <input id="ecommerce-rh-base-url" type="text">
+                            <button id="btn-ecommerce-save-rh-api" type="button"></button>
+                            <span id="ecommerce-rh-api-result"></span><span id="ecommerce-rh-account-status"></span>
+                        </details>
+                        <div id="ecommerce-precision-panel" class="ecommerce-precision-panel" hidden>
+                            <div class="ecommerce-notice">精准模式已启用：生成结果会进入第3栏人工逐验，不做 AI 自动质检。</div>
+                            <button type="button" class="btn btn-primary" id="btn-ecommerce-open-precision-matching">打开精准匹配</button>
+                            <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-clear-precision">清空匹配</button>
+                            <span id="ecommerce-precision-status" class="ecommerce-summary">尚未完成匹配</span>
+                        </div>
                     </details>
-                    <div id="ecommerce-precision-panel" class="ecommerce-precision-panel" hidden>
-                        <div class="ecommerce-notice">精准模式已启用：生成结果会进入第4栏人工逐验，不做 AI 自动质检。</div>
-                        <button type="button" class="btn btn-primary" id="btn-ecommerce-open-precision-matching">打开精准匹配</button>
-                        <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-clear-precision">清空匹配</button>
-                        <span id="ecommerce-precision-status" class="ecommerce-summary">尚未完成匹配</span>
+                    <div class="ecommerce-merged-divider">
+                        <span class="ecommerce-merged-divider-label">运行设置</span>
+                        <span class="ecommerce-help-tip" tabindex="0" data-tip="素材分段上传，任务按稳定身份绑定并发执行；暂停后可继续，不会按上传完成顺序错配服装。">?</span>
                     </div>
-                </article>
-
-                <div class="ecommerce-column-resizer" data-left="qc" data-right="run" title="拖动调整两栏宽度"></div>
-
-                <article class="ecommerce-card ecommerce-card-action" data-workbench-panel="run">
-                    <div class="ecommerce-card-title"><span>3</span>运行 <span class="ecommerce-help-tip" tabindex="0" data-tip="素材分段上传，任务按稳定身份绑定并发执行；暂停后可继续，不会按上传完成顺序错配服装。">?</span></div>
-                    <p class="ecommerce-help">结果不经过 AI 自动质检，按“服装 × 动作 × 抽卡序号”独立归档；返回不足会自动补齐，完成后请到第4栏人工逐验。RunningHub企业线路最高可设100。</p>
-                    <div class="ecommerce-settings-grid ecommerce-run-settings">
-                        <label>并发
-                            <div class="ecommerce-concurrency-control">
+                    <p class="ecommerce-help">结果不经过 AI 自动质检，按“服装 × 动作 × 抽卡序号”独立归档；返回不足会自动补齐，完成后请到第3栏人工逐验。RunningHub企业线路最高可设100。</p>
+                    <div class="ecommerce-run-settings">
+                        <label class="ecommerce-run-field" title="并发数会自动对齐为目标图数量的整数倍，避免跨服装混发；RunningHub 企业线路最高可设 100。">并发
+                            <span class="ecommerce-concurrency-control">
                                 <input id="ecommerce-concurrency" type="number" min="1" max="100" value="10" step="1">
-                                <select id="ecommerce-concurrency-presets" class="ecommerce-concurrency-presets" title="选择推荐并发数">
+                                <select id="ecommerce-concurrency-presets" class="ecommerce-concurrency-presets" title="按目标图数量选择推荐并发倍数">
                                     <option value="">倍数…</option>
                                 </select>
-                                <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-auto-concurrency">自动计算</button>
-                            </div>
-                            <small id="ecommerce-concurrency-hint">并发数会自动对齐为目标图数量的整数倍，避免跨服装混发。</small>
+                                <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-auto-concurrency" title="按当前目标图数量自动计算并发数">自动</button>
+                            </span>
                         </label>
-                        <label>网络/查询重试上限
-                            <select id="ecommerce-max-attempts" disabled><option value="5">5次</option></select>
-                            <small>已拿到 taskId 只查询原任务；供应商明确失败最多重新提交2次（总计3次）。</small>
+                        <label class="ecommerce-run-field" title="已拿到 taskId 只查询原任务；供应商明确失败最多重新提交 2 次（总计 3 次），当前固定为 5 次上限。">网络重试
+                            <select id="ecommerce-max-attempts" disabled><option value="5">5 次</option></select>
                         </label>
-                        <label id="ecommerce-samples-label">每张数量
+                        <label class="ecommerce-run-field" id="ecommerce-samples-label" title="每个动作生成的图片数量；选 2 张以上即抽卡。">每张数量
                             <select id="ecommerce-samples-per-action">
                                 <option value="1" selected>1 张（省钱）</option>
                                 <option value="2">2 张（抽卡）</option>
@@ -936,6 +977,7 @@
                             </select>
                         </label>
                     </div>
+                    <small id="ecommerce-concurrency-hint">并发数会自动对齐为目标图数量的整数倍，避免跨服装混发。</small>
                     <details class="ecommerce-advanced-settings">
                         <summary>输出与缓存设置</summary>
                     <div class="ecommerce-row">
@@ -988,14 +1030,15 @@
                     </div>
                 </article>
 
-                <div class="ecommerce-column-resizer" data-left="run" data-right="rerun" title="拖动调整两栏宽度"></div>
+                <div class="ecommerce-column-resizer" data-left="qc" data-right="rerun" title="拖动调整两栏宽度"></div>
 
                 <article class="ecommerce-card ecommerce-card-rerun" data-workbench-panel="rerun">
-                    <div class="ecommerce-card-title"><span>4</span>废片重做 <span class="ecommerce-help-tip" tabindex="0" data-tip="打开结果逐套人工验片，删除废片后可扫描整批或单组并记录模型废片率；删除图仍可从本地备份进入对比重做。">?</span><small class="ecommerce-resize-hint">右下角调高度</small><button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-expand">放大验片</button></div>
-                    <div class="ecommerce-row">
+                    <div class="ecommerce-card-title"><span>3</span>废片重做 <span class="ecommerce-help-tip" tabindex="0" data-tip="打开结果逐套人工验片，删除废片后可扫描整批或单组并记录模型废片率；删除图仍可从本地备份进入对比重做。">?</span><small class="ecommerce-resize-hint">右下角调高度</small><button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-expand">放大验片</button></div>
+                    <div class="ecommerce-row ecommerce-rerun-batch-row">
                         <select id="ecommerce-rerun-batch-select"><option value="">选择批次</option></select>
                         <button class="btn btn-primary" id="btn-ecommerce-rerun-scan">扫描整批</button>
                         <button class="btn btn-outline" id="btn-ecommerce-rerun-refresh" title="刷新批次数据并立即重新扫描废片">刷新并重扫</button>
+                        <button class="btn btn-outline" id="btn-ecommerce-relink-results" title="成品图片被移到别处后点这里：选择新位置（任意一张成品图所在的文件夹、某一套的文件夹，或它们的上一层文件夹），软件会扫描该文件夹和它的上一层文件夹，按文件名把整批成品重新接回来，不复制、不删除任何文件">🔗 链接新位置</button>
                     </div>
                     <div class="ecommerce-folder-preview-head">
                         <strong>逐套验片</strong><span class="ecommerce-help-tip" tabindex="0" data-tip="点右侧缩略图或“对比”，左边切换服装实拍参考，右边切换该组AI生成图。">?</span>
@@ -1009,40 +1052,44 @@
                         <button class="btn btn-primary" id="btn-ecommerce-rerun-scan-single">扫描所选单组</button>
                     </div>
                     <div id="ecommerce-rerun-summary" class="ecommerce-summary">尚未扫描</div>
-                    <details class="ecommerce-waste-stats" id="ecommerce-waste-disclosure">
-                        <summary><strong>模型废片率</strong><small id="ecommerce-waste-latest">需要时展开</small><span id="ecommerce-waste-disclosure-label">展开</span></summary>
-                        <div class="ecommerce-waste-body">
-                            <div class="ecommerce-waste-toolbar">
-                                <small>扫描自动更新，同批次不重复记账</small>
-                                <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-waste-toggle">展开近20次</button>
-                            </div>
-                            <div id="ecommerce-waste-list" class="ecommerce-waste-list"><div class="ecommerce-empty">扫描一次废片后开始记录模型表现。</div></div>
-                        </div>
-                    </details>
                     <div id="ecommerce-rerun-batches" class="ecommerce-rerun-batches">
                         <div class="ecommerce-empty">批量重做后，这里会保留可继续、可结束和可验片的重做批次。</div>
                     </div>
-                    <div id="ecommerce-rerun-list" class="ecommerce-rerun-list">
-                        <div class="ecommerce-empty">扫描后这里会列出每套服装被删掉的动作，点击可进入对比与重做。</div>
+                    <div id="ecommerce-rerun-bulk-params" class="ecommerce-rerun-bulk-params">
+                        <div class="ecommerce-empty">扫描废片后，这里会显示批量重做的平台、模型、并发与提示词参数。</div>
                     </div>
                 </article>
 
-                <div class="ecommerce-column-resizer" id="ecommerce-rerun-adjust-resizer" data-left="rerun" data-right="adjust" title="拖动调整废片列宽度" hidden></div>
+                <div class="ecommerce-column-resizer" data-left="rerun" data-right="wastelist" title="拖动调整两栏宽度"></div>
 
-                <article class="ecommerce-card ecommerce-card-rerun-adjust" id="ecommerce-rerun-adjust-panel" data-workbench-panel="adjust" hidden>
+                <article class="ecommerce-card ecommerce-card-wastelist" data-workbench-panel="wastelist">
+                    <div class="ecommerce-card-title"><span>4</span>废片列表 <span class="ecommerce-help-tip" tabindex="0" data-tip="全部待重做废片按服装分组。可逐张勾选、点缩略图放大对比，或点某一行到第5栏调整参考图与提示词；勾选结果与第3栏的批量重做同步。带「✧ 二次调整」青色标记的项排在最后，只用那张AI图作为唯一参考图重做。">?</span></div>
+                    <div class="ecommerce-wastelist-body">
+                        <div id="ecommerce-rerun-list" class="ecommerce-rerun-list">
+                            <div class="ecommerce-empty">扫描后这里会列出每套服装被删掉的动作，点击可进入对比与重做。</div>
+                        </div>
+                        <div class="ecommerce-vscroll-track" id="ecommerce-rerun-vscroll-track" hidden><div class="ecommerce-vscroll-thumb" id="ecommerce-rerun-vscroll-thumb"></div></div>
+                    </div>
+                </article>
+
+                <div class="ecommerce-column-resizer" id="ecommerce-rerun-adjust-resizer" data-left="wastelist" data-right="adjust" title="拖动调整废片列宽度"></div>
+
+                <article class="ecommerce-card ecommerce-card-rerun-adjust is-empty" id="ecommerce-rerun-adjust-panel" data-workbench-panel="adjust">
                     <div class="ecommerce-card-title">
                         <span>5</span>调整细节
-                        <span class="ecommerce-help-tip" tabindex="0" data-tip="逐张调整重做提示词与1～9张参考图；可选择只修改当前图片，或同步到本套全部废片。">?</span>
-                        <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-adjust-close">关闭</button>
+                        <span class="ecommerce-help-tip" tabindex="0" data-tip="逐张调整重做提示词与1～9张参考图，修改只影响当前这一张；三个保存按钮分别是「下一张」「下一套」「同步全部二次调整」。二次调整的提示词只认自己的输入框，批次大提示词不会覆盖它。">?</span>
+                        <button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-adjust-close">取消选择</button>
                     </div>
                     <div class="ecommerce-rerun-adjust-progress">
                         <strong id="ecommerce-rerun-adjust-group-progress">未选择服装</strong>
-                        <span id="ecommerce-rerun-adjust-item-progress">点击第4栏的“调整参考图”</span>
+                        <span id="ecommerce-rerun-adjust-item-progress">在第4栏废片列表点一张即可调整参考图</span>
                     </div>
                     <div id="ecommerce-rerun-adjust-host" class="ecommerce-rerun-adjust-host">
                         <div class="ecommerce-empty">从废片列表选择一张后，这里会显示独立调整工作台。</div>
                     </div>
                 </article>
+
+                <div class="ecommerce-column-resizer" data-left="adjust" data-right="final-export" title="拖动调整两栏宽度"></div>
 
                 <article class="ecommerce-card ecommerce-card-final-export" data-workbench-panel="final-export">
                     <div class="ecommerce-card-title">
@@ -1075,6 +1122,7 @@
                     <span id="ecommerce-compare-garment-indicator-top" class="ecommerce-compare-garment-indicator"></span>
                     <button type="button" id="ecommerce-compare-next-garment" class="btn btn-primary btn-compact" title="下一套服装 (PageDown)">下一套 ›</button>
                     <button type="button" id="ecommerce-compare-select-final" class="btn btn-outline btn-compact" hidden></button>
+                    <button type="button" id="ecommerce-compare-refine" class="btn btn-outline btn-compact" title="把当前这张AI图加入二次调整：扫描废片后出现在废片列表最后，只用这张AI图作为唯一参考图重做（不再送模特/服装参考图），新图紧跟源图之后" style="color:#0e7490;border-color:#a5f3fc;">✧ 添加到二次调整</button>
                     <button type="button" id="ecommerce-compare-mark-redo" class="btn btn-outline btn-compact" title="标记此图为待重做（不删除原图，重做后新旧图共存对比）" style="color:#2563eb;border-color:#93c5fd;">⚑ 标记重做</button>
                     <button type="button" id="ecommerce-compare-delete" class="btn btn-outline btn-compact" title="删除当前AI生成图（Delete键，移到回收站）" style="color:#dc2626;border-color:#fecaca;">✕ 删除</button>
                     <button type="button" id="ecommerce-compare-recover" class="btn btn-outline btn-compact" hidden title="从回收站找回此图，与当前生成图并列对比" style="color:#059669;border-color:#a7f3d0;">↩ 找回</button>
@@ -1157,9 +1205,148 @@
 
     <div id="ecommerce-ref-crop-overlay" class="ecommerce-ref-crop-overlay" hidden aria-hidden="true">
         <section class="ecommerce-ref-crop-shell" role="dialog" aria-modal="true" aria-label="重做参考图裁剪">
-            <header><strong>裁剪本次重做参考图</strong><span>滚轮放大/缩小图片，拖动图片调整位置；裁剪框固定不变，不会修改原文件</span><button type="button" id="ecommerce-ref-crop-close">×</button></header>
+            <header><strong id="ecommerce-ref-crop-title">裁剪本次重做参考图</strong><span id="ecommerce-ref-crop-hint">拖动角点等比缩放，拖动四边单独调整；拖动图片移动位置，滚轮缩放图片。不会修改原文件</span><button type="button" id="ecommerce-ref-crop-close">×</button></header>
             <div class="ecommerce-ref-crop-stage"><canvas id="ecommerce-ref-crop-canvas" width="900" height="620"></canvas></div>
-            <footer><label>图片缩放 <input id="ecommerce-ref-crop-scale" type="range" min="1" max="100" value="12" title="滚轮控制更方便"></label><span style="color:#98a2b3;font-size:11px;">滚轮放大缩小图片 · 拖动图片调整位置 · 回车确认跳下一张 · C键打开裁剪</span><button type="button" class="btn btn-outline" id="ecommerce-ref-crop-reset">重置</button><button type="button" class="btn btn-primary" id="ecommerce-ref-crop-confirm">使用本次裁剪</button></footer>
+            <footer><label>图片缩放 <input id="ecommerce-ref-crop-scale" type="range" min="1" max="100" value="12" title="滚轮控制更方便"></label><span id="ecommerce-ref-crop-tip" style="color:#98a2b3;font-size:11px;">拖角等比 · 拖边单边 · 拖图片移动 · 回车确认跳下一张 · C键打开裁剪</span><button type="button" class="btn btn-outline" id="ecommerce-ref-crop-restore">恢复原图</button><button type="button" class="btn btn-outline" id="ecommerce-ref-crop-reset">重置</button><button type="button" class="btn btn-primary" id="ecommerce-ref-crop-confirm">使用本次裁剪</button></footer>
+        </section>
+    </div>
+
+    <!-- 证件照批量生成工作台 -->
+    <div id="idphoto-mode" class="main-content idphoto-mode" style="display:none">
+        <section class="idphoto-shell">
+            <header class="idphoto-header">
+                <div><h2>证件照批量生成</h2><p>模特脸型参考图可选；未提供时按提示词图生图。原图的表情、发型、服装和背景会保留。</p></div>
+                <div class="idphoto-status" id="idphoto-status">未开始</div>
+            </header>
+            <div class="idphoto-step-title"><span>1</span><div><strong>导入实拍图与脸型</strong></div></div>
+            <div class="idphoto-reference-tray">
+                <div class="idphoto-upload-card" id="idphoto-source-dropzone" data-idphoto-kind="source" tabindex="0" role="button" aria-label="导入实拍底图">
+                    <span class="idphoto-upload-icon">＋</span><b>实拍底图</b>
+                    <span class="idphoto-upload-state" id="idphoto-source-upload-state">单击多选图片 · 双击路径选大文件夹 · 可拖入图片或文件夹</span>
+                    <input id="idphoto-shared-source-file" type="file" accept=".jpg,.jpeg,.png,.webp" multiple hidden>
+                    <input id="idphoto-shared-source-folder" type="file" accept=".jpg,.jpeg,.png,.webp" webkitdirectory directory multiple hidden>
+                    <div class="idphoto-upload-path-row">
+                        <input id="idphoto-shared-source" type="text" placeholder="双击此处选择图片大文件夹，也可填写路径" aria-label="实拍底图图片或文件夹路径">
+                        <button type="button" class="idphoto-clear-btn" id="btn-idphoto-clear-source" title="清除实拍底图队列和路径" aria-label="清除实拍底图">× 清除</button>
+                    </div>
+                </div>
+                <div class="idphoto-reference-arrow">＋</div>
+                <div class="idphoto-upload-card" id="idphoto-face-dropzone" data-idphoto-kind="face" tabindex="0" role="button" aria-label="导入模特脸型参考图">
+                    <span class="idphoto-upload-icon">＋</span><b>模特脸型参考</b>
+                    <span class="idphoto-upload-state" id="idphoto-face-upload-state">可选：单击多选图片 · 双击选文件夹 · 可拖入</span>
+                    <input id="idphoto-shared-face-file" type="file" accept=".jpg,.jpeg,.png,.webp" multiple hidden>
+                    <input id="idphoto-shared-face-folder" type="file" accept=".jpg,.jpeg,.png,.webp" webkitdirectory directory multiple hidden>
+                    <div class="idphoto-upload-path-row">
+                        <input id="idphoto-shared-face" type="text" placeholder="也可填写本地图片/文件夹路径" aria-label="模特脸型本地路径">
+                        <button type="button" class="idphoto-clear-btn" id="btn-idphoto-clear-face" title="清除模特脸型参考队列和路径" aria-label="清除模特脸型参考">× 清除</button>
+                    </div>
+                </div>
+            </div>
+            <div class="idphoto-intake-previews">
+                <div id="idphoto-source-preview" class="idphoto-intake-preview" aria-label="实拍图任务预览"></div>
+                <div id="idphoto-face-preview" class="idphoto-intake-preview" aria-label="模特脸型预览"></div>
+            </div>
+            <label class="idphoto-repeat-toggle"><input id="idphoto-repeat-faces" type="checkbox"> 脸型不足时按顺序循环复用</label>
+            <div class="idphoto-step-title"><span>2</span><div><strong>选择生成模式</strong><small>三个模式共用上面的参考图。</small></div></div>
+            <nav class="idphoto-tabs idphoto-mode-choices" aria-label="证件照生成模式">
+                <button class="idphoto-tab active" data-idphoto-tab="swap"><strong>批量换脸</strong><small>单图、多图或文件夹自动分组排队</small></button>
+                <button class="idphoto-tab" data-idphoto-tab="faces"><strong>生成九宫格脸型</strong><small>一次生成 9 个脸型，再挑选裁剪</small></button>
+            </nav>
+            <label class="idphoto-shared-model">API易模型
+                <select id="idphoto-image-model">
+                    <option value="apiyi-nano-banana-2-2k" selected>Nano Banana 2｜2K｜整图候选 + 本地蒙版｜$0.025 ≈ ¥0.18/张</option>
+                    <option value="apiyi-nano-banana-2-4k">Nano Banana 2｜4K｜整图候选 + 本地蒙版｜$0.025 ≈ ¥0.18/张</option>
+                    <option value="apiyi-nano-banana-pro-4k">Nano Banana Pro｜4K｜整图候选 + 本地蒙版｜$0.09 ≈ ¥0.52/张</option>
+                    <option value="apiyi-chatgpt-2.5-flare-4k" data-native-mask="1">GPT2.5 Flare 快速版｜4K｜原生 Mask 图生图｜2K+medium约¥0.58/张，4K按Token</option>
+                    <option value="apiyi-chatgpt-2.5-sunburst-4k" data-native-mask="1">GPT2.5 Sunburst 精细版｜4K｜原生 Mask 图生图｜2K+medium约¥0.58/张，4K按Token</option>
+                    <option value="apiyi-chatgpt-2.5-4k">ChatGPT Image 2.5 官逆｜4K｜不支持原生 Mask，整图候选 + 本地蒙版｜$0.03 ≈ ¥0.22/张</option>
+                    <option value="apiyi-chatgpt-2-4k" data-native-mask="1">GPT2 官逆 VIP｜4K｜原生 Mask 图生图｜$0.03 ≈ ¥0.22/张</option>
+                </select>
+            </label>
+            <div class="idphoto-pane active" data-idphoto-pane="swap">
+                <div class="idphoto-step-title compact"><span>3</span><div><strong>批量换脸设置</strong><small>指定实拍根目录和脸型目录，程序按客户文件夹分组。</small></div></div>
+                <div class="idphoto-grid">
+                    <label>实拍根目录<span class="idphoto-path-field"><input id="idphoto-source-root" type="text" placeholder="选择包含客户子文件夹的大文件夹"><button type="button" class="btn btn-outline" id="btn-idphoto-source-folder">选择</button><button type="button" class="idphoto-clear-btn" id="btn-idphoto-clear-source-root" title="清除实拍根目录和已导入队列">×</button></span></label>
+                    <label>脸型目录<span class="idphoto-path-field"><input id="idphoto-face-root" type="text" placeholder="保存好的单张模特脸目录"><button type="button" class="btn btn-outline" id="btn-idphoto-face-folder">选择</button><button type="button" class="idphoto-clear-btn" id="btn-idphoto-clear-face-root" title="清除脸型目录和已导入队列">×</button></span></label>
+                    <label>输出目录<input id="idphoto-output-root" type="text" placeholder="留空=实拍文件夹旁的「文件夹名_证件照输出」"></label>
+                    <label title="只扩大面部皮肤蒙版，发际线、鬓角、下颌外轮廓和脖子仍保留原图">面部蒙版扩展<input id="idphoto-face-expand" type="number" min="1.05" max="1.2" step="0.05" value="1.15"></label>
+                    <label>并发数<input id="idphoto-concurrency" type="number" min="1" max="4" value="1"></label>
+                </div>
+                <label class="idphoto-generation-mode">换脸生成方式
+                    <select id="idphoto-swap-generation-mode">
+                        <option value="local-composite" selected>普通图生图（所有模型可用）</option>
+                        <option value="native-mask">原生 Mask 图生图（仅 GPT2.5 Flare / Sunburst / GPT2 VIP）</option>
+                    </select>
+                </label>
+                <label class="idphoto-auto-composite"><input id="idphoto-auto-composite" type="checkbox" checked> 自动合成 PSD（只保留 PSD）</label>
+                <textarea id="idphoto-swap-instruction" rows="3" placeholder="可选：告诉 DeepSeek 这批照片想要的模特气质，例如韩系清透、少女感、高级但真实，不要 AI 网红脸。">将图一的人物面部替换为真实自然、有特色的成年模特脸；如果提供模特脸型参考图，只参考脸型、五官和气质，不复制参考图表情；保持图一原来的表情不变，复刻眼睛睁闭、嘴角弧度、嘴唇开合和面部肌肉状态；只改变面部皮肤区域，保持发际线、头发、耳朵、下颌外轮廓、脖子、服装、背景和构图不变。真实自然的艺考宣传人像，韩系清透白开水妆，皮肤有真实纹理，不要塑料脸和统一网红脸。</textarea>
+                <div class="idphoto-prompt-template-bar" aria-label="批量换脸提示词模板">
+                    <span>提示词模板</span>
+                    <select id="idphoto-swap-template-select" aria-label="选择换脸提示词模板"><option value="">暂无模板</option></select>
+                    <button type="button" class="btn btn-outline btn-compact" id="btn-idphoto-save-swap-template">保存当前为默认</button>
+                    <button type="button" class="btn btn-outline btn-compact" id="btn-idphoto-delete-swap-template" title="删除当前模板">删除</button>
+                </div>
+                <div class="idphoto-actions"><button class="btn btn-outline" id="btn-idphoto-scan">扫描目录</button><button class="btn btn-primary" id="btn-idphoto-run-swap">开始批量换脸</button><button class="btn btn-outline" id="btn-idphoto-stop">暂停</button></div>
+                <div id="idphoto-scan-summary" class="idphoto-summary">尚未扫描</div><div id="idphoto-scan-list" class="idphoto-list"></div>
+            </div>
+            <div class="idphoto-pane" data-idphoto-pane="faces">
+                <div class="idphoto-step-title compact"><span>3</span><div><strong>生成与挑选</strong><small>生成九宫格后，在裁剪区填写要保留的编号。</small></div></div>
+                <div class="idphoto-grid idphoto-grid-generator-settings">
+                    <label>网格模式<select id="idphoto-grid-mode"><option value="9" selected>九宫格 3×3</option><option value="4">四宫格 2×2</option></select></label>
+                    <label>生成数量<input id="idphoto-face-count" type="number" min="1" max="1000" value="3"></label>
+                    <label>画面比例<select id="idphoto-face-ratio"><option value="auto">自动（竖图）</option><option value="3:4" selected>3:4 竖图</option><option value="2:3">2:3 竖图</option><option value="4:5">4:5 竖图</option><option value="9:16">9:16 竖图</option></select></label>
+                    <label>输出目录<input id="idphoto-face-output" type="text" placeholder="留空=统一测试目录"></label>
+                </div>
+                <section class="idphoto-feature-builder">
+                    <div class="idphoto-feature-head"><strong>九宫格五官组合</strong><span>随机开关关闭后固定该项</span><button type="button" class="btn btn-outline btn-compact" id="btn-idphoto-build-features">生成 9 套组合</button></div>
+                    <div id="idphoto-feature-controls" class="idphoto-feature-controls"></div>
+                    <details class="idphoto-imperfection-manager"><summary class="idphoto-imperfection-manager-head"><strong>自然瑕疵选项</strong><small>每个模特每次随机抽 1 个；点击展开编辑</small></summary><div id="idphoto-imperfection-editor"></div></details>
+                    <div id="idphoto-feature-preview" class="idphoto-feature-preview">尚未生成五官组合</div>
+                </section>
+                <section class="idphoto-grid-prompt-editor">
+                    <div class="idphoto-prompt-editor-head"><label for="idphoto-face-instruction">九宫格提示词前缀</label><button type="button" class="btn btn-outline btn-compact" id="btn-idphoto-save-grid-prefix">保存前缀</button></div>
+                    <textarea id="idphoto-face-instruction" rows="4" placeholder="输入每张九宫格都共用的前缀，例如年龄、审美、妆容、真实感和画面要求"></textarea>
+                    <small>运行时会自动在前缀后追加本次随机生成的 1～9 号脸型、眉眼、眼皮、卧蚕、鼻型、唇型、发际线和耳型描述。</small>
+                    <textarea id="idphoto-face-prompt-preview" rows="7" readonly aria-label="本次提交给图像模型的完整提示词"></textarea>
+                </section>
+                <div class="idphoto-actions"><button class="btn btn-primary" id="btn-idphoto-run-faces">生成九宫格</button></div>
+                <div class="idphoto-grid-progress" id="idphoto-grid-progress" role="status" aria-live="polite"><div class="idphoto-grid-progress-track"><div id="idphoto-grid-progress-bar" class="idphoto-grid-progress-bar"></div></div><span id="idphoto-grid-progress-text">尚未开始</span></div>
+                <div id="idphoto-face-results" class="idphoto-face-results"></div>
+            </div>
+            <div class="idphoto-tool-row">
+                <div class="idphoto-tool-card">
+                    <div class="idphoto-tool-heading"><span>逐张挑选裁剪</span><small>生成结果自动识别网格，外部图片可手动覆盖</small></div>
+                    <div class="idphoto-crop-dropzone" id="idphoto-crop-dropzone" tabindex="0" role="button">
+                        <input id="idphoto-crop-files" type="file" accept=".jpg,.jpeg,.png,.webp" multiple hidden>
+                        <span>拖入或单击选择多张四宫格/九宫格</span><small id="idphoto-crop-state">生成结果会自动加入</small>
+                    </div>
+                    <input id="idphoto-crop-source" type="text" placeholder="也可双击选择单张九宫格图片">
+                    <label class="idphoto-crop-mode-field">裁剪网格<select id="idphoto-crop-grid-mode"><option value="auto" selected>自动（生成记录/文件名识别）</option><option value="9">九宫格 3×3</option><option value="4">四宫格 2×2</option></select></label>
+                    <div class="idphoto-crop-review" id="idphoto-crop-review" hidden>
+                        <div class="idphoto-crop-preview-shell"><img id="idphoto-crop-preview" alt="当前九宫格"><div id="idphoto-crop-grid-selector" class="idphoto-crop-grid-selector" aria-label="九宫格脸型选择"></div></div>
+                        <div class="idphoto-crop-meta" id="idphoto-crop-meta">0 / 0</div>
+                        <div class="idphoto-crop-nav"><button class="btn btn-outline" id="btn-idphoto-crop-open-viewer">打开大图</button><button class="btn btn-outline" id="btn-idphoto-crop-prev">上一张</button><button class="btn btn-outline" id="btn-idphoto-crop-next">保存并下一张</button><button class="btn btn-primary" id="btn-idphoto-crop-faces">完成并全部裁剪</button></div>
+                    </div>
+                </div>
+                <div class="idphoto-tool-card">
+                    <div class="idphoto-tool-heading"><span>SeedVR 放大</span><small>单张、多张或大文件夹</small></div>
+                    <div class="idphoto-upscale-dropzone" id="idphoto-upscale-dropzone" tabindex="0" role="button">
+                        <input id="idphoto-upscale-files" type="file" accept=".jpg,.jpeg,.png,.webp" multiple hidden>
+                        <input id="idphoto-upscale-folder" type="file" accept=".jpg,.jpeg,.png,.webp" webkitdirectory directory multiple hidden>
+                        <span>单击多选图片 · 双击选文件夹 · 可拖入</span><small id="idphoto-upscale-state">尚未载入</small>
+                    </div>
+                    <label class="idphoto-inline-field">本地路径<input id="idphoto-upscale-input" type="text" placeholder="图片或文件夹；双击打开访达"></label>
+                    <div id="idphoto-upscale-preview" class="idphoto-upscale-preview"></div>
+                    <div class="idphoto-upscale-options">
+                        <label>分包数<input id="idphoto-upscale-packages" type="number" min="1" max="100" value="6"></label>
+                        <label>计划并发<input id="idphoto-upscale-concurrency" type="number" min="1" max="100" value="6"></label>
+                        <label>目标<select id="idphoto-upscale-resolution"><option value="2k">2K</option><option value="4k">4K</option></select></label>
+                        <button class="btn btn-outline" id="btn-idphoto-upscale">准备放大任务</button>
+                    </div>
+                    <div class="idphoto-upscale-footer"><button type="button" class="btn btn-outline btn-compact" id="btn-idphoto-runninghub-limit">查询账号并发</button><div id="idphoto-upscale-summary" class="idphoto-upscale-summary">RunningHub 自动提交待配置工作流 ID 与 ZIP 节点 ID</div></div>
+                </div>
+            </div>
+            <details class="idphoto-test-panel"><summary>无界面测试与 API 易低价冒烟</summary><p>普通测试不扣费；真实测试只用 1 张或 3 张图片和 API易 2K 模型。测试结果统一保存到 <code>_测试输出/证件照</code>。</p><button class="btn btn-outline" id="btn-idphoto-run-test">运行自动测试</button><pre id="idphoto-test-report"></pre></details>
         </section>
     </div>
 
@@ -1170,6 +1357,41 @@
             <div class="ecommerce-confirm-actions">
                 <button type="button" class="btn btn-outline" id="ecommerce-confirm-cancel">取消</button>
                 <button type="button" class="btn btn-primary" id="ecommerce-confirm-ok">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 继续运行：是否更换平台/模型 -->
+    <div id="ecommerce-switch-model-dialog" class="ecommerce-confirm-dialog" hidden>
+        <div class="ecommerce-confirm-box" style="max-width:460px;">
+            <p id="ecommerce-switch-model-message"></p>
+            <div class="ecommerce-confirm-actions">
+                <button type="button" class="btn btn-outline" id="ecommerce-switch-model-keep">沿用原模型继续</button>
+                <button type="button" class="btn btn-primary" id="ecommerce-switch-model-change">更换模型…</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 继续运行：选择新的平台与模型 -->
+    <div id="ecommerce-pick-model-dialog" class="ecommerce-confirm-dialog" hidden>
+        <div class="ecommerce-confirm-box" style="max-width:520px;">
+            <p style="margin-bottom:14px;">选择剩余任务要使用的平台与模型</p>
+            <div style="display:grid;gap:12px;margin-bottom:14px;">
+                <label style="font-size:12px;color:#475467;display:block;">平台
+                    <select id="ecommerce-pick-platform" style="width:100%;margin-top:4px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;font-size:13px;">
+                        <option value="oaihk">OpenAI-HK</option>
+                        <option value="runninghub">RunningHub</option>
+                        <option value="apiyi">API易</option>
+                    </select>
+                </label>
+                <label style="font-size:12px;color:#475467;display:block;">模型
+                    <select id="ecommerce-pick-model" style="width:100%;margin-top:4px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;font-size:13px;"></select>
+                </label>
+            </div>
+            <p id="ecommerce-pick-model-note" style="margin:0 0 18px;font-size:12px;color:#475467;line-height:1.6;"></p>
+            <div class="ecommerce-confirm-actions">
+                <button type="button" class="btn btn-outline" id="ecommerce-pick-model-cancel">取消</button>
+                <button type="button" class="btn btn-primary" id="ecommerce-pick-model-ok">确认更换并继续</button>
             </div>
         </div>
     </div>
@@ -1191,6 +1413,27 @@
                     <textarea id="prompt-template-new-text" placeholder="模板内容" rows="2" style="flex:2;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;resize:vertical;min-height:40px;"></textarea>
                     <button class="btn btn-primary btn-compact" id="btn-prompt-template-add" style="font-size:10px;padding:3px 8px;">添加</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 换装提示词模板：储存并替换 / 另存为新模板 -->
+    <div class="modal-overlay" id="modal-ecommerce-save-template" style="display:none;">
+        <div class="modal" style="width:440px;">
+            <div class="modal-header">
+                <h3>存储提示词模板</h3>
+                <button class="modal-close" data-close="modal-ecommerce-save-template">&times;</button>
+            </div>
+            <div class="modal-body" style="padding:12px;">
+                <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">当前提示词共 <span id="ecommerce-save-template-length">0</span> 字</div>
+                <label for="ecommerce-save-template-target" style="display:block;font-size:11px;margin-bottom:4px;">替换目标模板</label>
+                <select id="ecommerce-save-template-target" style="width:100%;font-size:11px;padding:4px 6px;border:1px solid var(--border);border-radius:3px;"></select>
+                <div id="ecommerce-save-template-hint" style="font-size:10px;color:var(--text-muted);margin-top:8px;line-height:1.6;"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" data-close="modal-ecommerce-save-template">取消</button>
+                <button class="btn btn-outline" id="btn-ecommerce-save-template-new">另存为新模板</button>
+                <button class="btn btn-primary" id="btn-ecommerce-save-template-replace">储存并替换</button>
             </div>
         </div>
     </div>
@@ -1415,117 +1658,99 @@
         </div>
     </div>
 
-    <!-- 模型配置弹窗（精简版：只保留API Key和接口配置） -->
+    <!-- 模型配置弹窗：按当前配置对象显示对应字段 -->
     <div class="modal-overlay" id="modal-model-config" style="display:none;">
-        <div class="modal" style="width:460px;">
+        <div class="modal api-config-modal" style="width:520px;">
             <div class="modal-header">
                 <h3>API 配置</h3>
                 <button class="modal-close" data-close="modal-model-config">&times;</button>
             </div>
             <div class="modal-body">
-                <!-- 大模型改写 API -->
-                <div class="config-section-title">Prompt优化模型</div>
-                <div class="form-group">
-                    <label>模型提供方</label>
-                    <select id="cfg-provider">
-                        <option value="deepseek">DeepSeek</option>
-                        <option value="glm">GLM</option>
+                <div class="api-config-picker">
+                    <label for="cfg-config-target">配置对象</label>
+                    <select id="cfg-config-target">
+                        <option value="prompt-deepseek">Prompt 优化 · DeepSeek</option>
+                        <option value="prompt-glm">Prompt 优化 · GLM</option>
+                        <option value="runninghub">图片生成 · RunningHub 海外</option>
+                        <option value="oaihk">图片生成 · OpenAI-HK</option>
+                        <option value="pptoken">图片生成 · PPT Token</option>
+                        <option value="apiyi">图片生成 · API易</option>
                     </select>
-                </div>
-                <div class="form-group">
-                    <label>API Key</label>
-                    <input type="password" id="cfg-api-key" placeholder="输入 API Key" autocomplete="off">
-                </div>
-                <div class="form-group">
-                    <label>接口地址</label>
-                    <input type="text" id="cfg-base-url" placeholder="留空使用默认地址">
-                </div>
-                <div class="form-group">
-                    <label>模型名称</label>
-                    <input type="text" id="cfg-model-name" placeholder="DeepSeek: deepseek-v4-flash | GLM: glm-4-flash">
-                </div>
-                <div class="form-group">
-                    <label>超时时间 (ms)</label>
-                    <input type="number" id="cfg-timeout" value="30000">
-                </div>
-                <div class="form-group">
-                    <label>重试次数</label>
-                    <input type="number" id="cfg-retry" value="1" min="0" max="5">
+                    <small id="cfg-config-target-hint">用于整理提示词，不负责图片生成。</small>
                 </div>
 
-                <!-- RunningHub API -->
-                <div class="config-section-title" style="margin-top:16px;">RunningHub API 引擎</div>
-                <div class="form-group">
-                    <label>API Key</label>
-                    <input type="password" id="cfg-rh-api-key" placeholder="输入 RunningHub API Key" autocomplete="off">
-                </div>
-                <div class="form-group">
-                    <label>接口地址</label>
-                    <input type="text" id="cfg-rh-base-url" placeholder="https://www.runninghub.ai/openapi/v2">
-                    <small style="color:var(--success);">已切换 RunningHub AI 新域名。旧CN标准模型地址会被软件自动迁移，不再用于新请求。</small>
-                </div>
-                <div class="form-group">
-                    <button type="button" class="btn btn-outline" id="btn-test-rh-preflight">验证企业共享权限（不生图、不扣费）</button>
-                    <small id="cfg-rh-preflight-status" style="display:block;color:var(--text-muted);margin-top:5px;">通过官方价格预估接口验证 Key、模型权限与预计单价，不会创建生成任务。</small>
-                </div>
-
-                <!-- OpenAI-HK API -->
-                <div class="config-section-title" style="margin-top:16px;">OpenAI-HK API 通道</div>
-                <div class="form-group">
-                    <label>API Key</label>
-                    <input type="password" id="cfg-oaihk-api-key" placeholder="输入 OpenAI-HK API Key" autocomplete="off">
-                </div>
-                <div class="form-group">
-                    <label>接口地址</label>
-                    <input type="text" id="cfg-oaihk-base-url" placeholder="留空使用默认 https://api.openai-hk.com">
-                </div>
-                <div class="form-group">
-                    <label>GPT 图片质量</label>
-                    <select id="cfg-oaihk-gpt-quality">
-                        <option value="medium">medium（推荐，4K 更稳）</option>
-                        <option value="low">low（最快）</option>
-                        <option value="high">high（最慢，易超时）</option>
-                        <option value="auto">auto（交给平台）</option>
-                    </select>
-                </div>
-
-                <!-- 上传素材压缩设置 -->
-                <div class="config-section-title" style="margin-top:16px;">素材上传压缩</div>
-                <div class="form-group">
-                    <label>上传处理</label>
-                    <select id="cfg-upload-mode">
-                        <option value="adaptive">自适应裁剪压缩（3:4 / 4:3）</option>
-                        <option value="original">不裁剪（保留原始像素尺寸）</option>
-                    </select>
-                    <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">选择“不裁剪”后，批量拖入会直接按顺序上传，不弹裁剪框，也不按 1K–4K 档位缩放。</div>
-                </div>
-                <div class="form-group">
-                    <label>裁剪压缩档位 <span style="font-size:9px;color:var(--text-muted);">（仅自适应裁剪模式生效）</span></label>
-                    <div id="cfg-upload-preset-group" style="display:flex;gap:6px;">
-                        <button type="button" class="upload-preset-btn" data-value="768" title="768×1024">1K</button>
-                        <button type="button" class="upload-preset-btn" data-value="1536" title="1536×2048">2K</button>
-                        <button type="button" class="upload-preset-btn" data-value="2304" title="2304×3072">3K</button>
-                        <button type="button" class="upload-preset-btn" data-value="3072" title="3072×4096">4K</button>
+                <section id="cfg-panel-prompt" class="api-config-panel">
+                    <div class="api-config-panel-title">Prompt 优化接口</div>
+                    <div class="api-config-grid">
+                        <div class="form-group"><label for="cfg-provider">提供方</label><select id="cfg-provider"><option value="deepseek">DeepSeek</option><option value="glm">GLM</option></select></div>
+                        <div class="form-group"><label for="cfg-model-name">模型</label><input type="text" id="cfg-model-name" placeholder="deepseek-v4-flash"></div>
+                        <div class="form-group api-config-span-2"><label for="cfg-api-key">API Key</label><input type="password" id="cfg-api-key" placeholder="输入 Prompt 模型 API Key" autocomplete="off"></div>
+                        <div class="form-group api-config-span-2"><label for="cfg-base-url">接口地址</label><input type="text" id="cfg-base-url" placeholder="留空使用该平台默认地址"></div>
                     </div>
-                    <input type="hidden" id="cfg-upload-short-edge" value="1536">
-                </div>
+                </section>
 
-                <!-- 隐藏字段（保留ID供JS引用，但不显示） -->
-                <input type="hidden" id="cfg-rh-model" value="">
+                <section id="cfg-panel-runninghub" class="api-config-panel" hidden>
+                    <div class="api-config-panel-title">RunningHub 海外标准模型 API</div>
+                    <div class="api-config-grid">
+                        <div class="form-group api-config-span-2"><label for="cfg-rh-api-key">API Key</label><input type="password" id="cfg-rh-api-key" placeholder="输入 runninghub.ai 的 API Key" autocomplete="off"><small id="cfg-rh-key-status" class="api-config-status"></small></div>
+                        <div class="form-group api-config-span-2"><label for="cfg-rh-base-url">接口地址</label><input type="text" id="cfg-rh-base-url" placeholder="https://www.runninghub.ai/openapi/v2"><small class="api-config-help">国内 runninghub.cn 地址会被自动迁移到海外地址。</small></div>
+                        <div class="form-group api-config-span-2"><label for="cfg-rh-model-config">默认模型</label><select id="cfg-rh-model-config"></select></div>
+                    </div>
+                </section>
+
+                <section id="cfg-panel-oaihk" class="api-config-panel" hidden>
+                    <div class="api-config-panel-title">OpenAI-HK 图片 API</div>
+                    <div class="api-config-grid">
+                        <div class="form-group api-config-span-2"><label for="cfg-oaihk-api-key">API Key</label><input type="password" id="cfg-oaihk-api-key" placeholder="输入 OpenAI-HK API Key" autocomplete="off"></div>
+                        <div class="form-group api-config-span-2"><label for="cfg-oaihk-base-url">接口地址</label><input type="text" id="cfg-oaihk-base-url" placeholder="留空使用默认 https://api.openai-hk.com"></div>
+                        <div class="form-group"><label for="cfg-oaihk-model-config">默认模型</label><select id="cfg-oaihk-model-config"></select></div>
+                        <div class="form-group"><label for="cfg-oaihk-gpt-quality">质量</label><select id="cfg-oaihk-gpt-quality"><option value="medium">medium · 推荐</option><option value="low">low · 快速</option><option value="high">high · 精细</option><option value="auto">auto · 平台决定</option></select></div>
+                    </div>
+                </section>
+
+                <section id="cfg-panel-pptoken" class="api-config-panel" hidden>
+                    <div class="api-config-panel-title">PPT Token 图片 API</div>
+                    <div class="api-config-grid">
+                        <div class="form-group api-config-span-2"><label for="cfg-pptoken-api-key">API Key</label><input type="password" id="cfg-pptoken-api-key" placeholder="粘贴 PPT Token 后台选定分组的 Key" autocomplete="off"><small class="api-config-help">分组由 Key 决定，不需要额外高并发地址。</small></div>
+                        <div class="form-group api-config-span-2"><label for="cfg-pptoken-base-url">接口地址</label><input type="text" id="cfg-pptoken-base-url" placeholder="https://api.pptoken.cc/v1"></div>
+                        <div class="form-group"><label for="cfg-pptoken-model-config">默认模型</label><select id="cfg-pptoken-model-config"><option value="gpt-image-2">gpt-image-2</option><option value="gpt-image-2.5" selected>gpt-image-2.5</option><option value="gpt-image-2.5-flare">gpt-image-2.5-flare</option><option value="gpt-image-2.5-sunburst">gpt-image-2.5-sunburst</option></select></div>
+                        <div class="form-group"><label for="cfg-pptoken-default-resolution">默认分辨率</label><select id="cfg-pptoken-default-resolution"><option value="1k">1K</option><option value="2k" selected>2K</option></select><small style="color:var(--text-muted)">gpt-image 模型最高 2K，4K 实测只返 1K</small></div>
+                    </div>
+                </section>
+
+                <section id="cfg-panel-apiyi" class="api-config-panel" hidden>
+                    <div class="api-config-panel-title">API易 图片 API</div>
+                    <div class="api-config-grid">
+                        <div class="form-group api-config-span-2"><label for="cfg-apiyi-api-key">API Key</label><input type="password" id="cfg-apiyi-api-key" placeholder="粘贴 API易 后台的 API Key" autocomplete="off"><small class="api-config-help">API Key 只保存在本机，不会上传到任何服务器。</small></div>
+                        <div class="form-group api-config-span-2"><label for="cfg-apiyi-proxy-api-key">官转专用 API Key（选填）</label><input type="password" id="cfg-apiyi-proxy-api-key" placeholder="选填：官转三款需用「按量优先」令牌" autocomplete="off"><small class="api-config-help">官转（快速版 / 精细版 / gpt-image-2）必须使用「按量优先」令牌，与上面常规 Key 的令牌类型不同。填了这里，官转模型自动用此 Key；留空则回退用上面的 API Key。</small></div>
+                        <div class="form-group api-config-span-2"><label for="cfg-apiyi-base-url">接口地址</label><input type="text" id="cfg-apiyi-base-url" placeholder="https://api.apiyi.com"></div>
+                        <div class="form-group"><label for="cfg-apiyi-model-config">默认模型</label><select id="cfg-apiyi-model-config"><option value="gemini-3-pro-image" selected>Nano Banana Pro</option><option value="gemini-3.1-flash-image-preview">Nano Banana 2</option><option value="gpt-image-2.5-flare">ChatGPT2.5 快速版·官转</option><option value="gpt-image-2.5-sunburst">ChatGPT2.5 精细版·官转</option><option value="gpt-image-2.5-all">ChatGPT2.5 官逆·最快（$0.03 ≈ ¥0.22）</option><option value="gpt-image-2-vip">ChatGPT2 官逆·锁尺寸（$0.03 ≈ ¥0.22）</option><option value="seedream-5-0-260128">即梦Seedream 5.0 Lite（$0.035 ≈ ¥0.245）</option><option value="seedream-4-0-250828">即梦Seedream 4.0（$0.03 ≈ ¥0.21）</option></select></div>
+                        <div class="form-group"><label for="cfg-apiyi-default-resolution">默认分辨率</label><select id="cfg-apiyi-default-resolution"><option value="1k">1K</option><option value="2k">2K</option><option value="4k" selected>4K</option></select></div>
+                    </div>
+                </section>
+
+                <div id="cfg-selected-test-hint" class="api-config-test-hint">测试当前选择的接口，不会保存未点击“保存配置”的内容。</div>
+
+                <details class="api-config-advanced">
+                    <summary>高级设置</summary>
+                    <div class="api-config-grid">
+                        <div class="form-group"><label for="cfg-timeout">Prompt 超时（ms）</label><input type="number" id="cfg-timeout" value="30000"></div>
+                        <div class="form-group"><label for="cfg-retry">Prompt 重试次数</label><input type="number" id="cfg-retry" value="1" min="0" max="5"></div>
+                        <div class="form-group api-config-span-2"><label>素材上传处理</label><select id="cfg-upload-mode"><option value="adaptive">自适应裁剪压缩（3:4 / 4:3）</option><option value="original">不裁剪（保留原始像素尺寸）</option></select></div>
+                        <div class="form-group api-config-span-2"><label>裁剪压缩档位</label><div id="cfg-upload-preset-group" class="api-config-presets"><button type="button" class="upload-preset-btn" data-value="768">1K</button><button type="button" class="upload-preset-btn" data-value="1536">2K</button><button type="button" class="upload-preset-btn" data-value="2304">3K</button><button type="button" class="upload-preset-btn" data-value="3072">4K</button></div><input type="hidden" id="cfg-upload-short-edge" value="1536"></div>
+                    </div>
+                </details>
+
+                <!-- 兼容旧调用链的字段 -->
                 <input type="hidden" id="cfg-rh-resolution" value="1k">
                 <input type="hidden" id="cfg-rh-aspect-ratio" value="3:4">
                 <input type="hidden" id="cfg-rh-seed-mode" value="random">
                 <input type="hidden" id="cfg-rh-seed" value="">
-
-                <!-- 快捷键设置 (3.7) -->
-                <div class="config-section-title" style="margin-top:16px;">快捷键设置</div>
-                <div class="shortcut-settings" id="shortcut-settings-container">
-                    <!-- Dynamically rendered by JS -->
-                </div>
-                <div style="font-size:10px;color:var(--text-muted);margin-top:4px;">点击快捷键列可设置，右键可清除</div>
+                <input type="hidden" id="cfg-rh-model" value="">
+                <div class="shortcut-settings" id="shortcut-settings-container" hidden></div>
             </div>
             <div class="modal-footer">
-                <button class="btn btn-outline" id="btn-test-connection">测试Prompt模型</button>
+                <button class="btn btn-outline" id="btn-test-connection">测试当前配置</button>
                 <button class="btn btn-outline" data-close="modal-model-config">取消</button>
                 <button class="btn btn-primary" id="btn-save-config">保存配置</button>
             </div>
@@ -1690,7 +1915,7 @@
                     <input type="checkbox" id="viewer-check" style="vertical-align:middle;"> 勾选下载
                 </label>
                 <span id="viewer-filename" style="font-size:10px;color:var(--text-muted);margin-left:auto;"></span>
-                <span style="font-size:9px;color:var(--text-muted);">点击图片区域退出 | 滚轮缩放 | 拖动平移</span>
+                <span id="viewer-help" style="font-size:9px;color:var(--text-muted);">点击图片区域退出 | 滚轮缩放 | 拖动平移</span>
             </div>
             <!-- 画布区域 -->
             <canvas id="viewer-canvas" style="flex:1;width:100%;cursor:grab;display:block;min-height:0;"></canvas>

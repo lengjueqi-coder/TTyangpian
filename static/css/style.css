@@ -1951,6 +1951,31 @@ body {
     margin-bottom: 10px;
 }
 
+/* Unified API configuration picker */
+.api-config-modal { max-width: calc(100vw - 28px); }
+.api-config-picker { padding: 10px; margin-bottom: 12px; border: 1px solid #dbe4ee; border-radius: 9px; background: linear-gradient(180deg, #f8fbff, #f5f8fc); }
+.api-config-picker label { display: block; margin-bottom: 5px; color: #344054; font-size: 11px; font-weight: 700; }
+.api-config-picker select { width: 100%; padding: 8px 10px; border: 1px solid #b8c7d9; border-radius: 7px; background: #fff; color: #1d2939; font-size: 12px; }
+.api-config-picker small, .api-config-help, .api-config-status { display: block; margin-top: 5px; color: #667085; font-size: 10px; line-height: 1.45; }
+.api-config-panel { padding: 12px; border: 1px solid #e4e7ec; border-radius: 9px; background: #fff; }
+.api-config-panel[hidden] { display: none; }
+.api-config-panel-title { margin-bottom: 10px; color: #1d2939; font-size: 12px; font-weight: 700; }
+.api-config-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 10px; }
+.api-config-span-2 { grid-column: 1 / -1; }
+.api-config-grid .form-group { margin-bottom: 0; }
+.api-config-grid .form-group label { font-size: 10px; }
+.api-config-grid .form-group input, .api-config-grid .form-group select { padding: 7px 9px; font-size: 11px; }
+.api-config-test-hint { margin-top: 10px; padding: 8px 10px; border-left: 3px solid #93c5fd; background: #eff6ff; color: #475569; font-size: 10px; line-height: 1.5; }
+.api-config-advanced { margin-top: 10px; border: 1px solid #e4e7ec; border-radius: 8px; background: #fafbfc; }
+.api-config-advanced > summary { cursor: pointer; padding: 8px 10px; color: #475467; font-size: 11px; font-weight: 650; }
+.api-config-advanced > .api-config-grid { padding: 0 10px 10px; }
+.api-config-presets { display: flex; gap: 6px; }
+.api-config-presets .upload-preset-btn { flex: 1; min-width: 0; padding: 6px 4px; }
+@media (max-width: 560px) {
+    .api-config-grid { grid-template-columns: 1fr; }
+    .api-config-span-2 { grid-column: auto; }
+}
+
 /* ========== API 结果图片 ========== */
 .api-result-card {
     position: relative;
@@ -2829,6 +2854,8 @@ body {
 .ecommerce-card-title > span { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 7px; background: #111827; color: #fff; font-size: 11px; }
 .ecommerce-help { min-height: 38px; margin: 8px 0 10px; color: #667085; font-size: 11px; line-height: 1.55; }
 .ecommerce-row { display: flex; gap: 7px; align-items: center; margin-top: 8px; }
+/* 第3栏批次行多了「链接新位置」，允许换行，避免把批次下拉框压到不可用。 */
+.ecommerce-rerun-batch-row { flex-wrap: wrap; }
 .ecommerce-row input, .ecommerce-row select, .ecommerce-settings-grid input, .ecommerce-settings-grid select, #ecommerce-batch-select { min-width: 0; border: 1px solid #d0d5dd; border-radius: 6px; padding: 7px 9px; background: #fff; color: #344054; font-size: 11px; }
 .ecommerce-row input, .ecommerce-row select { flex: 1; }
 .ecommerce-summary { margin-top: 9px; padding: 8px 10px; border-radius: 7px; background: #f8fafc; color: #475467; font-size: 11px; line-height: 1.5; }
@@ -2900,9 +2927,12 @@ body {
 .ecommerce-action-item.is-target-reference.is-dragover { border-color: #2563eb; box-shadow: 0 0 0 2px rgba(37,99,235,.18); }
 #ecommerce-standard-prompt { box-sizing: border-box; width: 100%; margin-top: 7px; padding: 7px 9px; resize: vertical; border: 1px solid #d0d5dd; border-radius: 6px; color: #344054; font-size: 10px; line-height: 1.5; }
 .ecommerce-field-label { display: block; margin-top: 11px; color: #344054; font-size: 10px; font-weight: 650; }
-.ecommerce-model-stack { display: grid; grid-template-columns: 58px minmax(0, 1fr) 72px; gap: 4px; margin-top: 7px; align-items: end; width: 100%; min-width: 0; }
+.ecommerce-model-stack { display: grid; grid-template-columns: 72px minmax(0, 1fr) 118px 64px; gap: 4px; margin-top: 7px; align-items: end; width: 100%; min-width: 0; }
 .ecommerce-model-step { display: grid; gap: 4px; min-width: 0; color: #667085; font-size: 9px; }
 .ecommerce-model-step > span { font-weight: 650; color: #475467; }
+/* 说明文字不放在窄格子里：长句会溢出压到相邻列。统一挪到整排下方（见 .ecommerce-model-note）。 */
+.ecommerce-model-stack .ecommerce-model-step > small { display: none; }
+.ecommerce-model-note { margin: 5px 0 0; color: #667085; font-size: 9px; line-height: 1.5; }
 .ecommerce-model-stack select { box-sizing: border-box; width: 100%; max-width: none !important; min-width: 0; border: 1px solid #d0d5dd; border-radius: 6px; padding: 6px 4px; background: #fff; color: #344054; font-size: 9px; }
 .ecommerce-settings-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-top: 10px; }
 .ecommerce-settings-grid label { display: grid; gap: 4px; color: #667085; font-size: 10px; }
@@ -2923,9 +2953,17 @@ body {
 .ecommerce-inline-results #ecommerce-batch-select { box-sizing: border-box; width: 100%; min-width: 0; }
 .ecommerce-inline-results .ecommerce-task-list { height: calc(100% - 62px); max-height: none; overflow: auto; }
 .ecommerce-inline-results .ecommerce-task-row { min-width: 800px; }
-.ecommerce-run-settings { grid-template-columns: 1fr 1fr; }
-.ecommerce-concurrency-control { display: grid; grid-template-columns: minmax(70px, 110px) 1fr; gap: 6px; }
-.ecommerce-concurrency-control input { min-width: 0; padding: 7px 9px; border: 1px solid #d0d5dd; border-radius: 6px; font-variant-numeric: tabular-nums; }
+/* 运行设置：单排紧凑排列，控件宽度按内容自适应（不再分列，避免叠盖/换行）；长说明改挂 title 提示 */
+.ecommerce-run-settings { display: flex; align-items: flex-end; flex-wrap: nowrap; gap: 7px; margin-top: 8px; }
+.ecommerce-run-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; color: #667085; font-size: 10px; line-height: 1.2; white-space: nowrap; }
+.ecommerce-run-field > input,
+.ecommerce-run-field > select { box-sizing: border-box; height: 30px; min-width: 0; border: 1px solid #d0d5dd; border-radius: 6px; padding: 0 5px; background: #fff; color: #344054; font-size: 11px; }
+.ecommerce-concurrency-control { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; min-width: 0; }
+.ecommerce-concurrency-control input { box-sizing: border-box; flex: 0 0 50px; width: 50px; height: 30px; min-width: 0; border: 1px solid #d0d5dd; border-radius: 6px; padding: 0 2px; background: #fff; color: #344054; font-size: 11px; text-align: center; font-variant-numeric: tabular-nums; }
+.ecommerce-concurrency-presets { box-sizing: border-box; flex: 0 0 58px; width: 58px; height: 30px; min-width: 0; border: 1px solid #d0d5dd; border-radius: 6px; padding: 0 4px; background: #fff; color: #344054; font-size: 11px; cursor: pointer; }
+.ecommerce-concurrency-control #btn-ecommerce-auto-concurrency { flex: 0 0 auto; height: 30px; padding: 0 8px; }
+#ecommerce-max-attempts { width: 58px; }
+#ecommerce-samples-per-action { width: 96px; }
 #ecommerce-concurrency-hint { color: #667085; line-height: 1.4; }
 .ecommerce-cache-manager { margin-top: 9px; border: 1px solid #d8dee8; border-radius: 8px; background: #f8fafc; }
 .ecommerce-cache-manager summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 10px; cursor: pointer; color: #344054; }
@@ -2942,7 +2980,7 @@ body {
 .ecommerce-folder-preview-head { display: flex; align-items: center; gap: 5px; margin-top: 8px; padding-top: 7px; border-top: 1px solid #eaecf0; }
 .ecommerce-folder-preview-head strong { color: #182230; font-size: 12px; font-weight: 650; }
 .ecommerce-folder-preview-head small { color: #98a2b3; font-size: 10px; line-height: 1.4; }
-.ecommerce-result-folders { margin-top: 5px; max-height: 160px; overflow-y: auto; overflow-x: hidden; border: 1px solid #eaecf0; border-radius: 7px; }
+.ecommerce-result-folders { margin-top: 5px; max-height: 160px; overflow-y: auto; overflow-x: auto; border: 1px solid #eaecf0; border-radius: 7px; }
 .ecommerce-folder-row { display: grid; grid-template-columns: fit-content(126px) max-content max-content; justify-content: start; gap: 5px; align-items: center; min-width: 0; padding: 4px 6px; border-bottom: 1px solid #f0f2f5; border-left: 3px solid transparent; font-size: 10px; color: #475467; }
 .ecommerce-folder-row > :first-child { min-width: 56px; }
 .ecommerce-folder-row:not(.is-head) { content-visibility: auto; contain-intrinsic-size: 42px; }
@@ -2954,8 +2992,16 @@ body {
 .ecommerce-folder-status { justify-self: start; padding: 2px 4px; border-radius: 4px; background: #f2f4f7; color: #475467; font-variant-numeric: tabular-nums; font-size: 9px; white-space: nowrap; }
 .ecommerce-folder-open { justify-self: end; font-size: 10px; padding: 4px 8px; }
 .ecommerce-folder-ref-thumb { width: 28px; height: 34px; object-fit: cover; border-radius: 4px; border: 1px solid #d0d5dd; cursor: zoom-in; }
-.ecommerce-folder-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; min-width: 0; }
+.ecommerce-folder-actions { display: flex; align-items: center; justify-content: flex-end; gap: 4px; min-width: 0; flex-wrap: wrap; row-gap: 4px; }
 .ecommerce-folder-actions .btn { min-width: 44px; padding: 4px 6px; white-space: nowrap; }
+.ecommerce-folder-relink-garment.is-missing { color: #b45309; border-color: #fbbf24; background: #fffbeb; font-weight: 600; }
+/* 第3栏验片行只常驻「对比 / 📁 打开 / ✓ 确认该组」；低频的「链成片 / 链实拍图」收进「⋯ 更多」，
+   点击后在行内就地展开（不用浮层，避免被 #ecommerce-result-folders 的 overflow 裁剪）。 */
+.ecommerce-folder-more-btn.is-missing { color: #b45309; border-color: #fbbf24; background: #fffbeb; font-weight: 600; }
+.ecommerce-folder-more-row { grid-column: 2 / -1; display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 4px; padding: 2px 0 1px; }
+.ecommerce-folder-more-row[hidden] { display: none; }
+.ecommerce-folder-more-row .btn { min-width: 44px; padding: 4px 6px; white-space: nowrap; }
+.ecommerce-ref-missing-badge { display: inline-block; margin-left: 4px; padding: 1px 5px; border-radius: 999px; background: #fef3c7; color: #b45309; font-size: 9px; font-weight: 600; white-space: nowrap; }
 .ecommerce-qc-switch-wrap { margin-top: 10px; padding-top: 10px; border-top: 1px solid #eaecf0; display: flex; flex-direction: column; gap: 6px; }
 .ecommerce-qc-switch { display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
 .ecommerce-qc-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
@@ -2975,28 +3021,9 @@ label.ecommerce-disabled { opacity: .45; }
 .ecommerce-card-rerun.is-expanded .ecommerce-result-folders { max-height: 42vh; }
 body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-resize-hint { margin-left: auto; color: #98a2b3; font-size: 9px; font-weight: 400; }
-.ecommerce-waste-stats { margin-top: 7px; border: 1px solid #d8dee8; border-radius: 7px; overflow: hidden; background: #fff; }
-.ecommerce-waste-stats > summary { display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 7px; padding: 6px 8px; cursor: pointer; list-style: none; color: #344054; background: #f8fafc; }
-.ecommerce-waste-stats > summary::-webkit-details-marker { display: none; }
-.ecommerce-waste-stats > summary strong { font-size: 10px; }
-.ecommerce-waste-stats > summary small { color: #667085; font-size: 9px; }
-.ecommerce-waste-stats > summary span { color: #175cd3; font-size: 9px; }
-.ecommerce-waste-body { border-top: 1px solid #eaecf0; }
-.ecommerce-waste-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 5px 6px; }
-.ecommerce-waste-toolbar small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #98a2b3; font-size: 8px; }
-.ecommerce-waste-list { max-height: 440px; overflow: auto; }
-.ecommerce-waste-row { display: grid; grid-template-columns: minmax(82px,1.1fr) minmax(78px,1fr) 30px 30px 46px 44px; gap: 3px; align-items: center; padding: 7px 6px; border-bottom: 1px solid #eef1f5; color: #475467; font-size: 9px; }
-.ecommerce-waste-row:last-child { border-bottom: 0; }
-.ecommerce-waste-row.is-head { position: sticky; top: 0; z-index: 1; background: #f4f6f8; color: #667085; font-weight: 700; }
-.ecommerce-waste-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ecommerce-waste-row > span:first-child { display: grid; gap: 2px; }
-.ecommerce-waste-row > span:first-child small { color: #98a2b3; overflow: hidden; text-overflow: ellipsis; }
-.ecommerce-waste-rate { justify-self: start; padding: 2px 6px; border-radius: 999px; font-weight: 750; font-variant-numeric: tabular-nums; }
-.ecommerce-waste-rate.is-low { background: #ecfdf3; color: #027a48; }
-.ecommerce-waste-rate.is-mid { background: #fffaeb; color: #b54708; }
-.ecommerce-waste-rate.is-high { background: #fef3f2; color: #b42318; }
 .ecommerce-rerun-list { margin-top: 8px; min-height: 120px; flex: 1 1 0; overflow-y: auto; border: 1px solid #eaecf0; border-radius: 8px; }
-.ecommerce-rerun-batches { display: grid; gap: 5px; margin-top: 7px; }
+/* 重做会话行：每递交一批就留一行，只有点「完成」才消失，所以整块要能滚动 */
+.ecommerce-rerun-batches { display: grid; gap: 5px; margin-top: 7px; max-height: 22vh; overflow-y: auto; }
 .ecommerce-final-export { margin-top: 7px; border: 1px solid #bbf7d0; border-radius: 7px; overflow: hidden; background: #f0fdf4; }
 .ecommerce-final-export > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; cursor: pointer; list-style: none; color: #166534; }
 .ecommerce-final-export > summary::-webkit-details-marker { display: none; }
@@ -3040,13 +3067,16 @@ body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-rerun-list.is-running { cursor: progress; }
 .ecommerce-rerun-bulk-bar textarea { box-sizing: border-box; width: 100%; min-height: 48px; padding: 5px 6px; border: 1px solid #d0d5dd; border-radius: 5px; resize: vertical; font: 9px/1.4 inherit; }
 .ecommerce-rerun-group { border-bottom: 1px solid #d0d5dd; position: relative; }
-.ecommerce-rerun-group-head { display: flex; align-items: center; gap: 6px; padding: 7px 90px 7px 8px; background: #fff7ed; color: #475467; font-size: 9px; cursor: pointer; }
+/* 分组头与「打开文件夹」同一行：以前按钮绝对定位、头部右侧留 90px，既浪费宽度又容易被长标题挤乱。 */
+.ecommerce-rerun-group-bar { display: flex; align-items: center; gap: 6px; padding-right: 8px; background: #fff7ed; }
+.ecommerce-rerun-group-head { display: flex; flex: 1 1 auto; min-width: 0; align-items: center; gap: 6px; padding: 5px 0 5px 8px; color: #475467; font-size: 9px; cursor: pointer; }
 .ecommerce-rerun-count-badge { display: inline-block; padding: 1px 5px; border-radius: 3px; background: #ecfdf3; color: #027a48; border: 1px solid #abefc6; font-size: 9px; white-space: nowrap; }
 .ecommerce-rerun-group-head strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #7a2e0e; font-size: 10px; }
 .ecommerce-rerun-group-head span { margin-left: auto; color: #b54708; white-space: nowrap; }
-.ecommerce-rerun-folder-open { position: absolute; top: 5px; right: 8px; z-index: 2; padding: 2px 6px; font-size: 9px; }
-.ecommerce-rerun-item { display: grid; grid-template-columns: 18px 24px minmax(54px,1fr) 58px 50px 58px 76px; gap: 4px; align-items: center; padding: 7px 8px; border-bottom: 1px solid #f0f2f5; font-size: 10px; color: #475467; }
-.ecommerce-rerun-item:has(.ecommerce-rerun-count-badge) { grid-template-columns: 18px 24px minmax(54px,1fr) 58px 50px 86px 58px 76px; }
+.ecommerce-rerun-folder-open { flex: 0 0 auto; padding: 2px 7px; font-size: 10px; }
+/* 行内只保留「序号 / 动作N / 重做类型 / 预览图」四类信息；动作名列用 1fr 吃掉剩余宽度，徽章列按内容自适应。 */
+.ecommerce-rerun-item { display: grid; grid-template-columns: 16px 20px minmax(0,1fr) auto auto auto 46px; gap: 4px; align-items: center; padding: 4px 8px; border-bottom: 1px solid #f0f2f5; font-size: 10px; color: #475467; cursor: pointer; }
+.ecommerce-rerun-item:hover { background: #f8fafc; }
 .ecommerce-rerun-item:last-child { border-bottom: 0; }
 .ecommerce-rerun-item.is-active { background: #fff7ed; }
 .ecommerce-rerun-item.is-marked-redo { background: #eff6ff; }
@@ -3054,19 +3084,29 @@ body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-rerun-type-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-size: 9px; font-weight: 600; white-space: nowrap; text-align: center; }
 .ecommerce-rerun-type-badge.is-marked { background: #dbeafe; color: #1d4ed8; }
 .ecommerce-rerun-type-badge.is-waste { background: #fef3f2; color: #b42318; }
+/* 单张提示词标记：这些图会完整替换批量提示词，必须一眼可见 */
+.ecommerce-rerun-prompt-badge { display: inline-block; padding: 1px 5px; border-radius: 3px; background: #fffaeb; color: #b54708; border: 1px solid #fedf89; font-size: 9px; font-weight: 600; white-space: nowrap; }
+/* 批量重做参数里的「统一使用批量提示词」开关与提示 */
+.ecommerce-rerun-prompt-guard { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.ecommerce-rerun-prompt-guard label { display: flex; align-items: center; gap: 4px; color: #475467; font-size: 10px; white-space: nowrap; cursor: pointer; }
+.ecommerce-rerun-prompt-guard small { color: #667085; font-size: 10px; line-height: 1.3; }
+.ecommerce-rerun-prompt-guard small.is-warning { color: #b54708; font-weight: 600; }
+.ecommerce-rerun-prompt-owner { margin: 4px 0 0; font-size: 10px; line-height: 1.4; color: #667085; }
+.ecommerce-rerun-prompt-owner.is-warning { color: #b54708; font-weight: 600; }
 .ecommerce-rerun-index { color: #98a2b3; font-variant-numeric: tabular-nums; }
 .ecommerce-rerun-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #344054; font-weight: 500; }
-.ecommerce-rerun-action { color: #667085; font-size: 10px; }
-.ecommerce-rerun-thumb { width: 60px; height: 60px; object-fit: cover; border-radius: 4px; border: 1px solid #eaecf0; }
+.ecommerce-rerun-thumb { width: 46px; height: 46px; object-fit: cover; border-radius: 4px; border: 1px solid #eaecf0; }
 .ecommerce-rerun-compare { margin-top: 10px; padding: 10px; background: #f8fafc; border: 1px solid #eaecf0; border-radius: 8px; }
-.ecommerce-rerun-compare-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-.ecommerce-rerun-compare-head strong { font-size: 12px; color: #182230; }
-.ecommerce-rerun-sync-choice { display: inline-flex; align-items: center; gap: 4px; color: #475467; font-size: 9px; white-space: nowrap; }
-.ecommerce-rerun-sync-choice select { max-width: 116px; padding: 4px 5px; border: 1px solid #d0d5dd; border-radius: 5px; background: #fff; color: #344054; font-size: 9px; }
-.ecommerce-rerun-compare-grid { display: grid; grid-template-columns: minmax(120px,.8fr) minmax(120px,.8fr) minmax(220px,1.4fr); gap: 10px; }
+/* 标题必须能缩能省略，否则窄栏下会被挤成一个字一行（竖排）；按钮整体换行到下一行。 */
+.ecommerce-rerun-compare-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.ecommerce-rerun-compare-head strong { flex: 1 1 140px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: #182230; }
+.ecommerce-rerun-system-actions { display: flex; flex: 0 0 auto; gap: 5px; margin-left: auto; }
+.ecommerce-rerun-system-actions .btn { padding: 2px 7px; font-size: 10px; }
+/* 两列：动作参考图 + 服装参考图。AI成品图不再单独占列（原第三列最小220px是最大空间黑洞），
+   改为头部「⚖ 对比成品图」按钮进入大图对比弹窗。 */
+.ecommerce-rerun-compare-grid { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 8px; }
 .ecommerce-rerun-compare-col { display: flex; flex-direction: column; gap: 4px; }
 .ecommerce-rerun-compare-col h4 { margin: 0; font-size: 10px; color: #667085; font-weight: 600; }
-.ecommerce-rerun-compare-img { width: 100%; border-radius: 6px; border: 1px solid #eaecf0; }
 .ecommerce-rerun-target-action { position: relative; display: flex; flex-direction: column; gap: 4px; min-height: 160px; padding: 6px; border: 1px solid #bfdbfe; border-radius: 7px; background: #eff6ff; cursor: zoom-in; outline: none; }
 .ecommerce-rerun-target-action:focus-visible { box-shadow: 0 0 0 3px rgba(37,99,235,.22); }
 .ecommerce-rerun-target-action img { width: 100%; min-height: 130px; max-height: 360px; flex: 1 1 auto; object-fit: contain; border-radius: 5px; background: #101828; }
@@ -3082,13 +3122,19 @@ body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-rerun-ref.is-temporary img { border-color: #2e90fa; box-shadow: inset 0 0 0 1px #2e90fa; }
 .ecommerce-rerun-ref-state { position: absolute; top: 2px; right: 2px; padding: 1px 4px; border-radius: 3px; background: rgba(16,24,40,.82); color: #fff; font-size: 8px; pointer-events: none; }
 .ecommerce-rerun-prompt { width: 100%; min-height: 70px; margin-top: 8px; font-size: 11px; border: 1px solid #d0d5dd; border-radius: 6px; padding: 6px 8px; resize: vertical; font-family: inherit; }
-.ecommerce-shared-prompt-templates { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 8px; padding: 6px 8px; border: 1px solid #dbe4ef; border-radius: 7px; background: #f8fafc; }
+.ecommerce-shared-prompt-templates { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 8px; padding: 5px 8px; border: 1px solid #dbe4ef; border-radius: 7px; background: #f8fafc; }
+.ecommerce-shared-prompt-toggle { flex: 0 0 auto; width: 18px; height: 18px; padding: 0; border: 1px solid #d0d5dd; border-radius: 4px; background: #fff; color: #475467; font-size: 10px; line-height: 1; cursor: pointer; }
+.ecommerce-shared-prompt-body { display: flex; flex: 1 1 auto; align-items: center; flex-wrap: wrap; gap: 5px; min-width: 0; }
+/* 折叠后只留标题行，把高度让给提示词输入框 */
+.ecommerce-shared-prompt-templates.is-collapsed .ecommerce-shared-prompt-body { display: none; }
+.ecommerce-shared-prompt-templates.is-collapsed { padding: 3px 8px; }
 .ecommerce-shared-prompt-label { flex: 0 0 auto; font-size: 10px; font-weight: 700; color: #475467; }
 .ecommerce-shared-prompt-list { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-width: 0; }
 .ecommerce-shared-prompt-more { max-width: 125px; padding: 3px 7px; border: 1px solid #d0d5dd; border-radius: 999px; background: #fff; font-size: 10px; }
 .ecommerce-shared-prompt-save { margin-left: auto; white-space: nowrap; }
 .ecommerce-shared-prompt-empty { color: #98a2b3; font-size: 10px; }
 .ecommerce-rerun-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.ecommerce-rerun-actions .btn { max-width: 100%; white-space: nowrap; }
 .ecommerce-rerun-mode-switch { display: flex; align-items: center; gap: 4px; margin: 8px 0; padding: 3px; border: 1px solid #e4e7ec; border-radius: 7px; background: #f8fafc; }
 .ecommerce-rerun-mode-switch button { padding: 5px 9px; border: 0; border-radius: 5px; background: transparent; color: #667085; font-size: 10px; font-weight: 650; cursor: pointer; }
 .ecommerce-rerun-mode-switch button.is-active { background: #182230; color: #fff; box-shadow: 0 1px 3px rgba(16,24,40,.18); }
@@ -3102,7 +3148,46 @@ body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-rerun-ref.is-detail { border-color: #f59e0b; background: #fffbeb; }
 .ecommerce-rerun-ref-check { position: absolute; left: 2px; bottom: 2px; display: flex; align-items: center; gap: 2px; color: #475467; font-size: 8px; cursor: pointer; }
 .ecommerce-rerun-ref-check input { width: 11px; height: 11px; margin: 0; }
+/* 缩略图上直接进裁剪，不必先点开大图 */
+.ecommerce-rerun-ref-crop { position: absolute; right: 2px; bottom: 2px; padding: 0 3px; border: 1px solid #d0d5dd; border-radius: 3px; background: rgba(255,255,255,.94); color: #475467; font-size: 8px; line-height: 13px; cursor: pointer; }
+.ecommerce-rerun-ref-crop:hover { border-color: #f59e0b; color: #b45309; }
 .ecommerce-rerun-add-detail { margin-top: 6px; }
+/* 二次调整「＋ 添加参考图」：缩略图带右上角 × 移除，最多 6 张 */
+.ecommerce-rerun-ref.is-refine { padding-bottom: 0; border-color: #b2ddff; background: #eff8ff; }
+.ecommerce-rerun-ref.is-refine img { cursor: zoom-in; }
+.ecommerce-rerun-ref-remove { position: absolute; top: -5px; right: -5px; width: 16px; height: 16px; padding: 0; border: 1px solid #fff; border-radius: 50%; background: #f04438; color: #fff; font-size: 11px; line-height: 14px; cursor: pointer; z-index: 3; }
+.ecommerce-rerun-ref-remove:hover { background: #d92d20; }
+.ecommerce-rerun-add-refine-ref { margin-top: 6px; }
+.ecommerce-rerun-add-refine-ref:disabled { opacity: .55; cursor: not-allowed; }
+/* 二次调整「局部重绘」：涂哪里改哪里，只有涂抹区会被重画 */
+.ecommerce-rerun-mask { margin-top: 8px; padding: 6px 8px; border: 1px dashed #fda29b; border-radius: 7px; background: #fffbfa; }
+.ecommerce-rerun-mask.has-mask { border-style: solid; border-color: #f97066; background: #fef3f2; }
+.ecommerce-rerun-mask-head { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.ecommerce-rerun-mask-head strong { font-size: 10px; color: #b42318; }
+.ecommerce-rerun-mask-head .btn { padding: 2px 7px; font-size: 10px; }
+.ecommerce-rerun-mask > small { display: block; margin-top: 4px; color: #667085; font-size: 9px; line-height: 1.5; }
+.ecommerce-rerun-mask-thumb { display: block; width: 100%; max-height: 120px; margin-top: 5px; object-fit: contain; border: 1px solid #fda29b; border-radius: 5px; background: #101828; cursor: pointer; }
+.ecommerce-mask-overlay { position: fixed; inset: 0; z-index: 10095; display: grid; place-items: center; padding: 16px; background: rgba(7,11,18,.92); }
+.ecommerce-mask-shell { width: min(1180px,97vw); height: min(94vh,900px); display: grid; grid-template-rows: auto auto minmax(0,1fr) auto; overflow: hidden; border: 1px solid #344054; border-radius: 10px; background: #101828; color: #f8fafc; box-shadow: 0 28px 90px rgba(0,0,0,.6); }
+.ecommerce-mask-shell > header { display: flex; align-items: center; gap: 12px; min-height: 46px; padding: 8px 12px; border-bottom: 1px solid #344054; background: #182230; }
+.ecommerce-mask-shell > header strong { font-size: 13px; }
+.ecommerce-mask-shell > header span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #98a2b3; font-size: 11px; }
+.ecommerce-mask-shell > header button { margin-left: auto; border: 0; background: transparent; color: #fff; font-size: 24px; line-height: 1; cursor: pointer; }
+.ecommerce-mask-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #344054; background: #1d2939; }
+.ecommerce-mask-toolbar small { margin-left: auto; color: #98a2b3; font-size: 10px; }
+.ecommerce-mask-toolbar button { padding: 4px 10px; border: 1px solid #475467; border-radius: 6px; background: transparent; color: #d0d5dd; font-size: 11px; cursor: pointer; }
+.ecommerce-mask-toolbar button:hover { background: rgba(255,255,255,.08); }
+.ecommerce-mask-toolbar .ecommerce-mask-tool.is-active { border-color: #f97066; background: #f97066; color: #fff; font-weight: 700; }
+.ecommerce-mask-size-label { display: flex; align-items: center; gap: 6px; color: #d0d5dd; font-size: 11px; }
+.ecommerce-mask-size-label input { width: min(220px,26vw); }
+.ecommerce-mask-size-value { min-width: 30px; color: #fda29b; font-variant-numeric: tabular-nums; }
+.ecommerce-mask-stage { min-height: 0; overflow: auto; padding: 12px; background: #0c111d; }
+.ecommerce-mask-canvas-wrap { position: relative; margin: 0 auto; touch-action: none; cursor: crosshair; }
+.ecommerce-mask-canvas-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.ecommerce-mask-paint { opacity: .5; }
+.ecommerce-mask-cursor { position: absolute; z-index: 3; transform: translate(-50%, -50%); border: 1px solid rgba(255,255,255,.9); border-radius: 50%; box-shadow: 0 0 0 1px rgba(0,0,0,.5); pointer-events: none; opacity: 0; }
+.ecommerce-mask-shell > footer { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-top: 1px solid #344054; background: #182230; }
+.ecommerce-mask-status { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #98a2b3; font-size: 11px; }
 .ecommerce-rerun-system-actions { display: flex; gap: 5px; margin-left: auto; }
 .ecommerce-ref-crop-overlay[hidden] { display: none; }
 .ecommerce-ref-crop-overlay { position: fixed; inset: 0; z-index: 10090; display: grid; place-items: center; padding: 18px; background: rgba(7,11,18,.9); }
@@ -3122,7 +3207,7 @@ body.ecommerce-rerun-expanded { overflow: hidden; }
 .ecommerce-output-status.is-checking { color: #475467; }
 .ecommerce-output-status.is-ok { color: #027a48; }
 .ecommerce-output-status.is-error { color: #b42318; }
-.ecommerce-rerun-thumb, .ecommerce-rerun-open-ref, .ecommerce-rerun-compare-img { cursor: zoom-in; }
+.ecommerce-rerun-thumb, .ecommerce-rerun-open-ref { cursor: zoom-in; }
 body.ecommerce-compare-open { overflow: hidden; }
 .ecommerce-reference-overlay[hidden] { display: none; }
 .ecommerce-reference-overlay { position: fixed; inset: 0; z-index: 10060; background: rgba(7,11,18,.94); display: grid; place-items: center; padding: 18px; }
@@ -3282,7 +3367,7 @@ body.ecommerce-compare-open { overflow: hidden; }
 .ecommerce-keyword-compact { display: flex; align-items: center; gap: 4px; margin-top: 7px; }
 .ecommerce-keyword-compact input { flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid #d0d5dd; border-radius: 6px; font-size: 10px; }
 #ecommerce-standard-prompt { min-height: 68px; max-height: 150px; }
-.ecommerce-model-stack { grid-template-columns: 52px minmax(0, 1fr) 64px; }
+.ecommerce-model-stack { grid-template-columns: 78px minmax(0, 1fr) 78px 78px; }
 .ecommerce-card-qc .ecommerce-settings-grid { grid-template-columns: 1fr; gap: 6px; }
 .ecommerce-card-qc .ecommerce-api-switch { display: none; }
 .ecommerce-card-qc .ecommerce-api-switch[open] { display: block; }
@@ -3290,8 +3375,7 @@ body.ecommerce-compare-open { overflow: hidden; }
 #ecommerce-qc-off-hint,
 #ecommerce-qc-on-hint { display: none !important; }
 .ecommerce-inline-results { height: 270px; min-height: 150px; margin-top: 9px; padding-top: 8px; }
-.ecommerce-card-action .ecommerce-run-settings { grid-template-columns: 1fr; gap: 6px; }
-.ecommerce-card-action #ecommerce-concurrency-hint { display: none; }
+.ecommerce-card-qc #ecommerce-concurrency-hint { display: none; }
 .ecommerce-advanced-settings { margin-top: 8px; border: 1px solid #e4e7ec; border-radius: 7px; background: #f8fafc; }
 .ecommerce-advanced-settings > summary { cursor: pointer; padding: 7px 9px; color: #667085; font-size: 10px; font-weight: 600; }
 .ecommerce-advanced-settings > .ecommerce-row,
@@ -3303,11 +3387,9 @@ body.ecommerce-compare-open { overflow: hidden; }
 
 @media (max-width: 1180px) and (min-width: 761px) {
     .ecommerce-grid { grid-template-columns: minmax(420px, 1.35fr) minmax(250px, .8fr); }
-    .ecommerce-card-action { grid-column: 1 / -1; }
 }
 @media (max-width: 760px) {
     .ecommerce-grid { grid-template-columns: minmax(0, 1fr); }
-    .ecommerce-card-action,
     .ecommerce-card-rerun { grid-column: 1; }
     .ecommerce-source-pickers { grid-template-columns: 1fr 1fr; }
 }
@@ -3332,13 +3414,6 @@ body.ecommerce-compare-open { overflow: hidden; }
 .ecommerce-compare-shortcuts-hint kbd { display: inline-block; padding: 1px 5px; background: #1d2939; border: 1px solid #344054; border-radius: 3px; font-size: 10px; color: #d0d5dd; font-family: inherit; margin: 0 1px; }
 
 .ecommerce-compare-zoom-controls button.is-active { background: #f79009 !important; color: #fff !important; }
-
-.ecommerce-concurrency-control { display: flex; gap: 4px; align-items: center; }
-.ecommerce-concurrency-presets { padding: 3px 4px; border: 1px solid #d0d5dd; border-radius: 5px; font-size: 11px; background: #fff; cursor: pointer; }
-.ecommerce-card-action.is-running .ecommerce-run-settings label,
-.ecommerce-card-action.is-running .ecommerce-advanced-settings,
-.ecommerce-card-action.is-running #btn-ecommerce-create,
-.ecommerce-card-action.is-running #ecommerce-batch-name { opacity: 0.5; pointer-events: none; }
 
 .ecommerce-rerun-ref { position: relative; }
 .ecommerce-rerun-ref.is-drop-target::after { content: ''; position: absolute; inset: 0; border: 3px dashed #2563eb; border-radius: 6px; background: rgba(37,99,235,.1); pointer-events: none; z-index: 2; }
@@ -3607,32 +3682,9 @@ body.ecommerce-compare-open { overflow: hidden; }
 /* 电商模式：main-content保持overflow:hidden，前3栏固定高度 */
 body.ecommerce-mode-active .main-content { overflow: hidden; }
 #ecommerce-mode .ecommerce-shell { height: 100%; min-height: 100%; overflow: hidden; display: flex; flex-direction: column; }
-/* 顶部水平滚动轨道：当4栏总宽超出视口时出现，拖动轨道thumb可左右滚动 */
-.ecommerce-scroll-track {
-    position: sticky;
-    top: 0;
-    z-index: 10;
-    height: 6px;
-    background: #eaecf0;
-    border-radius: 3px;
-    margin: 0 4px;
-    cursor: pointer;
-    flex-shrink: 0;
-}
-.ecommerce-scroll-thumb {
-    position: absolute;
-    top: 0;
-    height: 100%;
-    min-width: 30px;
-    background: #98a2b3;
-    border-radius: 3px;
-    cursor: grab;
-    transition: background .12s;
-}
-.ecommerce-scroll-thumb:hover,
-.ecommerce-scroll-thumb.is-dragging { background: #667085; }
-.ecommerce-scroll-thumb.is-dragging { cursor: grabbing; }
-.ecommerce-scroll-track[hidden] { display: none; }
+/* 权重制布局：6栏始终压缩在一个屏内，不可能横向溢出。
+   每栏用 --wb-weight 分配剩余空间，用 --wb-floor 兜住内容最小可用宽度；
+   视口过窄时权重失效，由 --wb-floor 决定实际宽度（必要时才出现整体横向滚动）。 */
 #ecommerce-mode .ecommerce-grid {
     display: flex;
     align-items: stretch;
@@ -3643,15 +3695,14 @@ body.ecommerce-mode-active .main-content { overflow: hidden; }
     padding: 0 0 5px;
     overflow-x: auto;
     overflow-y: hidden;
-    scrollbar-width: none;
 }
-#ecommerce-mode .ecommerce-grid::-webkit-scrollbar { display: none; }
+#ecommerce-mode .ecommerce-grid::-webkit-scrollbar { height: 6px; }
 #ecommerce-mode .ecommerce-grid > .ecommerce-card {
     box-sizing: border-box;
-    flex: 0 0 auto;
-    width: var(--workbench-width, 320px);
+    flex: var(--wb-weight, 1) 1 0;
+    width: auto;
+    min-width: var(--wb-floor, 0px);
     min-height: calc(100vh - 130px);
-    min-width: 180px;
     max-width: none;
     max-height: none;
     overflow: auto;
@@ -3665,14 +3716,25 @@ body.ecommerce-column-resizing #ecommerce-mode .ecommerce-card * {
 body.ecommerce-column-resizing #ecommerce-mode .ecommerce-card {
     pointer-events: none;
 }
-#ecommerce-mode .ecommerce-card-material { --workbench-width: 400px; }
-#ecommerce-mode .ecommerce-card-qc { --workbench-width: 280px; }
-#ecommerce-mode .ecommerce-card-action { --workbench-width: 300px; }
-/* 第4栏废片重做：自身作为垂直滚动容器，内部内容可以上下滚动，
-   向下滚动时顶部"逐套验片"等区域被顶上去，下面列表完整展示。
-   三个滚动条：1)逐套验片内部滚动 2)废片列表内部滚动 3)第4栏整体滚动 */
+#ecommerce-mode .ecommerce-card-material { --wb-weight: 15; --wb-floor: 170px; }
+#ecommerce-mode .ecommerce-card-qc { --wb-weight: 18; --wb-floor: 200px; }
+/* 第2栏已合并原第3栏“运行设置”，两段之间用虚线分隔。 */
+.ecommerce-merged-divider {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 13px 0 6px;
+    padding-top: 10px;
+    border-top: 1px dashed #d0d5dd;
+    color: #7c2d12;
+    font-size: 11px;
+    font-weight: 700;
+}
+.ecommerce-merged-divider-label { letter-spacing: .5px; }
+/* 第3栏废片重做：自身作为垂直滚动容器，逐套验片与批量参数在同一个卡片内滚动。 */
 #ecommerce-mode .ecommerce-card-rerun {
-    --workbench-width: 420px;
+    --wb-weight: 22;
+    --wb-floor: 260px;
     grid-column: auto;
     display: flex;
     flex-direction: column;
@@ -3681,26 +3743,29 @@ body.ecommerce-column-resizing #ecommerce-mode .ecommerce-card {
     min-height: calc(100vh - 130px);
     max-height: calc(100vh - 130px);
 }
-/* 第4栏内各区域：标题、按钮区、逐套验片不压缩 */
+/* 第3栏内各区域：标题、按钮区、逐套验片、批量参数不压缩 */
 #ecommerce-mode .ecommerce-card-rerun > .ecommerce-card-title,
 #ecommerce-mode .ecommerce-card-rerun > .ecommerce-row,
 #ecommerce-mode .ecommerce-card-rerun > .ecommerce-folder-preview-head,
 #ecommerce-mode .ecommerce-card-rerun > .ecommerce-summary,
-#ecommerce-mode .ecommerce-card-rerun > .ecommerce-waste-stats,
-#ecommerce-mode .ecommerce-card-rerun > .ecommerce-rerun-batches { flex-shrink: 0; }
-/* 逐套验片（结果文件夹）：有限高度，内部可滚动 */
+#ecommerce-mode .ecommerce-card-rerun > .ecommerce-rerun-batches,
+#ecommerce-mode .ecommerce-card-rerun > #ecommerce-rerun-bulk-params { flex-shrink: 0; }
+/* 逐套验片（结果文件夹）：收紧高度，避免把下面的批量参数挤出可视区 */
 #ecommerce-mode .ecommerce-card-rerun > #ecommerce-result-folders {
     flex-shrink: 0;
-    max-height: 25vh;
+    max-height: 22vh;
     overflow-y: auto;
 }
-/* 废片重做列表：有足够的最小高度撑开卡片产生总滚动条，内部可滚动 */
-#ecommerce-mode .ecommerce-card-rerun > #ecommerce-rerun-list {
-    flex-shrink: 0;
-    min-height: 500px;
-    overflow-y: auto;
+/* 批量重做参数：从原“废片列表”里拆出来，留在第3栏。 */
+.ecommerce-rerun-bulk-params .ecommerce-rerun-bulk-bar {
+    position: static;
+    margin-top: 6px;
+    border: 1px solid #eaecf0;
+    border-radius: 8px;
+    background: #fff;
+    box-shadow: none;
 }
-/* 第4栏废片重做的标题不sticky，让它可以随卡片内部滚动被顶上去。
+/* 第3栏废片重做的标题不sticky，让它可以随卡片内部滚动被顶上去。
    保持和其他卡片一致的负margin贴边效果，但position:static不吸附。 */
 #ecommerce-mode .ecommerce-card-rerun .ecommerce-card-title {
     position: static;
@@ -3708,11 +3773,134 @@ body.ecommerce-column-resizing #ecommerce-mode .ecommerce-card {
     padding: 11px 12px 8px;
     background: rgba(255,251,235,.96);
 }
-#ecommerce-mode .ecommerce-card-rerun-adjust { --workbench-width: 520px; border-color: #a7f3d0; background: linear-gradient(180deg,#ecfdf5,#fff); }
-#ecommerce-mode .ecommerce-card-rerun-adjust[hidden],
-#ecommerce-mode #ecommerce-rerun-adjust-resizer[hidden] { display: none !important; }
+
+/* 第4栏废片列表：卡片本身固定高度，内部列表独立滚动，右侧常驻自绘滚动条。 */
+#ecommerce-mode .ecommerce-card-wastelist {
+    --wb-weight: 15;
+    --wb-floor: 170px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-height: calc(100vh - 130px);
+    max-height: calc(100vh - 130px);
+    border-color: #d0d5dd;
+}
+#ecommerce-mode .ecommerce-card-wastelist > .ecommerce-card-title {
+    flex-shrink: 0;
+    position: static;
+    margin: -12px -12px 0;
+    padding: 11px 12px 8px;
+    background: rgba(248,250,252,.97);
+    border-bottom: 1px solid #eaecf0;
+}
+#ecommerce-mode .ecommerce-card-wastelist .ecommerce-wastelist-body {
+    position: relative;
+    flex: 1 1 0;
+    min-height: 120px;
+    display: flex;
+    padding-right: 16px;
+}
+.ecommerce-compare-result-thumbnails button.is-refine { border-color: #06b6d4; box-shadow: 0 0 0 1px #06b6d4 inset; }
+.ecommerce-compare-result-thumbnails button.is-refine span { background: #06b6d4; color: #fff; }
+/* 二次调整项：集中在废片列表最后，用青色与普通废片（红/橙/蓝）区分。 */
+.ecommerce-rerun-refine-divider { display: flex; align-items: center; gap: 8px; margin: 6px 0 3px; padding: 0 2px; color: #0e7490; font-size: 10px; font-weight: 600; }
+.ecommerce-rerun-refine-divider::before,
+.ecommerce-rerun-refine-divider::after { content: ''; flex: 1 1 auto; height: 1px; background: #a5f3fc; }
+.ecommerce-rerun-group.is-refine { border-left: 3px solid #06b6d4; background: #f0fdff; }
+.ecommerce-rerun-group.is-refine > .ecommerce-rerun-group-bar { background: #cffafe; }
+.ecommerce-rerun-group.is-refine > .ecommerce-rerun-group-bar > .ecommerce-rerun-group-head { color: #0e7490; }
+.ecommerce-rerun-group.is-refine > .ecommerce-rerun-group-bar .ecommerce-rerun-group-head strong,
+.ecommerce-rerun-group.is-refine > .ecommerce-rerun-group-bar .ecommerce-rerun-group-head span { color: #0e7490; }
+.ecommerce-rerun-item.is-refine-redo { background: #ecfeff; }
+.ecommerce-rerun-item.is-refine-redo.is-active { background: #cffafe; }
+.ecommerce-rerun-type-badge.is-refine { background: #06b6d4; color: #fff; }
+#ecommerce-mode .ecommerce-card-wastelist #ecommerce-rerun-list {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 0;
+    margin-top: 0;
+    overflow-y: auto;
+    scrollbar-width: none;
+}
+#ecommerce-mode .ecommerce-card-wastelist #ecommerce-rerun-list::-webkit-scrollbar { display: none; }
+/* 全选 / 已选计数：吸附在列表顶部，滚动时始终可见 */
+.ecommerce-rerun-select-bar {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 9px;
+    border-bottom: 1px solid #d0d5dd;
+    background: #f8fafc;
+    box-shadow: 0 3px 8px rgba(16,24,40,.06);
+    color: #475467;
+    font-size: 11px;
+}
+.ecommerce-rerun-select-bar label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+.ecommerce-rerun-select-bar strong { color: #1d2939; font-size: 11px; font-variant-numeric: tabular-nums; }
+/* 自绘竖向滚动条：常驻可见、可拖动、可点轨道跳转 */
+.ecommerce-vscroll-track {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    bottom: 2px;
+    width: 12px;
+    border: 1px solid #e4e7ec;
+    border-radius: 6px;
+    background: #eef2f6;
+    cursor: pointer;
+}
+.ecommerce-vscroll-track[hidden] { display: none; }
+.ecommerce-vscroll-thumb {
+    position: absolute;
+    left: 1px;
+    width: 8px;
+    min-height: 28px;
+    border-radius: 5px;
+    background: #98a2b3;
+    cursor: grab;
+    transition: background .12s;
+}
+.ecommerce-vscroll-thumb:hover,
+.ecommerce-vscroll-thumb.is-dragging { background: #667085; }
+.ecommerce-vscroll-thumb.is-dragging { cursor: grabbing; }
+/* “放大验片”：第3栏与第4栏左右并排铺满窗口 */
+body.ecommerce-rerun-expanded .ecommerce-card-rerun.is-expanded {
+    position: fixed;
+    top: 14px;
+    bottom: 14px;
+    left: 14px;
+    right: 42%;
+    width: auto !important;
+    height: auto !important;
+    max-width: none;
+    max-height: none;
+    z-index: 10040;
+    border-color: #f59e0b;
+    box-shadow: 0 24px 80px rgba(15,23,42,.35);
+}
+body.ecommerce-rerun-expanded .ecommerce-card-wastelist.is-expanded {
+    position: fixed;
+    top: 14px;
+    bottom: 14px;
+    right: 14px;
+    left: 58%;
+    width: auto !important;
+    height: auto !important;
+    max-width: none;
+    max-height: none;
+    z-index: 10040;
+    border-color: #f59e0b;
+    box-shadow: 0 24px 80px rgba(15,23,42,.35);
+}
+#ecommerce-mode .ecommerce-card-rerun-adjust { --wb-weight: 17; --wb-floor: 190px; border-color: #a7f3d0; background: linear-gradient(180deg,#ecfdf5,#fff); }
+/* 未选中废片时收窄，避免空栏长期占位把第6栏挤出视口 */
+#ecommerce-mode .ecommerce-card-rerun-adjust.is-empty { max-width: 200px; }
 #ecommerce-mode .ecommerce-card-rerun-adjust .ecommerce-card-title { background: rgba(236,253,245,.97); }
-#ecommerce-mode .ecommerce-card-final-export { --workbench-width: 380px; border-color: #bbf7d0; background: linear-gradient(180deg,#f0fdf4,#fff); display: flex; flex-direction: column; }
+#ecommerce-mode .ecommerce-card-final-export { --wb-weight: 13; --wb-floor: 150px; border-color: #bbf7d0; background: linear-gradient(180deg,#f0fdf4,#fff); display: flex; flex-direction: column; }
 #ecommerce-mode .ecommerce-card-final-export > .ecommerce-card-title { flex-shrink: 0; }
 #ecommerce-mode .ecommerce-card-final-export > .ecommerce-final-export-body { flex: 1 1 0; min-height: 0; overflow-y: auto; }
 #ecommerce-mode .ecommerce-card-final-export .ecommerce-card-title { background: rgba(240,253,244,.97); }
@@ -3773,40 +3961,9 @@ body.ecommerce-column-resizing { cursor: col-resize !important; user-select: non
 .ecommerce-results-disclosure > summary { padding: 7px 0 2px; cursor: pointer; color: #475467; font-size: 10px; font-weight: 650; }
 .ecommerce-results-disclosure:not([open]) .ecommerce-inline-results { display: none; }
 #ecommerce-mode .ecommerce-inline-results { height: 360px; min-height: 150px; margin-top: 4px; border-top: 0; }
-#ecommerce-mode .ecommerce-card-action .ecommerce-run-settings {
-    grid-template-columns: minmax(150px, 1.5fr) 66px 82px;
-    align-items: end;
-    gap: 5px;
-}
-/* 并发控件：input 固定宽（显示3位数字），select 窄宽（只显示"倍数…"或"×N"），按钮按内容 */
-#ecommerce-mode .ecommerce-concurrency-control {
-    display: flex;
-    gap: 4px;
-    align-items: center;
-    flex-wrap: nowrap;
-    min-width: 0;
-}
-#ecommerce-mode .ecommerce-concurrency-control input {
-    flex: 0 0 56px;
-    width: 56px;
-    min-width: 0;
-    padding: 6px 4px;
-    text-align: center;
-    font-variant-numeric: tabular-nums;
-}
-#ecommerce-mode .ecommerce-concurrency-control select.ecommerce-concurrency-presets {
-    flex: 0 0 64px;
-    width: 64px;
-    min-width: 0;
-    padding: 6px 4px;
-    box-sizing: border-box;
-}
-#ecommerce-mode .ecommerce-concurrency-control #btn-ecommerce-auto-concurrency {
-    flex: 0 0 auto;
-    padding: 5px 8px;
-    white-space: nowrap;
-}
-#ecommerce-mode .ecommerce-run-settings select { width: 100%; box-sizing: border-box; padding: 6px 4px; }
+/* 运行设置区已改为单排 flex 紧凑布局，见 .ecommerce-run-settings 基础规则；
+   栏宽被拖到过窄时允许换行，避免控件被裁切或互相叠盖 */
+#ecommerce-mode .ecommerce-run-settings { flex-wrap: wrap; row-gap: 6px; }
 #ecommerce-mode .ecommerce-card-title { position: sticky; top: -12px; z-index: 5; margin: -12px -12px 0; padding: 11px 12px 8px; background: #fff; }
 #ecommerce-mode .ecommerce-card-rerun .ecommerce-card-title { background: rgba(255,251,235,.96); }
 @media (max-width: 760px) {
@@ -3833,13 +3990,133 @@ body.ecommerce-column-resizing { cursor: col-resize !important; user-select: non
         height: auto;
     }
     #ecommerce-mode .ecommerce-column-resizer { display: none !important; }
-    .ecommerce-scroll-track { display: none !important; }
     #ecommerce-mode .ecommerce-card-rerun { min-height: 360px; }
 }
 /* 人工精准匹配 */
 .ecommerce-wire-row{border:1px solid #dbe3ef;border-radius:10px;padding:10px;background:#f8fafc}.ecommerce-wire-row-title{font-size:12px;font-weight:700;color:#334155;margin-bottom:8px}.ecommerce-wire-cards{display:flex;gap:10px;overflow-x:auto;padding:4px 2px 8px;min-height:150px}.ecommerce-precision-dialog.is-dense .ecommerce-wire-cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow-x:hidden;overflow-y:auto;max-height:32vh}.ecommerce-wire-target,.ecommerce-wire-garment{position:relative;flex:0 0 calc(108px * var(--precision-scale, 1));border:2px solid #dbe3ef;border-radius:8px;background:#fff;padding:5px;text-align:center;transition:.15s}.ecommerce-precision-dialog.is-dense .ecommerce-wire-target,.ecommerce-precision-dialog.is-dense .ecommerce-wire-garment{min-width:0}.ecommerce-wire-target img,.ecommerce-wire-garment img{display:block;width:calc(94px * var(--precision-scale, 1));height:calc(108px * var(--precision-scale, 1));object-fit:contain;background:#e2e8f0;border-radius:5px;margin:auto}.ecommerce-wire-target b,.ecommerce-wire-garment b{display:block;font-size:calc(11px * var(--precision-scale, 1));margin-top:5px;color:#334155}.ecommerce-wire-garment{cursor:grab}.ecommerce-wire-garment.is-dragging{opacity:.55}.ecommerce-wire-target{min-width:108px}.ecommerce-wire-target.is-drop-target{border-color:#2563eb;background:#dbeafe;transform:translateY(-2px)}.ecommerce-wire-target.is-matched{border-color:#16a34a}.ecommerce-wire-match{display:block;color:#16a34a;font-size:10px;margin-top:3px;white-space:nowrap}.ecommerce-wire-gap{height:24px;position:relative}.ecommerce-wire-gap:after{content:'拖动下排服装参考图到上排目标图';position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:#64748b;font-size:11px;white-space:nowrap}.ecommerce-precision-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:8px 0;color:#64748b;font-size:11px}.ecommerce-precision-toolbar label{display:flex;align-items:center;gap:7px;color:#334155}.ecommerce-precision-toolbar input{width:180px;accent-color:#2563eb}.ecommerce-precision-toolbar output{min-width:42px;color:#2563eb;font-variant-numeric:tabular-nums}
+.ecommerce-precision-cropmode{display:inline-flex;align-items:center;gap:6px;color:#334155;font-size:11px}
+.ecommerce-precision-cropmode b{font-weight:600}
+.ecommerce-precision-cropmode button{border:1px solid #cbd5e1;background:#fff;color:#475569;border-radius:999px;padding:3px 10px;font-size:11px;cursor:pointer}
+.ecommerce-precision-cropmode button.is-active{border-color:#2563eb;background:#dbeafe;color:#1d4ed8;font-weight:600}
+.ecommerce-wire-crop{display:block;width:100%;margin-top:4px;border:1px solid #93c5fd;background:#eff6ff;color:#1d4ed8;border-radius:6px;padding:2px 0;font-size:calc(10px * var(--precision-scale, 1));line-height:1.5;cursor:pointer}
+.ecommerce-wire-crop:hover{background:#dbeafe}
 .ecommerce-precision-legend{display:flex;align-items:center;gap:8px;overflow-x:auto;padding:8px 0;border-bottom:1px solid #e5e7eb}.ecommerce-precision-legend>span:first-child{font-size:12px;font-weight:600;white-space:nowrap}.ecommerce-precision-legend-item{position:relative;display:inline-flex;flex:0 0 auto}.ecommerce-precision-legend-item img{width:58px;height:58px;object-fit:cover;border-radius:6px;border:1px solid #cbd5e1;background:#f1f5f9}.ecommerce-precision-legend-item b{position:absolute;right:3px;bottom:3px;background:#111827;color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.ecommerce-precision-row{display:grid;grid-template-columns:150px minmax(0,1fr);align-items:center;gap:10px}.ecommerce-precision-target{display:flex;flex-direction:column;gap:5px;font-size:12px}.ecommerce-precision-target img{width:100%;height:120px;object-fit:contain;background:#e2e8f0;border-radius:6px}.ecommerce-precision-choice-list{display:flex;gap:7px;overflow-x:auto;padding:4px 0}.ecommerce-precision-choice{position:relative;flex:0 0 74px;border:2px solid transparent;border-radius:8px;padding:3px;background:#f8fafc;cursor:pointer}.ecommerce-precision-choice img{display:block;width:66px;height:96px;object-fit:cover;border-radius:5px;background:#e2e8f0}.ecommerce-precision-choice span{position:absolute;right:5px;bottom:5px;background:rgba(15,23,42,.82);color:#fff;border-radius:4px;padding:1px 4px;font-size:10px}.ecommerce-precision-choice.is-selected{border-color:#2563eb;background:#dbeafe;box-shadow:0 0 0 2px rgba(37,99,235,.15)}
-.ecommerce-precision-toggle{display:flex;align-items:center;gap:8px;margin:10px 0 0;padding:8px 10px;border:1px solid #c7d2fe;border-radius:8px;background:#eef2ff;font-weight:600}.ecommerce-precision-toggle small{font-weight:400;color:#475569}.ecommerce-precision-panel{margin-top:8px}.ecommerce-precision-overlay{position:fixed;inset:0;z-index:10000;display:grid;place-items:center;background:rgba(15,23,42,.58);padding:24px}.ecommerce-precision-dialog{width:min(900px,96vw);max-height:90vh;overflow:auto;background:#fff;border-radius:14px;box-shadow:0 20px 70px rgba(0,0,0,.3);padding:18px}.ecommerce-precision-dialog header,.ecommerce-precision-dialog footer{display:flex;align-items:center;justify-content:space-between;gap:12px}.ecommerce-precision-dialog header{font-size:17px;border-bottom:1px solid #e5e7eb;padding-bottom:12px}.ecommerce-precision-dialog header button{border:0;background:none;font-size:26px;cursor:pointer}.ecommerce-precision-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin:14px 0}.ecommerce-precision-row{display:flex;flex-direction:column;gap:6px;border:1px solid #e5e7eb;border-radius:10px;padding:8px;background:#f8fafc}.ecommerce-precision-row img{width:100%;height:150px;object-fit:contain;background:#e2e8f0;border-radius:6px}.ecommerce-precision-row select{width:100%;padding:6px}.ecommerce-precision-dialog footer{justify-content:flex-end;border-top:1px solid #e5e7eb;padding-top:12px}
+.ecommerce-precision-toggle{display:flex;align-items:center;gap:8px;margin:10px 0 0;padding:8px 10px;border:1px solid #c7d2fe;border-radius:8px;background:#eef2ff;font-weight:600}.ecommerce-precision-toggle small{font-weight:400;color:#475569}.ecommerce-precision-panel{margin-top:8px}
+/* 第2栏「人工精准匹配」折叠条：建批时用一次，平时只占一行。 */
+.ecommerce-precision-fold{margin:6px 0 0;border:1px solid #e4e7ec;border-radius:8px;background:#fbfcfe}
+.ecommerce-precision-fold>summary{display:flex;align-items:center;gap:6px;padding:6px 8px;cursor:pointer;color:#344054;font-size:11px;list-style:none}
+.ecommerce-precision-fold>summary::-webkit-details-marker{display:none}
+.ecommerce-precision-fold>summary::before{content:'▸';color:#98a2b3;font-size:10px}
+.ecommerce-precision-fold[open]>summary::before{content:'▾'}
+.ecommerce-precision-fold>summary b{font-weight:700}
+.ecommerce-precision-fold>summary .ecommerce-summary{margin-left:auto;font-size:10px;color:#667085}
+.ecommerce-precision-fold[open]>summary{border-bottom:1px solid #eef1f5}
+.ecommerce-precision-fold>.ecommerce-help{margin:6px 8px 0}
+.ecommerce-precision-fold .ecommerce-precision-toggle{margin:6px 8px}
+.ecommerce-precision-fold .ecommerce-precision-panel{margin:6px 8px}.ecommerce-precision-overlay{position:fixed;inset:0;z-index:10000;display:grid;place-items:center;background:rgba(15,23,42,.58);padding:24px}.ecommerce-precision-dialog{width:min(900px,96vw);max-height:90vh;overflow:auto;background:#fff;border-radius:14px;box-shadow:0 20px 70px rgba(0,0,0,.3);padding:18px}.ecommerce-precision-dialog header,.ecommerce-precision-dialog footer{display:flex;align-items:center;justify-content:space-between;gap:12px}.ecommerce-precision-dialog header{font-size:17px;border-bottom:1px solid #e5e7eb;padding-bottom:12px}.ecommerce-precision-dialog header button{border:0;background:none;font-size:26px;cursor:pointer}.ecommerce-precision-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin:14px 0}.ecommerce-precision-row{display:flex;flex-direction:column;gap:6px;border:1px solid #e5e7eb;border-radius:10px;padding:8px;background:#f8fafc}.ecommerce-precision-row img{width:100%;height:150px;object-fit:contain;background:#e2e8f0;border-radius:6px}.ecommerce-precision-row select{width:100%;padding:6px}.ecommerce-precision-dialog footer{justify-content:flex-end;border-top:1px solid #e5e7eb;padding-top:12px}
 .ecommerce-precision-dialog{height:min(760px,90vh);min-height:420px;resize:both;}
+/* 精准匹配弹窗里的单图提示词区：一个共用输入框 + 一行轻量模板条，别挤占匹配区。 */
+.ecommerce-precision-prompt{margin:10px 0 12px;padding:8px 10px;border:1px solid #dbe4ef;border-radius:8px;background:#f8fafc}
+.ecommerce-precision-prompt-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;min-width:0}
+.ecommerce-precision-prompt-head b{font-size:12px;color:#1d4ed8}
+.ecommerce-precision-prompt-head small{font-size:10px;color:#64748b}
+.ecommerce-precision-prompt .ecommerce-prompt-templates-bar{margin-top:6px}
+.ecommerce-precision-prompt textarea{box-sizing:border-box;width:100%;margin-top:6px;padding:7px 9px;border:1px solid #d0d5dd;border-radius:6px;color:#344054;font-size:12px;line-height:1.5;resize:vertical}
+#ecommerce-precision-prompt-input{min-height:64px;max-height:220px}
+#ecommerce-precision-prompt-input:disabled{background:#f2f4f7;color:#98a2b3}
+.ecommerce-wire-target{cursor:pointer}
+.ecommerce-wire-target.is-prompt-selected{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.22)}
+.ecommerce-wire-single-flag{position:absolute;left:5px;top:5px;display:none;padding:0 4px;border-radius:4px;background:#f59e0b;color:#fff;font-size:10px;line-height:15px}
+.ecommerce-wire-target.has-single-prompt .ecommerce-wire-single-flag{display:block}
+.ecommerce-wire-unmatch{position:absolute;right:4px;top:4px;display:none;width:18px;height:18px;padding:0;border:1px solid #fca5a5;border-radius:50%;background:#fff;color:#dc2626;font-size:11px;line-height:1;cursor:pointer}
+.ecommerce-wire-target.is-matched .ecommerce-wire-unmatch{display:block}
+.ecommerce-wire-unmatch:hover{background:#fee2e2}
 .ecommerce-compare-result-thumbnails button.is-selected{border-color:#f59e0b!important;box-shadow:0 0 0 3px rgba(245,158,11,.9) inset,0 0 0 1px #f59e0b;background:#451a03}.ecommerce-compare-result-thumbnails button.is-selected span{background:#b45309!important;color:#fff}
 .ecommerce-rerun-reference-toolbar{display:flex;align-items:center;gap:8px;margin:8px 0 4px;padding:6px 8px;border:1px solid #dbe3ef;border-radius:6px;background:#f8fafc}.ecommerce-rerun-reference-toolbar strong{font-size:11px;color:#334155}.ecommerce-rerun-reference-toolbar small{color:#64748b;font-size:10px}
+
+/* 证件照批量工作台：保持窄、平、可扫描，避免再套一层复杂卡片。 */
+.idphoto-mode{padding:20px 24px;overflow:auto;background:#f4f6f8}.idphoto-shell{max-width:1240px;margin:0 auto;background:#fff;border:1px solid #e3e7ed;border-radius:10px;padding:22px;box-shadow:0 2px 12px rgba(16,24,40,.04)}
+.idphoto-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;border-bottom:1px solid #edf0f4;padding-bottom:10px}.idphoto-header h2{margin:0;font-size:18px;color:#1f2937}.idphoto-header p{margin:5px 0 0;color:#667085;font-size:11px}.idphoto-status{font-size:11px;color:#667085;white-space:nowrap}.idphoto-tabs{display:flex;gap:4px;margin:12px 0}.idphoto-tab{border:1px solid #d0d5dd;background:#fff;color:#475467;border-radius:5px;padding:6px 12px;font-size:12px;cursor:pointer}.idphoto-tab.active{background:#111827;border-color:#111827;color:#fff}.idphoto-pane{display:none}.idphoto-pane.active{display:block}.idphoto-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.idphoto-grid label,.idphoto-crop-controls{display:flex;flex-direction:column;gap:4px;color:#475467;font-size:11px}.idphoto-grid input,.idphoto-grid select,.idphoto-crop-controls input,.idphoto-pane textarea{box-sizing:border-box;width:100%;border:1px solid #d0d5dd;border-radius:5px;padding:7px 8px;font-size:12px;color:#1d2939;background:#fff}.idphoto-pane textarea{margin-top:10px;resize:vertical;line-height:1.45}.idphoto-actions{display:flex;gap:6px;align-items:center;margin:10px 0}.idphoto-summary{padding:8px 10px;background:#f8fafc;border:1px solid #edf0f4;border-radius:5px;color:#475467;font-size:11px;white-space:pre-wrap}.idphoto-list{max-height:280px;overflow:auto;margin-top:8px;font-size:11px;color:#667085}.idphoto-list .idphoto-row{display:flex;justify-content:space-between;gap:10px;padding:5px 6px;border-bottom:1px solid #f0f2f5}.idphoto-face-results{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-top:10px}.idphoto-face-results img{width:100%;aspect-ratio:3/4;object-fit:cover;border:1px solid #e4e7ec;border-radius:5px}.idphoto-crop-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.idphoto-test-panel{margin-top:14px;border-top:1px solid #edf0f4;padding-top:10px;color:#667085;font-size:11px}.idphoto-test-panel summary{cursor:pointer;color:#475467;font-weight:600}.idphoto-test-panel p{margin:8px 0}.idphoto-test-panel pre{max-height:180px;overflow:auto;white-space:pre-wrap;color:#344054;background:#f8fafc;padding:8px;border-radius:5px}.idphoto-status.is-running{color:#b54708}.idphoto-status.is-success{color:#027a48}.idphoto-status.is-error{color:#b42318}@media(max-width:760px){.idphoto-grid{grid-template-columns:1fr}.idphoto-crop-controls{grid-template-columns:1fr}.idphoto-header{display:block}.idphoto-status{margin-top:8px}}
+.idphoto-step-title{display:flex;gap:10px;align-items:flex-start;margin:18px 0 10px;color:#1d2939}.idphoto-step-title>span{display:grid;place-items:center;width:22px;height:22px;border-radius:50%;background:#111827;color:#fff;font-size:12px;font-weight:700}.idphoto-step-title strong{display:block;font-size:13px}.idphoto-step-title small{display:block;margin-top:3px;color:#667085;font-size:11px;font-weight:400}.idphoto-step-title.compact{margin-top:16px}.idphoto-reference-tray{display:grid;grid-template-columns:minmax(0,1fr) 34px minmax(0,1fr);gap:10px;align-items:center}.idphoto-upload-card{min-height:118px;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:5px;border:1px dashed #98a2b3;border-radius:8px;background:#fafbfc;color:#344054;cursor:pointer}.idphoto-upload-card:hover{border-color:#111827;background:#f8fafc}.idphoto-upload-card b{font-size:13px}.idphoto-upload-card small{font-size:11px;color:#667085}.idphoto-upload-card input[type=text]{width:84%;margin-top:5px;text-align:center}.idphoto-upload-icon{font-size:23px;line-height:1;color:#667085}.idphoto-reference-arrow{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:#eef2f6;color:#667085;font-weight:700}.idphoto-mode-choices{gap:8px;margin:10px 0 14px}.idphoto-mode-choices .idphoto-tab{flex:1;text-align:left;padding:11px 13px;background:#fff}.idphoto-mode-choices .idphoto-tab strong{display:block;font-size:13px}.idphoto-mode-choices .idphoto-tab small{display:block;margin-top:4px;color:#667085;font-size:11px}.idphoto-mode-choices .idphoto-tab.active{background:#111827}.idphoto-mode-choices .idphoto-tab.active small{color:#d0d5dd}.idphoto-tool-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px;border-top:1px solid #edf0f4;padding-top:16px}.idphoto-tool-card{padding:12px;border:1px solid #e3e7ed;border-radius:8px;background:#fbfcfd}.idphoto-tool-heading{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}.idphoto-tool-heading span{font-size:13px;font-weight:700;color:#1d2939}.idphoto-tool-heading small{color:#667085;font-size:11px}.idphoto-inline-field{display:flex;align-items:center;gap:8px;color:#475467;font-size:11px}.idphoto-inline-field input{flex:1;min-width:0;border:1px solid #d0d5dd;border-radius:5px;padding:7px 8px;font-size:12px}.idphoto-inline-row{display:flex;gap:8px;margin-top:8px}.idphoto-inline-row select{border:1px solid #d0d5dd;border-radius:5px;padding:6px 8px}.idphoto-inline-row .btn{flex:1}.idphoto-tool-card>.btn{margin-top:9px}.idphoto-mode-choices+.idphoto-pane{}
+.idphoto-upscale-options{display:grid;grid-template-columns:70px 78px 64px minmax(110px,1fr);gap:5px;align-items:end;margin-top:6px}.idphoto-upscale-options label{display:grid;gap:2px;color:#667085;font-size:9px}.idphoto-upscale-options input,.idphoto-upscale-options select{box-sizing:border-box;width:100%;min-width:0;border:1px solid #d0d5dd;border-radius:5px;background:#fff;padding:5px 6px;color:#344054;font-size:11px}.idphoto-upscale-summary{margin-top:5px;overflow:hidden;color:#667085;font-size:9px;line-height:1.4;text-overflow:ellipsis;white-space:nowrap}
+@media(max-width:760px){.idphoto-mode{padding:12px}.idphoto-shell{padding:14px}.idphoto-reference-tray,.idphoto-tool-row{grid-template-columns:1fr}.idphoto-reference-arrow{margin:auto;transform:rotate(90deg)}.idphoto-mode-choices{display:grid}.idphoto-inline-field{display:block}.idphoto-inline-field input{width:100%;margin-top:5px;box-sizing:border-box}}
+
+/* 证件照工作台：核心操作单屏可见，说明文字收进结构而不占用工作区。 */
+.idphoto-mode{height:calc(100vh - 95px);box-sizing:border-box;overflow:hidden;padding:8px 12px;background:#f4f6f8}
+.idphoto-shell{height:100%;box-sizing:border-box;overflow:hidden;padding:12px}
+.idphoto-header{padding-bottom:6px}
+.idphoto-header p,.idphoto-step-title small,.idphoto-upload-card small,.idphoto-mode-choices .idphoto-tab small{display:none}
+.idphoto-step-title{margin:8px 0 6px;gap:7px;align-items:center}
+.idphoto-step-title>span{width:18px;height:18px;font-size:10px}
+.idphoto-step-title.compact{margin-top:8px}
+.idphoto-reference-tray{gap:6px}
+.idphoto-upload-card{min-height:72px;padding:6px;gap:3px}
+.idphoto-upload-icon{font-size:18px}
+.idphoto-upload-card b{font-size:12px}
+.idphoto-upload-card input[type=text]{margin-top:2px;padding:5px 6px;font-size:11px}
+.idphoto-mode-choices{margin:6px 0 8px;gap:6px}
+.idphoto-mode-choices .idphoto-tab{padding:7px 9px}
+.idphoto-mode-choices .idphoto-tab strong{font-size:12px}
+.idphoto-shared-model{display:flex;align-items:center;gap:8px;margin:0 0 7px;color:#475467;font-size:11px}.idphoto-shared-model select{flex:1;min-width:0;border:1px solid #d0d5dd;border-radius:5px;padding:6px 8px;background:#fff;color:#1d2939;font-size:12px}
+.idphoto-grid{gap:6px}
+.idphoto-prompt-template-bar{display:flex;align-items:center;gap:5px;margin-top:5px;color:#667085;font-size:10px}.idphoto-prompt-template-bar span{white-space:nowrap}.idphoto-prompt-template-bar select{min-width:120px;flex:1;border:1px solid #d0d5dd;border-radius:4px;padding:4px 6px;background:#fff;color:#344054;font-size:10px}.idphoto-prompt-template-bar .btn{white-space:nowrap}
+.idphoto-grid input,.idphoto-grid select,.idphoto-crop-controls input,.idphoto-pane textarea{padding:5px 7px}
+.idphoto-path-field{display:flex;gap:4px;min-width:0}.idphoto-path-field input{min-width:0;flex:1}.idphoto-path-field .btn{flex:0 0 auto;padding:4px 9px;font-size:11px}
+.idphoto-pane textarea{margin-top:6px;min-height:44px}
+.idphoto-actions{margin:6px 0;gap:5px}
+.idphoto-tool-row{margin-top:8px;padding-top:8px;gap:6px}
+.idphoto-tool-card{padding:8px}
+.idphoto-tool-heading{margin-bottom:5px}
+.idphoto-tool-heading small{display:none}
+.idphoto-test-panel{margin-top:6px;padding-top:5px}
+.idphoto-list{max-height:110px}
+.idphoto-face-results{max-height:150px;overflow:auto}
+@media(max-width:760px){.idphoto-mode{height:auto;min-height:calc(100vh - 80px);overflow:auto}.idphoto-shell{height:auto;overflow:visible}.idphoto-mode-choices .idphoto-tab{padding:8px}.idphoto-tool-row{margin-top:8px}.idphoto-upscale-options{grid-template-columns:repeat(3,minmax(0,1fr))}.idphoto-upscale-options .btn{grid-column:1/-1}}
+/* ID-photo intake states for real multi-file and folder drops. */
+.idphoto-upload-card:hover,.idphoto-upload-card.is-dragover{border-color:#2563eb;background:#eff6ff}
+.idphoto-upload-card.is-ready{border-color:#12b76a;background:#f0fdf4}
+.idphoto-upload-card.is-error{border-color:#f04438;background:#fff5f5}
+.idphoto-upload-card.is-uploading{border-color:#f79009;background:#fffaeb}
+.idphoto-upload-state{max-width:92%;overflow:hidden;color:#667085;font-size:11px;text-align:center;text-overflow:ellipsis;white-space:nowrap}
+.idphoto-upload-card.is-ready .idphoto-upload-state{color:#027a48}
+.idphoto-upload-card.is-error .idphoto-upload-state{color:#b42318}
+.idphoto-intake-previews{display:none;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;align-items:start;margin-top:6px}
+.idphoto-intake-previews.has-preview{display:grid}
+.idphoto-intake-preview{display:grid;grid-template-columns:repeat(auto-fill,minmax(54px,1fr));gap:4px;max-height:74px;overflow:auto;padding:3px;border:1px solid #edf0f4;border-radius:5px;background:#fbfcfd;min-height:12px}
+.idphoto-intake-preview:empty{display:none}
+.idphoto-intake-preview figure{position:relative;margin:0;min-width:0}
+.idphoto-intake-preview img{display:block;width:100%;height:48px;object-fit:cover;border-radius:4px;background:#e5e7eb}
+.idphoto-intake-preview figcaption{display:flex;gap:2px;align-items:center;min-width:0;margin-top:1px;color:#667085;font-size:9px;line-height:12px}
+.idphoto-intake-preview figcaption b{flex:0 0 auto;color:#1d4ed8}
+.idphoto-intake-preview figcaption span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.idphoto-intake-preview figcaption small{flex:0 0 auto;color:#98a2b3}
+.idphoto-repeat-toggle{display:flex;align-items:center;justify-content:flex-end;gap:4px;margin-top:4px;color:#667085;font-size:10px;line-height:16px;cursor:pointer;white-space:nowrap}
+.idphoto-repeat-toggle input{margin:0}
+@media(max-width:760px){.idphoto-intake-previews{grid-template-columns:1fr}.idphoto-repeat-toggle{justify-content:flex-start}}
+.idphoto-feature-builder{margin-top:6px;padding:6px;border:1px solid #e4e7ec;border-radius:6px;background:#fbfcfd}
+.idphoto-feature-head{display:flex;align-items:center;gap:7px;margin-bottom:5px}.idphoto-feature-head strong{font-size:11px;color:#344054}.idphoto-feature-head span{color:#98a2b3;font-size:9px}.idphoto-feature-head .btn{margin-left:auto;padding:3px 7px;font-size:10px}
+.idphoto-feature-controls{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:4px}
+.idphoto-feature-control{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:3px;min-width:0;color:#475467;font-size:9px}.idphoto-feature-control>span{white-space:nowrap}.idphoto-feature-control select{min-width:0;width:100%;padding:3px 4px;border:1px solid #d0d5dd;border-radius:4px;background:#fff;font-size:9px}.idphoto-feature-control em{display:flex;align-items:center;gap:1px;font-style:normal;white-space:nowrap}.idphoto-feature-control input{margin:0}
+.idphoto-feature-preview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-top:5px;max-height:72px;overflow:auto;color:#667085;font-size:9px}.idphoto-feature-preview details{padding:2px 4px;border:1px solid #edf0f4;border-radius:4px;background:#fff}.idphoto-feature-preview summary{cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#344054}.idphoto-feature-preview p{margin:3px 0;line-height:1.35}
+@media(max-width:900px){.idphoto-feature-controls{grid-template-columns:repeat(2,minmax(0,1fr))}.idphoto-feature-preview{grid-template-columns:1fr}}
+.idphoto-grid-generator-settings{grid-template-columns:78px 78px 92px minmax(0,1fr)}
+.idphoto-fixed-prompt-row{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(280px,1.3fr);gap:6px;margin-top:5px}.idphoto-fixed-prompt-row label{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:5px;color:#475467;font-size:9px}.idphoto-fixed-prompt-row input{min-width:0;border:1px solid #d0d5dd;border-radius:4px;padding:4px 6px;font-size:10px}
+.idphoto-crop-dropzone,.idphoto-upscale-dropzone{display:flex;align-items:center;justify-content:space-between;gap:6px;min-height:28px;padding:4px 7px;border:1px dashed #98a2b3;border-radius:5px;background:#fff;color:#475467;font-size:10px;cursor:pointer}.idphoto-crop-dropzone:hover,.idphoto-crop-dropzone.is-dragover,.idphoto-upscale-dropzone:hover,.idphoto-upscale-dropzone.is-dragover{border-color:#2563eb;background:#eff6ff}.idphoto-crop-dropzone small,.idphoto-upscale-dropzone small{overflow:hidden;color:#667085;text-overflow:ellipsis;white-space:nowrap}
+.idphoto-crop-mode-field{display:flex;align-items:center;gap:6px;margin-top:5px;color:#475467;font-size:10px}.idphoto-crop-mode-field select{border:1px solid #d0d5dd;border-radius:4px;padding:4px 6px;color:#344054;background:#fff;font-size:10px}
+#idphoto-crop-source{box-sizing:border-box;width:100%;margin-top:4px;border:1px solid #d0d5dd;border-radius:5px;padding:5px 7px;font-size:10px}.idphoto-crop-review{position:relative;display:grid;grid-template-columns:64px minmax(0,1fr);gap:5px;margin-top:5px}.idphoto-crop-review[hidden]{display:none}.idphoto-crop-preview,#idphoto-crop-preview{display:block;grid-row:1/4;width:64px;height:84px;max-width:64px;max-height:84px;object-fit:contain;border:1px solid #e4e7ec;border-radius:4px;background:#f2f4f7}.idphoto-crop-meta{font-size:9px;color:#667085}.idphoto-number-picker{display:grid;grid-template-columns:repeat(9,minmax(20px,1fr));gap:2px}.idphoto-number-picker button{height:22px;padding:0;border:1px solid #d0d5dd;border-radius:3px;background:#fff;color:#344054;font-size:10px;cursor:pointer}.idphoto-number-picker button.is-selected{border-color:#2563eb;background:#2563eb;color:#fff}.idphoto-crop-nav{display:flex;gap:3px}.idphoto-crop-nav .btn{flex:1;padding:4px 5px;font-size:9px}
+.idphoto-upscale-preview{display:flex;gap:3px;max-height:42px;overflow:auto;margin-top:4px}.idphoto-upscale-preview figure{position:relative;flex:0 0 36px;margin:0}.idphoto-upscale-preview img{display:block;width:36px;height:36px;object-fit:cover;border:1px solid #e4e7ec;border-radius:3px}.idphoto-upscale-preview b{position:absolute;right:1px;bottom:1px;padding:0 2px;border-radius:2px;background:rgba(17,24,39,.82);color:#fff;font-size:8px}.idphoto-upscale-dropzone{margin-bottom:4px}.idphoto-upscale-footer{display:flex;align-items:center;gap:6px;margin-top:5px}.idphoto-upscale-footer .idphoto-upscale-summary{min-width:0;flex:1;margin-top:0}.idphoto-upscale-footer .btn{flex:0 0 auto}
+@media(max-width:760px){.idphoto-grid-generator-settings,.idphoto-fixed-prompt-row{grid-template-columns:1fr}.idphoto-fixed-prompt-row label{grid-template-columns:1fr}.idphoto-number-picker{grid-template-columns:repeat(5,1fr)}}
+.idphoto-grid-prompt-editor{display:grid;gap:4px;margin:7px 0}.idphoto-prompt-editor-head{display:flex;align-items:center;justify-content:space-between;gap:6px}.idphoto-prompt-editor-head label{font-size:10px;font-weight:600;color:#344054}.idphoto-grid-prompt-editor textarea{box-sizing:border-box;width:100%;border:1px solid #d0d5dd;border-radius:5px;padding:6px 7px;font:inherit;font-size:10px;line-height:1.5;resize:vertical}.idphoto-grid-prompt-editor textarea:focus{outline:2px solid rgba(37,99,235,.16);border-color:#2563eb}.idphoto-grid-prompt-editor textarea[readonly]{background:#f8fafc;color:#475467}.idphoto-grid-prompt-editor small{font-size:9px;line-height:1.45;color:#667085}
+.idphoto-imperfection-manager{margin-top:5px;padding:5px 6px;border:1px solid #eaecf0;border-radius:5px;background:#fcfcfd}.idphoto-imperfection-manager-head{display:flex;align-items:baseline;gap:6px;cursor:pointer;list-style:none}.idphoto-imperfection-manager-head::-webkit-details-marker{display:none}.idphoto-imperfection-manager-head::before{content:'▸';font-size:9px;color:#667085}.idphoto-imperfection-manager[open] .idphoto-imperfection-manager-head::before{content:'▾'}.idphoto-imperfection-manager-head strong{font-size:10px;color:#344054}.idphoto-imperfection-manager-head small{font-size:9px;color:#667085}.idphoto-imperfection-manager[open] #idphoto-imperfection-editor{margin-top:4px}.idphoto-imperfection-list{display:grid;gap:3px}.idphoto-imperfection-row,.idphoto-imperfection-add{display:flex;align-items:center;gap:3px}.idphoto-imperfection-row input,.idphoto-imperfection-add input{min-width:0;flex:1;box-sizing:border-box;border:1px solid #d0d5dd;border-radius:3px;padding:3px 5px;font-size:9px}.idphoto-imperfection-row .btn,.idphoto-imperfection-add .btn{padding:3px 5px;font-size:9px;white-space:nowrap}.idphoto-imperfection-add{margin-top:4px}
+.idphoto-crop-preview-shell{width:min(100%,420px);aspect-ratio:3/4;max-height:560px;margin:0 auto}.idphoto-crop-preview-shell img,#idphoto-crop-preview{width:100%;height:100%;object-fit:fill}
+.idphoto-crop-cell{color:rgba(255,255,255,.9);background:rgba(17,24,39,.08);text-shadow:0 1px 3px #111827}
+.idphoto-grid-progress{display:flex;align-items:center;gap:8px;min-height:18px;margin:3px 0 7px;color:#667085;font-size:10px}.idphoto-grid-progress-track{height:6px;flex:1;overflow:hidden;border-radius:999px;background:#eaecf0}.idphoto-grid-progress-bar{width:0;height:100%;border-radius:inherit;background:#2563eb;transition:width .2s ease}.idphoto-grid-progress.is-running .idphoto-grid-progress-bar{background:#f79009}.idphoto-grid-progress.is-success .idphoto-grid-progress-bar{background:#12b76a}.idphoto-grid-progress.is-error .idphoto-grid-progress-bar{background:#f04438}.idphoto-grid-progress-text{min-width:112px;text-align:right;white-space:nowrap}.idphoto-face-results{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));max-height:220px}.idphoto-result-card{display:flex;flex-direction:column;gap:3px;min-width:0;padding:3px;border:1px solid #e4e7ec;border-radius:5px;background:#fff;cursor:zoom-in;text-align:left}.idphoto-result-card:hover{border-color:#2563eb;box-shadow:0 1px 5px rgba(16,24,40,.12)}.idphoto-result-card img{display:block;width:100%;aspect-ratio:3/4;object-fit:cover;border:0;border-radius:3px}.idphoto-result-card span{padding:0 3px 2px;color:#475467;font-size:10px}.idphoto-crop-review{display:grid;grid-template-columns:minmax(0,1fr);gap:5px;margin-top:6px}.idphoto-crop-preview-shell{position:relative;width:100%;max-height:420px;overflow:hidden;border:1px solid #d0d5dd;border-radius:5px;background:#111827;display:flex;justify-content:center}.idphoto-crop-preview-shell img,#idphoto-crop-preview{display:block;width:auto;max-width:100%;height:auto;max-height:420px;object-fit:contain}.idphoto-crop-grid-selector{position:absolute;inset:0;display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr)}.idphoto-crop-cell{position:relative;border:1px solid rgba(255,255,255,.72);background:rgba(37,99,235,0);color:transparent;font-size:16px;font-weight:700;cursor:pointer;transition:background .15s ease,box-shadow .15s ease}.idphoto-crop-cell:hover{background:rgba(37,99,235,.2)}.idphoto-crop-cell.is-selected{background:rgba(37,99,235,.42);box-shadow:inset 0 0 0 2px #60a5fa;color:#fff;text-shadow:0 1px 2px #111827}.idphoto-crop-cell.is-selected::after{content:'✓';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:24px}.idphoto-crop-meta{font-size:10px;color:#667085}.idphoto-crop-nav{display:flex;flex-wrap:wrap;gap:3px}.idphoto-crop-nav .btn{flex:1;min-width:72px;padding:4px 5px;font-size:9px}
+/* 证件照网格裁剪始终采用竖版预览；网格列数由当前模式决定。 */
+.idphoto-crop-preview-shell[data-grid-mode="4"],.idphoto-crop-preview-shell[data-grid-mode="9"]{aspect-ratio:3/4;max-height:560px;height:auto}
+.idphoto-crop-preview-shell[data-grid-mode="4"] .idphoto-crop-grid-selector{grid-template-columns:repeat(2,1fr);grid-template-rows:repeat(2,1fr)}
+.idphoto-crop-preview-shell[data-grid-mode="9"] .idphoto-crop-grid-selector{grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,1fr)}
+/* 网格图预览固定为真正的竖版画布：避免宽屏卡片把 max-height 压成横向外框。 */
+.idphoto-crop-preview-shell,.idphoto-crop-preview-shell[data-grid-mode="4"],.idphoto-crop-preview-shell[data-grid-mode="9"]{width:min(100%,315px);height:auto;aspect-ratio:3 / 4;max-height:none;margin-inline:auto}
+.idphoto-crop-preview-shell img,#idphoto-crop-preview{width:100%;height:100%;max-width:none;max-height:none;object-fit:fill}
+.idphoto-upload-path-row{display:flex;align-items:center;gap:4px;width:92%;margin-top:2px}.idphoto-upload-path-row input[type=text]{width:auto;min-width:0;flex:1;margin-top:0}.idphoto-clear-btn{flex:0 0 auto;padding:4px 7px;border:1px solid #d0d5dd;border-radius:5px;background:#fff;color:#475467;font-size:10px;line-height:1.2;cursor:pointer}.idphoto-clear-btn:hover{border-color:#f04438;background:#fff5f5;color:#b42318}
+.idphoto-generation-mode{display:flex;align-items:center;gap:7px;margin-top:6px;color:#475467;font-size:10px}.idphoto-generation-mode select{min-width:0;flex:1;border:1px solid #d0d5dd;border-radius:5px;background:#fff;color:#344054;padding:5px 7px;font-size:10px}

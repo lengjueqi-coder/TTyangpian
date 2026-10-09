@@ -17,6 +17,129 @@ const SPLIT_GLOBAL_GEN_CONCURRENCY = 6;
  */
 const IMAGE_UPLOAD_CONCURRENCY = 1;
 const DEFAULT_PRESET_TAGS = ['肖像', '写真', '日系写真', '纯欲写真', '私房写真', '外景写真', '樱花写真', '新中式', '古风', '旗袍', '韩杂', '日杂', '杂志', '氛围感肖像', '胶片写真', '暗黑写真', '欧美肖像', '商业写真', '复古写真', '纪实写真'];
+// 首轮数据加载和撤销快照可能早于各功能模块执行，跨模块状态先完成初始化。
+const DEFAULT_PREFIX_TEMPLATES = ['请参考', '请模仿', '请替换', '请融合'];
+let selectedPrefixIds = new Set();
+let selectedSuffixIds = new Set();
+let activePromptPresetIds = new Set();
+let lastAutoPrompt = '';
+let prevPromptCn = '';
+let promptTemplates = { prefixes: [], suffixes: [] };
+let promptPresets = [];
+let prefixTemplates = [...DEFAULT_PREFIX_TEMPLATES];
+let activePrefix = prefixTemplates[0] || '请参考';
+let idPhotoInitialized = false;
+let idPhotoActiveJob = '';
+let idPhotoPollTimer = null;
+let idPhotoJobPaused = false;
+let idPhotoGridRunning = false;
+const idPhotoIntake = {
+    source: { intakeId: '', records: [], sourceGroups: [], scan: null, directoryMode: false },
+    face: { intakeId: '', records: [], faceFiles: [], directoryMode: false },
+};
+let idPhotoFeaturePrompt = '';
+let idPhotoGridPrefixDirty = false;
+// 九宫格前缀保留旧的 9 格 key 以兼容已有用户；4 格使用独立 key。
+const IDPHOTO_GRID_PREFIX_STORAGE_KEY = 'idphoto-grid-prompt-prefix-9';
+const IDPHOTO_GRID_PREFIX_KEYS = { '9': IDPHOTO_GRID_PREFIX_STORAGE_KEY, '4': 'idphoto-grid-prompt-prefix-4' };
+const DEFAULT_IDPHOTO_GRID_PREFIX = '18至22岁的明确成年年轻女性模特，偏中国审美，韩系清透白开水妆，妆感轻薄自然，真实皮肤纹理和细微不对称，不过度磨皮，不要塑料脸、统一网红脸或明显AI感。一次只生成一张竖版3×3九宫格，九个格子都是独立的正脸头像，光线统一、背景干净，不要文字、编号、边框、水印或重复脸。';
+const DEFAULT_IDPHOTO_QUAD_PREFIX = '18至22岁的明确成年年轻女性模特，偏中国审美，韩系清透白开水妆，妆感轻薄自然，真实皮肤纹理和细微不对称，不过度磨皮，不要塑料脸、统一网红脸或明显AI感。一次只生成一张竖版2×2四宫格，四个格子都是独立的正脸头像，光线统一、背景干净，不要文字、编号、边框、水印或重复脸。';
+const idPhotoCropState = { items: [], index: 0, selections: new Map(), mode: '9' };
+let idPhotoUpscaleFiles = [];
+const IDPHOTO_FEATURE_LIBRARY = [
+    { key: 'origin', label: '国籍气质', options: ['中国汉族清秀气质', '江南温婉气质', '川渝明艳气质', '云南少数民族灵秀气质', '新疆少数民族立体气质', '朝鲜族清透气质', '韩国自然女团气质', '日本清新自然气质', '中韩融合的东亚气质', '自然东亚轻混血气质'] },
+    { key: 'face', label: '脸型', options: ['流畅鹅蛋脸', '下颌略尖的精致鹅蛋脸', '韩系柔和鹅蛋脸', '自然瓜子脸', '轻骨感方圆脸', '饱满可爱圆脸', '成熟大气的窄鹅蛋脸'] },
+    { key: 'brow', label: '眉型', options: ['自然平直雾眉', '低弧度野生眉', '柔和柳叶眉', '利落小挑眉', '自然流星眉', '舒展新月眉', '标准弧形眉', '清淡羽感眉'] },
+    { key: 'eye', label: '眼型', options: ['清澈杏眼', '柔和桃花眼', '细长丹凤眼', '灵动小鹿眼', '利落猫系眼', '自然下垂狗狗眼', '内收外展的扇形眼', '平行舒展眼型', '清冷窄长眼'] },
+    { key: 'eyelid', label: '眼皮', options: ['清爽单眼皮', '自然内双', '窄扇形双眼皮', '开扇形双眼皮', '窄平行双眼皮', '自然平行双眼皮'] },
+    { key: 'aegyo', label: '卧蚕', options: ['薄而浅的自然卧蚕', '窄幅细卧蚕', '柔和中等卧蚕', '笑起时明显的饱满卧蚕', '内窄外舒展的卧蚕'] },
+    { key: 'nose', label: '鼻型', options: ['小巧直鼻，鼻头精致', '柔和直鼻，线条圆润', '轻骨感高鼻梁，鼻尖自然', '微翘小鼻，鼻孔收敛', '立体直鼻，鼻翼窄', '略有肉感的自然鼻头', '鼻梁适中、鼻头稍大但比例协调', '山根柔和、鼻尖清晰的自然鼻'] },
+    { key: 'lip', label: '唇型', options: ['自然M形唇', '嘴角微扬的微笑唇', '小巧樱桃唇', '上薄下丰的自然唇', '饱满柔和的花瓣唇', '清秀偏薄唇', '唇峰清晰的标准唇', '圆润短唇'] },
+    { key: 'hairline', label: '额头发际线', options: ['比例适中的圆润额头与自然弧形发际线', '略高额头与干净圆弧发际线', '窄额头与柔和低发际线', '舒展宽额头与自然碎发发际线', '饱满额头与细软绒毛碎发', '自然美人尖与柔和额角'] },
+    { key: 'ear', label: '耳型', options: ['小巧标准椭圆耳', '轮廓清晰的圆耳', '贴面耳与小耳垂', '自然外展耳与饱满耳垂', '修长耳廓与分离耳垂'] },
+];
+const IDPHOTO_DEFAULT_IMPERFECTIONS = ['鼻翼旁一颗很小的淡痣', '额头或脸颊一颗小痘痘，轻微且自然', '一颗自然的小虎牙，笑时若隐若现', '嘴角有一点点不对称，笑容仍然自然', '眼下轻微细纹和真实皮肤纹理', '鼻梁或面颊有少量淡淡雀斑', '脸颊一颗边缘柔和的浅色小痣', '轻微的晒斑或肤色不均，程度很淡'];
+const IDPHOTO_SWAP_TEMPLATE_KEY = 'idphoto_swap_prompt_templates_v1';
+function idPhotoSwapTemplatesLoad() {
+    try {
+        const data = JSON.parse(localStorage.getItem(IDPHOTO_SWAP_TEMPLATE_KEY) || '{}');
+        return {templates: Array.isArray(data.templates) ? data.templates.filter(item => item && item.id && item.text) : [], defaultId: String(data.defaultId || '')};
+    } catch (_) { return {templates: [], defaultId: ''}; }
+}
+function idPhotoSwapTemplatesSave(data) {
+    try { localStorage.setItem(IDPHOTO_SWAP_TEMPLATE_KEY, JSON.stringify(data)); } catch (_) {}
+}
+function idPhotoSwapTemplatesRender(applyDefault = false) {
+    const select = document.getElementById('idphoto-swap-template-select');
+    if (!select) return;
+    const data = idPhotoSwapTemplatesLoad();
+    select.innerHTML = data.templates.length
+        ? data.templates.map(item => `<option value="${ecommerceEscape(item.id)}"${item.id === data.defaultId ? ' selected' : ''}>${ecommerceEscape(item.name || '默认换脸')}</option>`).join('')
+        : '<option value="">暂无模板</option>';
+    if (applyDefault && data.defaultId) {
+        const active = data.templates.find(item => item.id === data.defaultId);
+        const input = document.getElementById('idphoto-swap-instruction');
+        if (active && input) input.value = active.text;
+    }
+}
+function idPhotoBindSwapTemplates() {
+    const select = document.getElementById('idphoto-swap-template-select');
+    const saveButton = document.getElementById('btn-idphoto-save-swap-template');
+    const deleteButton = document.getElementById('btn-idphoto-delete-swap-template');
+    if (!select || !saveButton || !deleteButton || select.dataset.bound === '1') return;
+    select.dataset.bound = '1';
+    idPhotoSwapTemplatesRender(true);
+    select.addEventListener('change', () => {
+        const data = idPhotoSwapTemplatesLoad();
+        const active = data.templates.find(item => item.id === select.value);
+        if (active) document.getElementById('idphoto-swap-instruction').value = active.text;
+    });
+    saveButton.addEventListener('click', () => {
+        const input = document.getElementById('idphoto-swap-instruction');
+        const text = String(input?.value || '').trim();
+        if (!text) return showToast('提示词不能为空', 'error');
+        const data = idPhotoSwapTemplatesLoad();
+        const current = data.templates.find(item => item.id === select.value);
+        const fallbackName = current?.name || '默认换脸';
+        const name = window.prompt('模板名称', fallbackName);
+        if (name === null) return;
+        const id = current?.id || `swap-${Date.now()}`;
+        const item = {id, name: String(name).trim() || fallbackName, text};
+        const index = data.templates.findIndex(entry => entry.id === id);
+        if (index >= 0) data.templates[index] = item; else data.templates.push(item);
+        data.defaultId = id;
+        idPhotoSwapTemplatesSave(data);
+        idPhotoSwapTemplatesRender(false);
+        select.value = id;
+        showToast('换脸提示词已保存为默认模板', 'success');
+    });
+    deleteButton.addEventListener('click', () => {
+        const data = idPhotoSwapTemplatesLoad();
+        const id = select.value;
+        if (!id) return showToast('当前没有可删除的模板', 'info');
+        data.templates = data.templates.filter(item => item.id !== id);
+        if (data.defaultId === id) data.defaultId = data.templates[0]?.id || '';
+        idPhotoSwapTemplatesSave(data);
+        idPhotoSwapTemplatesRender(true);
+        showToast('模板已删除', 'success');
+    });
+}
+let idPhotoImperfectionOptions = [...IDPHOTO_DEFAULT_IMPERFECTIONS];
+function idPhotoLoadImperfections() {
+    try {
+        const saved = JSON.parse(localStorage.getItem('idphoto-imperfection-options') || 'null');
+        if (Array.isArray(saved)) {
+            const options = saved.map(value => String(value || '').trim()).filter(Boolean).slice(0, 50);
+            if (options.length) idPhotoImperfectionOptions = options;
+        }
+    } catch (_) {}
+}
+function idPhotoSaveImperfections() {
+    try { localStorage.setItem('idphoto-imperfection-options', JSON.stringify(idPhotoImperfectionOptions)); } catch (_) {}
+}
+function idPhotoFeatureLibrary() {
+    return [...IDPHOTO_FEATURE_LIBRARY, { key: 'imperfection', label: '自然瑕疵', options: idPhotoImperfectionOptions }];
+}
 
 const state = {
     categories: [],
@@ -508,10 +631,12 @@ function applyUndoModeVisibility(mode) {
     const imageMode = document.getElementById('image-mode');
     const splitModeEl = document.getElementById('split-mode');
     const ecommerceMode = document.getElementById('ecommerce-mode');
+    const idphotoMode = document.getElementById('idphoto-mode');
     if (promptMode) promptMode.style.display = currentMode === 'prompt' ? 'flex' : 'none';
     if (imageMode) imageMode.style.display = currentMode === 'image' ? 'flex' : 'none';
     if (splitModeEl) splitModeEl.style.display = currentMode === 'split' ? 'flex' : 'none';
     if (ecommerceMode) ecommerceMode.style.display = currentMode === 'ecommerce' ? 'block' : 'none';
+    if (idphotoMode) idphotoMode.style.display = currentMode === 'idphoto' ? 'block' : 'none';
 }
 
 function buildUndoPersistPayload(snapshot) {
@@ -927,7 +1052,7 @@ async function loadAllData() {
         if (state.modelConfig.rh_model) {
             const inlineModel = document.getElementById('cfg-rh-model-inline');
             if (inlineModel) {
-                inlineModel.value = state.modelConfig.rh_model;
+                inlineModel.value = normalizeRhModelKey(state.modelConfig.rh_model);
                 updateRhModelParamsInline();
             }
         }
@@ -2943,10 +3068,77 @@ document.getElementById('btn-gallery-open-folder')?.addEventListener('click', as
 });
 
 // ========== 模型配置 ==========
+const API_CONFIG_TARGETS = Object.freeze({
+    'prompt-deepseek': { panel: 'cfg-panel-prompt', hint: '用于整理提示词，不负责图片生成。', provider: 'deepseek' },
+    'prompt-glm': { panel: 'cfg-panel-prompt', hint: '用于整理提示词，不负责图片生成。', provider: 'glm' },
+    runninghub: { panel: 'cfg-panel-runninghub', hint: 'RunningHub 海外标准模型。测试按钮只做权限/价格预检，不创建生图任务。' },
+    oaihk: { panel: 'cfg-panel-oaihk', hint: 'OpenAI-HK 图片兼容接口。测试按钮只检查 /models，不会生成图片。' },
+    pptoken: { panel: 'cfg-panel-pptoken', hint: 'PPT Token 图片兼容接口。分组由 API Key 决定，测试按钮只检查 /models。' },
+    apiyi: { panel: 'cfg-panel-apiyi', hint: 'API易 图片中转接口。测试按钮只检查 /models，不会生成图片。' },
+});
+
+function syncConfigModelSelects() {
+    const rhSource = document.getElementById('cfg-rh-model-inline');
+    const rhTarget = document.getElementById('cfg-rh-model-config');
+    if (rhSource && rhTarget && rhTarget.options.length === 0) rhTarget.innerHTML = rhSource.innerHTML;
+    const hkSource = document.getElementById('cfg-oaihk-model-inline');
+    const hkTarget = document.getElementById('cfg-oaihk-model-config');
+    if (hkSource && hkTarget && hkTarget.options.length === 0) hkTarget.innerHTML = hkSource.innerHTML;
+}
+
+function updateRunningHubKeyStatus(config) {
+    const status = document.getElementById('cfg-rh-key-status');
+    if (!status) return;
+    const key = String(config?.rh_api_key || '').trim();
+    status.textContent = key
+        ? `已保存海外 Key：${key}（输入框中的遮蔽值不会覆盖它）`
+        : '尚未配置 runninghub.ai 海外 Key';
+    status.style.color = key ? 'var(--success)' : 'var(--danger)';
+}
+
+function updateModelConfigTarget(target) {
+    const selected = API_CONFIG_TARGETS[target] || API_CONFIG_TARGETS['prompt-deepseek'];
+    document.querySelectorAll('.api-config-panel').forEach(panel => {
+        panel.hidden = panel.id !== selected.panel;
+    });
+    const hint = document.getElementById('cfg-config-target-hint');
+    if (hint) hint.textContent = selected.hint;
+    const testHint = document.getElementById('cfg-selected-test-hint');
+    if (testHint) testHint.textContent = target === 'runninghub'
+        ? '测试当前配置：RunningHub 官方权限/价格预检，不生图、不创建任务、不扣费。'
+        : target.startsWith('prompt-')
+            ? '测试当前配置：发送一条最小 Prompt 请求，会消耗少量文本额度。'
+            : '测试当前配置：检查图片接口 /models，不会生成图片、不扣图片费用。';
+    if (selected.provider) {
+        const provider = document.getElementById('cfg-provider');
+        if (provider) provider.value = selected.provider;
+    }
+    try { localStorage.setItem('model-config-target', target); } catch (_) {}
+}
+
+function getDefaultModelConfigTarget(config) {
+    let saved = '';
+    try { saved = localStorage.getItem('model-config-target') || ''; } catch (_) {}
+    if (API_CONFIG_TARGETS[saved]) return saved;
+    if (config?.provider === 'glm') return 'prompt-glm';
+    if (config?.provider === 'deepseek') return 'prompt-deepseek';
+    return config?.api_platform && API_CONFIG_TARGETS[config.api_platform] ? config.api_platform : 'prompt-deepseek';
+}
+
+document.getElementById('cfg-config-target')?.addEventListener('change', event => updateModelConfigTarget(event.target.value));
+document.getElementById('cfg-provider')?.addEventListener('change', event => {
+    const target = document.getElementById('cfg-config-target');
+    if (target && (event.target.value === 'deepseek' || event.target.value === 'glm')) {
+        target.value = `prompt-${event.target.value}`;
+        updateModelConfigTarget(target.value);
+    }
+});
+
 $('#btn-model-config').addEventListener('click', async () => {
     try {
         const config = await api('GET', '/api/model-config');
         state.modelConfig = config;
+        syncConfigModelSelects();
         $('#cfg-provider').value = config.provider || 'deepseek';
         $('#cfg-api-key').value = config.api_key || '';
         $('#cfg-base-url').value = config.base_url || '';
@@ -2956,8 +3148,12 @@ $('#btn-model-config').addEventListener('click', async () => {
 
         // RunningHub 配置
         $('#cfg-rh-api-key').value = config.rh_api_key || '';
+        updateRunningHubKeyStatus(config);
         $('#cfg-rh-base-url').value = config.rh_base_url || '';
-        if (config.rh_model) $('#cfg-rh-model').value = config.rh_model;
+        const normalizedRhModel = normalizeRhModelKey(config.rh_model || 'rhart-image-n-g31-flash/image-to-image');
+        if (config.rh_model) $('#cfg-rh-model').value = normalizedRhModel;
+        const rhConfigModel = document.getElementById('cfg-rh-model-config');
+        if (rhConfigModel) rhConfigModel.value = normalizedRhModel || document.getElementById('cfg-rh-model-inline')?.value || rhConfigModel.value;
         if (config.rh_resolution) $('#cfg-rh-resolution').value = config.rh_resolution;
         if (config.rh_aspect_ratio) $('#cfg-rh-aspect-ratio').value = config.rh_aspect_ratio;
         if (config.rh_seed_mode) $('#cfg-rh-seed-mode').value = config.rh_seed_mode;
@@ -2975,10 +3171,34 @@ $('#btn-model-config').addEventListener('click', async () => {
         const gptQualitySelect = document.getElementById('cfg-oaihk-gpt-quality');
         if (gptQualitySelect) gptQualitySelect.value = config.oaihk_gpt_quality || 'medium';
         if (config.oaihk_model) setSelectValue('cfg-oaihk-model-inline', config.oaihk_model);
+        const hkConfigModel = document.getElementById('cfg-oaihk-model-config');
+        if (hkConfigModel) hkConfigModel.value = config.oaihk_model || document.getElementById('cfg-oaihk-model-inline')?.value || hkConfigModel.value;
         if (config.oaihk_aspect_ratio) {
             const hkModel = OAIHK_MODELS[document.getElementById('cfg-oaihk-model-inline')?.value];
             fillAspectRatioSelect(document.getElementById('cfg-oaihk-aspect-ratio-inline'), hkModel?.aspectRatios, config.oaihk_aspect_ratio);
         }
+
+        // PPT Token 配置
+        const pptKeyInput = document.getElementById('cfg-pptoken-api-key');
+        const pptBaseInput = document.getElementById('cfg-pptoken-base-url');
+        const pptDefaultResolution = document.getElementById('cfg-pptoken-default-resolution');
+        if (pptKeyInput) pptKeyInput.value = config.pptoken_api_key || '';
+        if (pptBaseInput) pptBaseInput.value = config.pptoken_base_url || 'https://api.pptoken.cc/v1';
+        if (pptDefaultResolution) pptDefaultResolution.value = config.pptoken_default_resolution || '2k';
+        const pptModel = document.getElementById('cfg-pptoken-model-config');
+        if (pptModel) pptModel.value = normalizePptokenModelKey(config.pptoken_model);
+
+        // API易 配置
+        const apiyiKeyInput = document.getElementById('cfg-apiyi-api-key');
+        const apiyiProxyKeyInput = document.getElementById('cfg-apiyi-proxy-api-key');
+        const apiyiBaseInput = document.getElementById('cfg-apiyi-base-url');
+        const apiyiDefaultResolution = document.getElementById('cfg-apiyi-default-resolution');
+        if (apiyiKeyInput) apiyiKeyInput.value = config.apiyi_api_key || '';
+        if (apiyiProxyKeyInput) apiyiProxyKeyInput.value = config.apiyi_proxy_api_key || '';
+        if (apiyiBaseInput) apiyiBaseInput.value = config.apiyi_base_url || 'https://api.apiyi.com';
+        if (apiyiDefaultResolution) apiyiDefaultResolution.value = config.apiyi_default_resolution || '4k';
+        const apiyiModel = document.getElementById('cfg-apiyi-model-config');
+        if (apiyiModel) apiyiModel.value = normalizeApiyiModelKey(config.apiyi_model);
 
         // 上传压缩设置
         const uploadModeSelect = document.getElementById('cfg-upload-mode');
@@ -2996,6 +3216,11 @@ $('#btn-model-config').addEventListener('click', async () => {
             const platformSelect = document.getElementById('cfg-api-platform');
             if (platformSelect) platformSelect.value = config.api_platform;
         }
+        const configTarget = document.getElementById('cfg-config-target');
+        if (configTarget) {
+            configTarget.value = getDefaultModelConfigTarget(config);
+            updateModelConfigTarget(configTarget.value);
+        }
 
         // 系统提示词
         $('#cfg-system-prompt-prompt').value = config.system_prompt_prompt || '';
@@ -3006,7 +3231,7 @@ $('#btn-model-config').addEventListener('click', async () => {
         // 同步内联模型选择
         if (config.rh_model) {
             const inlineModel = document.getElementById('cfg-rh-model-inline');
-            if (inlineModel) inlineModel.value = config.rh_model;
+            if (inlineModel) inlineModel.value = normalizedRhModel;
             updateRhModelParamsInline();
         }
         openModal('modal-model-config');
@@ -3016,6 +3241,14 @@ $('#btn-model-config').addEventListener('click', async () => {
 });
 
 $('#btn-save-config').addEventListener('click', async () => {
+    const rhConfigModel = normalizeRhModelKey(document.getElementById('cfg-rh-model-config')?.value || document.getElementById('cfg-rh-model-inline')?.value || '');
+    const hkConfigModel = document.getElementById('cfg-oaihk-model-config')?.value || document.getElementById('cfg-oaihk-model-inline')?.value || '';
+    const rhHiddenModel = document.getElementById('cfg-rh-model');
+    if (rhHiddenModel) rhHiddenModel.value = rhConfigModel;
+    const rhInlineModel = document.getElementById('cfg-rh-model-inline');
+    if (rhInlineModel && rhConfigModel) rhInlineModel.value = rhConfigModel;
+    const hkInlineModel = document.getElementById('cfg-oaihk-model-inline');
+    if (hkInlineModel && hkConfigModel) hkInlineModel.value = hkConfigModel;
     const config = {
         provider: $('#cfg-provider').value, api_key: $('#cfg-api-key').value, base_url: $('#cfg-base-url').value, model_name: $('#cfg-model-name').value, timeout_ms: parseInt($('#cfg-timeout').value, 10) || 30000, retry_count: parseInt($('#cfg-retry').value, 10) || 1,
         // 平台选择
@@ -3023,7 +3256,7 @@ $('#btn-save-config').addEventListener('click', async () => {
         // RunningHub
         rh_api_key: $('#cfg-rh-api-key').value,
         rh_base_url: $('#cfg-rh-base-url').value,
-        rh_model: $('#cfg-rh-model').value,
+        rh_model: rhConfigModel,
         rh_resolution: $('#cfg-rh-resolution').value,
         rh_aspect_ratio: $('#cfg-rh-aspect-ratio').value,
         rh_seed_mode: $('#cfg-rh-seed-mode').value,
@@ -3034,9 +3267,20 @@ $('#btn-save-config').addEventListener('click', async () => {
         // OpenAI-HK
         oaihk_api_key: $('#cfg-oaihk-api-key').value,
         oaihk_base_url: $('#cfg-oaihk-base-url').value,
-        oaihk_model: document.getElementById('cfg-oaihk-model-inline')?.value || state.modelConfig.oaihk_model || 'fal-ai/banana/v3.1/flash/2k',
+        oaihk_model: hkConfigModel || state.modelConfig.oaihk_model || 'fal-ai/banana/v3.1/flash/2k',
         oaihk_aspect_ratio: document.getElementById('cfg-oaihk-aspect-ratio-inline')?.value || state.modelConfig.oaihk_aspect_ratio || '3:4',
         oaihk_gpt_quality: document.getElementById('cfg-oaihk-gpt-quality')?.value || state.modelConfig.oaihk_gpt_quality || 'medium',
+        // PPT Token
+        pptoken_api_key: document.getElementById('cfg-pptoken-api-key')?.value || '',
+        pptoken_base_url: document.getElementById('cfg-pptoken-base-url')?.value?.trim() || 'https://api.pptoken.cc/v1',
+        pptoken_default_resolution: document.getElementById('cfg-pptoken-default-resolution')?.value || '2k',
+        pptoken_model: normalizePptokenModelKey(document.getElementById('cfg-pptoken-model-config')?.value || state.modelConfig?.pptoken_model),
+        // API易
+        apiyi_api_key: document.getElementById('cfg-apiyi-api-key')?.value || '',
+        apiyi_proxy_api_key: document.getElementById('cfg-apiyi-proxy-api-key')?.value || '',
+        apiyi_base_url: document.getElementById('cfg-apiyi-base-url')?.value?.trim() || 'https://api.apiyi.com',
+        apiyi_default_resolution: document.getElementById('cfg-apiyi-default-resolution')?.value || '4k',
+        apiyi_model: normalizeApiyiModelKey(document.getElementById('cfg-apiyi-model-config')?.value || state.modelConfig?.apiyi_model),
         // 上传压缩设置
         upload_mode: document.getElementById('cfg-upload-mode')?.value === 'original' ? 'original' : 'adaptive',
         upload_short_edge: parseInt($('#cfg-upload-short-edge')?.value, 10) || 1536,
@@ -3047,9 +3291,16 @@ $('#btn-save-config').addEventListener('click', async () => {
         // 图片命名前缀
         image_prefix: document.getElementById('cfg-image-prefix')?.value?.trim() || ''
     };
+    // 遮蔽值保护：输入框中含 **** 的是占位遮蔽值，保存时不会覆盖真实 Key。
+    // 若用户以为"已替换"而实际未粘贴新 Key，这里明确提醒，避免静默沿用旧 Key。
+    const rhKeyValue = String(config.rh_api_key || '');
+    if (rhKeyValue.includes('****')) {
+        showToast('RunningHub API Key 未更换：输入框内是遮蔽值（含 ****），已保留原 Key。请把新 Key 完整粘贴替换掉遮蔽文本后重新保存。', 'warning', 7000);
+    }
     try {
         await api('PUT', '/api/model-config', config);
         state.modelConfig = config;
+        updateEcommerceImportPlatformUI();
         closeModal('modal-model-config');
         // 同步到内联模型选择
         const inlineModel = document.getElementById('cfg-rh-model-inline');
@@ -3077,14 +3328,47 @@ document.querySelectorAll('#cfg-upload-preset-group .upload-preset-btn').forEach
 
 $('#btn-test-connection').addEventListener('click', async () => {
     const btn = $('#btn-test-connection');
+    const target = document.getElementById('cfg-config-target')?.value || 'prompt-deepseek';
     btn.disabled = true;
     btn.textContent = '测试中...';
     try {
-        const config = { provider: $('#cfg-provider').value, api_key: $('#cfg-api-key').value, base_url: $('#cfg-base-url').value, model_name: $('#cfg-model-name').value, timeout_ms: parseInt($('#cfg-timeout').value, 10) || 30000 };
-        const result = await api('POST', '/api/test-connection', config);
+        let result;
+        if (target.startsWith('prompt-')) {
+            result = await api('POST', '/api/test-connection', {
+                provider: $('#cfg-provider').value,
+                api_key: $('#cfg-api-key').value,
+                base_url: $('#cfg-base-url').value,
+                model_name: $('#cfg-model-name').value,
+                timeout_ms: parseInt($('#cfg-timeout').value, 10) || 30000
+            });
+        } else if (target === 'runninghub') {
+            result = await api('POST', '/api/rh-preflight', {
+                api_key: $('#cfg-rh-api-key').value,
+                base_url: $('#cfg-rh-base-url').value,
+                model_id: document.getElementById('cfg-rh-model-config')?.value || 'rhart-image-g-2-official/image-to-image',
+                resolution: '4k'
+            }, 45000);
+        } else {
+            const apiyiTestModel = document.getElementById('cfg-apiyi-model-config')?.value || 'gemini-3-pro-image';
+            const apiyiTestKey = apiyiModelChannel(apiyiTestModel) === 'proxy'
+                ? ($('#cfg-apiyi-proxy-api-key').value || $('#cfg-apiyi-api-key').value)
+                : $('#cfg-apiyi-api-key').value;
+            result = await api('POST', '/api/test-image-connection', {
+                provider: target,
+                api_key: target === 'apiyi' ? apiyiTestKey
+                    : target === 'pptoken' ? $('#cfg-pptoken-api-key').value : $('#cfg-oaihk-api-key').value,
+                base_url: target === 'apiyi' ? $('#cfg-apiyi-base-url').value
+                    : target === 'pptoken' ? $('#cfg-pptoken-base-url').value : $('#cfg-oaihk-base-url').value,
+                model: target === 'apiyi'
+                    ? (document.getElementById('cfg-apiyi-model-config')?.value || 'gemini-3-pro-image')
+                    : target === 'pptoken'
+                        ? (document.getElementById('cfg-pptoken-model-config')?.value || 'gpt-image-2.5')
+                        : (document.getElementById('cfg-oaihk-model-config')?.value || 'gpt-image-2')
+            }, 45000);
+        }
         showToast(result.success ? result.message : result.message, result.success ? 'success' : 'error');
     } catch (e) { showToast(e.message, 'error'); }
-    finally { btn.disabled = false; btn.textContent = '测试Prompt模型'; }
+    finally { btn.disabled = false; btn.textContent = '测试当前配置'; }
 });
 
 $('#btn-test-rh-preflight')?.addEventListener('click', async () => {
@@ -3233,7 +3517,8 @@ function removeAppLoading() {
 // 超时兜底：10秒后强制移除加载指示器
 setTimeout(removeAppLoading, 10000);
 
-loadAllData().then(() => {
+// 等当前脚本完成解析后再开始首轮加载，避免缓存接口的微任务先于后置常量声明执行。
+setTimeout(() => loadAllData().then(() => {
     setUndoBaseline();
     removeAppLoading();
 }).catch(e => {
@@ -3245,7 +3530,7 @@ loadAllData().then(() => {
     errDiv.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:20px 30px;z-index:99999;text-align:center;max-width:400px;';
     errDiv.innerHTML = `<h3 style="margin:0 0 10px;color:#856404;">加载失败</h3><p style="margin:0 0 10px;color:#666;font-size:13px;">页面初始化出错，请刷新重试</p><button onclick="location.reload()" style="padding:6px 16px;border:1px solid #ccc;border-radius:4px;cursor:pointer;">刷新重试</button>`;
     document.body.appendChild(errDiv);
-});
+}), 0);
 
 // ========== 文生图系统 ==========
 
@@ -6214,35 +6499,39 @@ function switchMode(mode) {
     const imageMode = document.getElementById('image-mode');
     const splitMode = document.getElementById('split-mode');
     const ecommerceMode = document.getElementById('ecommerce-mode');
+    const idphotoMode = document.getElementById('idphoto-mode');
+
+    if (promptMode) promptMode.style.display = mode === 'prompt' ? 'flex' : 'none';
 
     if (mode === 'image') {
-        if (promptMode) promptMode.style.display = 'none';
         if (imageMode) imageMode.style.display = 'flex';
         if (splitMode) splitMode.style.display = 'none';
         if (ecommerceMode) ecommerceMode.style.display = 'none';
+        if (idphotoMode) idphotoMode.style.display = 'none';
         document.body.classList.remove('ecommerce-mode-active');
         if (!imageState.loaded) loadImageModeData();
     } else if (mode === 'split') {
-        if (promptMode) promptMode.style.display = 'none';
         if (imageMode) imageMode.style.display = 'none';
         if (splitMode) splitMode.style.display = 'flex';
         if (ecommerceMode) ecommerceMode.style.display = 'none';
+        if (idphotoMode) idphotoMode.style.display = 'none';
         document.body.classList.remove('ecommerce-mode-active');
         if (!splitModeLoaded) loadSplitModeData();
         else renderSplitLibrary();
     } else if (mode === 'ecommerce') {
-        if (promptMode) promptMode.style.display = 'none';
         if (imageMode) imageMode.style.display = 'none';
         if (splitMode) splitMode.style.display = 'none';
         if (ecommerceMode) ecommerceMode.style.display = 'block';
+        if (idphotoMode) idphotoMode.style.display = 'none';
         document.body.classList.add('ecommerce-mode-active');
         setTimeout(() => loadEcommerceModeData(), 0);
     } else {
-        if (promptMode) promptMode.style.display = 'flex';
         if (imageMode) imageMode.style.display = 'none';
         if (splitMode) splitMode.style.display = 'none';
         if (ecommerceMode) ecommerceMode.style.display = 'none';
+        if (idphotoMode) idphotoMode.style.display = mode === 'idphoto' ? 'block' : 'none';
         document.body.classList.remove('ecommerce-mode-active');
+        if (mode === 'idphoto') initIdPhotoMode();
     }
 
     // 切换后恢复提示词文本
@@ -6266,6 +6555,902 @@ if (currentMode === 'image') {
     switchMode('split');
 } else if (currentMode === 'ecommerce') {
     switchMode('ecommerce');
+} else if (currentMode === 'idphoto') {
+    switchMode('idphoto');
+}
+
+// ---------- 证件照批量生成 ----------
+function idPhotoSetStatus(text, kind = '') {
+    const el = document.getElementById('idphoto-status');
+    if (!el) return;
+    el.textContent = text; el.className = `idphoto-status ${kind ? `is-${kind}` : ''}`;
+}
+function idPhotoGetGridMode() {
+    return document.getElementById('idphoto-grid-mode')?.value === '4' ? '4' : '9';
+}
+function idPhotoGridCount(mode = idPhotoGetGridMode()) {
+    return String(mode) === '4' ? 4 : 9;
+}
+function idPhotoGridSize(mode = idPhotoGetGridMode()) {
+    return String(mode) === '4' ? 2 : 3;
+}
+function idPhotoGridLabel(mode = idPhotoGetGridMode()) {
+    return String(mode) === '4' ? '四宫格' : '九宫格';
+}
+function idPhotoDefaultGridPrefix(mode = idPhotoGetGridMode()) {
+    return String(mode) === '4' ? DEFAULT_IDPHOTO_QUAD_PREFIX : DEFAULT_IDPHOTO_GRID_PREFIX;
+}
+function idPhotoGridStorageKey(mode = idPhotoGetGridMode()) {
+    return IDPHOTO_GRID_PREFIX_KEYS[String(mode) === '4' ? '4' : '9'];
+}
+function idPhotoGetGridPrefix(mode = idPhotoGetGridMode()) {
+    const input = document.getElementById('idphoto-face-instruction');
+    return String(input?.value || '').trim() || idPhotoDefaultGridPrefix(mode);
+}
+function idPhotoLoadGridPrefix(mode = idPhotoGetGridMode()) {
+    const input = document.getElementById('idphoto-face-instruction');
+    if (!input) return idPhotoDefaultGridPrefix(mode);
+    let saved = '';
+    try { saved = localStorage.getItem(idPhotoGridStorageKey(mode)) || ''; } catch (_) {}
+    if (!idPhotoGridPrefixDirty || !input.value.trim()) input.value = saved.trim() || idPhotoDefaultGridPrefix(mode);
+    idPhotoGridPrefixDirty = false;
+    return input.value.trim();
+}
+function idPhotoSaveGridPrefix(showToastMessage = true, mode = idPhotoGetGridMode()) {
+    const input = document.getElementById('idphoto-face-instruction');
+    if (!input) return idPhotoDefaultGridPrefix(mode);
+    const value = String(input.value || '').trim() || idPhotoDefaultGridPrefix(mode);
+    input.value = value;
+    try { localStorage.setItem(idPhotoGridStorageKey(mode), value); } catch (_) {}
+    idPhotoGridPrefixDirty = false;
+    idPhotoRenderGridPromptPreview(idPhotoFeaturePrompt, mode);
+    if (showToastMessage) showToast(`${idPhotoGridLabel(mode)}提示词前缀已保存，下次打开自动应用`, 'success');
+    return value;
+}
+function idPhotoComposeGridInstruction(prefix, featurePrompt, batchIndex = 0, mode = idPhotoGetGridMode()) {
+    const count = idPhotoGridCount(mode);
+    const label = idPhotoGridLabel(mode);
+    const size = idPhotoGridSize(mode);
+    const runLabel = batchIndex ? `这是本批第 ${batchIndex} 张${label}。` : '';
+    const layoutGuard = String(mode) === '4'
+        ? '必须严格是两列两行：第一行 1、2 号，第二行 3、4 号；禁止四张图横向排成一行。'
+        : '必须严格是三列三行，从左到右、从上到下对应 1 至 9 号。';
+    return `${String(prefix || idPhotoDefaultGridPrefix(mode)).trim()}\n\n${runLabel}下面是本张${label}从左到右、从上到下的 1 至 ${count} 号模特独立五官组合；每个编号只对应一个格子，不得串位、合并或重复：\n${featurePrompt}\n严格按 1 至 ${count} 的顺序排成同一张 ${size}×${size} ${label}，只输出这一张图。${layoutGuard}`.trim();
+}
+function idPhotoRenderGridPromptPreview(featurePrompt = idPhotoFeaturePrompt, mode = idPhotoGetGridMode()) {
+    const preview = document.getElementById('idphoto-face-prompt-preview');
+    if (!preview) return;
+    const count = idPhotoGridCount(mode);
+    preview.value = idPhotoComposeGridInstruction(idPhotoGetGridPrefix(mode), featurePrompt || `（点击“生成 ${count} 套组合”后自动填入）`, 0, mode);
+}
+function idPhotoUpdateGridModeUi() {
+    const mode = idPhotoGetGridMode();
+    // 保持旧版调用契约：当前模式前缀仍可通过无参调用取得。
+    const currentPrefix = idPhotoGetGridPrefix();
+    const label = idPhotoGridLabel(mode);
+    const count = idPhotoGridCount(mode);
+    const title = document.querySelector('[data-idphoto-pane="faces"] .idphoto-feature-head strong');
+    const build = document.getElementById('btn-idphoto-build-features');
+    const prefixLabel = document.querySelector('label[for="idphoto-face-instruction"]');
+    const run = document.getElementById('btn-idphoto-run-faces');
+    const help = document.querySelector('[data-idphoto-pane="faces"] .idphoto-grid-prompt-editor small');
+    const cropHint = document.querySelector('.idphoto-tool-card:first-child .idphoto-tool-heading small');
+    if (title) title.textContent = `${label}五官组合`;
+    if (build) build.textContent = `生成 ${count} 套组合`;
+    if (prefixLabel) prefixLabel.textContent = `${label}提示词前缀`;
+    if (run) run.textContent = `生成${label}`;
+    if (help) help.textContent = `运行时会自动在前缀后追加本次随机生成的 1～${count} 号脸型、眉眼、眼皮、卧蚕、鼻型、唇型、发际线和耳型描述。`;
+    if (cropHint) cropHint.textContent = '四宫格/九宫格均按竖版预览，外部图片自动识别';
+    idPhotoRenderGridPromptPreview(idPhotoFeaturePrompt, mode);
+}
+function idPhotoShowTab(name) {
+    document.querySelectorAll('.idphoto-tab').forEach(b => b.classList.toggle('active', b.dataset.idphotoTab === name));
+    document.querySelectorAll('.idphoto-pane').forEach(p => p.classList.toggle('active', p.dataset.idphotoPane === name));
+    if (name === 'faces') {
+        idPhotoLoadGridPrefix(idPhotoGetGridMode());
+        idPhotoUpdateGridModeUi();
+    }
+}
+function idPhotoResetIntake(kind) {
+    idPhotoIntake[kind] = kind === 'source'
+        ? { intakeId: '', records: [], sourceGroups: [], scan: null, directoryMode: false }
+        : { intakeId: '', records: [], faceFiles: [], directoryMode: false };
+}
+function idPhotoClearIntake(kind) {
+    const isSource = kind === 'source';
+    const sharedId = isSource ? 'idphoto-shared-source' : 'idphoto-shared-face';
+    const rootId = isSource ? 'idphoto-source-root' : 'idphoto-face-root';
+    const fileId = isSource ? 'idphoto-shared-source-file' : 'idphoto-shared-face-file';
+    const folderId = isSource ? 'idphoto-shared-source-folder' : 'idphoto-shared-face-folder';
+    const emptyState = isSource ? '单击多选图片 · 双击路径选大文件夹 · 可拖入图片或文件夹' : '单击多选图片 · 双击选文件夹 · 可拖入';
+    idPhotoResetIntake(kind);
+    [sharedId, rootId, fileId, folderId].forEach(id => {
+        const input = document.getElementById(id);
+        if (input) input.value = '';
+    });
+    idPhotoRenderIntakePreview(kind);
+    idPhotoSetUploadState(kind, emptyState);
+    if (isSource) idPhotoRenderScan({group_count: 0, valid_count: 0, skipped_count: 0, ignored_nested_folder_count: 0, ignored_non_image_count: 0, groups: []});
+    showToast(isSource ? '实拍底图已清除' : '模特脸型参考已清除', 'success');
+}
+function idPhotoUpdateGenerationModeUi() {
+    const model = document.getElementById('idphoto-image-model');
+    const mode = document.getElementById('idphoto-swap-generation-mode');
+    const nativeOption = mode?.querySelector('option[value="native-mask"]');
+    if (!model || !mode || !nativeOption) return;
+    const supported = model.selectedOptions?.[0]?.dataset.nativeMask === '1';
+    nativeOption.disabled = !supported;
+    nativeOption.textContent = supported
+        ? '原生 Mask 图生图（当前模型支持）'
+        : '原生 Mask（当前模型不支持，请选 GPT2.5 Flare / Sunburst / GPT2 VIP）';
+    if (!supported && mode.value === 'native-mask') mode.value = 'local-composite';
+}
+function idPhotoSetUploadState(kind, text, state = '') {
+    const status = document.getElementById(`idphoto-${kind}-upload-state`);
+    const zone = document.getElementById(`idphoto-${kind}-dropzone`);
+    if (status) status.textContent = text;
+    if (zone) {
+        zone.classList.toggle('is-uploading', state === 'uploading');
+        zone.classList.toggle('is-ready', state === 'ready');
+        zone.classList.toggle('is-error', state === 'error');
+    }
+}
+function idPhotoLocalPreviewUrl(path) {
+    return `/api/ecommerce/local-image?thumbnail=1&max_edge=240&path=${encodeURIComponent(path || '')}`;
+}
+function idPhotoRenderIntakePreview(kind) {
+    const host = document.getElementById(`idphoto-${kind}-preview`);
+    if (!host) return;
+    if (kind === 'source') {
+        const groups = idPhotoIntake.source.sourceGroups || [];
+        host.innerHTML = groups.map((group, index) => {
+            const images = group.images || [];
+            const first = images[0];
+            return `<figure title="${ecommerceEscape(group.name)}｜${images.length}张"><img src="${idPhotoLocalPreviewUrl(first?.path)}" alt="客户组${index + 1}"><figcaption><b>${index + 1}</b><span>${ecommerceEscape(group.name)}</span><small>${images.length}张</small></figcaption></figure>`;
+        }).join('');
+        host.parentElement?.classList.toggle('has-preview', !!host.parentElement.querySelector('figure'));
+        return;
+    }
+    const faces = idPhotoIntake.face.faceFiles || [];
+    host.innerHTML = faces.map((path, index) => `<figure title="脸型${index + 1}｜${ecommerceEscape(String(path).split('/').pop())}"><img src="${idPhotoLocalPreviewUrl(path)}" alt="脸型${index + 1}"><figcaption><b>${index + 1}</b><span>脸型</span></figcaption></figure>`).join('');
+    host.parentElement?.classList.toggle('has-preview', !!host.parentElement.querySelector('figure'));
+}
+function idPhotoRenderFeatureBuilder() {
+    const host = document.getElementById('idphoto-feature-controls');
+    if (!host) return;
+    const previous = {};
+    host.querySelectorAll('[data-feature-key]').forEach(select => {
+        const key = select.dataset.featureKey;
+        previous[key] = {
+            value: select.value,
+            random: document.querySelector(`[data-feature-random="${key}"]`)?.checked !== false,
+        };
+    });
+    host.innerHTML = idPhotoFeatureLibrary().map(category => `<label class="idphoto-feature-control"><span>${ecommerceEscape(category.label)}</span><select data-feature-key="${category.key}">${category.options.map(option => `<option value="${ecommerceEscape(option)}">${ecommerceEscape(option)}</option>`).join('')}</select><em><input type="checkbox" data-feature-random="${category.key}" checked>随机</em></label>`).join('');
+    idPhotoFeatureLibrary().forEach(category => {
+        const saved = previous[category.key];
+        const select = host.querySelector(`[data-feature-key="${category.key}"]`);
+        const random = host.querySelector(`[data-feature-random="${category.key}"]`);
+        if (saved && select && category.options.includes(saved.value)) select.value = saved.value;
+        if (saved && random) random.checked = saved.random;
+    });
+    idPhotoRenderImperfectionEditor();
+}
+function idPhotoRenderImperfectionEditor() {
+    const host = document.getElementById('idphoto-imperfection-editor');
+    if (!host) return;
+    host.innerHTML = `<div class="idphoto-imperfection-list">${idPhotoImperfectionOptions.map((option, index) => `<div class="idphoto-imperfection-row"><input type="text" value="${ecommerceEscape(option)}" data-imperfection-index="${index}" aria-label="瑕疵选项${index + 1}"><button type="button" class="btn btn-outline btn-compact" data-imperfection-save="${index}">保存</button><button type="button" class="btn btn-outline btn-compact" data-imperfection-delete="${index}" title="删除该瑕疵">删除</button></div>`).join('')}</div><div class="idphoto-imperfection-add"><input type="text" id="idphoto-imperfection-new" placeholder="添加自定义瑕疵，例如轻微泪痣"><button type="button" class="btn btn-outline btn-compact" id="btn-idphoto-add-imperfection">＋ 添加</button></div>`;
+    host.querySelectorAll('[data-imperfection-save]').forEach(button => button.addEventListener('click', () => {
+        const index = Number(button.dataset.imperfectionSave);
+        const input = host.querySelector(`[data-imperfection-index="${index}"]`);
+        const value = String(input?.value || '').trim();
+        if (!value) { showToast('瑕疵内容不能为空', 'error'); return; }
+        idPhotoImperfectionOptions[index] = value;
+        idPhotoSaveImperfections();
+        idPhotoRenderFeatureBuilder();
+        idPhotoBuildFeatures();
+        showToast('瑕疵选项已更新', 'success');
+    }));
+    host.querySelectorAll('[data-imperfection-delete]').forEach(button => button.addEventListener('click', () => {
+        if (idPhotoImperfectionOptions.length <= 1) { showToast('至少保留一个瑕疵选项', 'error'); return; }
+        const index = Number(button.dataset.imperfectionDelete);
+        idPhotoImperfectionOptions.splice(index, 1);
+        idPhotoSaveImperfections();
+        idPhotoRenderFeatureBuilder();
+        idPhotoBuildFeatures();
+        showToast('瑕疵选项已删除', 'success');
+    }));
+    host.querySelector('#btn-idphoto-add-imperfection')?.addEventListener('click', () => {
+        const input = host.querySelector('#idphoto-imperfection-new');
+        const value = String(input?.value || '').trim();
+        if (!value) { showToast('先填写要添加的瑕疵', 'error'); return; }
+        if (idPhotoImperfectionOptions.includes(value)) { showToast('这个瑕疵已经存在', 'info'); return; }
+        idPhotoImperfectionOptions.push(value);
+        idPhotoSaveImperfections();
+        idPhotoRenderFeatureBuilder();
+        idPhotoBuildFeatures();
+        showToast('已添加自定义瑕疵', 'success');
+    });
+}
+function idPhotoBuildFeatures(mode = idPhotoGetGridMode()) {
+    const count = idPhotoGridCount(mode);
+    const selections = idPhotoFeatureLibrary().map(category => {
+        const select = document.querySelector(`[data-feature-key="${category.key}"]`);
+        const random = document.querySelector(`[data-feature-random="${category.key}"]`)?.checked !== false;
+        return { ...category, selected: select?.value || category.options[0], random };
+    });
+    const identityDetails = ['五官间距舒展、轻微真实不对称', '面中比例紧凑、下颌线柔和', '眉眼间距略宽、苹果肌自然', '面部骨骼清晰但不过分骨感', '眼距适中、鼻基底自然', '脸颊有轻微软组织感', '下庭比例略短、少女感自然', '轮廓修长、颧面转折柔和', '五官量感均衡、面部留白自然'];
+    const combinations = [];
+    const signatures = new Set();
+    for (let index = 0; index < count; index++) {
+        let values = [];
+        let signature = '';
+        for (let attempt = 0; attempt < 20; attempt++) {
+            values = selections.map(category => category.random
+                ? category.options[Math.floor(Math.random() * category.options.length)]
+                : category.selected);
+            signature = values.join('|');
+            if (!signatures.has(signature) || selections.every(category => !category.random)) break;
+        }
+        signatures.add(signature);
+        combinations.push([...values, identityDetails[index]]);
+    }
+    idPhotoFeaturePrompt = combinations.map((values, index) => `${index + 1}号模特：${values.join('；')}；发型默认为自然精致、有空气感的丸子头。`).join('\n');
+    const preview = document.getElementById('idphoto-feature-preview');
+    if (preview) preview.innerHTML = combinations.map((values, index) => `<details><summary>${index + 1}号｜${ecommerceEscape(values[1])}｜${ecommerceEscape(values[3])}</summary><p>${ecommerceEscape(values.join('；'))}</p></details>`).join('');
+    idPhotoRenderGridPromptPreview(idPhotoFeaturePrompt, mode);
+    return idPhotoFeaturePrompt;
+}
+async function idPhotoCollectDropRecords(dataTransfer, kind) {
+    const records = [];
+    const entries = Array.from(dataTransfer?.items || [])
+        .filter(item => item.kind === 'file')
+        .map(item => item.webkitGetAsEntry?.())
+        .filter(Boolean);
+    const hasDirectory = entries.some(entry => entry.isDirectory);
+    const maxFileDepth = kind === 'source' ? 2 : (kind === 'upscale' ? 20 : 1);
+    const walk = async (entry, parentPath = '', depth = 0) => {
+        if (!entry || entry.name?.startsWith('.')) return;
+        const relativePath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+        if (entry.isFile) {
+            if (depth > maxFileDepth || !ecommerceIsSupportedImageName(entry.name)) return;
+            const file = await ecommerceEntryFileWithTimeout(entry, 10000);
+            if (file && ecommerceIsSupportedImageFile(file)) records.push({ file, relativePath });
+            return;
+        }
+        if (!entry.isDirectory || depth >= maxFileDepth) return;
+        const children = await ecommerceReadAllDirectoryEntries(entry);
+        children.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN', { numeric: true, sensitivity: 'base' }));
+        for (const child of children) await walk(child, relativePath, depth + 1);
+    };
+    if (entries.length) {
+        for (const entry of entries) await walk(entry, '', 0);
+        if (records.length) return { records: ecommerceNaturalPathSort(records), directoryMode: hasDirectory };
+    }
+    const fallback = Array.from(dataTransfer?.files || []).map(file => ({
+        file,
+        relativePath: file.webkitRelativePath || file.name,
+    })).filter(item => ecommerceIsSupportedImageFile(item.file));
+    return { records: ecommerceNaturalPathSort(fallback), directoryMode: hasDirectory || fallback.some(item => item.relativePath.includes('/')) };
+}
+async function idPhotoLoadFiles(kind, rawRecords, options = {}) {
+    const records = ecommerceNaturalPathSort(Array.from(rawRecords || []).map(item => item?.file ? item : ({
+        file: item,
+        relativePath: item?.webkitRelativePath || item?.name || '',
+    })).filter(item => ecommerceIsSupportedImageFile(item.file)));
+    if (!records.length) {
+        idPhotoSetUploadState(kind, '没有可用的 JPG、PNG 或 WEBP', 'error');
+        showToast('没有找到可用的 JPG、PNG 或 WEBP 图片', 'error');
+        return null;
+    }
+    const directoryMode = !!options.directoryMode || records.some(item => String(item.relativePath || '').includes('/'));
+    idPhotoResetIntake(kind);
+    idPhotoIntake[kind].directoryMode = directoryMode;
+    const staged = [];
+    try {
+        for (let index = 0; index < records.length; index++) {
+            const { file, relativePath } = records[index];
+            idPhotoSetUploadState(kind, `正在导入 ${index + 1}/${records.length}：${relativePath || file.name}`, 'uploading');
+            const form = new FormData();
+            form.append('file', file, file.name);
+            form.append('kind', kind);
+            form.append('relative_path', relativePath || file.name);
+            if (idPhotoIntake[kind].intakeId) form.append('intake_id', idPhotoIntake[kind].intakeId);
+            const response = await fetch('/api/idphoto/intake/upload', { method: 'POST', body: form });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result.record) throw new Error(result.error || `HTTP ${response.status}`);
+            idPhotoIntake[kind].intakeId = result.intake_id;
+            staged.push(result.record);
+        }
+        const finalized = await api('POST', '/api/idphoto/intake/finalize', {
+            kind,
+            records: staged,
+            directory_mode: directoryMode,
+        }, 600000, undefined, true);
+        idPhotoIntake[kind].records = staged;
+        const shared = document.getElementById(kind === 'source' ? 'idphoto-shared-source' : 'idphoto-shared-face');
+        if (kind === 'source') {
+            idPhotoIntake.source.sourceGroups = finalized.source_groups || [];
+            idPhotoIntake.source.scan = finalized.scan || null;
+            if (shared) shared.value = `已导入 ${finalized.scan?.group_count || 0} 组 / ${finalized.scan?.valid_count || 0} 张`;
+            idPhotoRenderScan(finalized.scan || {});
+            idPhotoSetUploadState(kind, `${finalized.scan?.group_count || 0} 个客户组 · ${finalized.scan?.valid_count || 0} 张可处理`, 'ready');
+        } else {
+            idPhotoIntake.face.faceFiles = finalized.face_files || [];
+            if (shared) shared.value = `已导入 ${finalized.count || 0} 张脸型`;
+            idPhotoSetUploadState(kind, `${finalized.count || 0} 张脸型已进入队列`, 'ready');
+        }
+        idPhotoRenderIntakePreview(kind);
+        idPhotoSyncSharedReferences();
+        showToast(kind === 'source' ? '实拍图已按客户组载入' : '模特脸型已载入', 'success');
+        return finalized;
+    } catch (error) {
+        idPhotoResetIntake(kind);
+        idPhotoSetUploadState(kind, error.message || '导入失败', 'error');
+        showToast(error.message || '导入失败', 'error');
+        return null;
+    }
+}
+async function idPhotoStageUtilityFiles(kind, rawRecords) {
+    const records = ecommerceNaturalPathSort(Array.from(rawRecords || []).map(item => item?.file ? item : ({file: item, relativePath: item?.webkitRelativePath || item?.name || ''})).filter(item => ecommerceIsSupportedImageFile(item.file)));
+    if (!records.length) throw new Error('没有找到可用图片');
+    const intakeId = crypto.randomUUID().replaceAll('-', '');
+    const paths = [];
+    for (let index = 0; index < records.length; index++) {
+        const {file, relativePath} = records[index];
+        const form = new FormData(); form.append('file', file, file.name); form.append('kind', kind); form.append('intake_id', intakeId); form.append('relative_path', relativePath || file.name);
+        const response = await fetch('/api/idphoto/intake/upload', {method: 'POST', body: form});
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.record) throw new Error(result.error || `HTTP ${response.status}`);
+        paths.push(result.record.path);
+    }
+    return paths;
+}
+function idPhotoRenderCropReview() {
+    const review = document.getElementById('idphoto-crop-review');
+    const preview = document.getElementById('idphoto-crop-preview');
+    const meta = document.getElementById('idphoto-crop-meta');
+    const state = document.getElementById('idphoto-crop-state');
+    const selector = document.getElementById('idphoto-crop-grid-selector');
+    const item = idPhotoCropState.items[idPhotoCropState.index];
+    if (!review || !preview || !meta || !state || !selector) return;
+    if (!item) { review.hidden = true; state.textContent = '尚未载入'; return; }
+    review.hidden = false;
+    const modeSelect = document.getElementById('idphoto-crop-grid-mode');
+    const mode = idPhotoResolveCropMode(item);
+    idPhotoCropState.mode = mode;
+    if (modeSelect && modeSelect.value !== mode && modeSelect.value !== 'auto') modeSelect.value = mode;
+    const shell = document.querySelector('.idphoto-crop-preview-shell');
+    // 证件照脸型网格统一按竖版预览。模型偶尔返回横向排版时，预览仍保持
+    // 竖版 2×2/3×3 选区，避免界面跟着异常返回图变成横向裁剪框。
+    if (shell) {
+        shell.dataset.gridMode = mode;
+        shell.style.aspectRatio = '3 / 4';
+    }
+    preview.style.objectFit = 'fill';
+    preview.src = idPhotoLocalPreviewUrl(item.path);
+    meta.textContent = `${idPhotoCropState.index + 1} / ${idPhotoCropState.items.length} · ${item.sourceName || String(item.path).split('/').pop()}`;
+    document.getElementById('idphoto-crop-source').value = item.path;
+    const selected = idPhotoCropState.selections.get(item.path) || new Set();
+    const count = idPhotoGridCount(mode);
+    selector.dataset.gridMode = mode;
+    selector.style.gridTemplateColumns = `repeat(${idPhotoGridSize(mode)}, 1fr)`;
+    selector.style.gridTemplateRows = `repeat(${idPhotoGridSize(mode)}, 1fr)`;
+    selector.innerHTML = Array.from({length: count}, (_, index) => {
+        const number = index + 1;
+        return `<button type="button" class="idphoto-crop-cell${selected.has(number) ? ' is-selected' : ''}" data-grid-number="${number}" aria-label="选择第 ${number} 格">${number}</button>`;
+    }).join('');
+    selector.querySelectorAll('[data-grid-number]').forEach(button => button.addEventListener('click', event => {
+        event.stopPropagation();
+        idPhotoToggleCropNumber(Number(button.dataset.gridNumber));
+    }));
+    state.textContent = `${idPhotoCropState.items.length} 张待挑选 · 当前${idPhotoGridLabel(mode)}`;
+}
+function idPhotoInferGridMode(path) {
+    const name = String(path || '').toLowerCase();
+    if (/(四宫格|4宫格|2x2|2×2|4grid|quad[-_ ]?grid)/i.test(name)) return '4';
+    if (/(九宫格|9宫格|3x3|3×3|9grid|nine[-_ ]?grid)/i.test(name)) return '9';
+    return '9';
+}
+function idPhotoResolveCropMode(item) {
+    const selected = document.getElementById('idphoto-crop-grid-mode')?.value || 'auto';
+    if (selected === '4' || selected === '9') return selected;
+    return item?.mode === '4' || item?.mode === '9' ? item.mode : idPhotoInferGridMode(item?.path);
+}
+function idPhotoApplyCropMode(mode, clearSelection = true) {
+    const normalized = mode === '4' ? '4' : mode === '9' ? '9' : 'auto';
+    const select = document.getElementById('idphoto-crop-grid-mode');
+    if (select) select.value = normalized;
+    if (normalized !== 'auto') idPhotoCropState.mode = normalized;
+    if (clearSelection) idPhotoSaveCropSelection();
+    idPhotoRenderCropReview();
+}
+function idPhotoToggleCropNumber(number) {
+    const item = idPhotoCropState.items[idPhotoCropState.index];
+    const mode = idPhotoResolveCropMode(item);
+    if (!item || !Number.isInteger(number) || number < 1 || number > idPhotoGridCount(mode)) return;
+    const selected = new Set(idPhotoCropState.selections.get(item.path) || []);
+    if (selected.has(number)) selected.delete(number); else selected.add(number);
+    idPhotoCropState.selections.set(item.path, selected);
+    document.querySelectorAll('#idphoto-crop-grid-selector [data-grid-number]').forEach(button => {
+        button.classList.toggle('is-selected', selected.has(Number(button.dataset.gridNumber)));
+    });
+    const state = document.getElementById('idphoto-crop-state');
+    if (state) state.textContent = `${idPhotoCropState.items.length} 张待挑选 · 当前已选 ${selected.size} 格`;
+}
+function idPhotoSaveCropSelection() {
+    const item = idPhotoCropState.items[idPhotoCropState.index];
+    if (!item) return;
+    const selected = new Set(Array.from(document.querySelectorAll('#idphoto-crop-grid-selector [data-grid-number].is-selected')).map(button => Number(button.dataset.gridNumber)));
+    idPhotoCropState.selections.set(item.path, selected);
+}
+async function idPhotoLoadCropFiles(rawRecords) {
+    try {
+        const records = ecommerceNaturalPathSort(Array.from(rawRecords || []).map(item => item?.file ? item : ({file: item, relativePath: item?.webkitRelativePath || item?.name || ''})).filter(item => ecommerceIsSupportedImageFile(item.file)));
+        const paths = await idPhotoStageUtilityFiles('crop', records);
+        idPhotoCropState.items = paths.map((path, index) => {
+            const sourceName = records[index]?.relativePath || records[index]?.file?.name || '';
+            return {path, sourceName, mode: idPhotoInferGridMode(sourceName || path)};
+        }); idPhotoCropState.index = 0; idPhotoCropState.selections.clear();
+        idPhotoCropState.mode = idPhotoCropState.items[0]?.mode || '9';
+        const modeSelect = document.getElementById('idphoto-crop-grid-mode');
+        if (modeSelect) modeSelect.value = 'auto';
+        idPhotoRenderCropReview();
+        showToast(`已载入 ${paths.length} 张待裁剪图片（按生成记录/文件名自动识别，未标记时默认为九宫格）`, 'success');
+    } catch (error) { showToast(error.message || '载入九宫格失败', 'error'); }
+}
+async function idPhotoLoadUpscaleFiles(rawRecords) {
+    try {
+        const records = ecommerceNaturalPathSort(Array.from(rawRecords || []).map(item => item?.file ? item : ({file: item, relativePath: item?.webkitRelativePath || item?.name || ''})).filter(item => ecommerceIsSupportedImageFile(item.file)));
+        if (!records.length) throw new Error('没有找到可用图片');
+        idPhotoUpscaleFiles = await idPhotoStageUtilityFiles('upscale', records);
+        const host = document.getElementById('idphoto-upscale-preview');
+        if (host) host.innerHTML = idPhotoUpscaleFiles.map((path, index) => `<figure title="${ecommerceEscape(String(path).split('/').pop())}"><img src="${idPhotoLocalPreviewUrl(path)}" alt="放大${index + 1}"><b>${index + 1}</b></figure>`).join('');
+        const state = document.getElementById('idphoto-upscale-state'); if (state) state.textContent = `${idPhotoUpscaleFiles.length} 张已进入放大队列`;
+        showToast(`已载入 ${idPhotoUpscaleFiles.length} 张待放大图片`, 'success');
+    } catch (error) { showToast(error.message || '载入待放大图片失败', 'error'); }
+}
+function idPhotoSyncSharedReferences() {
+    const source = document.getElementById('idphoto-shared-source')?.value.trim() || '';
+    const sourceRoot = document.getElementById('idphoto-source-root');
+    if (sourceRoot && source && /\.(jpe?g|png|webp)$/i.test(source) && !sourceRoot.value) sourceRoot.value = source.replace(/[/\\][^/\\]+$/, '');
+    if (sourceRoot && source && !/\.(jpe?g|png|webp)$/i.test(source) && !/^已导入/.test(source) && !sourceRoot.value) sourceRoot.value = source;
+}
+function idPhotoBindReferenceInputs() {
+    ['idphoto-shared-source', 'idphoto-shared-face'].forEach(id => document.getElementById(id)?.addEventListener('input', idPhotoSyncSharedReferences));
+    ['source', 'face'].forEach(kind => {
+        const zone = document.getElementById(`idphoto-${kind}-dropzone`);
+        const fileInput = document.getElementById(`idphoto-shared-${kind}-file`);
+        const folderInput = document.getElementById(`idphoto-shared-${kind}-folder`);
+        const clearButton = document.getElementById(`btn-idphoto-clear-${kind}`);
+        let clickTimer = null;
+        [fileInput, folderInput, document.getElementById(`idphoto-shared-${kind}`)].forEach(input => input?.addEventListener('click', event => event.stopPropagation()));
+        clearButton?.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            idPhotoClearIntake(kind);
+        });
+        fileInput?.addEventListener('change', event => {
+            void idPhotoLoadFiles(kind, event.target.files, { directoryMode: false });
+            event.target.value = '';
+        });
+        folderInput?.addEventListener('change', event => {
+            void idPhotoLoadFiles(kind, event.target.files, { directoryMode: true });
+            event.target.value = '';
+        });
+        zone?.addEventListener('click', event => {
+            if (event.target.closest('input')) return;
+            clearTimeout(clickTimer);
+            clickTimer = setTimeout(() => fileInput?.click(), 220);
+        });
+        zone?.addEventListener('dblclick', event => {
+            if (event.target.closest('input')) return;
+            event.preventDefault(); clearTimeout(clickTimer); folderInput?.click();
+        });
+        zone?.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); fileInput?.click(); }
+        });
+        zone?.addEventListener('dragover', event => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; zone.classList.add('is-dragover'); });
+        zone?.addEventListener('dragleave', event => { if (!zone.contains(event.relatedTarget)) zone.classList.remove('is-dragover'); });
+        zone?.addEventListener('drop', async event => {
+            event.preventDefault(); event.stopPropagation(); zone.classList.remove('is-dragover');
+            idPhotoSetUploadState(kind, '正在读取拖入内容…', 'uploading');
+            try {
+                const collected = await idPhotoCollectDropRecords(event.dataTransfer, kind);
+                await idPhotoLoadFiles(kind, collected.records, { directoryMode: collected.directoryMode });
+            } catch (error) {
+                idPhotoSetUploadState(kind, error.message || '读取失败', 'error');
+                showToast(error.message || '读取拖入内容失败', 'error');
+            }
+        });
+    });
+    document.getElementById('btn-idphoto-upscale')?.addEventListener('click', idPhotoPrepareUpscale);
+    const chooseFolder = async (inputId, memoryKey) => {
+        const input = document.getElementById(inputId);
+        try {
+            const result = await api('POST', '/api/select-folder', {
+                initial_dir: input?.value || '/Volumes/外置固态/宣传艺考照',
+                memory_key: memoryKey,
+            }, 120000, null, true);
+            if (result?.path && input) {
+                input.value = result.path;
+                if (inputId === 'idphoto-source-root') {
+                    idPhotoResetIntake('source');
+                    await idPhotoScan();
+                }
+                if (inputId === 'idphoto-face-root') {
+                    const faces = await api('POST', '/api/idphoto/scan-faces', { root: result.path }, 120000, undefined, true);
+                    idPhotoIntake.face.faceFiles = faces.face_files || [];
+                    idPhotoRenderIntakePreview('face');
+                    idPhotoSetUploadState('face', `${faces.count || 0} 张脸型已载入`, faces.count ? 'ready' : 'error');
+                }
+            }
+        } catch (error) {
+            showToast(error.message || '选择文件夹失败', 'error');
+        }
+    };
+    document.getElementById('btn-idphoto-source-folder')?.addEventListener('click', () => chooseFolder('idphoto-source-root', 'idphoto-source-root'));
+    document.getElementById('btn-idphoto-face-folder')?.addEventListener('click', () => chooseFolder('idphoto-face-root', 'idphoto-face-root'));
+    document.getElementById('btn-idphoto-clear-source-root')?.addEventListener('click', event => {
+        event.preventDefault(); event.stopPropagation(); idPhotoClearIntake('source');
+    });
+    document.getElementById('btn-idphoto-clear-face-root')?.addEventListener('click', event => {
+        event.preventDefault(); event.stopPropagation(); idPhotoClearIntake('face');
+    });
+    const pathKinds = {
+        // 顶部实拍底图支持单张/多张点击上传；双击路径输入框选择客户大文件夹。
+        'idphoto-shared-source': 'folder',
+        'idphoto-shared-face': 'image',
+        'idphoto-source-root': 'folder',
+        'idphoto-face-root': 'folder',
+        'idphoto-output-root': 'folder',
+        'idphoto-face-output': 'folder',
+        'idphoto-crop-source': 'image',
+        'idphoto-upscale-input': 'folder',
+    };
+    Object.entries(pathKinds).forEach(([inputId, kind]) => {
+        const input = document.getElementById(inputId);
+        if (!input) return;
+        input.dataset.pathPickerBound = '1';
+        input.title = `${input.title ? `${input.title}；` : ''}双击打开访达选择，自动记住本入口上次位置`;
+        input.addEventListener('dblclick', async event => {
+            event.preventDefault(); event.stopPropagation();
+            try {
+                const selected = await api('POST', '/api/select-path', {
+                    kind,
+                    initial_path: input.value,
+                    memory_key: inputId,
+                }, 130000, undefined, true);
+                if (selected?.path) {
+                    input.value = selected.path;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    if (inputId === 'idphoto-shared-source' && !/\.(jpe?g|png|webp)$/i.test(selected.path)) {
+                        const sourceRoot = document.getElementById('idphoto-source-root');
+                        if (sourceRoot) sourceRoot.value = selected.path;
+                        idPhotoResetIntake('source');
+                        await idPhotoScan();
+                    }
+                }
+            } catch (error) {
+                showToast(error.message || '选择路径失败', 'error');
+            }
+        });
+    });
+}
+
+// 所有可编辑的本地路径输入都支持双击打开访达，并按入口记住上次位置。
+// 只绑定明确的路径字段，避免误伤普通文字输入或其他工作区的拖拽区域。
+function bindRememberedPathInputs() {
+    const pathKinds = {
+        'cfg-rh-download-path': 'folder',
+        'split-cfg-download-path': 'folder',
+        'ecommerce-final-output-path': 'folder',
+        'ecommerce-output-path': 'folder',
+        'ecommerce-rerun-result-path': 'folder',
+        'ecommerce-final-export-path': 'folder',
+    };
+    Object.entries(pathKinds).forEach(([inputId, kind]) => {
+        const input = document.getElementById(inputId);
+        if (!input || input.dataset.pathPickerBound === '1' || input.type === 'hidden') return;
+        input.dataset.pathPickerBound = '1';
+        input.title = `${input.title ? `${input.title}；` : ''}双击打开访达选择，自动记住本入口上次位置`;
+        input.addEventListener('dblclick', async event => {
+            event.preventDefault();
+            event.stopPropagation();
+            try {
+                const selected = await api('POST', '/api/select-path', {
+                    kind,
+                    initial_path: input.value,
+                    memory_key: inputId,
+                }, 130000, undefined, true);
+                if (selected?.path) {
+                    input.value = selected.path;
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            } catch (error) {
+                showToast(error.message || '选择路径失败', 'error');
+            }
+        });
+    });
+}
+function idPhotoRenderScan(data) {
+    const summary = document.getElementById('idphoto-scan-summary');
+    const list = document.getElementById('idphoto-scan-list');
+    if (!summary || !list) return;
+    summary.textContent = `客户组 ${data.group_count} 个｜可处理图片 ${data.valid_count} 张｜跳过 ${data.skipped_count} 张｜忽略二级目录 ${data.ignored_nested_folder_count || 0} 个｜忽略非图片 ${data.ignored_non_image_count || 0} 个`;
+    list.innerHTML = (data.groups || []).map(group => {
+        const skipped = (group.skipped || []).map(x => `<span style="color:#b42318">${ecommerceEscape(x.relative_path)}：${ecommerceEscape(x.reason || '')}</span>`).join('<br>');
+        return `<div class="idphoto-row"><b>${ecommerceEscape(group.name)}</b><span>可处理 ${group.images.length} 张${skipped ? `<br>${skipped}` : ''}</span></div>`;
+    }).join('');
+}
+async function idPhotoScan() {
+    const root = document.getElementById('idphoto-source-root')?.value.trim();
+    if (idPhotoIntake.source.scan && idPhotoIntake.source.sourceGroups.length && (!root || idPhotoIntake.source.scan.root === root)) {
+        idPhotoRenderScan(idPhotoIntake.source.scan);
+        idPhotoSetStatus('已载入上传队列', 'success');
+        return idPhotoIntake.source.scan;
+    }
+    if (!root) { showToast('请填写实拍根目录', 'error'); return null; }
+    idPhotoSetStatus('扫描中…', 'running');
+    try {
+        const data = await api('POST', '/api/idphoto/scan', {root}, 120000, undefined, true);
+        idPhotoIntake.source.sourceGroups = data.groups || [];
+        idPhotoIntake.source.scan = data;
+        idPhotoRenderIntakePreview('source');
+        idPhotoRenderScan(data); idPhotoSetStatus('扫描完成', 'success'); return data;
+    }
+    catch (err) { idPhotoSetStatus(err.message || '扫描失败', 'error'); showToast(err.message || '扫描失败', 'error'); return null; }
+}
+async function idPhotoRunSwap() {
+    const scan = await idPhotoScan();
+    const sourceRoot = document.getElementById('idphoto-source-root')?.value.trim() || '';
+    const faceRoot = document.getElementById('idphoto-face-root')?.value.trim();
+    const sourceGroups = idPhotoIntake.source.sourceGroups || [];
+    const faceFiles = idPhotoIntake.face.faceFiles || [];
+    const generationMode = document.getElementById('idphoto-swap-generation-mode')?.value || 'local-composite';
+    const selectedModel = document.getElementById('idphoto-image-model')?.selectedOptions?.[0];
+    if (generationMode === 'native-mask' && selectedModel?.dataset.nativeMask !== '1') {
+        showToast('当前模型不支持原生 Mask，请先选择 GPT2.5 Flare、Sunburst 或 GPT2 VIP', 'error');
+        return;
+    }
+    if (!scan) return;
+    const usableGroups = (scan.groups || []).filter(group => (group.images || []).length).length;
+    const repeatFaces = !!document.getElementById('idphoto-repeat-faces')?.checked;
+    if (faceFiles.length && faceFiles.length < usableGroups && !repeatFaces) {
+        showToast(`当前有 ${usableGroups} 个客户组，但只有 ${faceFiles.length} 张脸型，还需要 ${usableGroups - faceFiles.length} 张`, 'error');
+        return;
+    }
+    idPhotoSetStatus('批量换脸中…', 'running');
+    try {
+        const result = await api('POST', '/api/idphoto/run-batch', {
+            // 原生选择的大文件夹可以直接让后端读取原位置，这样默认输出也能放在原目录旁；
+            // 浏览器拖入/多选图片没有绝对路径时，继续使用已暂存的分组队列。
+            root: sourceRoot || (sourceGroups.length ? '' : scan.root),
+            source_groups: sourceRoot ? undefined : (sourceGroups.length ? sourceGroups : undefined),
+            face_root: faceFiles.length ? '' : faceRoot,
+            face_files: faceFiles.length ? faceFiles : undefined,
+            repeat_faces: repeatFaces,
+            output_root: document.getElementById('idphoto-output-root')?.value.trim(),
+            model: document.getElementById('idphoto-image-model')?.value,
+            generation_mode: generationMode,
+            auto_composite: !!document.getElementById('idphoto-auto-composite')?.checked,
+            expand: Number(document.getElementById('idphoto-face-expand')?.value || 1.15),
+            instruction: document.getElementById('idphoto-swap-instruction')?.value || '',
+        }, 120000, undefined, true);
+        idPhotoActiveJob = result.job_id || '';
+        if (idPhotoActiveJob) idPhotoPollJob();
+    } catch (err) { idPhotoSetStatus(err.message || '批量失败', 'error'); showToast(err.message || '批量失败', 'error'); }
+}
+async function idPhotoPollJob() {
+    if (!idPhotoActiveJob) return;
+    try {
+        const job = await api('GET', `/api/idphoto/batch-status/${encodeURIComponent(idPhotoActiveJob)}`, 30000, undefined, true);
+        const total = Number(job.total || 0); const done = Number(job.done || 0);
+        const summary = document.getElementById('idphoto-scan-summary');
+        if (summary) summary.textContent = `批量任务 ${done}/${total}｜成功 ${job.succeeded || 0}｜复用已有 ${job.reused || 0}｜失败 ${job.failed || 0}`;
+        idPhotoJobPaused = job.status === 'paused';
+        const stopButton = document.getElementById('btn-idphoto-stop');
+        if (stopButton) stopButton.textContent = idPhotoJobPaused ? '继续' : '暂停';
+        if (job.status === 'completed' || job.status === 'completed_with_errors' || job.status === 'cancelled') {
+            idPhotoSetStatus(job.status === 'completed' ? '批量换脸完成' : job.status === 'cancelled' ? '批量任务已取消' : '完成但有失败项', job.status === 'completed' ? 'success' : 'error');
+            idPhotoActiveJob = ''; return;
+        }
+        idPhotoSetStatus(job.status === 'paused' ? '批量任务已暂停' : `批量换脸中 ${done}/${total}`, job.status === 'paused' ? '' : 'running');
+        idPhotoPollTimer = setTimeout(idPhotoPollJob, 1800);
+    } catch (err) {
+        idPhotoSetStatus(err.message || '任务状态读取失败', 'error');
+        idPhotoPollTimer = setTimeout(idPhotoPollJob, 4000);
+    }
+}
+async function idPhotoStop() {
+    if (!idPhotoActiveJob) { showToast('当前没有运行中的批量任务', 'error'); return; }
+    try {
+        const job = await api('POST', `/api/idphoto/batch-control/${encodeURIComponent(idPhotoActiveJob)}`, {action: idPhotoJobPaused ? 'resume' : 'pause'}, 30000, undefined, true);
+        idPhotoJobPaused = job.status === 'paused';
+        const stopButton = document.getElementById('btn-idphoto-stop');
+        if (stopButton) stopButton.textContent = idPhotoJobPaused ? '继续' : '暂停';
+        idPhotoSetStatus(idPhotoJobPaused ? `已暂停，已完成 ${job.done || 0}/${job.total || 0}` : '已继续执行', idPhotoJobPaused ? '' : 'running');
+        if (!idPhotoJobPaused) idPhotoPollJob();
+    } catch (err) { showToast(err.message || '暂停失败', 'error'); }
+}
+async function idPhotoRunGrid() {
+    const mode = idPhotoGetGridMode();
+    const label = idPhotoGridLabel(mode);
+    if (idPhotoGridRunning) { showToast(`${label}正在生成，请等待当前任务完成`, 'info'); return; }
+    idPhotoGridRunning = true;
+    const runButton = document.getElementById('btn-idphoto-run-faces');
+    const progress = document.getElementById('idphoto-grid-progress');
+    const progressBar = document.getElementById('idphoto-grid-progress-bar');
+    const progressText = document.getElementById('idphoto-grid-progress-text');
+    const setProgress = (done, total, text, kind = 'running') => {
+        if (progress) progress.className = `idphoto-grid-progress is-${kind}`;
+        if (progressBar) progressBar.style.width = `${total ? Math.round(done / total * 100) : 0}%`;
+        if (progressText) progressText.textContent = text;
+    };
+    if (runButton) { runButton.disabled = true; runButton.dataset.originalText = runButton.textContent; runButton.textContent = '生成中…'; }
+    try {
+        const prefix = idPhotoGetGridPrefix(mode);
+        const count = Math.max(1, Math.min(1000, Number(document.getElementById('idphoto-face-count')?.value || 1)));
+        const ratio = document.getElementById('idphoto-face-ratio')?.value || '3:4';
+        const outputRoot = document.getElementById('idphoto-face-output')?.value.trim() || '';
+        const box = document.getElementById('idphoto-face-results');
+        const outputs = [];
+        if (box) box.innerHTML = '';
+        setProgress(0, count, `准备生成 0/${count}`);
+        idPhotoSetStatus(`${label}生成中 0/${count}`, 'running');
+        for (let index = 0; index < count; index++) {
+            const featurePrompt = idPhotoBuildFeatures(mode);
+            const instruction = idPhotoComposeGridInstruction(prefix, featurePrompt, index + 1, mode);
+            setProgress(index, count, `正在生成第 ${index + 1}/${count} 张…`);
+            idPhotoSetStatus(`${label}生成中 ${index + 1}/${count}`, 'running');
+            const result = await api('POST', '/api/idphoto/run-grid', {instruction, grid_mode: mode, output_root: outputRoot, index: index + 1, model: document.getElementById('idphoto-image-model')?.value, aspect_ratio: ratio}, 600000, undefined, true);
+            outputs.push(result.output);
+            idPhotoRenderGridResults(outputs, mode);
+            setProgress(index + 1, count, `已完成 ${index + 1}/${count}`);
+            idPhotoSetStatus(`${label} ${index + 1}/${count} 完成`, 'running');
+        }
+        idPhotoCropState.items = outputs.map(path => ({path, mode})); idPhotoCropState.mode = mode; idPhotoCropState.index = 0; idPhotoCropState.selections.clear();
+        const cropMode = document.getElementById('idphoto-crop-grid-mode'); if (cropMode) cropMode.value = 'auto';
+        idPhotoRenderCropReview();
+        setProgress(count, count, `全部完成 ${count}/${count}`, 'success');
+        idPhotoSetStatus(`${label}完成，共 ${outputs.length} 张`, 'success');
+    } catch (err) {
+        setProgress(0, 1, `生成失败：${err.message || '未知错误'}`, 'error');
+        idPhotoSetStatus(err.message || '九宫格失败', 'error'); showToast(err.message || '九宫格失败', 'error');
+    } finally {
+        idPhotoGridRunning = false;
+        if (runButton) { runButton.disabled = false; runButton.textContent = runButton.dataset.originalText || `生成${label}`; }
+    }
+}
+function idPhotoRenderGridResults(outputs, mode = idPhotoGetGridMode()) {
+    const box = document.getElementById('idphoto-face-results');
+    if (!box) return;
+    const label = idPhotoGridLabel(mode);
+    box.innerHTML = outputs.map((path, index) => `<button type="button" class="idphoto-result-card" data-idphoto-result-index="${index}" aria-label="查看第 ${index + 1} 张${label}"><img src="/api/ecommerce/local-image?thumbnail=1&max_edge=480&path=${encodeURIComponent(path)}" alt="脸型${label}${index + 1}"><span>第 ${index + 1} 张${label}</span></button>`).join('');
+    const images = outputs.map((path, index) => ({
+        url: `/api/ecommerce/local-image?path=${encodeURIComponent(path)}`,
+        filename: `脸型九宫格_${String(index + 1).padStart(3, '0')}.jpg`,
+    }));
+    box.querySelectorAll('[data-idphoto-result-index]').forEach(card => card.addEventListener('click', () => {
+        openImageViewer(images, Number(card.dataset.idphotoResultIndex) || 0, {mode: 'idphoto'});
+    }));
+}
+async function idPhotoCropGrid() {
+    try {
+        idPhotoSaveCropSelection();
+        const items = idPhotoCropState.items.map(item => ({source: item.path, grid_mode: idPhotoResolveCropMode(item), numbers: Array.from(idPhotoCropState.selections.get(item.path) || [])})).filter(item => item.numbers.length);
+        if (!items.length) throw new Error('请先在每张九宫格上点选至少一个编号');
+        const result = await api('POST', '/api/idphoto/crop-grid', {items, grid_mode: idPhotoResolveCropMode(idPhotoCropState.items[idPhotoCropState.index]), output_root: document.getElementById('idphoto-face-output')?.value.trim()}, 120000, undefined, true);
+        const box = document.getElementById('idphoto-face-results');
+        if (box) box.innerHTML += result.images.map(path => `<img src="/api/ecommerce/local-image?path=${encodeURIComponent(path)}" alt="裁剪脸型">`).join('');
+        showToast(`已裁剪 ${result.images.length} 张脸型`, 'success');
+    } catch (err) { showToast(err.message || '裁剪失败', 'error'); }
+}
+async function idPhotoPrepareUpscale() {
+    const inputRoot = document.getElementById('idphoto-upscale-input')?.value.trim();
+    if (!inputRoot && !idPhotoUpscaleFiles.length) { showToast('请先选择待放大的图片、图片组或文件夹', 'error'); return; }
+    const summary = document.getElementById('idphoto-upscale-summary');
+    if (summary) summary.textContent = '正在扫描并创建 ZIP 分包…';
+    try {
+        const result = await api('POST', '/api/idphoto/prepare-upscale', {
+            input_root: inputRoot,
+            input_files: idPhotoUpscaleFiles,
+            packages: Number(document.getElementById('idphoto-upscale-packages')?.value || 6),
+            concurrency: Number(document.getElementById('idphoto-upscale-concurrency')?.value || 6),
+            resolution: document.getElementById('idphoto-upscale-resolution')?.value || '2k',
+        }, 600000, undefined, true);
+        if (summary) summary.textContent = `已准备 ${result.image_count} 张 / ${result.package_count} 个 ZIP｜计划并发 ${result.planned_concurrency}｜返回目录 ${result.return_root}`;
+        showToast(`SeedVR 分包完成：${result.package_count} 个 ZIP`, 'success');
+    } catch (error) {
+        if (summary) summary.textContent = error.message || '创建 ZIP 分包失败';
+        showToast(error.message || '创建 ZIP 分包失败', 'error');
+    }
+}
+async function idPhotoLoadRunningHubLimit() {
+    const summary = document.getElementById('idphoto-upscale-summary');
+    try {
+        if (summary) summary.textContent = '正在读取 RunningHub 当前账号队列…';
+        const result = await api('GET', '/api/idphoto/runninghub-queue', undefined, 30000, undefined, true);
+        const concurrency = document.getElementById('idphoto-upscale-concurrency');
+        if (concurrency && result.concurrent_limit > 0) concurrency.value = String(result.concurrent_limit);
+        if (summary) summary.textContent = `${result.api_key_type}｜并发上限 ${result.concurrent_limit}｜运行 ${result.running_count}｜排队 ${result.queued_count}`;
+    } catch (error) {
+        if (summary) summary.textContent = error.message || 'RunningHub 队列读取失败';
+        showToast(error.message || 'RunningHub 队列读取失败', 'error');
+    }
+}
+async function idPhotoRunTest() {
+    const root = document.getElementById('idphoto-source-root')?.value.trim();
+    if (!root) { showToast('先填写实拍根目录', 'error'); return; }
+    const scan = await idPhotoScan(); if (!scan) return;
+    const first = scan.groups.flatMap(g => g.images || [])[0];
+    if (!first) { showToast('没有找到可测试的单人正脸', 'error'); return; }
+    document.getElementById('idphoto-test-report').textContent = JSON.stringify({scan, selected: first, note: '普通自动测试完成；真实 API易测试需要配置脸型目录后点击批量换脸'}, null, 2);
+}
+function initIdPhotoMode() {
+    if (idPhotoInitialized) return; idPhotoInitialized = true;
+    idPhotoBindReferenceInputs();
+    idPhotoBindSwapTemplates();
+    idPhotoLoadGridPrefix(idPhotoGetGridMode());
+    idPhotoLoadImperfections();
+    idPhotoRenderFeatureBuilder();
+    idPhotoBuildFeatures(idPhotoGetGridMode());
+    idPhotoUpdateGridModeUi();
+    idPhotoUpdateGenerationModeUi();
+    const gridModeSelect = document.getElementById('idphoto-grid-mode');
+    if (gridModeSelect) gridModeSelect.dataset.previousMode = gridModeSelect.value || '9';
+    document.querySelectorAll('.idphoto-tab').forEach(b => b.addEventListener('click', () => idPhotoShowTab(b.dataset.idphotoTab)));
+    document.getElementById('btn-idphoto-scan')?.addEventListener('click', idPhotoScan);
+    document.getElementById('btn-idphoto-run-swap')?.addEventListener('click', idPhotoRunSwap);
+    document.getElementById('idphoto-image-model')?.addEventListener('change', idPhotoUpdateGenerationModeUi);
+    document.getElementById('btn-idphoto-stop')?.addEventListener('click', idPhotoStop);
+    document.getElementById('btn-idphoto-run-faces')?.addEventListener('click', idPhotoRunGrid);
+    document.getElementById('btn-idphoto-save-grid-prefix')?.addEventListener('click', () => idPhotoSaveGridPrefix(true));
+    document.getElementById('idphoto-grid-mode')?.addEventListener('change', event => {
+        const previousMode = event.target.dataset.previousMode || '9';
+        if (idPhotoGridPrefixDirty) idPhotoSaveGridPrefix(false, previousMode);
+        event.target.dataset.previousMode = event.target.value;
+        idPhotoLoadGridPrefix(event.target.value);
+        idPhotoBuildFeatures(event.target.value);
+        idPhotoUpdateGridModeUi();
+    });
+    document.getElementById('idphoto-face-instruction')?.addEventListener('input', () => {
+        idPhotoGridPrefixDirty = true;
+        idPhotoRenderGridPromptPreview();
+    });
+    document.getElementById('btn-idphoto-build-features')?.addEventListener('click', () => { const mode = idPhotoGetGridMode(); idPhotoBuildFeatures(mode); showToast(`已生成 ${idPhotoGridCount(mode)} 套不同五官组合`, 'success'); });
+    document.getElementById('btn-idphoto-crop-faces')?.addEventListener('click', idPhotoCropGrid);
+    document.getElementById('btn-idphoto-crop-open-viewer')?.addEventListener('click', () => {
+        const item = idPhotoCropState.items[idPhotoCropState.index];
+        if (!item) return;
+        openImageViewer([{url: `/api/ecommerce/local-image?path=${encodeURIComponent(item.path)}`, filename: String(item.path).split('/').pop() || '九宫格.jpg'}], 0, {mode: 'idphoto'});
+    });
+    document.getElementById('btn-idphoto-crop-prev')?.addEventListener('click', () => { idPhotoSaveCropSelection(); idPhotoCropState.index = Math.max(0, idPhotoCropState.index - 1); idPhotoRenderCropReview(); });
+    document.getElementById('btn-idphoto-crop-next')?.addEventListener('click', () => { idPhotoSaveCropSelection(); idPhotoCropState.index = Math.min(idPhotoCropState.items.length - 1, idPhotoCropState.index + 1); idPhotoRenderCropReview(); });
+    document.getElementById('idphoto-crop-grid-mode')?.addEventListener('change', event => {
+        idPhotoApplyCropMode(event.target.value, true);
+    });
+    const cropZone = document.getElementById('idphoto-crop-dropzone');
+    const cropFiles = document.getElementById('idphoto-crop-files');
+    cropZone?.addEventListener('click', event => { if (!event.target.closest('input')) cropFiles?.click(); });
+    cropFiles?.addEventListener('change', event => { void idPhotoLoadCropFiles(event.target.files); event.target.value = ''; });
+    cropZone?.addEventListener('dragover', event => { event.preventDefault(); cropZone.classList.add('is-dragover'); });
+    cropZone?.addEventListener('dragleave', () => cropZone.classList.remove('is-dragover'));
+    cropZone?.addEventListener('drop', async event => { event.preventDefault(); cropZone.classList.remove('is-dragover'); const collected = await idPhotoCollectDropRecords(event.dataTransfer, 'crop'); await idPhotoLoadCropFiles(collected.records); });
+    const upscaleZone = document.getElementById('idphoto-upscale-dropzone');
+    const upscaleFiles = document.getElementById('idphoto-upscale-files');
+    const upscaleFolder = document.getElementById('idphoto-upscale-folder');
+    let upscaleClickTimer = null;
+    upscaleZone?.addEventListener('click', event => { if (event.target.closest('input')) return; clearTimeout(upscaleClickTimer); upscaleClickTimer = setTimeout(() => upscaleFiles?.click(), 220); });
+    upscaleZone?.addEventListener('dblclick', event => { if (event.target.closest('input')) return; event.preventDefault(); clearTimeout(upscaleClickTimer); upscaleFolder?.click(); });
+    upscaleFiles?.addEventListener('change', event => { void idPhotoLoadUpscaleFiles(event.target.files); event.target.value = ''; });
+    upscaleFolder?.addEventListener('change', event => { void idPhotoLoadUpscaleFiles(event.target.files); event.target.value = ''; });
+    upscaleZone?.addEventListener('dragover', event => { event.preventDefault(); upscaleZone.classList.add('is-dragover'); });
+    upscaleZone?.addEventListener('dragleave', () => upscaleZone.classList.remove('is-dragover'));
+    upscaleZone?.addEventListener('drop', async event => { event.preventDefault(); upscaleZone.classList.remove('is-dragover'); const collected = await idPhotoCollectDropRecords(event.dataTransfer, 'upscale'); await idPhotoLoadUpscaleFiles(collected.records); });
+    document.getElementById('btn-idphoto-runninghub-limit')?.addEventListener('click', idPhotoLoadRunningHubLimit);
+    document.getElementById('btn-idphoto-run-test')?.addEventListener('click', idPhotoRunTest);
 }
 
 // ---------- 数据加载 ----------
@@ -7370,7 +8555,6 @@ function renderImageSlots() {
 
 // 实时拼接本地Prompt（无AI）
 // 记录上次拼接的内容，用于增量更新
-let lastAutoPrompt = '';
 
 function safeJsonParse(raw, fallback) {
     try {
@@ -7705,9 +8889,6 @@ document.getElementById('slot-zoom-slider')?.addEventListener('input', () => {
 
 // 批量修改前缀模板按钮
 // 自定义前缀模板列表（持久化到服务端）
-const DEFAULT_PREFIX_TEMPLATES = ['请参考', '请模仿', '请替换', '请融合'];
-let prefixTemplates = [...DEFAULT_PREFIX_TEMPLATES];
-let activePrefix = prefixTemplates[0] || '请参考';
 
 // 从服务端加载前缀模板
 async function loadPrefixTemplates() {
@@ -8477,9 +9658,6 @@ document.getElementById('btn-img-copy-cn').addEventListener('click', () => {
 // ========== 前缀/后缀模板系统（服务器持久化 + 按钮直接操作提示词） ==========
 // 数据结构：{ prefixes: [{id, name, text}], suffixes: [{id, name, text}] }
 // 按钮点击 → 前缀插入提示词最前方，后缀插入提示词最后方；再点击取消移除
-let promptTemplates = { prefixes: [], suffixes: [] };
-let selectedPrefixIds = new Set();
-let selectedSuffixIds = new Set();
 
 // 显示顺序：localStorage存储勾选的ID列表（按勾选顺序），默认前10个
 function getDisplayedTemplateIds(type) {
@@ -8909,10 +10087,7 @@ document.getElementById('btn-prompt-template-add')?.addEventListener('click', ()
 });
 
 // ========== 提示词预设系统 ==========
-let promptPresets = [];
 let promptPresetGroups = [];
-let activePromptPresetIds = new Set();
-let prevPromptCn = '';
 let editingPromptPresetId = null;
 const PROMPT_PRESET_ALL_GROUP = '__all';
 
@@ -10510,88 +11685,67 @@ const RH_MODELS = {
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: true
     },
+    // Nano Banana（Gemini）在 RunningHub 平台上只保留经济版两个模型：Nano Banana 2 与 Nano Banana Pro。
     'rhart-image-n-g31-flash/image-to-image': {
-        name: 'V2(Gemini Flash)-图生图-低价渠道版', shortName: 'V2低价', price: '¥0.19/张', type: 'image-to-image',
-        priceByResolution: { '1k': '¥0.19/张', '2k': '¥0.19/张', '4k': '¥0.30/张' },
+        name: 'Nano Banana 2｜经济版', shortName: 'Nano Banana 2', price: '$0.027 ≈ ¥0.19/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-g31-flash/image-to-image', resolutionOptions: ['1k', '2k', '4k'],
         channel: 'low-cost', resolutionGuaranteed: false,
         maxImages: 10, maxImageMB: 30, hasResolution: true,
-        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
-        aspectRatioRequired: false
-    },
-    'rhart-image-n-g31-flash/image-to-image-2k': {
-        name: 'Nano Banana 2｜2K｜低价渠道', shortName: 'NB2低价-2K', price: '¥0.19/张', type: 'image-to-image',
-        endpoint: 'rhart-image-n-g31-flash/image-to-image', fixedResolution: '2k',
-        channel: 'low-cost', resolutionGuaranteed: false,
-        maxImages: 10, maxImageMB: 30, hasResolution: true,
-        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
-        aspectRatioRequired: false
-    },
-    'rhart-image-n-g31-flash/image-to-image-4k': {
-        name: 'Nano Banana 2｜4K｜低价渠道（已实测真4K）', shortName: 'NB2低价-4K', price: '¥0.30/张', type: 'image-to-image',
-        endpoint: 'rhart-image-n-g31-flash/image-to-image', fixedResolution: '4k',
-        channel: 'low-cost', resolutionGuaranteed: false,
-        maxImages: 10, maxImageMB: 30, hasResolution: true,
-        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
-        aspectRatioRequired: false
-    },
-    'rhart-image-n-g31-flash-official/image-to-image': {
-        name: 'V2(Gemini Flash)-图生图-官方稳定版', shortName: 'V2官方', price: '¥0.74～0.99/张', type: 'image-to-image',
-        channel: 'official', resolutionGuaranteed: true, quality: 'high',
-        maxImages: 14, maxImageMB: 10, hasResolution: true,
-        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
-        aspectRatioRequired: false
-    },
-    'rhart-image-n-g31-flash-official/image-to-image-2k': {
-        name: 'Nano Banana 2｜2K｜官方稳定版', shortName: 'NB2官方-2K', price: '¥0.74/张', type: 'image-to-image',
-        endpoint: 'rhart-image-n-g31-flash-official/image-to-image', fixedResolution: '2k',
-        channel: 'official', resolutionGuaranteed: true, quality: 'high',
-        maxImages: 14, maxImageMB: 10, hasResolution: true,
-        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
-        aspectRatioRequired: false
-    },
-    'rhart-image-n-g31-flash-official/image-to-image-4k': {
-        name: 'Nano Banana 2｜4K｜官方稳定版', shortName: 'NB2官方-4K', price: '¥0.99/张', type: 'image-to-image',
-        endpoint: 'rhart-image-n-g31-flash-official/image-to-image', fixedResolution: '4k',
-        channel: 'official', resolutionGuaranteed: true, quality: 'high',
-        maxImages: 14, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9','1:4','4:1','1:8','8:1'],
         aspectRatioRequired: false
     },
     'rhart-image-n-pro/edit': {
-        name: 'PRO(Gemini Pro)-图生图-低价渠道版', shortName: 'PRO低价', price: '¥0.40/张', type: 'image-to-image',
-        priceByResolution: { '1k': '¥0.40/张', '2k': '¥0.40/张', '4k': '¥0.50/张' },
+        name: 'Nano Banana Pro｜经济版', shortName: 'Nano Banana Pro', price: '$0.06 ≈ ¥0.43/张', type: 'image-to-image',
+        endpoint: 'rhart-image-n-pro/edit', resolutionOptions: ['1k', '2k', '4k'],
         channel: 'low-cost', resolutionGuaranteed: false,
         maxImages: 10, maxImageMB: 10, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
     },
-    'rhart-image-n-pro/edit-2k': {
-        name: 'Nano Banana Pro｜2K｜低价渠道', shortName: 'NBPro低价-2K', price: '¥0.40/张', type: 'image-to-image',
-        endpoint: 'rhart-image-n-pro/edit', fixedResolution: '2k',
+    'rhart-image-g-2/image-to-image': {
+        name: 'ChatGPT Image 2｜经济版', shortName: 'GPT Image 2', price: '$0.015 ≈ ¥0.11/张｜多数返1K', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2/image-to-image', resolutionOptions: ['1k', '2k', '4k'],
         channel: 'low-cost', resolutionGuaranteed: false,
-        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        maxImages: 10, maxImageMB: 30, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
     },
-    'rhart-image-n-pro/edit-4k': {
-        name: 'Nano Banana Pro｜4K｜低价渠道', shortName: 'NBPro低价-4K', price: '¥0.50/张', type: 'image-to-image',
-        endpoint: 'rhart-image-n-pro/edit', fixedResolution: '4k',
+    'rhart-image-g-2.5-official-token/flare/edit': {
+        name: 'ChatGPT 稳定版 Flare', shortName: 'GPT2.5稳定Flare', price: '¥1.00/张', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2.5-official-token/flare/edit', resolutionOptions: ['1k', '2k', '4k'],
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
+        enterpriseOnly: true, // 仅企业级-共享 API Key 可调用，普通 Key 服务端直接拒绝
+        maxImages: 16, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatioRequired: false
+    },
+    'rhart-image-g-2.5-official-token/sunburst/edit': {
+        name: 'ChatGPT 稳定版 Sunburst', shortName: 'GPT2.5稳定Sunburst', price: '¥1.00/张', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2.5-official-token/sunburst/edit', resolutionOptions: ['1k', '2k', '4k'],
+        channel: 'official', resolutionGuaranteed: true, quality: 'high',
+        enterpriseOnly: true, // 仅企业级-共享 API Key 可调用，普通 Key 服务端直接拒绝
+        maxImages: 16, maxImageMB: 10, hasResolution: true,
+        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
+        aspectRatioRequired: false
+    },
+    // RunningHub ChatGPT Image 2.5 经济版（图生图）：官方标准模型，固定 $0.03/次，1K/2K/4K 同价。
+    'rhart-image-g-2.5/flare/image-to-image': {
+        name: 'ChatGPT 经济版 Flare', shortName: 'GPT2.5经济Flare', price: '$0.03 ≈ ¥0.22/张｜1K/2K/4K同价', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2.5/flare/image-to-image', resolutionOptions: ['1k', '2k', '4k'],
         channel: 'low-cost', resolutionGuaranteed: false,
-        maxImages: 10, maxImageMB: 10, hasResolution: true,
+        enterpriseOnly: true, // 标准模型 API 仅企业级-共享 API Key 可调用
+        maxImages: 10, maxImageMB: 50, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
     },
-    'rhart-image-n-pro-official/edit': {
-        name: '全能图片 Pro｜图生图 Ultra｜官方稳定版', shortName: 'Pro Ultra官方', price: '¥0.98/张（4K）', type: 'image-to-image',
-        maxImages: 10, maxImageMB: 10, hasResolution: true,
+    'rhart-image-g-2.5/sunburst/image-to-image': {
+        name: 'ChatGPT 经济版 Sunburst', shortName: 'GPT2.5经济Sunburst', price: '$0.03 ≈ ¥0.22/张｜1K/2K/4K同价', type: 'image-to-image',
+        endpoint: 'rhart-image-g-2.5/sunburst/image-to-image', resolutionOptions: ['1k', '2k', '4k'],
+        channel: 'low-cost', resolutionGuaranteed: false,
+        enterpriseOnly: true, // 标准模型 API 仅企业级-共享 API Key 可调用
+        maxImages: 10, maxImageMB: 50, hasResolution: true,
         aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'],
         aspectRatioRequired: false
-    },
-    'rhart-image-n-pro-official/edit-ultra-4k': {
-        name: '全能图片 Pro｜图生图 Ultra｜4K｜官方稳定版', shortName: 'Pro Ultra官方-4K', price: '¥1.50/张', type: 'image-to-image',
-        endpoint: 'rhart-image-n-pro-official/edit-ultra', fixedResolution: '4k', channel: 'official', resolutionGuaranteed: true,
-        maxImages: 10, maxImageMB: 10, hasResolution: true,
-        aspectRatios: ['auto','1:1','16:9','9:16','4:3','3:4','3:2','2:3','5:4','4:5','21:9'], aspectRatioRequired: false
     },
     'seedream-v5-pro/image-to-image-1k': {
         name: '即梦Seedream 5.0 Pro｜1K｜图生图', shortName: 'SD5Pro-1K', price: '约¥0.30/张', type: 'image-to-image',
@@ -10610,6 +11764,20 @@ const RH_MODELS = {
         aspectRatioRequired: false
     }
 };
+
+const RH_LEGACY_MODEL_MAP = Object.freeze({
+    'rhart-image-g-2/image-to-image-2k': 'rhart-image-g-2/image-to-image',
+    'rhart-image-g-2/image-to-image-4k': 'rhart-image-g-2/image-to-image',
+    'rhart-image-n-g31-flash/image-to-image-2k': 'rhart-image-n-g31-flash/image-to-image',
+    'rhart-image-n-g31-flash/image-to-image-4k': 'rhart-image-n-g31-flash/image-to-image',
+    'rhart-image-n-pro/edit-2k': 'rhart-image-n-pro/edit',
+    'rhart-image-n-pro/edit-4k': 'rhart-image-n-pro/edit',
+});
+
+function normalizeRhModelKey(value) {
+    const key = String(value || '').trim();
+    return RH_LEGACY_MODEL_MAP[key] || key;
+}
 
 function getRhPriceLabel(model, resolution) {
     if (!model) return '';
@@ -10700,23 +11868,146 @@ const OAIHK_MODELS = {
         isGptImage: true
     },
     'gpt-image-2/4k': {
-        name: 'ChatGPT Image 2 4K请求（HK实测可能仅返1K）', shortName: 'GPT2-4K⚠', price: '¥0.16/张',
+        name: 'ChatGPT Image 2 4K请求（HK实测最高仅返2K）', shortName: 'GPT2-4K⚠', price: '¥0.16/张',
         endpoint: 'gpt-image-2',
         modelId: 'gpt-image-2',
         pollEndpoint: null,
         shortEdge: 2048,
+        maxResolution: '2k', // HK 网关与 PPT Token 同为 OpenAI 兼容接口，4K 请求上游只回落 ~1-2K
         sizes: { '3:4': '2448x3264', '2:3': '2336x3504', '3:2': '3504x2336', '1:1': '2880x2880', '9:16': '2160x3840', '4:3': '3264x2448', '16:9': '3840x2160', '4:5': '2560x3200', '5:4': '3200x2560', '21:9': '3808x1632' },
         aspectRatios: GPT_IMAGE_ASPECT_RATIOS,
         isGptImage: true,
         resolutionGuaranteed: false
+    },
+    'gpt-image-2.5/4k': {
+        name: 'ChatGPT Image 2.5 精细版 4K', shortName: 'GPT2.5-4K',
+        price: '4K按实际Token计费（800积分≈1K low参考）',
+        endpoint: 'gpt-image-2.5', modelId: 'gpt-image-2.5', pollEndpoint: null,
+        shortEdge: 2048,
+        sizes: { '3:4': '2448x3264', '2:3': '2336x3504', '3:2': '3504x2336', '1:1': '2880x2880', '9:16': '2160x3840', '4:3': '3264x2448', '16:9': '3840x2160', '4:5': '2560x3200', '5:4': '3200x2560', '21:9': '3808x1632' },
+        aspectRatios: GPT_IMAGE_ASPECT_RATIOS, isGptImage: true, resolutionGuaranteed: true
+    },
+    'gpt-image-2.5-flare/4k': {
+        name: 'ChatGPT Image 2.5 Flare 快速版 4K', shortName: 'GPT2.5-Flare-4K',
+        price: '4K按实际Token计费（800积分≈1K low参考）',
+        endpoint: 'gpt-image-2.5-flare', modelId: 'gpt-image-2.5-flare', pollEndpoint: null,
+        shortEdge: 2048,
+        sizes: { '3:4': '2448x3264', '2:3': '2336x3504', '3:2': '3504x2336', '1:1': '2880x2880', '9:16': '2160x3840', '4:3': '3264x2448', '16:9': '3840x2160', '4:5': '2560x3200', '5:4': '3200x2560', '21:9': '3808x1632' },
+        aspectRatios: GPT_IMAGE_ASPECT_RATIOS, isGptImage: true, resolutionGuaranteed: true
+    },
+    'gpt-image-2.5-sunburst/4k': {
+        name: 'ChatGPT Image 2.5 旭日精细版 4K', shortName: 'GPT2.5-Sunburst-4K',
+        price: '4K按实际Token计费（800积分≈1K low参考）',
+        endpoint: 'gpt-image-2.5-sunburst', modelId: 'gpt-image-2.5-sunburst', pollEndpoint: null,
+        shortEdge: 2048,
+        sizes: { '3:4': '2448x3264', '2:3': '2336x3504', '3:2': '3504x2336', '1:1': '2880x2880', '9:16': '2160x3840', '4:3': '3264x2448', '16:9': '3840x2160', '4:5': '2560x3200', '5:4': '3200x2560', '21:9': '3808x1632' },
+        aspectRatios: GPT_IMAGE_ASPECT_RATIOS, isGptImage: true, resolutionGuaranteed: true
     }
 };
+
+// PPT Token's group is selected by the API Key in its console. These are the four
+// model IDs shown by the provider; the UI never tries to switch the key's group.
+const PPTOKEN_LEGACY_MODEL_MAP = Object.freeze({
+    'gpt-image-2.5-fast': 'gpt-image-2.5',
+    'gpt-image-2.5-precise': 'gpt-image-2.5',
+    'gpt-image-2-fast': 'gpt-image-2',
+    'gpt-image-2-precise': 'gpt-image-2',
+});
+
+function normalizePptokenModelKey(value) {
+    const key = String(value || '').trim();
+    return PPTOKEN_LEGACY_MODEL_MAP[key] || (PPTOKEN_MODELS[key] ? key : 'gpt-image-2.5');
+}
+
+const PPTOKEN_MODELS = {
+    'gpt-image-2': {
+        name: 'gpt-image-2', shortName: 'PPT-GPT2',
+        price: '1K ¥0.06/0.08 · 2K ¥0.08/0.09 · 4K ¥0.12/0.18', modelId: 'gpt-image-2', quality: 'high', isGptImage: true,
+        maxResolution: '2k'
+    },
+    'gpt-image-2.5': {
+        name: 'gpt-image-2.5', shortName: 'PPT-GPT2.5',
+        price: '1K ¥0.06/0.08 · 2K ¥0.08/0.09 · 4K ¥0.12/0.18', modelId: 'gpt-image-2.5', quality: 'high', isGptImage: true,
+        maxResolution: '2k'
+    },
+    'gpt-image-2.5-flare': {
+        name: 'gpt-image-2.5-flare', shortName: 'PPT-Flare',
+        price: '1K ¥0.06/0.08 · 2K ¥0.08/0.09 · 4K ¥0.12/0.18', modelId: 'gpt-image-2.5-flare', quality: 'high', isGptImage: true,
+        maxResolution: '2k'
+    },
+    'gpt-image-2.5-sunburst': {
+        name: 'gpt-image-2.5-sunburst', shortName: 'PPT-Sunburst',
+        price: '1K ¥0.06/0.08 · 2K ¥0.08/0.09 · 4K ¥0.12/0.18', modelId: 'gpt-image-2.5-sunburst', quality: 'high', isGptImage: true,
+        maxResolution: '2k'
+    }
+};
+
+// API易（apiyi）：Gemini 原生协议走 aspect_ratio，OpenAI edits 协议走 size 映射表。
+// 官转两款按 Token 计费需带 quality；官逆两款（-all / -vip）与 Gemini 两款按次固定单价、
+// 不带 quality；其中 -all 连 size 都不接受（noSize），画幅只能写进提示词。
+const APIYI_GEMINI_ASPECT_RATIOS = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
+
+const APIYI_MODELS = {
+    'gemini-3-pro-image': {
+        name: 'Nano Banana Pro', shortName: 'APY-NBP',
+        price: '$0.09/张 ≈ ¥0.52（1K/2K/4K 同价）', modelId: 'gemini-3-pro-image', protocol: 'gemini-native',
+        aspectRatios: APIYI_GEMINI_ASPECT_RATIOS
+    },
+    'gemini-3.1-flash-image-preview': {
+        name: 'Nano Banana 2', shortName: 'APY-NB2',
+        price: '$0.025/张 ≈ ¥0.18', modelId: 'gemini-3.1-flash-image-preview', protocol: 'gemini-native',
+        aspectRatios: APIYI_GEMINI_ASPECT_RATIOS
+    },
+    'gpt-image-2.5-flare': {
+        name: 'ChatGPT2.5 快速版·官转', shortName: 'APY-Flare',
+        price: '官转按量计费｜2K+medium 约 $0.08 ≈ ¥0.58（充值85折约 ¥0.49）', modelId: 'gpt-image-2.5-flare', protocol: 'openai-edits', quality: 'medium'
+    },
+    'gpt-image-2.5-sunburst': {
+        name: 'ChatGPT2.5 精细版·官转', shortName: 'APY-Sunburst',
+        price: '官转按量计费｜2K+medium 约 $0.08 ≈ ¥0.58（充值85折约 ¥0.49）', modelId: 'gpt-image-2.5-sunburst', protocol: 'openai-edits', quality: 'medium'
+    },
+    'gpt-image-2.5-all': {
+        name: 'ChatGPT2.5 官逆·最快', shortName: 'APY-2.5All',
+        price: '$0.03/张 ≈ ¥0.22（1K/2K/4K 同价，最快约 90s）', modelId: 'gpt-image-2.5-all', protocol: 'openai-edits', noSize: true
+    },
+    'gpt-image-2-vip': {
+        name: 'ChatGPT2 官逆·锁尺寸', shortName: 'APY-2VIP',
+        price: '$0.03/张 ≈ ¥0.22（1K/2K/4K 同价，可锁 30 档尺寸）', modelId: 'gpt-image-2-vip', protocol: 'openai-edits'
+    },
+    // Seedream 走 /v1/images/generations（没有 edits 端点），size 只认档位、不接受像素，
+    // 宽高比跟随参考图，所以这里不设 size/quality。按张计费，与分辨率无关。
+    'seedream-5-0-260128': {
+        name: '即梦Seedream 5.0 Lite', shortName: 'APY-SD5L',
+        price: '$0.035/张 ≈ ¥0.245（2K/4K 同价）', modelId: 'seedream-5-0-260128', protocol: 'seedream',
+        resolutionOptions: ['2k', '4k']
+    },
+    'seedream-4-0-250828': {
+        name: '即梦Seedream 4.0', shortName: 'APY-SD4',
+        price: '$0.03/张 ≈ ¥0.21（2K/4K 同价）', modelId: 'seedream-4-0-250828', protocol: 'seedream'
+    }
+};
+
+function normalizeApiyiModelKey(value) {
+    const key = String(value || '').trim();
+    return APIYI_MODELS[key] ? key : 'gemini-3-pro-image';
+}
+
+// 与后端 _apiyi_gpt_channel 保持一致：-vip 走官逆 Adobe 线，-all 走官逆网页线，
+// 其余（gpt-image-2.5-flare / sunburst / gpt-image-2）为官转，需用「按量优先」令牌。
+function apiyiModelChannel(value) {
+    const name = String(value || '').toLowerCase();
+    if (name.endsWith('-vip')) return 'vip';
+    if (name.endsWith('-all')) return 'all';
+    return 'proxy';
+}
 
 // 所有生图入口共享的平台元数据。以后新增平台时先在这里登记，
 // 再为该平台提供独立模型表与后端适配器，避免把不同协议混在一起。
 const IMAGE_PLATFORM_META = Object.freeze({
     runninghub: { label: 'RunningHub（企业 API）', shortLabel: 'RunningHub', verified: true },
-    oaihk: { label: 'OpenAI-HK（原平台）', shortLabel: 'OpenAI-HK', verified: true }
+    oaihk: { label: 'OpenAI-HK（原平台）', shortLabel: 'OpenAI-HK', verified: true },
+    pptoken: { label: 'PPT Token（中转 API）', shortLabel: 'PPT', verified: true },
+    apiyi: { label: 'API易（中转 API）', shortLabel: 'API易', verified: true }
 });
 
 function getImagePlatformLabel(platform) {
@@ -10728,7 +12019,81 @@ function getImagePlatformShortLabel(platform) {
 }
 
 function getImageModelMeta(platform, modelKey) {
-    return platform === 'runninghub' ? RH_MODELS[modelKey] : OAIHK_MODELS[modelKey];
+    if (platform === 'runninghub') return RH_MODELS[modelKey];
+    if (platform === 'pptoken') return PPTOKEN_MODELS[modelKey];
+    if (platform === 'apiyi') return APIYI_MODELS[modelKey];
+    return OAIHK_MODELS[modelKey];
+}
+
+function getPptokenImageSize(resolution = '4k', aspectRatio = '3:4') {
+    // PPToken 的 gpt-image 2/2.5 为 OpenAI 兼容接口，实测无法输出真 4K：
+    // 即使请求 2048px 短边，上游也只会返回 ≤1536px（2K）。故 4K 一律钳制到 2K。
+    const shortEdge = { '1k': 1024, '2k': 1536, '4k': 1536 }[String(resolution).toLowerCase()] || 1536;
+    if (!aspectRatio || aspectRatio === 'auto') return `${shortEdge}x${shortEdge}`;
+    const parsed = parseAspectRatio(aspectRatio);
+    if (!parsed) return `${shortEdge}x${shortEdge}`;
+    let width = parsed.w >= parsed.h ? Math.round(shortEdge * parsed.w / parsed.h) : shortEdge;
+    let height = parsed.w >= parsed.h ? shortEdge : Math.round(shortEdge * parsed.h / parsed.w);
+    width = Math.max(512, Math.round(width / 8) * 8);
+    height = Math.max(512, Math.round(height / 8) * 8);
+    return `${width}x${height}`;
+}
+
+// API易 官转/官逆（openai-edits）只接受官方 30 档 size 表，不能自由拼尺寸。
+// aspectRatio 为 'auto' 或表里没有的值时返回 'auto'，交由上游按参考图决定。
+const APIYI_IMAGE_SIZES = {
+    '1k': { '1:1': '1280x1280', '2:3': '848x1280', '3:2': '1280x848', '3:4': '960x1280', '4:3': '1280x960', '4:5': '1024x1280', '5:4': '1280x1024', '9:16': '720x1280', '16:9': '1280x720', '21:9': '1280x544' },
+    '2k': { '1:1': '2048x2048', '2:3': '1360x2048', '3:2': '2048x1360', '3:4': '1536x2048', '4:3': '2048x1536', '4:5': '1632x2048', '5:4': '2048x1632', '9:16': '1152x2048', '16:9': '2048x1152', '21:9': '2048x864' },
+    '4k': { '1:1': '2880x2880', '2:3': '2336x3520', '3:2': '3520x2336', '3:4': '2480x3312', '4:3': '3312x2480', '4:5': '2560x3216', '5:4': '3216x2560', '9:16': '2160x3840', '16:9': '3840x2160', '21:9': '3840x1632' }
+};
+
+function getApiyiImageSize(resolution = '4k', aspectRatio = 'auto') {
+    const table = APIYI_IMAGE_SIZES[String(resolution).toLowerCase()] || APIYI_IMAGE_SIZES['4k'];
+    if (!aspectRatio || aspectRatio === 'auto') return 'auto';
+    return table[aspectRatio] || 'auto';
+}
+
+// API易 只让用户选「几K」：比例留「自动」时，后端按目标参考图的构图比例吸附出具体 size。
+// 官逆 -all 通道不接受 size，此时隐藏分辨率栏（画幅只能写进提示词）。
+// Seedream 只认档位（比例跟随参考图），5.0 Lite 没有 1K，按模型的 resolutionOptions 隐藏。
+function syncEcommerceApiyiResolution() {
+    const resolutionSelect = document.getElementById('ecommerce-import-apiyi-resolution');
+    const hint = document.getElementById('ecommerce-apiyi-size-hint');
+    if (!resolutionSelect) return;
+    const key = document.getElementById('ecommerce-import-apiyi-model')?.value || '';
+    const model = APIYI_MODELS[key];
+    const unsupported = !!model && !!model.noSize;
+    const allowed = Array.isArray(model?.resolutionOptions) && model.resolutionOptions.length
+        ? model.resolutionOptions
+        : null;
+    [...resolutionSelect.options].forEach(option => {
+        option.hidden = !!allowed && !allowed.includes(option.value);
+    });
+    if (allowed && !allowed.includes(resolutionSelect.value)) {
+        resolutionSelect.value = allowed.includes('4k') ? '4k' : allowed[0];
+    }
+    resolutionSelect.style.display = unsupported ? 'none' : '';
+    if (hint) {
+        hint.textContent = unsupported
+            ? '该模型不接受尺寸参数，画幅由提示词决定'
+            : model?.protocol === 'seedream'
+                ? '比例跟随参考图；按张计费，2K/4K 同价'
+                : '比例选「自动」时按目标参考图的比例出图';
+    }
+}
+
+// 窄格子里放不下长句：把当前可见步骤的说明统一提到整排下方，
+// 否则 nowrap 的长文本会溢出格子、压到相邻的「比例」列上。
+function updateEcommerceModelNote() {
+    const note = document.getElementById('ecommerce-model-note');
+    const stack = document.querySelector('.ecommerce-model-stack');
+    if (!note || !stack) return;
+    const texts = [...stack.querySelectorAll('.ecommerce-model-step')]
+        .filter(step => step.offsetParent !== null)
+        .map(step => step.querySelector('small')?.textContent?.trim() || '')
+        .filter(Boolean);
+    note.textContent = texts.join('；');
+    note.hidden = !texts.length;
 }
 
 const DEFAULT_IMAGE_ASPECT_RATIOS = ['auto', '3:4', '4:3', '1:1', '16:9', '9:16', '2:3', '3:2'];
@@ -10761,6 +12126,26 @@ function parseAspectRatio(ratio) {
 function getOaihkImageSize(model, aspectRatio = '3:4') {
     const ratio = aspectRatio || '3:4';
     if (ratio === 'auto') return 'auto';
+    // 0) 分辨率上限钳制：HK 的 gpt-image-2 网关与 PPT Token 同属 OpenAI 兼容接口，
+    //    实测 4K 请求上游只回落 ~1-2K（日志无任何真 4K 返回记录）。模型声明了
+    //    maxResolution 时按上限重算，不命中其 4K sizes 映射，避免发无效尺寸被上游降级。
+    if (model?.maxResolution) {
+        const cap = { '1k': 1024, '2k': 1536 }[model.maxResolution] || 1536;
+        const parsed = parseAspectRatio(ratio);
+        if (!parsed) return `${cap}x${cap}`;
+        let w;
+        let h;
+        if (parsed.w >= parsed.h) {
+            h = cap;
+            w = Math.round((cap * parsed.w) / parsed.h);
+        } else {
+            w = cap;
+            h = Math.round((cap * parsed.h) / parsed.w);
+        }
+        w = Math.max(512, Math.round(w / 8) * 8);
+        h = Math.max(512, Math.round(h / 8) * 8);
+        return `${w}x${h}`;
+    }
     // 1) 优先使用模型给出的官方size映射
     if (model?.sizes?.[ratio]) return model.sizes[ratio];
     if (model?.size) return model.size;
@@ -10795,11 +12180,13 @@ const ecommerceState = {
     currentBatchId: '',
     detail: null,
     pollTimer: null,
+    refreshVersion: 0,
+    controlBusy: false,
     renderCache: { batchList: '', tasks: '', folders: '', apiConfig: '' }
 };
 
-const ECOMMERCE_DRAFT_KEY = 'ecommerce_generation_draft_v2';
-const ECOMMERCE_DRAFT_FIELD_IDS = new Set(['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-samples-per-action','ecommerce-precision-matching']);
+const ECOMMERCE_DRAFT_KEY = 'ecommerce_generation_draft_v3';
+const ECOMMERCE_DRAFT_FIELD_IDS = new Set(['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-rh-resolution','ecommerce-import-oaihk-model','ecommerce-import-pptoken-model','ecommerce-import-pptoken-resolution','ecommerce-import-apiyi-model','ecommerce-import-apiyi-resolution','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-samples-per-action','ecommerce-precision-matching']);
 function saveEcommerceDraft() {
     try {
         const ids = [...ECOMMERCE_DRAFT_FIELD_IDS];
@@ -10822,10 +12209,15 @@ function restoreEcommerceDraft() {
         if (!draft) return false;
         Object.entries(draft.fields || {}).forEach(([id, value]) => {
             const el = document.getElementById(id);
-            if (id === 'ecommerce-import-rh-model' && value === 'rhart-image-n-pro-official/edit-4k') value = 'rhart-image-n-pro-official/edit-ultra-4k';
+            if (id === 'ecommerce-import-rh-model') value = normalizeRhModelKey(value);
             if (el && value !== undefined && value !== null) {
                 if (el.type === 'checkbox') el.checked = value === true || value === '1';
                 else el.value = value;
+                if (id === 'ecommerce-import-pptoken-model' || id === 'ecommerce-import-pptoken-resolution'
+                    || id === 'ecommerce-import-apiyi-model' || id === 'ecommerce-import-apiyi-resolution'
+                    || id === 'ecommerce-import-rh-model' || id === 'ecommerce-import-rh-resolution') {
+                    el.dataset.userSelected = '1';
+                }
             }
         });
         ecommerceState.inlineGarment = draft.inlineGarment || null;
@@ -10869,7 +12261,11 @@ function updateEcommercePrecisionUi() {
     if (panel) panel.hidden = !enabled;
     const status = document.getElementById('ecommerce-precision-status');
     const count = ecommerceState.precisionMatching?.mapping?.length || 0;
-    if (status) status.textContent = enabled && count ? `已匹配 ${count} 张目标图` : (enabled ? '请打开匹配界面' : '未启用');
+    const singleCount = Object.values(ecommerceState.precisionMatching?.actionPrompts || {}).filter(value => String(value || '').trim()).length;
+    if (status) status.textContent = enabled && count ? `已匹配 ${count} 张目标图${singleCount ? ` · 单图提示词 ${singleCount} 张` : ''}` : (enabled ? '请打开匹配界面' : '未启用');
+    // 折叠条上的一行摘要：不展开也能看到精准匹配是否开启、已匹配几张。
+    const foldState = document.getElementById('ecommerce-precision-fold-state');
+    if (foldState) foldState.textContent = enabled ? (count ? `已匹配 ${count} 张${singleCount ? ` · 单图提示词 ${singleCount} 张` : ''}` : '已开启 · 待匹配') : '已关闭';
 }
 
 function openEcommercePrecisionMatching() {
@@ -10880,13 +12276,62 @@ function openEcommercePrecisionMatching() {
     const refs = garments[0].images || [];
     if (!refs.length) return showToast('第一套服装没有可用参考图', 'error');
     const current = ecommerceState.precisionMatching?.mapping || [];
+    // 每张目标动作图可以单独写提示词（按动作序号，所有服装套共用同一组）；
+    // 这里先用副本编辑，点「确认匹配」才写回状态，取消不改动原数据。
+    const singlePrompts = { ...(ecommerceState.precisionMatching?.actionPrompts || {}) };
+    let promptIndex = -1;
+    let cropMode = 'replace';
     const overlay = document.createElement('div');
     overlay.className = 'ecommerce-precision-overlay';
     overlay.id = 'ecommerce-precision-overlay';
     const denseLayout = actions.length > 10 || refs.length > 10;
-    overlay.innerHTML = `<div class="ecommerce-precision-dialog ecommerce-precision-wiring${denseLayout ? ' is-dense' : ''}" role="dialog" aria-modal="true"><header><strong>人工精准匹配参考图</strong><button type="button" id="ecommerce-precision-close">×</button></header><div class="ecommerce-precision-toolbar"><span>拖动下排服装参考图到上排目标图</span><label>显示大小 <input id="ecommerce-precision-scale" type="range" min="60" max="150" value="100" step="5"><output id="ecommerce-precision-scale-value">100%</output></label></div><p>一个服装参考图可以连接多个目标图；目标图也可以暂时不匹配。图片较多时会自动分成两列，使用上方滑块调整显示大小。</p><section class="ecommerce-wire-row ecommerce-wire-target-row"><div class="ecommerce-wire-row-title">目标动作参考图（最多20张）</div><div class="ecommerce-wire-cards">${actions.map((action, i) => { const selected = current[i] === undefined ? -1 : Number(current[i]); return `<div class="ecommerce-wire-target${selected >= 0 ? ' is-matched' : ''}" data-precision-row="${i}" ${selected >= 0 ? `data-precision-ref="${selected}"` : ''}><img src="${ecommerceEscape(ecommerceTargetImageSource(action))}" alt="目标图${i + 1}"><b>目标图${i + 1}</b><small class="ecommerce-wire-match">${selected >= 0 ? `已选服装图 ${selected + 1}` : '未匹配'}</small></div>`; }).join('')}</div></section><div class="ecommerce-wire-gap"></div><section class="ecommerce-wire-row ecommerce-wire-garment-row"><div class="ecommerce-wire-row-title">服装参考图（最多20张）</div><div class="ecommerce-wire-cards">${refs.map((path, j) => `<div class="ecommerce-wire-garment" draggable="true" data-precision-ref="${j}" title="拖动到上方目标图"><img src="${ecommerceEscape(ecommerceTargetImageSource({path}))}" alt="服装参考图${j + 1}"><b>服装图${j + 1}</b></div>`).join('')}</div></section><footer><button type="button" class="btn btn-outline" id="ecommerce-precision-cancel">取消</button><button type="button" class="btn btn-primary" id="ecommerce-precision-confirm">确认匹配</button></footer></div>`;
+    overlay.innerHTML = `<div class="ecommerce-precision-dialog ecommerce-precision-wiring${denseLayout ? ' is-dense' : ''}" role="dialog" aria-modal="true"><header><strong>人工精准匹配参考图</strong><button type="button" id="ecommerce-precision-close">×</button></header><div class="ecommerce-precision-toolbar"><span>拖动下排服装参考图到上排目标图</span><span class="ecommerce-precision-cropmode" role="group" aria-label="裁剪方式"><b>裁剪方式</b><button type="button" class="is-active" data-crop-mode="replace">替换原来那一张</button><button type="button" data-crop-mode="add">新增一张</button></span><label>显示大小 <input id="ecommerce-precision-scale" type="range" min="60" max="150" value="100" step="5"><output id="ecommerce-precision-scale-value">100%</output></label></div><p>一个服装参考图可以连接多个目标图；目标图也可以暂时不匹配。图片较多时会自动分成两列，使用上方滑块调整显示大小。<br>景别不一致时（例如动作是半身特写、服装图是全身），点服装图上的「裁剪」把服装图裁成同景别，可避免模型照抄服装图构图。裁剪会直接更新服装文件夹里这张图本身（替换=覆盖原来那一张，新增=文件夹里真的多一张），不会新建任何子文件夹；递交时按文件夹里的最新张数读取。原图备份在应用缓存里，随时可点「恢复原图」还原。</p><section class="ecommerce-precision-prompt"><div class="ecommerce-precision-prompt-head"><b id="ecommerce-precision-prompt-label">未选择目标图</b><small>点某张目标图即可单独写提示词；单图优先于总提示词，留空则用总提示词</small></div><div class="ecommerce-prompt-templates-bar ecommerce-shared-prompt-templates" data-ecommerce-prompt-template-target="#ecommerce-precision-prompt-input"><span class="ecommerce-shared-prompt-label">提示词模板</span><div class="ecommerce-shared-prompt-list"></div><select class="ecommerce-shared-prompt-more"><option value="">更多模板…</option></select><button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button></div><textarea id="ecommerce-precision-prompt-input" rows="3" disabled placeholder="点上方任意一张目标图，可单独给它写提示词；留空则用总提示词"></textarea></section><section class="ecommerce-wire-row ecommerce-wire-target-row"><div class="ecommerce-wire-row-title">目标动作参考图（最多20张）</div><div class="ecommerce-wire-cards">${actions.map((action, i) => { const selected = current[i] === undefined ? -1 : Number(current[i]); const single = String(singlePrompts[i] ?? '').trim(); return `<div class="ecommerce-wire-target${selected >= 0 ? ' is-matched' : ''}${single ? ' has-single-prompt' : ''}" data-precision-row="${i}" ${selected >= 0 ? `data-precision-ref="${selected}"` : ''} title="点击这张目标图，可在上方单独写提示词"><img src="${ecommerceEscape(ecommerceThumbnailUrl(ecommerceTargetImageSource(action), 480))}" alt="目标图${i + 1}"><b>目标图${i + 1}</b><small class="ecommerce-wire-match">${selected >= 0 ? `已选服装图 ${selected + 1}` : '未匹配'}</small><span class="ecommerce-wire-single-flag" title="这张已单独设置提示词">单</span><button type="button" class="ecommerce-wire-unmatch" draggable="false" title="取消匹配">✕</button></div>`; }).join('')}</div></section><div class="ecommerce-wire-gap"></div><section class="ecommerce-wire-row ecommerce-wire-garment-row"><div class="ecommerce-wire-row-title">服装参考图（最多20张）</div><div class="ecommerce-wire-cards">${refs.map((path, j) => `<div class="ecommerce-wire-garment" draggable="true" data-precision-ref="${j}" title="拖动到上方目标图"><img src="${ecommerceEscape(ecommerceThumbnailUrl(ecommerceTargetImageSource({path}), 480))}" alt="服装参考图${j + 1}"><b>服装图${j + 1}</b><button type="button" class="ecommerce-wire-crop" draggable="false" data-crop-ref="${j}" title="按当前裁剪方式裁剪这张服装参考图">裁剪</button></div>`).join('')}</div></section><footer><button type="button" class="btn btn-outline" id="ecommerce-precision-cancel">取消</button><button type="button" class="btn btn-primary" id="ecommerce-precision-confirm">确认匹配</button></footer></div>`;
     document.body.appendChild(overlay);
+    // 精准匹配弹窗里也挂一份「提示词模板」，与总提示词处的模板库同源同步。
+    if (typeof renderEcommerceRerunPromptTemplates === 'function') renderEcommerceRerunPromptTemplates(overlay);
     const close = () => overlay.remove();
+    const promptInput = overlay.querySelector('#ecommerce-precision-prompt-input');
+    const promptLabel = overlay.querySelector('#ecommerce-precision-prompt-label');
+    const syncPromptInput = () => {
+        if (!promptInput) return;
+        promptInput.value = promptIndex >= 0 ? String(singlePrompts[promptIndex] || '') : '';
+        promptInput.disabled = promptIndex < 0;
+        promptInput.placeholder = promptIndex < 0
+            ? '点上方任意一张目标图，可单独给它写提示词；留空则用总提示词'
+            : `目标图${promptIndex + 1} 的单图提示词：留空则用总提示词`;
+        if (promptLabel) promptLabel.textContent = promptIndex < 0 ? '未选择目标图' : `目标图${promptIndex + 1}`;
+    };
+    const selectPromptTarget = index => {
+        promptIndex = index;
+        // 切换图片后不沿用上一张的模板来源标记，避免「存为模板」误选覆盖。
+        if (promptInput) delete promptInput.dataset.ecommerceTemplateSource;
+        overlay.querySelectorAll('.ecommerce-wire-target').forEach(card => {
+            card.classList.toggle('is-prompt-selected', Number(card.dataset.precisionRow) === index);
+        });
+        syncPromptInput();
+    };
+    promptInput?.addEventListener('input', () => {
+        if (promptIndex < 0) return;
+        const value = promptInput.value;
+        if (value.trim()) singlePrompts[promptIndex] = value;
+        else delete singlePrompts[promptIndex];
+        overlay.querySelector(`[data-precision-row="${promptIndex}"]`)?.classList.toggle('has-single-prompt', !!value.trim());
+    });
+    // 默认选中第一张，避免模板条在“未选中目标图”时点了没反应。
+    selectPromptTarget(0);
+    overlay.querySelectorAll('.ecommerce-precision-cropmode button').forEach(button => {
+        button.addEventListener('click', () => {
+            cropMode = button.dataset.cropMode || 'replace';
+            overlay.querySelectorAll('.ecommerce-precision-cropmode button').forEach(item => item.classList.toggle('is-active', item === button));
+        });
+    });
+    overlay.querySelectorAll('.ecommerce-wire-crop').forEach(button => {
+        button.addEventListener('click', event => {
+            event.stopPropagation();
+            event.preventDefault();
+            openEcommerceGarmentCropQueue(Number(button.dataset.cropRef), cropMode);
+        });
+    });
     const scale = overlay.querySelector('#ecommerce-precision-scale');
     const scaleValue = overlay.querySelector('#ecommerce-precision-scale-value');
     scale?.addEventListener('input', event => {
@@ -10912,13 +12357,31 @@ function openEcommercePrecisionMatching() {
             target.classList.add('is-matched');
             const label = target.querySelector('.ecommerce-wire-match');
             if (label) label.textContent = `已选服装图 ${draggedRef + 1}`;
+            selectPromptTarget(Number(target.dataset.precisionRow));
         });
-        target.addEventListener('click', () => { delete target.dataset.precisionRef; target.classList.remove('is-matched'); const label = target.querySelector('.ecommerce-wire-match'); if (label) label.textContent = '未匹配'; });
+        // 取消匹配挪到卡片右上角的 ✕；点击卡片本身改为“选中它、编辑这张的单图提示词”。
+        target.querySelector('.ecommerce-wire-unmatch')?.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            delete target.dataset.precisionRef;
+            target.classList.remove('is-matched');
+            const label = target.querySelector('.ecommerce-wire-match');
+            if (label) label.textContent = '未匹配';
+        });
+        target.addEventListener('click', () => selectPromptTarget(Number(target.dataset.precisionRow)));
     });
     overlay.querySelector('#ecommerce-precision-confirm').onclick = () => {
         const mapping = actions.map((_, i) => { const value = overlay.querySelector(`[data-precision-row="${i}"]`)?.dataset.precisionRef; return value === undefined ? -1 : Number(value); });
+        // 只保留真正写了字的单图提示词；空白的直接删掉，回落到总提示词。
+        const actionPrompts = {};
+        Object.entries(singlePrompts).forEach(([key, value]) => {
+            const text = String(value || '').trim();
+            if (text) actionPrompts[key] = text;
+        });
+        const singleCount = Object.keys(actionPrompts).length;
         ecommerceState.precisionMatching = {
             mapping,
+            actionPrompts,
             reference_count: refs.length,
             source_garment_id: garments[0].id,
             source_signature: ecommercePrecisionSourceSignature(),
@@ -10926,7 +12389,7 @@ function openEcommercePrecisionMatching() {
         saveEcommerceDraft();
         updateEcommercePrecisionUi();
         close();
-        showToast(`已完成 ${mapping.length} 张目标图的精准匹配`, 'success');
+        showToast(`已完成 ${mapping.length} 张目标图的精准匹配${singleCount ? `，其中 ${singleCount} 张使用单图提示词` : ''}`, 'success');
     };
 }
 
@@ -11008,7 +12471,6 @@ async function loadEcommerceModeData(force = false) {
     if (ecommerceState.loaded && !force) {
         renderEcommerceBatchList();
         renderEcommerceRhApiConfig();
-        loadEcommerceWasteStats().catch(() => {});
         if (ecommerceState.currentBatchId) {
             await refreshEcommerceBatch();
             // 同步重做栏批次选择器并加载已确认组列表
@@ -11029,13 +12491,19 @@ async function loadEcommerceModeData(force = false) {
         ]);
         ecommerceState.batches = batchData.batches || [];
         ecommerceState.rhConfig = modelConfig || {};
+        state.modelConfig = { ...(state.modelConfig || {}), ...(modelConfig || {}) };
+        updateEcommerceImportPlatformUI();
         ecommerceState.loaded = true;
-        if (!ecommerceState.currentBatchId && ecommerceState.batches.length) {
+        const selectedBatch = ecommerceState.batches.find(batch => batch.id === ecommerceState.currentBatchId);
+        const activeBatch = ecommerceState.batches.find(batch => ['running', 'resuming', 'cancelling'].includes(batch.status));
+        const selectedIsTerminal = !selectedBatch || ['completed', 'cancelled'].includes(selectedBatch.status);
+        if (activeBatch && (!ecommerceState.currentBatchId || (force && selectedIsTerminal))) {
+            ecommerceState.currentBatchId = activeBatch.id;
+        } else if (!ecommerceState.currentBatchId && ecommerceState.batches.length) {
             ecommerceState.currentBatchId = ecommerceState.batches[0].id;
         }
         renderEcommerceBatchList();
         renderEcommerceRhApiConfig();
-        loadEcommerceWasteStats().catch(() => {});
         if (ecommerceState.currentBatchId) {
             await refreshEcommerceBatch();
             // 同步重做栏批次选择器并加载已确认组列表
@@ -11066,7 +12534,7 @@ async function loadEcommerceModeData(force = false) {
 }
 
 // 电商批量工作台是长表单，输入、模型、比例、并发和已上传参考图都持续保存。
-['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-samples-per-action'].forEach(id => {
+['ecommerce-standard-prompt','ecommerce-import-platform','ecommerce-import-rh-model','ecommerce-import-rh-resolution','ecommerce-import-oaihk-model','ecommerce-import-ratio','ecommerce-concurrency','ecommerce-concurrency-presets','ecommerce-batch-name','ecommerce-garment-keyword','ecommerce-samples-per-action'].forEach(id => {
     document.getElementById(id)?.addEventListener('input', saveEcommerceDraft);
     document.getElementById(id)?.addEventListener('change', saveEcommerceDraft);
 });
@@ -11137,10 +12605,10 @@ async function saveAndVerifyEcommerceRhApi() {
         const saved = await ecommerceApi('PUT', '/api/model-config', payload);
         ecommerceState.rhConfig = saved || {};
         state.modelConfig = { ...(state.modelConfig || {}), ...(saved || {}) };
-        const modelKey = document.getElementById('ecommerce-import-rh-model')?.value || 'rhart-image-n-g31-flash/image-to-image-4k';
+        const modelKey = normalizeRhModelKey(document.getElementById('ecommerce-import-rh-model')?.value || 'rhart-image-n-g31-flash/image-to-image');
         const model = RH_MODELS[modelKey] || {};
         const modelId = model.endpoint || model.modelId || modelKey.replace(/-(?:2k|4k)$/i, '');
-        const resolution = model.fixedResolution || (String(modelKey).endsWith('/4k') ? '4k' : '2k');
+        const resolution = model.fixedResolution || document.getElementById('ecommerce-import-rh-resolution')?.value || '2k';
         const preview = await ecommerceApi('POST', '/api/rh-preflight', { model_id: modelId, resolution }, 45000);
         if (resultText) {
             const accountText = preview.account?.remain_money != null
@@ -11166,10 +12634,14 @@ function buildEcommercePromptAction() {
     const prompt = document.getElementById('ecommerce-standard-prompt')?.value.trim();
     const platform = document.getElementById('ecommerce-import-platform')?.value || 'runninghub';
     const modelKey = platform === 'runninghub'
-        ? (document.getElementById('ecommerce-import-rh-model')?.value || '')
-        : (document.getElementById('ecommerce-import-oaihk-model')?.value || '');
+        ? normalizeRhModelKey(document.getElementById('ecommerce-import-rh-model')?.value || '')
+        : platform === 'pptoken'
+            ? (document.getElementById('ecommerce-import-pptoken-model')?.value || '')
+            : platform === 'apiyi'
+                ? normalizeApiyiModelKey(document.getElementById('ecommerce-import-apiyi-model')?.value || '')
+                : (document.getElementById('ecommerce-import-oaihk-model')?.value || '');
     const ratio = document.getElementById('ecommerce-import-ratio')?.value || 'auto';
-    const model = platform === 'runninghub' ? RH_MODELS[modelKey] : OAIHK_MODELS[modelKey];
+    const model = getImageModelMeta(platform, modelKey);
     if (!prompt) throw new Error('提示词不能为空');
     if (!model) throw new Error('请选择有效生图模型');
     const common = {
@@ -11179,15 +12651,55 @@ function buildEcommercePromptAction() {
         aspect_ratio: ratio,
     };
     if (platform === 'runninghub') {
+        const resolution = model.fixedResolution
+            || document.getElementById('ecommerce-import-rh-resolution')?.value
+            || state.modelConfig?.rh_resolution || '2k';
         return {
             ...common,
-            resolution: model.fixedResolution || '2k',
+            resolution,
             quality: model.quality || '',
             channel: model.channel || 'low-cost',
             resolution_guaranteed: model.resolutionGuaranteed !== false,
             max_images: model.maxImages || 10,
-            price: model.price || ''
+            price: getRhPriceLabel(model, resolution)
         };
+    }
+    if (platform === 'pptoken') {
+        const resolution = document.getElementById('ecommerce-import-pptoken-resolution')?.value
+            || state.modelConfig?.pptoken_default_resolution || '2k';
+        return {
+            ...common,
+            provider: 'pptoken',
+            model_id: model.modelId || modelKey,
+            is_gpt_image: true,
+            pptoken_resolution: resolution,
+            resolution,
+            size: ratio === 'auto' ? 'auto' : getPptokenImageSize(resolution, ratio),
+            quality: model.quality || 'high',
+            short_edge: ({ '1k': 1024, '2k': 1536, '4k': 2048 })[resolution] || 2048,
+            price: model.price || '价格以账户实时计费'
+        };
+    }
+    if (platform === 'apiyi') {
+        const resolution = document.getElementById('ecommerce-import-apiyi-resolution')?.value
+            || state.modelConfig?.apiyi_default_resolution || '4k';
+        const action = {
+            ...common,
+            provider: 'apiyi',
+            platform: 'apiyi',
+            model_id: model.modelId || modelKey,
+            protocol: model.protocol,
+            resolution,
+            price: model.price || '价格以账户实时计费'
+        };
+        // OpenAI edits 协议必须给官方 size；Gemini 原生协议只用 aspect_ratio，不给 size。
+        // 官逆 -all 通道不接受 size（noSize），画幅交给提示词，同样不给。
+        // 比例选具体值 → 直接查表锁定 size；比例「自动」→ 发 auto，
+        // 由后端按目标参考图的实际构图比例吸附出具体 size。
+        if (model.protocol === 'openai-edits' && !model.noSize) action.size = getApiyiImageSize(resolution, ratio);
+        // 仅按 Token 计费的官转两款带 quality，其余模型不带。
+        if (model.quality) action.quality = model.quality;
+        return action;
     }
     return {
         ...common,
@@ -11204,12 +12716,18 @@ function buildCurrentEcommerceTargetActions() {
     if (!loaded?.actions?.length) throw new Error('请先加载1～20张目标替换参考图');
     const settings = buildEcommercePromptAction();
     const mapping = ecommerceState.precisionMatching?.mapping || [];
-    return (loaded.actions || []).map((item, index) => ({
-        ...settings,
-        name: item.name || `目标图${index + 1}`,
-        action_image: item.path,
-        ...(mapping.length ? { garment_reference_index: Number(mapping[index] ?? -1) } : {}),
-    }));
+    const singlePrompts = ecommerceState.precisionMatching?.actionPrompts || {};
+    return (loaded.actions || []).map((item, index) => {
+        const single = String(singlePrompts[index] ?? '').trim();
+        return {
+            ...settings,
+            // 单图提示词优先于总提示词：只有这张图留空时才回落到总提示词。
+            ...(single ? { prompt: single } : {}),
+            name: item.name || `目标图${index + 1}`,
+            action_image: item.path,
+            ...(mapping.length ? { garment_reference_index: Number(mapping[index] ?? -1) } : {}),
+        };
+    });
 }
 
 let ecommerceTargetDragIndex = null;
@@ -11236,7 +12754,7 @@ function renderEcommerceImportActionPreview(scanned) {
     preview.innerHTML = actions.map((item, index) => {
         const src = ecommerceTargetImageSource(item);
         return `<div class="ecommerce-action-item is-target-reference" draggable="true" data-target-index="${index}" title="${ecommerceEscape(item.name || `目标图${index + 1}`)}｜点击查看大图">
-            <img src="${ecommerceEscape(src)}" alt="目标图${index + 1}" loading="lazy">
+            <img src="${ecommerceEscape(ecommerceThumbnailUrl(src, 480))}" alt="目标图${index + 1}" loading="lazy" decoding="async">
             <strong>${index + 1}</strong>
         </div>`;
     }).join('');
@@ -11402,7 +12920,8 @@ function clearEcommerceGarmentReferences() {
 async function chooseEcommerceFolder(inputId) {
     const input = document.getElementById(inputId);
     try {
-        const picked = await ecommerceApi('POST', '/api/select-folder', { initial_dir: input?.value || '~/Downloads' }, 130000);
+        // memory_key 用输入框 id：后端按入口记住上次目录，下次直接打开那里。
+        const picked = await ecommerceApi('POST', '/api/select-folder', { initial_dir: input?.value || '~/Downloads', memory_key: inputId }, 130000);
         if (picked.ok && picked.path && input) {
             input.value = picked.path;
             // 记住路径，刷新后自动恢复
@@ -11516,13 +13035,26 @@ async function scanEcommerceGarments() {
         ecommerceState.scanned = scanned;
         const valid = ecommerceState.scanned.garments || [];
         const invalid = ecommerceState.scanned.invalid || [];
-        if (summary) summary.textContent = generationMode === 'garment_prompt'
-            ? `递归识别 ${valid.length} 个来源文件夹、${ecommerceState.scanned.image_total || 0} 张图；每张都将单独使用当前提示词生成。`
-            : `有效服装 ${valid.length} 套；不完整文件夹 ${invalid.length} 个。将创建 ${valid.length} × 目标图数量 个任务。`;
+        const groupImageCounts = ecommerceState.scanned.group_image_counts || [];
+        const imageCountsConsistent = ecommerceState.scanned.image_counts_consistent !== false;
+        if (summary) {
+            if (generationMode === 'garment_prompt') {
+                summary.textContent = `递归识别 ${valid.length} 个来源文件夹、${ecommerceState.scanned.image_total || 0} 张图；每张都将单独使用当前提示词生成。`;
+                summary.className = 'ecommerce-summary ecommerce-compact-summary';
+            } else if (!imageCountsConsistent && groupImageCounts.length > 1) {
+                const detail = groupImageCounts.map(item => `${item.name} ${item.count}张`).join('、');
+                summary.textContent = `子文件夹图片数量不一致：${detail}。请确保各子文件夹参考图张数相同后再创建批次。`;
+                summary.className = 'ecommerce-summary ecommerce-compact-summary ecommerce-output-status is-error';
+            } else {
+                summary.textContent = `有效服装 ${valid.length} 套；不完整文件夹 ${invalid.length} 个。将创建 ${valid.length} × 目标图数量 个任务。`;
+                summary.className = 'ecommerce-summary ecommerce-compact-summary';
+            }
+        }
         const list = document.getElementById('ecommerce-garment-list');
         if (list) list.innerHTML = valid.slice(0, 100).map(g => `<span title="${ecommerceEscape(g.path)}">${ecommerceEscape(g.name)}</span>`).join('');
         updateEcommerceGenerateButton();
         if (!valid.length) showToast('没有找到可用图片', 'error');
+        else if (!imageCountsConsistent && groupImageCounts.length > 1) showToast('子文件夹图片数量不一致，请修正后再创建批次', 'warning');
         else showToast(generationMode === 'garment_prompt' ? `已递归加载${ecommerceState.scanned.image_total || 0}张图` : `扫描完成：${valid.length}套服装`, 'success');
     } catch (e) {
         ecommerceState.scanned = null;
@@ -11549,7 +13081,7 @@ function renderEcommerceGarmentPreview() {
     if (!preview) return;
     const images = ecommerceState.inlineGarment?.images || [];
     const visible = images.slice(0, 80);
-    preview.innerHTML = visible.map((item, index) => `<figure title="${ecommerceEscape(item.relative_path || item.name)}"><img src="${ecommerceEscape(item.url)}" alt="服装参考${index + 1}" loading="lazy" decoding="async"><figcaption>${index + 1} · ${ecommerceEscape(item.relative_path || item.name)}</figcaption></figure>`).join('')
+    preview.innerHTML = visible.map((item, index) => `<figure title="${ecommerceEscape(item.relative_path || item.name)}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(item.url, 400))}" alt="服装参考${index + 1}" loading="lazy" decoding="async"><figcaption>${index + 1} · ${ecommerceEscape(item.relative_path || item.name)}</figcaption></figure>`).join('')
         + (images.length > visible.length ? `<span class="ecommerce-help">另有 ${images.length - visible.length} 张已加载，预览区不全部展开</span>` : '');
 }
 
@@ -11564,7 +13096,11 @@ function ecommerceNaturalPathSort(items) {
 }
 
 function ecommerceReadDirectoryBatch(reader) {
-    return new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    return new Promise((resolve, reject) => {
+        // 桌面壳（WKWebView）下 readEntries 回调可能不触发，加超时避免递归永久挂起
+        const timer = setTimeout(() => reject(new Error('读取文件夹目录超时，文件夹可能过大或正在被系统同步')), 15000);
+        reader.readEntries(entries => { clearTimeout(timer); resolve(entries); }, err => { clearTimeout(timer); reject(err); });
+    });
 }
 
 async function ecommerceReadAllDirectoryEntries(directoryEntry) {
@@ -11582,25 +13118,68 @@ function ecommerceEntryFile(entry) {
     return new Promise((resolve, reject) => entry.file(resolve, reject));
 }
 
+// 带超时的单文件读取：桌面壳（WKWebView）下个别文件的 file() 回调可能永不触发，
+// 超时后返回 null 跳过该文件，避免整次拖入递归永久挂起。
+function ecommerceEntryFileWithTimeout(entry, timeoutMs = 6000) {
+    return new Promise(resolve => {
+        let settled = false;
+        const timer = setTimeout(() => { if (!settled) { settled = true; resolve(null); } }, timeoutMs);
+        entry.file(file => {
+            if (settled) return;
+            settled = true; clearTimeout(timer); resolve(file);
+        }, () => {
+            if (settled) return;
+            settled = true; clearTimeout(timer); resolve(null);
+        });
+    });
+}
+
+function ecommerceIsSupportedImageName(name) {
+    return ['.jpg', '.jpeg', '.png', '.webp'].includes(String(name || '').toLowerCase().match(/\.[^.]+$/)?.[0] || '');
+}
+
 async function collectDroppedEcommerceGarmentFiles(dataTransfer) {
     const records = [];
+    let scannedDirs = 0;
+    const summaryEl = document.getElementById('ecommerce-scan-summary');
     const skipDirectories = new Set(['_运行缓存', '_生成样本备份', '_废片预览备份', '_重做历史', '_重做临时参考图', '_质检缓存', '_成品输出', '__MACOSX']);
+    // 总时长看门狗：超过90秒仍扫不完就明确报错，引导改用后端「选择文件夹」扫描，避免界面假死
+    const MAX_WALK_MS = 90 * 1000;
+    const startedAt = Date.now();
+    const ensureTimeBudget = () => {
+        if (Date.now() - startedAt <= MAX_WALK_MS) return;
+        throw new Error('拖入文件夹过大，递归读取超过90秒仍未完成。请改用「选择文件夹」按钮，由后端直接扫描，避免界面卡住');
+    };
+    let lastReportAt = 0;
+    const reportProgress = () => {
+        const now = Date.now();
+        if (now - lastReportAt < 400) return;
+        lastReportAt = now;
+        if (summaryEl) summaryEl.textContent = `正在递归读取拖入的文件夹… 已扫描 ${scannedDirs} 个目录、找到 ${records.length} 张图片`;
+    };
     const walk = async (entry, parentPath = '') => {
+        ensureTimeBudget();
         if (!entry || entry.name?.startsWith('.')) return;
         const relativePath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
         if (entry.isDirectory) {
+            scannedDirs += 1;
             if (skipDirectories.has(entry.name) || entry.name.startsWith('AI换装结果-')) return;
+            reportProgress();
             const children = await ecommerceReadAllDirectoryEntries(entry);
             children.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN', { numeric: true, sensitivity: 'base' }));
             for (const child of children) await walk(child, relativePath);
             return;
         }
         if (!entry.isFile) return;
-        const file = await ecommerceEntryFile(entry);
+        // 先用文件名判断扩展名，避免对每张非图片文件都发起昂贵的 file() 读取
+        if (!ecommerceIsSupportedImageName(entry.name)) return;
+        const file = await ecommerceEntryFileWithTimeout(entry, 6000);
+        if (!file) return; // 读取超时/失败的文件跳过，不阻塞整次拖入
         if (!ecommerceIsSupportedImageFile(file)) return;
         const stem = String(file.name || '').replace(/\.[^.]+$/, '');
         if (/(?:^|-)AI-\d+/i.test(stem) || stem.endsWith('.deleted')) return;
         records.push({ file, relativePath });
+        reportProgress();
         if (records.length > 10000) throw new Error('拖入目录超过10000张图片，为防止误提交高额费用，请分批处理');
     };
     const entries = Array.from(dataTransfer?.items || [])
@@ -11609,7 +13188,10 @@ async function collectDroppedEcommerceGarmentFiles(dataTransfer) {
         .filter(Boolean);
     if (entries.length) {
         for (const entry of entries) await walk(entry);
-        return ecommerceNaturalPathSort(records);
+        // WKWebView/pywebview 下目录内文件的 entry.file() 回调可能永不触发，
+        // 导致 walk 收集为空；此时回退到 dataTransfer.files 扁平列表
+        // （拖文件夹时 files 带 webkitRelativePath，仍能按子文件夹分组）。
+        if (records.length) return ecommerceNaturalPathSort(records);
     }
     return ecommerceNaturalPathSort(Array.from(dataTransfer?.files || []).map(file => ({
         file,
@@ -11634,12 +13216,14 @@ async function loadDroppedEcommerceGarmentFiles(fileList, options = {}) {
         relativePath: item?.webkitRelativePath || item?.name || '',
     })).filter(item => ecommerceIsSupportedImageFile(item.file)));
     if (!records.length) return showToast('没有找到可用的JPG、PNG或WEBP图片', 'error');
-    const maxFiles = ecommerceState.importActions?.actions?.length ? 6 : 10000;
-    if (records.length > maxFiles) return showToast(`当前模式一次最多选择${maxFiles}张；当前选择了${records.length}张`, 'error');
     const summary = document.getElementById('ecommerce-scan-summary');
     const dropzone = document.getElementById('ecommerce-garment-dropzone');
     const firstRelativeParts = String(records[0].relativePath || records[0].file.name || '').replace(/\\/g, '/').split('/').filter(Boolean);
     const isDirectoryDrop = !!options.directoryDrop || records.some(item => String(item.relativePath || '').includes('/'));
+    // 目录拖入=多组批量：不做总张数限制（每组1～10张由分组后各自生效）；
+    // 仅单套（非目录）素材按每组上限校验，与后端递归扫描口径一致。
+    const maxFiles = isDirectoryDrop ? Infinity : (ecommerceState.importActions?.actions?.length ? 10 : 10000);
+    if (records.length > maxFiles) return showToast(`当前模式一次最多选择${maxFiles}张；当前选择了${records.length}张`, 'error');
     const loaded = {
         name: isDirectoryDrop
             ? (firstRelativeParts[0] || '拖入文件夹')
@@ -11673,16 +13257,37 @@ async function loadDroppedEcommerceGarmentFiles(fileList, options = {}) {
     }
     if (dropzone) dropzone.classList.remove('is-uploading', 'is-dragover');
     const promptMode = !ecommerceState.importActions?.actions?.length;
-    const inlineGroups = promptMode
+    // 目录拖入一律按子文件夹分组（换装模式也支持多组批量）；
+    // 仅非目录拖入的单套素材在换装模式下按单套处理。
+    const inlineGroups = (promptMode || isDirectoryDrop)
         ? ecommerceInlineGarmentGroups(loaded.images, loaded.name)
         : [{ name: loaded.name, images: loaded.images.map(item => item.url) }];
-    ecommerceState.scanned = { garments: inlineGroups, invalid: [], garment_count: inlineGroups.length, image_total: loaded.images.length, source: isDirectoryDrop ? 'uploaded_directory' : 'uploaded_files' };
-    if (summary) summary.textContent = ecommerceState.importActions?.actions?.length
-        ? `单套测试：已按文件名顺序加载${loaded.images.length}张服装参考图；将生成 1 × 目标图数量 个任务。`
-        : `${isDirectoryDrop ? `已递归加载${inlineGroups.length}个原目录、` : '已选择'}${loaded.images.length}张服装原图；将按原目录分类并分别使用当前提示词生成。`;
+    const groupImageCounts = inlineGroups.map(g => ({ name: g.name, count: g.images.length }));
+    const imageCountsConsistent = new Set(groupImageCounts.map(item => item.count)).size === 1;
+    ecommerceState.scanned = { garments: inlineGroups, invalid: [], garment_count: inlineGroups.length, image_total: loaded.images.length, group_image_counts: groupImageCounts, image_counts_consistent: imageCountsConsistent, source: isDirectoryDrop ? 'uploaded_directory' : 'uploaded_files' };
+    if (summary) {
+        if (!promptMode && !imageCountsConsistent && inlineGroups.length > 1) {
+            const detail = groupImageCounts.map(item => `${item.name} ${item.count}张`).join('、');
+            summary.textContent = `子文件夹图片数量不一致：${detail}。请确保各子文件夹参考图张数相同后再创建批次。`;
+            summary.className = 'ecommerce-summary ecommerce-compact-summary ecommerce-output-status is-error';
+        } else if (isDirectoryDrop) {
+            summary.textContent = `已递归加载${inlineGroups.length}个原目录、${loaded.images.length}张服装原图；将按原目录分组生成 ${inlineGroups.length} × 目标图数量 个任务。`;
+            summary.className = 'ecommerce-summary ecommerce-compact-summary';
+        } else if (ecommerceState.importActions?.actions?.length) {
+            summary.textContent = `单套测试：已按文件名顺序加载${loaded.images.length}张服装参考图；将生成 1 × 目标图数量 个任务。`;
+            summary.className = 'ecommerce-summary ecommerce-compact-summary';
+        } else {
+            summary.textContent = `已选择${loaded.images.length}张服装原图；将按原目录分类并分别使用当前提示词生成。`;
+            summary.className = 'ecommerce-summary ecommerce-compact-summary';
+        }
+    }
     updateEcommerceGenerateButton();
     saveEcommerceDraft();
-    showToast(isDirectoryDrop ? `已递归加载${inlineGroups.length}个目录、${loaded.images.length}张图` : `已加载${loaded.images.length}张服装参考图`, 'success');
+    if (!promptMode && !imageCountsConsistent && inlineGroups.length > 1) {
+        showToast('子文件夹图片数量不一致，请修正后再创建批次', 'warning');
+    } else {
+        showToast(isDirectoryDrop ? `已递归加载${inlineGroups.length}个目录、${loaded.images.length}张图` : `已加载${loaded.images.length}张服装参考图`, 'success');
+    }
 }
 
 function renderEcommerceBatchList() {
@@ -11709,8 +13314,11 @@ function ecommerceTaskDisplayStatus(task) {
 
 async function refreshEcommerceBatch() {
     if (!ecommerceState.currentBatchId) return;
+    const batchId = ecommerceState.currentBatchId;
+    const refreshVersion = ++ecommerceState.refreshVersion;
     try {
-        const data = await ecommerceApi('GET', `/api/ecommerce/batches/${encodeURIComponent(ecommerceState.currentBatchId)}`);
+        const data = await ecommerceApi('GET', `/api/ecommerce/batches/${encodeURIComponent(batchId)}`);
+        if (batchId !== ecommerceState.currentBatchId || refreshVersion !== ecommerceState.refreshVersion) return;
         ecommerceState.detail = data.batch;
         const idx = ecommerceState.batches.findIndex(b => b.id === data.batch.id);
         const summary = { ...data.batch };
@@ -11762,6 +13370,10 @@ function renderEcommerceBatchDetail() {
     const usage = b.usage || {};
     const isRunning = b.status === 'running' || b.status === 'resuming';
     const isCancelling = b.status === 'cancelling';
+    const isBusy = !!ecommerceState.controlBusy;
+    const canStart = ['draft', 'paused', 'interrupted'].includes(b.status);
+    const canPause = isRunning;
+    const canCancel = !['completed', 'cancelled', 'cancelling'].includes(b.status);
     const percent = b.task_total ? Math.round((b.done_total || 0) / b.task_total * 100) : 0;
     const archiveFallback = !!b.settings?.archive_fallback;
     const archiveSummary = b.final_output_path
@@ -11803,18 +13415,27 @@ function renderEcommerceBatchDetail() {
             if (b.settings?.final_output_fallback) statusHtml += ` ｜ <span class="status-running">指定成品目录不可写，本批次按确认保存到本地成品目录</span>`;
             progressStatus.innerHTML = statusHtml;
         } else if (b.status === 'paused') {
-            progressStatus.innerHTML = `<span class="status-running">⏸ 已暂停</span> ｜ 已完成 ${b.done_total || 0}/${b.task_total || 0}`;
+            progressStatus.innerHTML = b.needs_recharge
+                ? `<span class="status-error">⏸ 已暂停（API余额不足）</span> ｜ 已完成 ${b.done_total || 0}/${b.task_total || 0} ｜ 充值后点击“开始 / 继续”，自动重跑因额度不足失败的任务`
+                : `<span class="status-running">⏸ 已暂停</span> ｜ 已完成 ${b.done_total || 0}/${b.task_total || 0}`;
+        } else if (b.status === 'interrupted') {
+            progressStatus.innerHTML = b.needs_recharge
+                ? `<span class="status-error">API余额不足导致中断</span> ｜ 已归档 ${acceptedTasks.length}/${b.task_total || 0} ｜ 充值后点击“开始 / 继续”，自动重跑失败任务`
+                : `<span class="status-error">有任务中断</span> ｜ 已归档 ${acceptedTasks.length}/${b.task_total || 0} ｜ 检查错误后点击“开始 / 继续”`;
         } else if (b.status === 'cancelled') {
             progressStatus.innerHTML = `已取消 ｜ 已完成 ${b.done_total || 0}/${b.task_total || 0}`;
         } else {
             progressStatus.textContent = '等待运行';
         }
     }
-    if (start) start.disabled = ['running','resuming','completed','cancelled'].includes(b.status);
+    if (start) {
+        start.disabled = isBusy || !canStart;
+        start.textContent = isRunning ? '运行中' : (b.status === 'paused' || b.status === 'interrupted' ? '开始 / 继续' : '开始');
+    }
     // 暂停按钮：running 和 resuming 都允许暂停（之前 resuming 状态无法暂停是 bug）
-    if (pause) pause.disabled = !isRunning;
+    if (pause) pause.disabled = isBusy || !canPause;
     if (cancel) {
-        cancel.disabled = ['completed','cancelled','cancelling'].includes(b.status);
+        cancel.disabled = isBusy || !canCancel;
         if (isCancelling) cancel.textContent = '正在收回…';
         else cancel.textContent = '取消';
     }
@@ -11827,9 +13448,10 @@ function renderEcommerceBatchDetail() {
     // 同步“开始运行”按钮状态：运行中时禁用并显示“正在运行中”
     const createBtn = document.getElementById('btn-ecommerce-create');
     if (createBtn) {
-        if (isRunning) {
+        const hasActiveBatch = ecommerceState.batches.some(batch => ['running', 'resuming', 'cancelling'].includes(batch.status));
+        if (isRunning || hasActiveBatch) {
             createBtn.disabled = true;
-            createBtn.textContent = '正在运行中…';
+            createBtn.textContent = '已有批次运行中…';
         } else {
             createBtn.disabled = false;
             updateEcommerceGenerateButton();
@@ -11872,7 +13494,7 @@ function renderEcommerceBatchDetail() {
 const ecommerceReferenceReview = { garment: null, index: 0 };
 
 function ecommerceReferenceUrl(path) {
-    return path ? (/^(?:https?:|data:|\/static\/)/.test(path) ? path : `/api/ecommerce/local-image?path=${encodeURIComponent(path)}`) : '';
+    return path ? ecommerceLocalImageUrl(path) : '';
 }
 
 function updateEcommerceReferenceReview() {
@@ -11909,25 +13531,44 @@ function closeEcommerceReferenceReview() {
 }
 
 // 异步扫描每套服装结果目录中的实际AI图数量，更新进度显示（删除文件后能实时反映）
-async function refreshEcommerceFolderStatusCounts(container, batch) {
+async function refreshEcommerceFolderStatusCounts(container, batch, precomputedItems = null) {
     const statusSpans = container.querySelectorAll('.ecommerce-folder-status[data-result-path]');
     if (!statusSpans.length || !batch?.id) return;
     try {
         // 调用 scan-deleted API 获取每套服装的废片数（即被删除的动作数）
-        const result = await ecommerceApi('POST', '/api/ecommerce/scan-deleted', { batch_id: batch.id });
+        // precomputedItems 用于已经扫过一遍的调用方（如扫描废片后），避免连扫两次。
+        const result = Array.isArray(precomputedItems)
+            ? { items: precomputedItems }
+            : await ecommerceApi('POST', '/api/ecommerce/scan-deleted', { batch_id: batch.id });
         const deletedByGarment = {};
         for (const item of (result.items || [])) {
             const gid = item.garment_id;
             if (!deletedByGarment[gid]) deletedByGarment[gid] = 0;
-            deletedByGarment[gid]++;
+            deletedByGarment[gid] += Math.max(1, Number(item.missing_count) || 1);
+        }
+        const acceptedByGarment = {};
+        for (const task of (batch.tasks || [])) {
+            if (task.state !== 'accepted') continue;
+            const gid = task.garment_id || task.garment_name;
+            if (gid) acceptedByGarment[gid] = (acceptedByGarment[gid] || 0) + 1;
         }
         statusSpans.forEach(span => {
             const row = span.closest('.ecommerce-folder-row');
+            const confirmButton = row?.querySelector('.ecommerce-folder-confirm');
             const garmentId = row?.dataset?.garmentId;
             const total = parseInt(span.dataset.taskTotal || '0', 10);
-            if (!garmentId || !total) return;
+            if (!garmentId || !total) {
+                if (confirmButton) {
+                    confirmButton.disabled = true;
+                    confirmButton.title = '本组暂无生成任务，无法确认';
+                }
+                return;
+            }
             const deleted = deletedByGarment[garmentId] || 0;
-            const remaining = Math.max(0, total - deleted);
+            // A task that failed before returning an image is not complete.
+            // Use accepted tasks as the source of truth so a missing result
+            // cannot make the folder view show a false 1/1.
+            const remaining = Math.max(0, Math.min(total, (acceptedByGarment[garmentId] || 0) - deleted));
             span.textContent = `${remaining}/${total}`;
             if (deleted > 0) {
                 span.style.color = '#f79009';
@@ -11935,10 +13576,23 @@ async function refreshEcommerceFolderStatusCounts(container, batch) {
             } else {
                 span.style.color = '';
             }
+            if (confirmButton) {
+                // 每个动作都有成品图（且没有待重做标记）才允许直接确认，与后端 confirm-group 的校验一致。
+                const markedCount = (batch.marked_redo || []).filter(m => m.garment_id === garmentId).length;
+                const complete = remaining >= total && !markedCount;
+                confirmButton.disabled = !complete;
+                confirmButton.title = complete
+                    ? `本组${total}个动作都有成品图，可直接确认，无需点进对比大图`
+                    : `暂不能确认：成品${remaining}/${total}张${deleted > 0 ? `，已删${deleted}张` : ''}${markedCount > 0 ? `，另有${markedCount}张标记重做` : ''}。补齐后再确认`;
+            }
         });
     } catch (e) {
         // 扫描失败时保持原有的任务状态显示
         console.warn('刷新文件夹状态计数失败:', e);
+        container.querySelectorAll('.ecommerce-folder-confirm').forEach(button => {
+            button.disabled = true;
+            button.title = '完整性检查失败，请点「刷新并重扫」后再试';
+        });
     }
 }
 
@@ -11955,7 +13609,16 @@ function renderEcommerceResultFolders() {
         container.innerHTML = '<div class="ecommerce-empty">尚未扫描到服装文件夹。</div>';
         return;
     }
-    const folderSignature = `${b.id}|${b.run_code || ''}|${garments.map(g => g.id).join(',')}|${(b.tasks || []).map(t => `${t.id}:${t.state}:${t.updated_at || ''}`).join('|')}|${JSON.stringify(b.confirmed_groups || {})}`;
+    // 删除/标记台账也必须进签名：标记重做或恢复废片后任务状态往往没变，
+    // 只按任务状态做签名会命中缓存直接 return，逐套验片的数字就不会刷新。
+    const activeDeletions = (b.deleted_samples || []).filter(
+        record => ['deleted', 'pending'].includes(String(record.status || ''))
+    ).length;
+    const markedRedoCount = (b.marked_redo || []).length;
+    // 二次调整（refine_redo）同样会改变「缺图数」，但不改任务状态也不进删除台账，
+    // 必须一起进签名，否则详情刷新后签名不变会命中缓存，进度数字不重算。
+    const refineRedoCount = (b.refine_redo || []).length;
+    const folderSignature = `${b.id}|${b.run_code || ''}|${activeDeletions}|${markedRedoCount}|${refineRedoCount}|${garments.map(g => g.id).join(',')}|${garments.map(g => `${g.path}:${(g.images || [])[0] || ''}`).join(',')}|${(b.tasks || []).map(t => `${t.id}:${t.state}:${t.updated_at || ''}`).join('|')}|${JSON.stringify(b.confirmed_groups || {})}`;
     if (folderSignature === ecommerceState.renderCache.folders) return;
     ecommerceState.renderCache.folders = folderSignature;
     const tasksByGarment = {};
@@ -11967,14 +13630,14 @@ function renderEcommerceResultFolders() {
     const rows = garments.map((g, index) => {
         const tasks = tasksByGarment[g.id] || [];
         const total = tasks.length;
-        const done = tasks.filter(t => ['accepted', 'manual_review', 'skipped', 'cancelled'].includes(t.state)).length;
+        const done = tasks.filter(t => t.state === 'accepted').length;
         const acceptedTasks = tasks.filter(t => t.state === 'accepted');
         const resultPath = b.result_dirs?.[g.id]
             || b.settings?.archive_fallback_garments?.[g.name]
             || (b.settings?.archive_fallback ? `${b.settings.archive_fallback_root}/${g.name}` : (b.output_path ? `${b.output_path}/_生成样本备份/${g.name}` : ''));
         // 进度显示：初始用任务状态，稍后异步扫描实际文件数量更新
         const statusText = total ? `${done}/${total}` : '—';
-        const statusDetail = total ? `已归档${acceptedTasks.length}；人工逐验请到第4栏处理` : '暂无任务';
+        const statusDetail = total ? `已归档${acceptedTasks.length}；人工逐验请到第3栏处理` : '暂无任务';
         const groupAction = b.generation_mode === 'garment_prompt'
             ? (b.template?.actions || []).find(action => action.garment_id === g.id)
             : null;
@@ -11982,16 +13645,25 @@ function renderEcommerceResultFolders() {
             ? (groupAction?.action_image || b.template?.actions?.[0]?.action_image)
             : '';
         const referenceUrl = ecommerceThumbnailUrl(ecommerceReferenceUrl(g.images?.[0] || fallbackTarget || ''), 120);
+        // 实拍图整体不可读时（文件夹被移动/改名），行上高亮「链实拍图」按钮。
+        const refMissingCount = Number(g.reference_missing || 0);
+        const refMissing = refMissingCount > 0 || !(g.images || []).length;
+        const refBadge = refMissing
+            ? `<span class="ecommerce-ref-missing-badge" title="服装实拍参考图已读不到，点右侧「🔗 链实拍图」重新接回">实拍图缺失${refMissingCount ? ` ${refMissingCount}` : ''}</span>`
+            : '';
         const isConfirmed = !!(b.confirmed_groups && b.confirmed_groups[g.id]);
         const confirmedBadge = isConfirmed ? '<span class="ecommerce-confirmed-badge" title="已确认该组">✓ 已确认</span>' : '';
+        // 本组每个动作都有成品图时才能直接确认，无需再点进对比大图。
+        const confirmButton = isConfirmed ? '' : `<button class="btn btn-outline btn-compact ecommerce-folder-confirm" type="button" disabled title="正在检查该组是否完整…" style="color:#7c3aed;border-color:#c4b5fd;">✓ 确认该组</button>`;
         return `<div class="ecommerce-folder-row${isConfirmed ? ' is-confirmed' : ''}" data-garment-id="${ecommerceEscape(g.id)}" data-result-path="${ecommerceEscape(resultPath)}" data-garment-path="${ecommerceEscape(g.path)}" data-task-total="${total}">
             <span class="ecommerce-folder-identity" title="${ecommerceEscape(g.path)}"><i>${index + 1}</i><b>${ecommerceEscape(g.name)}</b></span>
-            <span class="ecommerce-folder-status" title="${ecommerceEscape(statusDetail)}" data-result-path="${ecommerceEscape(resultPath)}" data-task-total="${total}">${statusText}${confirmedBadge}</span>
-            <span class="ecommerce-folder-actions">${referenceUrl ? `<img class="ecommerce-folder-ref-thumb ecommerce-folder-compare" src="${ecommerceEscape(referenceUrl)}" alt="${ecommerceEscape(g.name)}参考图" title="查看对比" loading="lazy" decoding="async">` : ''}<button class="btn btn-primary btn-compact ecommerce-folder-compare" type="button">对比</button><button class="btn btn-outline btn-compact ecommerce-folder-open" type="button" title="在访达中打开 ${ecommerceEscape(resultPath)}">📁 打开</button></span>
+            <span class="ecommerce-folder-status" title="${ecommerceEscape(statusDetail)}" data-result-path="${ecommerceEscape(resultPath)}" data-task-total="${total}">${statusText}${refBadge}${confirmedBadge}</span>
+            <span class="ecommerce-folder-actions">${referenceUrl ? `<img class="ecommerce-folder-ref-thumb ecommerce-folder-compare" src="${ecommerceEscape(referenceUrl)}" alt="${ecommerceEscape(g.name)}参考图" title="查看对比" loading="lazy" decoding="async">` : ''}<button class="btn btn-primary btn-compact ecommerce-folder-compare" type="button">对比</button><button class="btn btn-outline btn-compact ecommerce-folder-open" type="button" title="在访达中打开 ${ecommerceEscape(resultPath)}">📁 打开</button>${confirmButton}<button class="btn btn-outline btn-compact ecommerce-folder-more-btn${refMissing ? ' is-missing' : ''}" type="button" title="更多：重新链接这一套的成品图 / 服装实拍图">⋯ 更多</button></span>
+            <span class="ecommerce-folder-more-row" hidden><button class="btn btn-outline btn-compact ecommerce-folder-relink-result" type="button" title="这一套的成品图被移到别处了点这里：选择新位置后只重新接这一套的成品">🔗 链成片</button><button class="btn btn-outline btn-compact ecommerce-folder-relink-garment${refMissing ? ' is-missing' : ''}" type="button" title="${refMissing ? '这一套的服装实拍参考图已读不到（多半是文件夹被移动或改名）：点这里选择新位置' : '这一套的服装实拍参考图被移到别处了点这里：选择新位置后只重新接这一套的实拍图'}">🔗 链实拍图</button></span>
         </div>`;
     }).join('');
     const identityLabel = b.generation_mode === 'garment_prompt' ? '来源' : (b.generation_mode === 'target_only' ? '模式' : '服装');
-    container.innerHTML = `<div class="ecommerce-folder-row is-head" title="${ecommerceEscape(b.run_code || '')}"><span>${identityLabel}</span><span>进度</span><span>查看</span></div>${rows}`;
+    container.innerHTML = `<div class="ecommerce-folder-row is-head" title="${ecommerceEscape(b.run_code || '')}"><span>${identityLabel}</span><span>进度</span><span>查看 · 对比 · 打开 · 确认该组 · 更多</span></div>${rows}`;
     // 异步扫描实际文件夹中的AI图数量，更新进度显示（删除文件后能实时反映）
     refreshEcommerceFolderStatusCounts(container, b);
     container.querySelectorAll('.ecommerce-folder-compare').forEach(control => {
@@ -12010,6 +13682,40 @@ function renderEcommerceResultFolders() {
             } finally {
                 if (button) { button.disabled = false; button.textContent = originalText || '对比'; }
             }
+        });
+    });
+    // 「⋯ 更多」：就地展开本行的链成片/链实拍图，再点一次收起。
+    container.querySelectorAll('.ecommerce-folder-more-btn').forEach(button => {
+        button.addEventListener('click', () => {
+            const row = button.closest('.ecommerce-folder-row');
+            const more = row?.querySelector('.ecommerce-folder-more-row');
+            if (!more) return;
+            more.hidden = !more.hidden;
+            button.textContent = more.hidden ? '⋯ 更多' : '⋯ 收起';
+        });
+    });
+    container.querySelectorAll('.ecommerce-folder-relink-result').forEach(button => {
+        button.addEventListener('click', () => {
+            const row = button.closest('.ecommerce-folder-row');
+            runEcommerceRelink({
+                batchId: b.id,
+                target: 'results',
+                garmentId: row?.dataset.garmentId || '',
+                initialDir: ecommerceRelinkInitialDir(row?.dataset.resultPath || ''),
+                button
+            });
+        });
+    });
+    container.querySelectorAll('.ecommerce-folder-relink-garment').forEach(button => {
+        button.addEventListener('click', () => {
+            const row = button.closest('.ecommerce-folder-row');
+            runEcommerceRelink({
+                batchId: b.id,
+                target: 'garments',
+                garmentId: row?.dataset.garmentId || '',
+                initialDir: ecommerceRelinkInitialDir(row?.dataset.garmentPath || ''),
+                button
+            });
         });
     });
     container.querySelectorAll('.ecommerce-folder-open').forEach(button => {
@@ -12034,6 +13740,28 @@ function renderEcommerceResultFolders() {
             }
         });
     });
+    container.querySelectorAll('.ecommerce-folder-confirm').forEach(button => {
+        button.addEventListener('click', async () => {
+            const row = button.closest('.ecommerce-folder-row');
+            const garmentId = row?.dataset.garmentId || '';
+            if (!garmentId || !b.id) return;
+            const garmentName = row.querySelector('.ecommerce-folder-identity b')?.textContent || '该组';
+            const originalText = button.textContent;
+            button.disabled = true;
+            button.textContent = '确认中…';
+            try {
+                const resp = await ecommerceApi('POST', '/api/ecommerce/confirm-group', { batch_id: b.id, garment_id: garmentId });
+                if (!resp.ok && resp.error) throw new Error(resp.error);
+                showToast(`✓ 已确认 ${garmentName}，已移入成品导出列表`, 'success');
+                await refreshEcommerceBatch();
+                await loadEcommerceFinalExportStatus(false);
+            } catch (error) {
+                showToast(`确认失败：${error.message}`, 'error');
+                button.disabled = false;
+                button.textContent = originalText;
+            }
+        });
+    });
 }
 
 async function createAndStartEcommerceBatch() {
@@ -12048,6 +13776,15 @@ async function createAndStartEcommerceBatch() {
         const actionCount = ecommerceState.importActions?.actions?.length || 0;
         const mapping = ecommerceState.precisionMatching?.mapping || [];
         if (mapping.length !== actionCount) return showToast('请先完成所有目标图的人工精准匹配', 'error');
+    }
+    // 子文件夹图片数量一致性：多组批量必须各组参考图张数相同（仅换装模式），
+    // 不一致直接阻止创建，避免任务数错乱（后端也有同规则双保险）。
+    if (generationMode === 'garment_reference') {
+        const groupCounts = ecommerceState.scanned?.group_image_counts || [];
+        if (ecommerceState.scanned?.image_counts_consistent === false && groupCounts.length > 1) {
+            const detail = groupCounts.map(item => `${item.name} ${item.count}张`).join('、');
+            return showToast(`子文件夹图片数量不一致：${detail}。请确保各子文件夹参考图张数相同后再创建批次`, 'error');
+        }
     }
     // 新建前一定刷新批次索引，避免后台已收尾而页面仍拿旧“运行中”状态阻止下一批。
     try {
@@ -12086,6 +13823,7 @@ async function createAndStartEcommerceBatch() {
             if (endpoint) runningHubSpecs.set(`${endpoint}|${resolution}`, { endpoint, resolution });
         }
         for (const spec of runningHubSpecs.values()) {
+            const isEnterpriseModel = !!getImageModelMeta('runninghub', spec.endpoint)?.enterpriseOnly;
             try {
                 const preview = await ecommerceApi('POST', '/api/rh-preflight', {
                     model_id: spec.endpoint,
@@ -12097,9 +13835,14 @@ async function createAndStartEcommerceBatch() {
                     if (!proceed) throw new Error('已取消高价模型批次，请改用V2 Flash低价4K');
                 }
             } catch (preflightError) {
-                // 价格预估是非计费的安全提示，不应阻断批次创建；模型权限/参数错误会在真正提交时返回。
                 const message = preflightError?.message || '价格预估失败';
                 if (message.startsWith('已取消高价模型批次')) throw preflightError;
+                // 企业级-共享模型（如 GPT 2.5）必须先通过预检验证当前 Key 权限：
+                // 预检失败直接阻断批次创建，避免创建后每个任务都报“任务中断”。
+                // 普通模型保持非阻断，真实权限/参数错误在提交时返回。
+                if (isEnterpriseModel) {
+                    throw new Error(`模型 ${spec.endpoint} 预检未通过，当前 RunningHub API Key 无法调用该标准模型 API：\n${message}`);
+                }
                 runningHubPreflightWarnings.push(`${spec.endpoint} ${spec.resolution.toUpperCase()}：${message}`);
                 console.warn('[ecommerce] RunningHub价格预检失败，继续创建批次', spec, preflightError);
             }
@@ -12159,25 +13902,148 @@ async function createAndStartEcommerceBatch() {
     // 自动把按钮设为“正在运行中…”或还原为“开始运行”。仅在出错时手动还原。
 }
 
-async function controlEcommerceBatch(action) {
-    if (!ecommerceState.currentBatchId) return;
+async function controlEcommerceBatch(action, modelOverride = null) {
+    if (!ecommerceState.currentBatchId || ecommerceState.controlBusy) return;
+    const batchId = ecommerceState.currentBatchId;
+    const wasRechargeBlocked = !!ecommerceState.detail?.needs_recharge;
+    ecommerceState.controlBusy = true;
+    ecommerceState.refreshVersion += 1;
+    if (ecommerceState.pollTimer) clearTimeout(ecommerceState.pollTimer);
+    ecommerceState.pollTimer = null;
+    renderEcommerceBatchDetail();
     try {
-        await ecommerceApi('POST', `/api/ecommerce/batches/${encodeURIComponent(ecommerceState.currentBatchId)}/action`, { action });
+        const payload = { action };
+        if (modelOverride) payload.model_override = modelOverride;
+        const result = await ecommerceApi('POST', `/api/ecommerce/batches/${encodeURIComponent(batchId)}/action`, payload);
+        if (batchId !== ecommerceState.currentBatchId) return;
+        if (ecommerceState.detail?.id === batchId && result.status) {
+            ecommerceState.detail.status = result.status;
+        }
         await refreshEcommerceBatch();
-        if (action !== 'start' && action !== 'resume') showToast(`批次${action === 'pause' ? '已暂停' : '已取消'}`, 'success');
+        if (modelOverride) {
+            showToast(`已切换模型继续，剩余任务使用 ${modelOverride.model_key}`, 'success');
+        } else if (action === 'resume' && wasRechargeBlocked) {
+            showToast('已继续运行，正在自动重跑因余额不足中断的任务', 'success');
+        } else if (action !== 'start' && action !== 'resume') {
+            showToast(`批次${action === 'pause' ? '已暂停' : '已取消'}`, 'success');
+        }
     } catch (e) {
         showToast(`操作失败：${e.message}`, 'error');
+    } finally {
+        ecommerceState.controlBusy = false;
+        renderEcommerceBatchDetail();
+        scheduleEcommercePoll(['running', 'resuming', 'cancelling'].includes(ecommerceState.detail?.status));
     }
 }
 
+// 「继续」时先询问是否更换平台/模型：选「更换」才弹选择器，选「沿用」直接续跑。
+async function startOrResumeEcommerceBatch() {
+    const status = ecommerceState.detail?.status;
+    if (status !== 'paused' && status !== 'interrupted') {
+        await controlEcommerceBatch('start');
+        return;
+    }
+    const wantSwitch = await ecommerceAskSwitchModel();
+    if (wantSwitch === null) return;
+    if (!wantSwitch) {
+        await controlEcommerceBatch('resume');
+        return;
+    }
+    const override = await ecommercePickModelOverride();
+    if (!override) return;
+    await controlEcommerceBatch('resume', override);
+}
+
+// 返回 true=去更换模型，false=沿用原模型，null=取消
+function ecommerceAskSwitchModel() {
+    return new Promise(resolve => {
+        const dialog = document.getElementById('ecommerce-switch-model-dialog');
+        const messageEl = document.getElementById('ecommerce-switch-model-message');
+        const keepBtn = document.getElementById('ecommerce-switch-model-keep');
+        const changeBtn = document.getElementById('ecommerce-switch-model-change');
+        if (!dialog || !messageEl || !keepBtn || !changeBtn) { resolve(false); return; }
+        const detail = ecommerceState.detail || {};
+        const done = Number(detail.done_total || 0);
+        const pending = Math.max(0, Number(detail.task_total || 0) - done);
+        messageEl.innerHTML = '是否更换平台和模型继续？'
+            + `<small style="display:block;margin-top:6px;color:#475467;">已生成的 ${done} 张不会重跑、也不会重复扣费；`
+            + `剩余 ${pending} 张将使用你选择的模型。不更换则沿用原来的平台和模型。</small>`;
+        dialog.hidden = false;
+        const cleanup = result => {
+            dialog.hidden = true;
+            keepBtn.removeEventListener('click', onKeep);
+            changeBtn.removeEventListener('click', onChange);
+            dialog.removeEventListener('click', onBg);
+            document.removeEventListener('keydown', onKey);
+            resolve(result);
+        };
+        const onKeep = () => cleanup(false);
+        const onChange = () => cleanup(true);
+        const onBg = event => { if (event.target === dialog) cleanup(null); };
+        const onKey = event => { if (event.key === 'Escape') { event.preventDefault(); cleanup(null); } };
+        keepBtn.addEventListener('click', onKeep);
+        changeBtn.addEventListener('click', onChange);
+        dialog.addEventListener('click', onBg);
+        document.addEventListener('keydown', onKey);
+        setTimeout(() => { if (changeBtn.isConnected) changeBtn.focus(); }, 50);
+    });
+}
+
+// 返回 { platform, model_key }；取消返回 null
+function ecommercePickModelOverride() {
+    return new Promise(resolve => {
+        const dialog = document.getElementById('ecommerce-pick-model-dialog');
+        const platformSelect = document.getElementById('ecommerce-pick-platform');
+        const modelSelect = document.getElementById('ecommerce-pick-model');
+        const note = document.getElementById('ecommerce-pick-model-note');
+        const cancelBtn = document.getElementById('ecommerce-pick-model-cancel');
+        const okBtn = document.getElementById('ecommerce-pick-model-ok');
+        if (!dialog || !platformSelect || !modelSelect || !cancelBtn || !okBtn) { resolve(null); return; }
+        const refreshModels = () => {
+            modelSelect.innerHTML = ecommerceRerunModelOptions(platformSelect.value, modelSelect.value);
+            const model = getImageModelMeta(platformSelect.value, modelSelect.value);
+            note.textContent = model
+                ? `${model.name || modelSelect.value}｜${model.price || '价格以平台实时计费为准'}`
+                : '请选择模型';
+        };
+        const cleanup = result => {
+            dialog.hidden = true;
+            platformSelect.removeEventListener('change', refreshModels);
+            modelSelect.removeEventListener('change', refreshModels);
+            cancelBtn.removeEventListener('click', onCancel);
+            okBtn.removeEventListener('click', onOk);
+            dialog.removeEventListener('click', onBg);
+            document.removeEventListener('keydown', onKey);
+            resolve(result);
+        };
+        const onCancel = () => cleanup(null);
+        const onOk = () => {
+            if (!platformSelect.value || !modelSelect.value) return;
+            cleanup({ platform: platformSelect.value, model_key: modelSelect.value });
+        };
+        const onBg = event => { if (event.target === dialog) cleanup(null); };
+        const onKey = event => { if (event.key === 'Escape') { event.preventDefault(); cleanup(null); } };
+        platformSelect.addEventListener('change', refreshModels);
+        modelSelect.addEventListener('change', refreshModels);
+        cancelBtn.addEventListener('click', onCancel);
+        okBtn.addEventListener('click', onOk);
+        dialog.addEventListener('click', onBg);
+        document.addEventListener('keydown', onKey);
+        refreshModels();
+        dialog.hidden = false;
+        setTimeout(() => { if (platformSelect.isConnected) platformSelect.focus(); }, 50);
+    });
+}
+
 document.getElementById('btn-ecommerce-select-actions')?.addEventListener('click', chooseAndPreviewEcommerceActions);
-document.getElementById('btn-ecommerce-select-target-files')?.addEventListener('click', () => document.getElementById('ecommerce-target-files')?.click());
+// 「选择图片」也改走系统目录选择器：浏览器原生文件框无法指定打开目录，
+// 换成后端选择器后，才能按入口记住上次用过的目录。拖入指定几张图仍走原生拖拽。
+document.getElementById('btn-ecommerce-select-target-files')?.addEventListener('click', () => chooseAndPreviewEcommerceActions());
 document.getElementById('ecommerce-target-files')?.addEventListener('change', event => loadDroppedEcommerceTargetFiles(event.target.files));
 document.getElementById('btn-ecommerce-clear-targets')?.addEventListener('click', clearEcommerceTargetReferences);
 document.getElementById('btn-ecommerce-clear-garments')?.addEventListener('click', clearEcommerceGarmentReferences);
 const ecommerceTargetDropzone = document.getElementById('ecommerce-target-dropzone');
 if (ecommerceTargetDropzone) {
-    let targetClickTimer = null;
     ecommerceTargetDropzone.addEventListener('dragenter', event => {
         event.preventDefault();
         ecommerceTargetDropzone.classList.add('is-dragover');
@@ -12197,27 +14063,25 @@ if (ecommerceTargetDropzone) {
     });
     ecommerceTargetDropzone.addEventListener('click', event => {
         if (event.target === ecommerceTargetDropzone || event.target.closest('b, strong, span')) {
-            clearTimeout(targetClickTimer);
-            targetClickTimer = setTimeout(() => document.getElementById('ecommerce-target-files')?.click(), 220);
+            chooseAndPreviewEcommerceActions();
         }
     });
     ecommerceTargetDropzone.addEventListener('dblclick', event => {
         event.preventDefault();
-        clearTimeout(targetClickTimer);
-        document.getElementById('btn-ecommerce-select-actions')?.click();
+        chooseAndPreviewEcommerceActions();
     });
     ecommerceTargetDropzone.addEventListener('keydown', event => {
         if (event.key === 'Enter' || event.key === ' ') {
             event.preventDefault();
-            document.getElementById('ecommerce-target-files')?.click();
+            chooseAndPreviewEcommerceActions();
         }
     });
 }
 document.getElementById('btn-ecommerce-select-garment-files')?.addEventListener('click', event => {
     event.preventDefault();
     event.stopPropagation();
-    const input = document.getElementById('ecommerce-garment-files');
-    if (input) input.click();
+    // 同样改走系统目录选择器，避免每次从固定位置重新翻找。
+    document.getElementById('btn-ecommerce-select-root')?.click();
 });
 // 文件夹入口必须走系统目录选择器：浏览器的多文件选择器在桌面壳中
 // 可能只返回当前层文件，不能可靠表达“整个大文件夹”。后端会递归扫描
@@ -12232,7 +14096,6 @@ document.getElementById('ecommerce-garment-files')?.addEventListener('change', e
 });
 const ecommerceGarmentDropzone = document.getElementById('ecommerce-garment-dropzone');
 if (ecommerceGarmentDropzone) {
-    let garmentClickTimer = null;
     ecommerceGarmentDropzone.addEventListener('dragenter', event => { event.preventDefault(); ecommerceGarmentDropzone.classList.add('is-dragover'); });
     ecommerceGarmentDropzone.addEventListener('dragover', event => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'; ecommerceGarmentDropzone.classList.add('is-dragover'); });
     ecommerceGarmentDropzone.addEventListener('dragleave', event => { if (!ecommerceGarmentDropzone.contains(event.relatedTarget)) ecommerceGarmentDropzone.classList.remove('is-dragover'); });
@@ -12241,42 +14104,133 @@ if (ecommerceGarmentDropzone) {
         ecommerceGarmentDropzone.classList.remove('is-dragover');
         const summary = document.getElementById('ecommerce-scan-summary');
         try {
-            if (summary) summary.textContent = '正在递归读取拖入的文件夹…';
+            const hasDirectory = Array.from(event.dataTransfer?.items || []).some(item => item.webkitGetAsEntry?.()?.isDirectory);
+            if (summary) summary.textContent = hasDirectory ? '正在递归读取拖入的文件夹…' : '正在读取拖入的图片…';
             const records = await collectDroppedEcommerceGarmentFiles(event.dataTransfer);
             if (!records.length) throw new Error('没有找到可用的JPG、PNG或WEBP图片；若浏览器不支持文件夹拖入，请双击服装区选择文件夹');
-            const directoryDrop = Array.from(event.dataTransfer?.items || []).some(item => item.webkitGetAsEntry?.()?.isDirectory)
+            const directoryDrop = hasDirectory
                 || records.some(item => String(item.relativePath || '').includes('/'));
             await loadDroppedEcommerceGarmentFiles(records, { directoryDrop });
         } catch (error) {
             ecommerceGarmentDropzone.classList.remove('is-uploading', 'is-dragover');
-            if (summary) summary.textContent = `文件夹加载失败：${error.message}`;
-            showToast(`文件夹加载失败：${error.message}`, 'error');
+            if (summary) summary.textContent = `加载失败：${error.message}`;
+            showToast(`加载失败：${error.message}`, 'error');
         }
     });
     ecommerceGarmentDropzone.addEventListener('click', event => {
         if (event.target === ecommerceGarmentDropzone || event.target.closest('b, strong, span, .ecommerce-tile-action')) {
-            clearTimeout(garmentClickTimer);
-            garmentClickTimer = setTimeout(() => document.getElementById('ecommerce-garment-files')?.click(), 0);
+            document.getElementById('btn-ecommerce-select-root')?.click();
         }
     });
-    ecommerceGarmentDropzone.addEventListener('dblclick', event => {
-        event.preventDefault();
-        clearTimeout(garmentClickTimer);
-        document.getElementById('btn-ecommerce-select-root')?.click();
-    });
-    ecommerceGarmentDropzone.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); document.getElementById('ecommerce-garment-files')?.click(); } });
+    ecommerceGarmentDropzone.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); document.getElementById('btn-ecommerce-select-root')?.click(); } });
 }
 document.getElementById('btn-ecommerce-save-rh-api')?.addEventListener('click', saveAndVerifyEcommerceRhApi);
 function updateEcommerceImportPlatformUI() {
     const platform = document.getElementById('ecommerce-import-platform')?.value || 'runninghub';
     const runningHubModels = document.getElementById('ecommerce-import-rh-model');
     const hkModels = document.getElementById('ecommerce-import-oaihk-model');
+    const pptModels = document.getElementById('ecommerce-import-pptoken-model');
+    const apiyiModels = document.getElementById('ecommerce-import-apiyi-model');
+    const pptResolutionStep = document.getElementById('ecommerce-pptoken-resolution-step');
+    const apiyiResolutionStep = document.getElementById('ecommerce-apiyi-resolution-step');
+    const rhResolutionStep = document.getElementById('ecommerce-rh-resolution-step');
     const rhApiButton = document.getElementById('btn-ecommerce-open-rh-api');
     if (runningHubModels) runningHubModels.style.display = platform === 'runninghub' ? '' : 'none';
     if (hkModels) hkModels.style.display = platform === 'oaihk' ? '' : 'none';
+    if (pptModels) pptModels.style.display = platform === 'pptoken' ? '' : 'none';
+    if (apiyiModels) apiyiModels.style.display = platform === 'apiyi' ? '' : 'none';
+    // Let .ecommerce-model-step provide the grid layout when visible. Forcing
+    // flex here makes the label, select, and default hint fight inside one cell.
+    if (pptResolutionStep) pptResolutionStep.style.display = platform === 'pptoken' ? '' : 'none';
+    if (apiyiResolutionStep) apiyiResolutionStep.style.display = platform === 'apiyi' ? '' : 'none';
+    if (rhResolutionStep) rhResolutionStep.style.display = platform === 'runninghub' ? '' : 'none';
+    const ratioLabel = document.querySelector('#ecommerce-import-ratio')?.closest('.ecommerce-model-step')?.querySelector('span');
+    if (ratioLabel) ratioLabel.textContent = (platform === 'pptoken' || platform === 'apiyi' || platform === 'runninghub') ? '4 · 比例' : '3 · 比例';
+    if (platform === 'runninghub' && runningHubModels) {
+        const normalized = normalizeRhModelKey(runningHubModels.value);
+        runningHubModels.value = RH_MODELS[normalized] ? normalized : (runningHubModels.options[0]?.value || '');
+        syncEcommerceRhResolutionSelect(RH_MODELS[runningHubModels.value]);
+    }
+    if (platform === 'pptoken' && pptModels && !PPTOKEN_MODELS[pptModels.value]) {
+        // Migrate drafts saved before the real PPT Token group/model options existed.
+        pptModels.value = normalizePptokenModelKey(pptModels.value);
+    }
+    if (platform === 'pptoken' && pptModels && !pptModels.dataset.userSelected) {
+        const configuredModel = state.modelConfig?.pptoken_model;
+        if (configuredModel && PPTOKEN_MODELS[configuredModel]) pptModels.value = configuredModel;
+    }
+    if (platform === 'apiyi' && apiyiModels && !APIYI_MODELS[apiyiModels.value]) {
+        // Migrate drafts saved before the real API易 model options existed.
+        apiyiModels.value = normalizeApiyiModelKey(apiyiModels.value);
+    }
+    if (platform === 'apiyi' && apiyiModels && !apiyiModels.dataset.userSelected) {
+        const configuredModel = state.modelConfig?.apiyi_model;
+        if (configuredModel && APIYI_MODELS[configuredModel]) apiyiModels.value = configuredModel;
+    }
     if (rhApiButton) rhApiButton.style.display = platform === 'runninghub' ? '' : 'none';
+    const resolution = document.getElementById('ecommerce-import-pptoken-resolution');
+    if (resolution && platform === 'pptoken' && !resolution.dataset.userSelected) {
+        resolution.value = state.modelConfig?.pptoken_default_resolution || resolution.value || '2k';
+    }
+    const apiyiResolution = document.getElementById('ecommerce-import-apiyi-resolution');
+    if (apiyiResolution && platform === 'apiyi' && !apiyiResolution.dataset.userSelected) {
+        apiyiResolution.value = state.modelConfig?.apiyi_default_resolution || apiyiResolution.value || '4k';
+    }
+    // 平台/模型变化后，重排 API易 的分辨率栏与说明。
+    syncEcommerceApiyiResolution();
+    updateEcommerceModelNote();
+}
+
+function syncEcommerceRhResolutionSelect(model) {
+    const select = document.getElementById('ecommerce-import-rh-resolution');
+    const hint = document.getElementById('ecommerce-rh-resolution-hint');
+    if (!select) return;
+
+    const allowed = model?.fixedResolution
+        ? [model.fixedResolution]
+        : (model?.resolutionOptions || ['1k', '2k', '4k']);
+    [...select.options].forEach(option => {
+        option.hidden = !allowed.includes(option.value);
+    });
+    if (!allowed.includes(select.value)) select.value = allowed[0];
+    select.disabled = allowed.length <= 1;
+    if (hint) {
+        hint.textContent = allowed.length <= 1
+            ? '该接口仅支持 1K'
+            : model?.resolutionGuaranteed === false
+                ? '经济渠道，2K/4K 不保证原生输出'
+                : '可选 1K / 2K / 4K';
+    }
 }
 document.getElementById('ecommerce-import-platform')?.addEventListener('change', updateEcommerceImportPlatformUI);
+document.getElementById('ecommerce-import-rh-model')?.addEventListener('change', event => {
+    event.target.value = normalizeRhModelKey(event.target.value);
+    syncEcommerceRhResolutionSelect(RH_MODELS[event.target.value]);
+    updateEcommerceImportPlatformUI();
+    saveEcommerceDraft();
+});
+document.getElementById('ecommerce-import-rh-resolution')?.addEventListener('change', event => {
+    event.target.dataset.userSelected = '1';
+    saveEcommerceDraft();
+});
+document.getElementById('ecommerce-import-pptoken-model')?.addEventListener('change', event => {
+    event.target.dataset.userSelected = '1';
+    saveEcommerceDraft();
+});
+document.getElementById('ecommerce-import-pptoken-resolution')?.addEventListener('change', event => {
+    event.target.dataset.userSelected = '1';
+    saveEcommerceDraft();
+});
+document.getElementById('ecommerce-import-apiyi-model')?.addEventListener('change', event => {
+    event.target.dataset.userSelected = '1';
+    syncEcommerceApiyiResolution();
+    updateEcommerceModelNote();
+    saveEcommerceDraft();
+});
+document.getElementById('ecommerce-import-apiyi-resolution')?.addEventListener('change', event => {
+    event.target.dataset.userSelected = '1';
+    saveEcommerceDraft();
+});
 document.getElementById('btn-ecommerce-open-rh-api')?.addEventListener('click', () => {
     const panel = document.getElementById('ecommerce-rh-api-switch');
     if (!panel) return;
@@ -12286,137 +14240,92 @@ document.getElementById('btn-ecommerce-open-rh-api')?.addEventListener('click', 
 });
 updateEcommerceImportPlatformUI();
 
-// 可调宽工作台：第5栏只在调整参考图时展开，总宽超出视口时使用顶部轨道浏览。
+// 可调宽工作台：权重制布局，6栏始终压缩在一个屏内。
+// 每栏宽度 = (本栏权重 / 总权重) × 可用宽度；拖动分隔线只在这对相邻栏之间搬运权重，
+// 两栏像素宽之和恒定，所以不会把第6栏挤出视口；改变窗口大小时各栏按比例自动伸缩。
 (() => {
-    const storageKey = 'ecommerce_workbench_widths_v2';
+    // v5：改为权重制。旧 key 存的是像素宽，语义不同，换 key 避免串味。
+    const storageKey = 'ecommerce_workbench_widths_v5';
+    const order = ['material', 'qc', 'rerun', 'wastelist', 'adjust', 'final-export'];
     const panels = Object.fromEntries(
         [...document.querySelectorAll('[data-workbench-panel]')].map(panel => [panel.dataset.workbenchPanel, panel])
     );
-    const gridScroll = document.getElementById('ecommerce-grid-scroll');
-    const scrollTrack = document.getElementById('ecommerce-scroll-track');
-    const scrollThumb = document.getElementById('ecommerce-scroll-thumb');
+    const weights = {};
 
-    const MIN_W = 180;
-
-    const setPanelWidth = (panel, width) => {
-        if (!panel) return;
-        const value = Math.round(Math.max(MIN_W, width));
-        panel.style.width = `${value}px`;
-        panel.style.flexBasis = `${value}px`;
+    const readVar = (panel, name, fallback) => {
+        const raw = parseFloat(getComputedStyle(panel).getPropertyValue(name));
+        return Number.isFinite(raw) && raw > 0 ? raw : fallback;
     };
 
-    // 恢复保存的宽度
-    try {
-        const saved = JSON.parse(localStorage.getItem(storageKey) || '{}');
-        Object.entries(saved).forEach(([key, width]) => {
-            if (panels[key] && Number(width) >= MIN_W) setPanelWidth(panels[key], Number(width));
-        });
-    } catch (_e) {}
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (_e) { saved = {}; }
+
+    order.forEach(key => {
+        const panel = panels[key];
+        if (!panel) return;
+        // 默认权重写在 CSS 里；用户拖过则用保存值覆盖。
+        let weight = Number(saved[key]);
+        if (!Number.isFinite(weight) || weight <= 0) weight = readVar(panel, '--wb-weight', 1);
+        weights[key] = weight;
+        panel.style.setProperty('--wb-weight', String(weight));
+    });
 
     const persist = () => {
         try {
-            const widths = Object.fromEntries(Object.entries(panels).map(([key, panel]) => [key, Math.round(panel.getBoundingClientRect().width)]));
-            localStorage.setItem(storageKey, JSON.stringify(widths));
+            const payload = {};
+            order.forEach(key => { if (weights[key]) payload[key] = Math.round(weights[key] * 10) / 10; });
+            localStorage.setItem(storageKey, JSON.stringify(payload));
         } catch (_e) {}
     };
 
-    // ========== 顶部水平滚动轨道 ==========
-    const updateScrollTrack = () => {
-        if (!gridScroll || !scrollTrack || !scrollThumb) return;
-        const contentW = gridScroll.scrollWidth;
-        const viewportW = gridScroll.clientWidth;
-        const scrollable = contentW > viewportW + 2; // 2px容差
-        scrollTrack.hidden = !scrollable;
-        if (!scrollable) return;
-        const trackW = scrollTrack.clientWidth;
-        if (trackW <= 0) return;
-        // thumb宽 = 视口/内容 × 轨道宽
-        const thumbW = Math.max(30, Math.round(viewportW / contentW * trackW));
-        scrollThumb.style.width = `${thumbW}px`;
-        // thumb位置 = scrollLeft / maxScroll × (trackW - thumbW)
-        const maxScroll = contentW - viewportW;
-        const ratio = maxScroll > 0 ? gridScroll.scrollLeft / maxScroll : 0;
-        scrollThumb.style.left = `${Math.round(ratio * (trackW - thumbW))}px`;
-    };
-
-    // 同步轨道拖动 → gridScroll.scrollLeft
-    if (scrollThumb && scrollTrack && gridScroll) {
-        scrollThumb.addEventListener('pointerdown', e => {
-            e.preventDefault();
-            e.stopPropagation();
-            scrollThumb.setPointerCapture?.(e.pointerId);
-            scrollThumb.classList.add('is-dragging');
-            const startX = e.clientX;
-            const startLeft = parseFloat(scrollThumb.style.left) || 0;
-            const contentW = gridScroll.scrollWidth;
-            const viewportW = gridScroll.clientWidth;
-            const trackW = scrollTrack.clientWidth;
-            const thumbW = scrollThumb.clientWidth;
-            const maxScroll = contentW - viewportW;
-            const maxThumbLeft = trackW - thumbW;
-            const move = me => {
-                const delta = me.clientX - startX;
-                const newThumbLeft = Math.max(0, Math.min(maxThumbLeft, startLeft + delta));
-                scrollThumb.style.left = `${Math.round(newThumbLeft)}px`;
-                gridScroll.scrollLeft = (newThumbLeft / maxThumbLeft) * maxScroll;
-            };
-            const stop = () => {
-                scrollThumb.classList.remove('is-dragging');
-                scrollThumb.removeEventListener('pointermove', move);
-                scrollThumb.removeEventListener('pointerup', stop);
-                scrollThumb.removeEventListener('pointercancel', stop);
-            };
-            scrollThumb.addEventListener('pointermove', move);
-            scrollThumb.addEventListener('pointerup', stop);
-            scrollThumb.addEventListener('pointercancel', stop);
-        });
-        // 点击轨道空白处跳转
-        scrollTrack.addEventListener('click', e => {
-            if (e.target === scrollThumb) return;
-            const rect = scrollTrack.getBoundingClientRect();
-            const clickX = e.clientX - rect.left;
-            const thumbW = scrollThumb.clientWidth;
-            const trackW = scrollTrack.clientWidth;
-            const maxThumbLeft = trackW - thumbW;
-            const newThumbLeft = Math.max(0, Math.min(maxThumbLeft, clickX - thumbW / 2));
-            const contentW = gridScroll.scrollWidth;
-            const viewportW = gridScroll.clientWidth;
-            const maxScroll = contentW - viewportW;
-            scrollThumb.style.left = `${Math.round(newThumbLeft)}px`;
-            gridScroll.scrollLeft = (newThumbLeft / maxThumbLeft) * maxScroll;
-        });
-        // gridScroll原生滚动时同步thumb位置
-        gridScroll.addEventListener('scroll', updateScrollTrack);
-    }
-
-    // ========== 分隔线拖拽：左栏放大 → 右边所有栏右移 ==========
+    // ========== 分隔线拖拽：只在这对相邻两栏之间搬运权重 ==========
     document.querySelectorAll('.ecommerce-column-resizer').forEach(handle => {
         handle.addEventListener('pointerdown', event => {
-            const left = panels[handle.dataset.left];
-            if (!left) return;
+            const leftKey = handle.dataset.left;
+            const rightKey = handle.dataset.right;
+            const left = panels[leftKey];
+            const right = panels[rightKey];
+            if (!left || !right || !weights[leftKey] || !weights[rightKey]) return;
             event.preventDefault();
             handle.setPointerCapture?.(event.pointerId);
+
             const startX = event.clientX;
-            const leftStart = left.getBoundingClientRect().width;
+            const leftStartW = left.getBoundingClientRect().width;
+            const rightStartW = right.getBoundingClientRect().width;
+            if (leftStartW <= 0 || rightStartW <= 0) return;
+            const startLeftWeight = weights[leftKey];
+            const pairWeight = startLeftWeight + weights[rightKey];
+            const pairWidth = leftStartW + rightStartW;
+            const floorLeft = readVar(left, '--wb-floor', 0);
+            const floorRight = readVar(right, '--wb-floor', 0);
+
+            let frame = 0;
+            let pendingX = startX;
+            const apply = () => {
+                frame = 0;
+                const nextLeftW = Math.min(Math.max(leftStartW + (pendingX - startX), floorLeft), pairWidth - floorRight);
+                if (nextLeftW <= 0) return;
+                const nextLeftWeight = startLeftWeight * (nextLeftW / leftStartW);
+                const nextRightWeight = pairWeight - nextLeftWeight;
+                if (nextLeftWeight <= 0 || nextRightWeight <= 0) return;
+                weights[leftKey] = nextLeftWeight;
+                weights[rightKey] = nextRightWeight;
+                left.style.setProperty('--wb-weight', String(nextLeftWeight));
+                right.style.setProperty('--wb-weight', String(nextRightWeight));
+            };
             const move = moveEvent => {
-                const delta = moveEvent.clientX - startX;
-                let nextLeft = leftStart + delta;
-                // 左栏不能小于MIN_W，但不限制最大值（允许超出视口，用顶部滚动条浏览）
-                nextLeft = Math.max(MIN_W, nextLeft);
-                if (nextLeft !== Math.round(parseFloat(left.style.width))) {
-                    setPanelWidth(left, nextLeft);
-                    // 右边所有栏保持各自当前宽度不变，整体右移
-                    updateScrollTrack();
-                }
+                pendingX = moveEvent.clientX;
+                if (!frame) frame = requestAnimationFrame(apply);
             };
             const stop = () => {
+                if (frame) cancelAnimationFrame(frame);
+                apply();
                 handle.classList.remove('is-dragging');
                 document.body.classList.remove('ecommerce-column-resizing');
                 handle.removeEventListener('pointermove', move);
                 handle.removeEventListener('pointerup', stop);
                 handle.removeEventListener('pointercancel', stop);
                 persist();
-                updateScrollTrack();
             };
             handle.classList.add('is-dragging');
             document.body.classList.add('ecommerce-column-resizing');
@@ -12426,16 +14335,8 @@ updateEcommerceImportPlatformUI();
         });
     });
 
-    // 初始化 & resize时更新滚动轨道
-    updateScrollTrack();
-    const resizeObs = new ResizeObserver(() => updateScrollTrack());
-    if (gridScroll) resizeObs.observe(gridScroll);
-    const mutObs = new MutationObserver(() => updateScrollTrack());
-    if (gridScroll) mutObs.observe(gridScroll, { attributes: true, subtree: true, attributeFilter: ['style'] });
-
     // ========== 拖动结束后强制彻底 reflow ==========
     const forceFullReflow = () => {
-        void gridScroll?.offsetWidth;
         document.querySelectorAll('#ecommerce-mode .ecommerce-card').forEach(card => {
             void card.offsetHeight;
         });
@@ -12458,6 +14359,72 @@ updateEcommerceImportPlatformUI();
         }
     });
     bodyObs.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+})();
+
+// ========== 第4栏废片列表：常驻可拖动的竖向滚动条 ==========
+// macOS 默认的浮动滚动条不滚动时完全不可见，用户会以为列表只露出一两排、
+// 找不到往下翻的入口。这里自己画一条常驻轨道，样式与顶部水平轨道保持一致。
+(() => {
+    const list = document.getElementById('ecommerce-rerun-list');
+    const track = document.getElementById('ecommerce-rerun-vscroll-track');
+    const thumb = document.getElementById('ecommerce-rerun-vscroll-thumb');
+    if (!list || !track || !thumb) return;
+    const update = () => {
+        const contentH = list.scrollHeight;
+        const viewportH = list.clientHeight;
+        const scrollable = contentH > viewportH + 2;
+        track.hidden = !scrollable;
+        if (!scrollable) return;
+        const trackH = track.clientHeight;
+        if (trackH <= 0) return;
+        const thumbH = Math.max(28, Math.round(viewportH / contentH * trackH));
+        thumb.style.height = `${thumbH}px`;
+        const maxScroll = contentH - viewportH;
+        const ratio = maxScroll > 0 ? list.scrollTop / maxScroll : 0;
+        thumb.style.top = `${Math.round(ratio * (trackH - thumbH))}px`;
+    };
+    thumb.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        thumb.setPointerCapture?.(e.pointerId);
+        thumb.classList.add('is-dragging');
+        const startY = e.clientY;
+        const startTop = parseFloat(thumb.style.top) || 0;
+        const trackH = track.clientHeight;
+        const thumbH = thumb.clientHeight;
+        const maxScroll = list.scrollHeight - list.clientHeight;
+        const maxThumbTop = trackH - thumbH;
+        const move = me => {
+            const newTop = Math.max(0, Math.min(maxThumbTop, startTop + (me.clientY - startY)));
+            thumb.style.top = `${Math.round(newTop)}px`;
+            list.scrollTop = maxThumbTop > 0 ? (newTop / maxThumbTop) * maxScroll : 0;
+        };
+        const stop = () => {
+            thumb.classList.remove('is-dragging');
+            thumb.removeEventListener('pointermove', move);
+            thumb.removeEventListener('pointerup', stop);
+            thumb.removeEventListener('pointercancel', stop);
+        };
+        thumb.addEventListener('pointermove', move);
+        thumb.addEventListener('pointerup', stop);
+        thumb.addEventListener('pointercancel', stop);
+    });
+    track.addEventListener('click', e => {
+        if (e.target === thumb) return;
+        const rect = track.getBoundingClientRect();
+        const trackH = track.clientHeight;
+        const thumbH = thumb.clientHeight;
+        const maxThumbTop = trackH - thumbH;
+        const newTop = Math.max(0, Math.min(maxThumbTop, (e.clientY - rect.top) - thumbH / 2));
+        const maxScroll = list.scrollHeight - list.clientHeight;
+        thumb.style.top = `${Math.round(newTop)}px`;
+        list.scrollTop = maxThumbTop > 0 ? (newTop / maxThumbTop) * maxScroll : 0;
+    });
+    list.addEventListener('scroll', update);
+    new MutationObserver(update).observe(list, { childList: true, subtree: true });
+    if (window.ResizeObserver) new ResizeObserver(update).observe(list);
+    window.addEventListener('resize', update);
+    update();
 })();
 
 // ========== 防御性修复：原生 select 在 flex 布局宽度变化后下拉弹窗定位错乱 ==========
@@ -12500,34 +14467,13 @@ document.getElementById('btn-ecommerce-open-storage-permission')?.addEventListen
 document.getElementById('ecommerce-final-output-path')?.addEventListener('change', () => checkEcommerceFinalOutputPath(false));
 document.getElementById('btn-ecommerce-select-output')?.addEventListener('click', () => chooseEcommerceFolder('ecommerce-output-path'));
 document.getElementById('btn-ecommerce-create')?.addEventListener('click', createAndStartEcommerceBatch);
-document.getElementById('btn-ecommerce-start')?.addEventListener('click', () => controlEcommerceBatch('resume'));
+document.getElementById('btn-ecommerce-start')?.addEventListener('click', () => startOrResumeEcommerceBatch());
 document.getElementById('btn-ecommerce-pause')?.addEventListener('click', () => controlEcommerceBatch('pause'));
 document.getElementById('btn-ecommerce-cancel')?.addEventListener('click', () => { if (confirm('确定取消当前批次？未完成任务不会继续。')) controlEcommerceBatch('cancel'); });
 document.getElementById('btn-ecommerce-refresh')?.addEventListener('click', () => loadEcommerceModeData(true));
-// 自检面板折叠/展开：默认不开启 AI 质检时折叠后4栏变3栏，每栏更宽
-// AI 质检面板不再使用 display:none 折叠（会导致 4 栏变 3 栏，原生 select 下拉框定位全部错乱）。
-// 改为始终可见，初始宽度设为最小值 180px（窄条），用户可随时拖动分隔线放大。
-// 之前缓存的折叠状态已无意义，清理掉。
+// 第2栏已合并原第3栏“运行设置”，默认宽度由 CSS（440px）决定，不再强制收窄。
+// 拖动分隔线调整后的宽度由下方可调宽工作台统一持久化。
 localStorage.removeItem('ecommerce_qc_collapsed');
-// 如果 localStorage 中没有保存过宽度，给 QC 面板设置默认最小宽度
-(() => {
-    const qcPanel = document.querySelector('[data-workbench-panel="qc"]');
-    const storageKey = 'ecommerce_workbench_widths_v2';
-    try {
-        const saved = JSON.parse(localStorage.getItem(storageKey) || '{}');
-        if (!saved.qc || Number(saved.qc) < 180) {
-            if (qcPanel) {
-                qcPanel.style.width = '180px';
-                qcPanel.style.flexBasis = '180px';
-            }
-        }
-    } catch (_e) {
-        if (qcPanel) {
-            qcPanel.style.width = '180px';
-            qcPanel.style.flexBasis = '180px';
-        }
-    }
-})();
 // 强制重置：当批次状态卡死（resuming/interrupted/running 但任务不动）时，把状态重置为 paused
 // 不会丢失已生成图片，用户可以再点"开始/继续"恢复
 document.getElementById('btn-ecommerce-force-reset')?.addEventListener('click', async () => {
@@ -12559,11 +14505,12 @@ document.getElementById('ecommerce-batch-select')?.addEventListener('change', as
     ecommerceRerunState.activeRerunBatchId = '';
     ecommerceRerunState.activeIndex = -1;
     ecommerceRerunState.compareRefIndex = 0;
-    ecommerceRerunState.groupSyncByGarment = new Map();
     ecommerceRerunState.bulkProgress = { done: 0, total: 0, failed: 0, retrying: 0 };
     closeEcommerceRerunAdjustPanel(false);
     const rerunList = document.getElementById('ecommerce-rerun-list');
     if (rerunList) rerunList.innerHTML = '<div class="ecommerce-empty">点击「扫描废片」开始</div>';
+    const rerunParams = document.getElementById('ecommerce-rerun-bulk-params');
+    if (rerunParams) rerunParams.innerHTML = '<div class="ecommerce-empty">扫描废片后，这里会显示批量重做的平台、模型、并发与提示词参数。</div>';
     await refreshEcommerceBatch();
 });
 
@@ -12591,7 +14538,7 @@ function updateEcommerceAutoConcurrency(apply = false) {
         const maxMultiple = Math.floor(100 / actionCount);
         for (let m = 1; m <= Math.min(maxMultiple, 20); m++) {
             const val = m * actionCount;
-            options.push(`<option value="${val}">${m}套 (${val}并发)</option>`);
+            options.push(`<option value="${val}" title="同时 ${m} 套 × ${actionCount} 张 = ${val} 并发">${m}套</option>`);
         }
         presetSelect.innerHTML = options.join('');
         presetSelect.value = preset && Number(preset) % actionCount === 0 ? preset : '';
@@ -12748,9 +14695,10 @@ const ecommerceRerunState = {
     batchId: '', items: [], activeIndex: -1, compareRefIndex: 0,
     selectedIds: new Set(), bulkPrompt: '', bulkPlatform: '', bulkModelKey: '', bulkRatio: 'auto',
     bulkConcurrency: 10, bulkDrawCount: 1,
+    // 勾选后批量重做全部使用上面的批量提示词，忽略任何单张单独保存的提示词。
+    bulkIgnoreSinglePrompt: false,
     // 调整面板确认后的临时修改：在本次提交前即使自动重新扫描，也不能回退到批次原始配置。
     pendingEdits: new Map(),
-    groupSyncByGarment: new Map(),
     bulkProgress: { active: false, paused: false, total: 0, completed: 0, success: 0, failed: 0 },
     bulkPauseWaiters: [], rerunBatches: [], activeRerunBatchId: ''
 };
@@ -12765,14 +14713,22 @@ const ecommerceComparePanState = {
     result: { x: 0, y: 0 }
 };
 const ecommerceCompareFitFrames = { reference: 0, result: 0 };
-let ecommerceWasteExpanded = false;
 
 function ecommerceBuildRerunQueuePayload(item, config = {}) {
     const singleSource = ['target_only', 'garment_prompt'].includes(item.generation_mode);
-    const referenceImages = singleSource ? [] : (item.references || [])
-        .filter(reference => reference.selected !== false)
-        .map(reference => reference.override_url || reference.url)
-        .filter(Boolean);
+    // 二次调整自带一组「＋ 添加参考图」（最多6张），与单张提示词配套使用。
+    const refineImages = item.refine_redo
+        ? (item.refine_references || [])
+            .map(reference => reference.url || reference.path || '')
+            .filter(Boolean)
+            .slice(0, 6)
+        : [];
+    const referenceImages = item.refine_redo
+        ? refineImages
+        : (singleSource ? [] : (item.references || [])
+            .filter(reference => reference.selected !== false)
+            .map(reference => reference.override_url || reference.url)
+            .filter(Boolean));
     const drawCount = Math.max(1, Math.min(10, Number(config.drawCount) || 1));
     // 全废动作要补回原抽卡合约；人工标记则只按用户选择的数量重做。
     const requestedCount = item.marked_redo
@@ -12782,8 +14738,17 @@ function ecommerceBuildRerunQueuePayload(item, config = {}) {
         item_id: item.id, result_path: item.result_path || '',
         deletion_ids: Array.isArray(item.deletion_ids) ? item.deletion_ids.filter(Boolean) : [],
         mark_id: item.mark_id || '', marked_result_path: item.marked_result_path || '',
-        mode: 'full', prompt: String(item.rerun_prompt || '').trim() || String(config.prompt || ''),
+        mode: 'full',
+        // 提示词优先级：二次调整只认自己的单张提示词，批次大提示词（含「统一使用批量提示词」）
+        // 一律不覆盖它；普通废片 / 标记重做沿用旧规则（单张优先，勾选统一则强制用批量）。
+        prompt: item.refine_redo
+            ? String(item.rerun_prompt || '').trim()
+            : (config.ignoreSinglePrompt
+                ? String(config.prompt || '')
+                : (String(item.rerun_prompt || '').trim() || String(config.prompt || ''))),
         reference_images: referenceImages,
+        // 局部重绘蒙版（白=可重绘、黑=保持）：只有二次调整会带，只在 API易 官转通道生效。
+        mask_base64: item.refine_redo ? String(item.rerun_mask_data_url || '') : '',
         // 未临时替换时也必须把扫描时冻结的原始动作参考图传给后端。
         // 留空会触发后端 fallback，误把生成结果/废片备份当成动作参考图。
         target_action_image: String(item.target_action_override_url || item.target_action_url || '').trim(),
@@ -12791,6 +14756,8 @@ function ecommerceBuildRerunQueuePayload(item, config = {}) {
         model_override: {
             platform: config.platform || ecommerceRerunState.bulkPlatform || 'runninghub',
             model_key: config.modelKey || ecommerceRerunState.bulkModelKey,
+            // 与第一栏一致：几K 独立选择，不再写死在模型名里。
+            resolution: config.resolution || ecommerceRerunState.bulkResolution || '4k',
             aspect_ratio: config.ratio || ecommerceRerunState.bulkRatio || 'auto'
         }
     };
@@ -12799,43 +14766,30 @@ function ecommerceBuildRerunQueuePayload(item, config = {}) {
 function renderEcommerceRerunBatches() {
     const root = document.getElementById('ecommerce-rerun-batches');
     if (!root) return;
-    const rows = ecommerceRerunState.rerunBatches || [];
+    // 每次「批量重做」都会留下一个会话行，一直保留到用户点「完成」为止。
+    // 后端只把点过「完成」的会话标成 finalized 沉底，这里也照着过滤。
+    const rows = (ecommerceRerunState.rerunBatches || []).filter(row => row.status !== 'finalized');
     if (!rows.length) {
-        root.innerHTML = '<div class="ecommerce-empty">暂无重做批次；开始批量重做后会自动保存。</div>';
+        root.innerHTML = '<div class="ecommerce-empty">批量重做后，这里会保留可继续、可结束和可验片的重做批次。</div>';
         return;
     }
     const labels = { running: '运行中', paused: '已暂停', interrupted: '已中断', partial: '部分完成', completed: '已完成' };
-    root.innerHTML = rows.slice(0, 5).map(row => {
+    root.innerHTML = rows.map(row => {
         const total = Number(row.total_count) || 0;
         const done = Number(row.completed_count) || 0;
         const remaining = Math.max(0, total - done);
         const returnedImages = Number(row.returned_image_count ?? row.accepted_image_count) || 0;
         const requestedImages = Number(row.requested_image_count) || total;
-        const itemStateLabels = {
-            pending: '等待处理', running: '平台处理中', partial: '部分回填',
-            accepted: '回填成功', failed: '失败'
-        };
-        const itemLines = (row.item_statuses || []).map(item => {
-            const itemReturned = Number(item.success_count) || 0;
-            const itemRequested = Number(item.requested_count) || 1;
-            const stateText = item.recovery_pending
-                ? '应用重启后待接回（不会重复提交）'
-                : (itemStateLabels[item.status] || item.status || '等待处理');
-            return `<span class="ecommerce-rerun-batch-item-status is-${ecommerceEscape(item.status || 'pending')}">
-                ${ecommerceEscape(item.garment_name)} · 动作${Number(item.action_order) || 0}：${stateText}，已回填 ${itemReturned}/${itemRequested} 张${item.error ? ` · ${ecommerceEscape(item.error)}` : ''}
-            </span>`;
-        }).join('');
         const canContinue = remaining > 0 && ['running', 'paused', 'interrupted', 'partial'].includes(row.status);
-        const canFinalize = remaining > 0 && row.status !== 'partial';
-        const firstGarment = row.accepted_garments?.[0]?.id || '';
+        const garments = row.verifiable_garments || row.accepted_garments || [];
+        const firstGarment = garments[0]?.id || '';
         return `<div class="ecommerce-rerun-batch-row ${row.id === ecommerceRerunState.activeRerunBatchId ? 'is-active' : ''}" data-rerun-batch-id="${ecommerceEscape(row.id)}">
             <strong>${ecommerceEscape(row.name || '废片重做')} · ${done}/${total}</strong>
-            <small>${labels[row.status] || row.status} · 成功${done}/${total}项 · 已回填${returnedImages}/${requestedImages}张图${remaining ? ` · 剩余${remaining}项` : ''}${row.legacy_recovered ? ' · 旧任务提示词无法还原，继续时复用原任务提示词' : ''}</small>
-            <div class="ecommerce-rerun-batch-item-statuses">${itemLines}</div>
+            <small>${labels[row.status] || row.status} · 已回填${returnedImages}/${requestedImages}张图${remaining ? ` · 剩余${remaining}项` : ''}${row.legacy_recovered ? ' · 旧任务提示词无法还原，继续时复用原任务提示词' : ''}</small>
             <span class="ecommerce-rerun-batch-actions">
+                ${firstGarment ? `<button class="btn btn-outline ecommerce-rerun-session-review" data-garment-id="${ecommerceEscape(firstGarment)}" type="button">验片</button>` : ''}
                 ${canContinue ? '<button class="btn btn-primary ecommerce-rerun-session-resume" type="button">继续剩余</button>' : ''}
-                ${canFinalize ? '<button class="btn btn-outline ecommerce-rerun-session-finalize" type="button">结束本次</button>' : ''}
-                ${done && firstGarment ? `<button class="btn btn-outline ecommerce-rerun-session-review" data-garment-id="${ecommerceEscape(firstGarment)}" type="button">验片已完成</button>` : ''}
+                <button class="btn btn-outline ecommerce-rerun-session-finalize" data-remaining="${remaining}" type="button">完成</button>
             </span>
         </div>`;
     }).join('');
@@ -12845,8 +14799,18 @@ function renderEcommerceRerunBatches() {
     }));
     root.querySelectorAll('.ecommerce-rerun-session-finalize').forEach(button => button.addEventListener('click', async () => {
         const id = button.closest('.ecommerce-rerun-batch-row')?.dataset.rerunBatchId || '';
-        if (!id || !confirm('结束本次重做？\n\n已完成图片会形成可验片批次；剩余废片仍保留，可稍后重新扫描或继续。')) return;
-        await ecommerceApi('POST', `/api/ecommerce/rerun-batches/${encodeURIComponent(id)}/action`, { action: 'finalize' });
+        if (!id) return;
+        const remaining = Number(button.dataset.remaining) || 0;
+        const message = remaining
+            ? `完成这次重做会话？\n\n本批还有 ${remaining} 项没补齐，点「完成」后这一行会从列表消失。\n剩余废片仍留在第4栏废片列表里，可以重新扫描后再开一批重做。`
+            : '完成这次重做会话？\n\n这一行会从列表消失；已生成的成品可在「逐套验片」里查看和导出。';
+        if (!confirm(message)) return;
+        try {
+            await ecommerceApi('POST', `/api/ecommerce/rerun-batches/${encodeURIComponent(id)}/action`, { action: 'finalize' });
+        } catch (error) {
+            showToast(`完成失败：${error.message}`, 'error');
+            return;
+        }
         await loadEcommerceRerunBatches();
     }));
     root.querySelectorAll('.ecommerce-rerun-session-review').forEach(button => button.addEventListener('click', async () => {
@@ -12868,7 +14832,8 @@ async function recoverLatestEcommerceRerunBatch() {
     const config = {
         prompt: ecommerceRerunState.bulkPrompt || '', platform: ecommerceRerunState.bulkPlatform,
         modelKey: ecommerceRerunState.bulkModelKey, ratio: ecommerceRerunState.bulkRatio,
-        drawCount: ecommerceRerunState.bulkDrawCount
+        drawCount: ecommerceRerunState.bulkDrawCount,
+        ignoreSinglePrompt: !!ecommerceRerunState.bulkIgnoreSinglePrompt
     };
     const items = ecommerceRerunState.items.map(item => ecommerceBuildRerunQueuePayload(item, config));
     try {
@@ -12887,10 +14852,29 @@ async function recoverLatestEcommerceRerunBatch() {
 }
 
 async function openEcommerceRerunBatchCompare(rerunBatchId, garmentId) {
-    if (!rerunBatchId || !garmentId) return;
+    if (!rerunBatchId) return;
     const detail = await ecommerceApi('GET', `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}`);
-    const session = detail.rerun_batch;
-    const data = await ecommerceApi('GET', `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}/garments/${encodeURIComponent(garmentId)}/compare`);
+    const session = detail.rerun_batch || {};
+    // 在本批重做涉及的每一套服装之间都能切换（不只是已全部完成的那几套）。
+    const garments = session.verifiable_garments?.length
+        ? session.verifiable_garments
+        : (session.accepted_garments?.length ? session.accepted_garments : (garmentId ? [{ id: garmentId, name: '' }] : []));
+    if (!garments.length) return showToast('这一批重做还没有可验收的成品', 'warning');
+    // 个别服装的成品被删光后该套会没有可验收图片（409），从指定那套起往后找第一套能看到图的。
+    const startIndex = Math.max(0, garments.findIndex(entry => entry.id === garmentId));
+    let data = null;
+    let pickedIndex = -1;
+    for (let offset = 0; offset < garments.length; offset++) {
+        const index = (startIndex + offset) % garments.length;
+        try {
+            data = await ecommerceApi('GET', `/api/ecommerce/rerun-batches/${encodeURIComponent(rerunBatchId)}/garments/${encodeURIComponent(garments[index].id)}/compare`);
+            pickedIndex = index;
+            break;
+        } catch (error) {
+            // 这一套没有可验收的成品，继续试下一套
+        }
+    }
+    if (!data) return showToast('这一批重做还没有可验收的成品', 'warning');
     ecommerceGroupCompareState.mode = 'group';
     ecommerceGroupCompareState.data = data;
     ecommerceGroupCompareState.refIndex = 0;
@@ -12899,8 +14883,8 @@ async function openEcommerceRerunBatchCompare(rerunBatchId, garmentId) {
     ecommerceGroupCompareState.candidateIndex = 0;
     ecommerceGroupCompareState.hadChanges = false;
     clearEcommerceResultSelection();
-    ecommerceGroupCompareState.garmentList = session.accepted_garments || [{ id: garmentId, name: data.garment_name }];
-    ecommerceGroupCompareState.currentGarmentIndex = ecommerceGroupCompareState.garmentList.findIndex(entry => entry.id === garmentId);
+    ecommerceGroupCompareState.garmentList = garments;
+    ecommerceGroupCompareState.currentGarmentIndex = pickedIndex;
     ecommerceCompareZoomState.reference = 1;
     ecommerceCompareZoomState.result = 1;
     resetEcommerceComparePan('reference');
@@ -12916,15 +14900,43 @@ async function openEcommerceRerunBatchCompare(rerunBatchId, garmentId) {
     }
 }
 
-function ecommerceRerunGroupSyncEnabled(item) {
-    return !!(item && ecommerceRerunState.groupSyncByGarment.get(item.garment_id));
+// 第4栏的分组顺序就是用户看到的顺序：普通废片按服装首次出现分组排在前面，
+// 二次调整按服装分组整体追加在最后。「下一张 / 下一套」必须走这个顺序，
+// 不能直接用 items 下标 +1（marked / refine 项是追加在扫描结果尾部的）。
+function ecommerceRerunDisplayGroups() {
+    const normal = new Map();
+    const refine = new Map();
+    ecommerceRerunState.items.forEach((item, index) => {
+        const bucket = item.refine_redo ? refine : normal;
+        if (!bucket.has(item.garment_id)) bucket.set(item.garment_id, []);
+        bucket.get(item.garment_id).push({ item, index });
+    });
+    return { normal, refine };
 }
 
-function ecommerceRerunAdjustmentTargets(item) {
-    if (!item) return [];
-    return ecommerceRerunGroupSyncEnabled(item)
-        ? ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id)
-        : [item];
+// 按显示顺序（普通组在前、二次调整组最后）排列的 items 下标数组。
+function ecommerceRerunDisplayOrder() {
+    const { normal, refine } = ecommerceRerunDisplayGroups();
+    return [...normal.values(), ...refine.values()].flat().map(entry => entry.index);
+}
+
+// 二次调整的图不受批次大提示词影响（含「统一使用批量提示词」），必须各自单独写，
+// 所以「同步全部二次调整」的候选集只包含 refine_redo 项。
+function ecommerceRefineRerunItems() {
+    return ecommerceRerunState.items.filter(item => item.refine_redo);
+}
+
+// 保存前校验一张二次调整图的提示词；返回 null 表示通过，否则返回错误文案。
+// 与后端硬校验保持一致：不能留空、不能沿用原提示词、不能等于批次批量提示词。
+function ecommerceRerunPromptProblem(item, promptValue, bulkPrompt) {
+    if (!item?.refine_redo) return null;
+    const own = String(promptValue || '').trim();
+    if (!own) return '二次调整必须单独填写新提示词（留空会沿用原提示词，不被允许）';
+    const original = String(item.original_prompt || '').trim();
+    if (original && own === original) return '提示词和原提示词一样，请写出这一次具体要怎么改';
+    const bulk = String(bulkPrompt || '').trim();
+    if (bulk && own === bulk) return '提示词和批次批量大提示词一样，请写出这一次具体要怎么改';
+    return null;
 }
 
 function ecommerceCloneRerunReferences(references) {
@@ -12945,7 +14957,10 @@ function rememberEcommerceRerunEdits(item) {
         target_action_override_url: item.target_action_override_url || '',
         target_action_override_path: item.target_action_override_path || '',
         references: ecommerceCloneRerunReferences(item.references),
-        rerun_prompt: item.rerun_prompt || ''
+        refine_references: ecommerceCloneRerunReferences(item.refine_references),
+        rerun_prompt: item.rerun_prompt || '',
+        rerun_mask_data_url: item.rerun_mask_data_url || '',
+        rerun_mask_preview_url: item.rerun_mask_preview_url || ''
     });
 }
 
@@ -12955,7 +14970,15 @@ function restoreEcommerceRerunEdits(item) {
     if (saved.target_action_override_url) item.target_action_override_url = saved.target_action_override_url;
     if (saved.target_action_override_path) item.target_action_override_path = saved.target_action_override_path;
     if (Array.isArray(saved.references) && saved.references.length) item.references = ecommerceCloneRerunReferences(saved.references);
+    if (Array.isArray(saved.refine_references) && saved.refine_references.length) {
+        item.refine_references = ecommerceCloneRerunReferences(saved.refine_references);
+    }
     if (saved.rerun_prompt) item.rerun_prompt = saved.rerun_prompt;
+    // 蒙版可能被用户主动移除（重画后清空），所以这里连空值一起还原，不能只还原非空。
+    if ('rerun_mask_data_url' in saved) {
+        item.rerun_mask_data_url = saved.rerun_mask_data_url || '';
+        item.rerun_mask_preview_url = saved.rerun_mask_preview_url || '';
+    }
     return item;
 }
 
@@ -12994,8 +15017,9 @@ function setEcommerceRerunAdjustPanelVisible(visible, scrollIntoView = false) {
     const panel = document.getElementById('ecommerce-rerun-adjust-panel');
     const resizer = document.getElementById('ecommerce-rerun-adjust-resizer');
     if (!panel) return;
-    panel.hidden = !visible;
-    if (resizer) resizer.hidden = !visible;
+    panel.hidden = false;
+    panel.classList.toggle('is-empty', !visible);
+    if (resizer) resizer.hidden = false;
     if (visible && scrollIntoView) {
         requestAnimationFrame(() => panel.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' }));
     }
@@ -13004,25 +15028,33 @@ function setEcommerceRerunAdjustPanelVisible(visible, scrollIntoView = false) {
 function closeEcommerceRerunAdjustPanel(renderList = true) {
     const host = document.getElementById('ecommerce-rerun-adjust-host');
     if (host) host.innerHTML = '<div class="ecommerce-empty">从废片列表选择一张后，这里会显示独立调整工作台。</div>';
-    setEcommerceRerunAdjustPanelVisible(false);
+    const groupProgress = document.getElementById('ecommerce-rerun-adjust-group-progress');
+    if (groupProgress) groupProgress.textContent = '未选择服装';
+    const itemProgress = document.getElementById('ecommerce-rerun-adjust-item-progress');
+    if (itemProgress) itemProgress.textContent = '在第4栏废片列表点一张即可调整参考图';
+    document.getElementById('ecommerce-rerun-adjust-panel')?.classList.add('is-empty');
     ecommerceRerunState.activeIndex = -1;
     if (renderList) renderEcommerceRerunList();
 }
 
-function advanceEcommerceRerunWorkflow(currentIndex, syncWholeGarment) {
+// scope='item'：按列表显示顺序跳到下一张（可跨套），用于逐张微调提示词；
+// scope='garment'：跳到下一套（显示顺序里下一个服装分组）的第一张。
+function advanceEcommerceRerunWorkflow(currentIndex, scope = 'item') {
     const current = ecommerceRerunState.items[currentIndex];
     if (!current) return false;
     const items = ecommerceRerunState.items;
-    let nextIndex = -1;
-    if (!syncWholeGarment) {
-        nextIndex = items.findIndex((entry, index) => index > currentIndex && entry.garment_id === current.garment_id);
-    }
-    if (nextIndex < 0) {
-        nextIndex = items.findIndex((entry, index) => index > currentIndex && entry.garment_id !== current.garment_id);
-    }
+    const order = ecommerceRerunDisplayOrder();
+    const position = order.indexOf(currentIndex);
+    if (position < 0) return false;
+    const rest = order.slice(position + 1);
+    const nextIndex = scope === 'garment'
+        ? rest.find(index => items[index].garment_id !== current.garment_id) ?? -1
+        : (rest.length ? rest[0] : -1);
     if (nextIndex < 0) {
         closeEcommerceRerunAdjustPanel(true);
-        ecommerceToast('所有待重做图片都调整完了，可以批量重做了');
+        ecommerceToast(scope === 'garment'
+            ? '已经是最后一套了，所有待重做图片都调整完了'
+            : '所有待重做图片都调整完了，可以批量重做了');
         return false;
     }
     const scrollY = window.scrollY;
@@ -13086,11 +15118,52 @@ async function cancelEcommerceRerunItems(items, wholeGarment = false) {
     }
 }
 
+// 裁剪是原地覆盖服装文件夹里的同一个文件，路径不变。local-image 带 24 小时强缓存，
+// 只有换 URL 才能让浏览器重新取图，所以裁剪/恢复后统一推进这个版本号。
+let ecommerceImageCacheEpoch = 0;
+
+function ecommerceBumpImageCache() {
+    ecommerceImageCacheEpoch += 1;
+}
+
+function ecommerceLocalImageUrl(path, extra = '') {
+    const raw = String(path || '');
+    if (!raw || /^(?:https?:|data:|\/static\/)/.test(raw)) return raw;
+    return `/api/ecommerce/local-image?path=${encodeURIComponent(raw)}${extra}`;
+}
+
 function ecommerceThumbnailUrl(url, maxEdge = 320) {
     const raw = String(url || '');
     if (!raw || !raw.startsWith('/api/ecommerce/local-image')) return raw;
     const separator = raw.includes('?') ? '&' : '?';
-    return `${raw}${separator}thumb=1&max=${Math.max(96, Math.min(Number(maxEdge) || 320, 1200))}`;
+    return `${raw}${separator}thumb=1&max=${Math.max(96, Math.min(Number(maxEdge) || 320, 2400))}&_=${ecommerceImageCacheEpoch}`;
+}
+
+// 对比区主图先用这个尺寸的压缩预览，放大到 1.5 倍以上再换成原图。
+const ECOMMERCE_COMPARE_PREVIEW_EDGE = 1600;
+
+function ecommerceUpgradeCompareImage(side) {
+    const safeSide = side === 'result' ? 'result' : 'reference';
+    const imageId = safeSide === 'result' ? 'ecommerce-compare-bad-image' : 'ecommerce-compare-reference-image';
+    const image = document.getElementById(imageId);
+    if (!image) return;
+    const sourceUrl = image.dataset.sourceUrl || '';
+    if (!sourceUrl || image.dataset.loadedUrl === sourceUrl) return;
+    if ((Number(ecommerceCompareZoomState[safeSide]) || 1) <= 1.5) return;
+    if (image.dataset.upgradingUrl === sourceUrl) return;
+    image.dataset.upgradingUrl = sourceUrl;
+    const loader = new Image();
+    loader.onload = () => {
+        if (image.dataset.sourceUrl !== sourceUrl) return;
+        // 预加载完成后才换 src，换的那一瞬间不会闪白。
+        image.dataset.loadedUrl = sourceUrl;
+        image.src = sourceUrl;
+        scheduleEcommerceCompareZoom(safeSide);
+    };
+    loader.onerror = () => {
+        if (image.dataset.upgradingUrl === sourceUrl) image.dataset.upgradingUrl = '';
+    };
+    loader.src = sourceUrl;
 }
 
 async function openEcommerceSystemPreview(paths) {
@@ -13107,6 +15180,12 @@ async function openEcommerceSystemPreview(paths) {
 const ecommerceRefCropState = {
     itemIndex: -1,
     refIndex: -1,
+    // 'rerun' = 废片重做参考图；'garment' = 精准匹配里的服装参考图裁剪
+    mode: 'rerun',
+    // 服装裁剪队列：{ mode, items, index, presetRect, isInline }
+    garmentQueue: null,
+    // 从第5栏缩略图直接进裁剪时为 false：回车只保存并关闭，不跳到下一张参考图
+    advanceAfterConfirm: true,
     image: null,
     x: 0.2,
     y: 0.2,
@@ -13116,7 +15195,15 @@ const ecommerceRefCropState = {
     dragging: false,
     pointerOffsetX: 0,
     pointerOffsetY: 0,
-    fit: null
+    fit: null,
+    // 画布像素裁剪框 {left, top, width, height}，是裁剪框的唯一真源；null 时按默认规则居中初始化。
+    frameRect: null,
+    // 拖角/拖边状态
+    resizing: false,
+    activeHandle: '',
+    origFrameRect: null,
+    interactionStartX: 0,
+    interactionStartY: 0
 };
 
 function closeEcommerceReferenceCrop() {
@@ -13127,6 +15214,12 @@ function closeEcommerceReferenceCrop() {
     ecommerceRefCropState.dragging = false;
     ecommerceRefCropState.image = null;
     document.getElementById('ecommerce-ref-crop-canvas')?.classList.remove('is-dragging');
+    // 用户中途取消服装裁剪队列：清掉队列并恢复弹窗默认文案。
+    if (ecommerceRefCropState.mode === 'garment' && ecommerceRefCropState.garmentQueue) {
+        ecommerceRefCropState.garmentQueue = null;
+        ecommerceRefCropState.mode = 'rerun';
+        ecommerceSetCropDialogChrome();
+    }
 }
 
 function ecommerceClampCropPosition() {
@@ -13134,6 +15227,35 @@ function ecommerceClampCropPosition() {
     state.scale = Math.max(0.15, Math.min(1, state.scale));
     state.x = Math.max(0, Math.min(1 - state.scale, state.x));
     state.y = Math.max(0, Math.min(1 - state.scale, state.y));
+}
+
+// 按默认规则算一次裁剪框（画布正中央、原图比例、短边 60%），只初始化一次。
+function ecommerceInitCropFrame() {
+    const state = ecommerceRefCropState;
+    const image = state.image;
+    if (!image || !image.naturalWidth) return;
+    const canvas = document.getElementById('ecommerce-ref-crop-canvas');
+    const canvasWidth = canvas?.width || 900;
+    const canvasHeight = canvas?.height || 620;
+    const baseRatio = Math.min(canvasWidth / image.naturalWidth, canvasHeight / image.naturalHeight);
+    const baseWidth = image.naturalWidth * baseRatio;
+    const baseHeight = image.naturalHeight * baseRatio;
+    const cropBaseSize = Math.min(baseWidth, baseHeight) * 0.6;
+    const imgRatio = image.naturalWidth / image.naturalHeight;
+    let cropWidthPx, cropHeightPx;
+    if (imgRatio >= 1) {
+        cropWidthPx = cropBaseSize;
+        cropHeightPx = cropBaseSize / imgRatio;
+    } else {
+        cropHeightPx = cropBaseSize;
+        cropWidthPx = cropBaseSize * imgRatio;
+    }
+    state.frameRect = {
+        left: canvasWidth / 2 - cropWidthPx / 2,
+        top: canvasHeight / 2 - cropHeightPx / 2,
+        width: cropWidthPx,
+        height: cropHeightPx
+    };
 }
 
 function drawEcommerceReferenceCrop() {
@@ -13153,25 +15275,14 @@ function drawEcommerceReferenceCrop() {
     const top = (canvas.height - height) / 2 + (ecommerceRefCropState.imageOffsetY || 0);
     ecommerceRefCropState.fit = { left, top, width, height };
     ctx.drawImage(image, left, top, width, height);
-    // 裁剪框：固定大小和位置（不随图片缩放变化），固定在画布正中央
-    // 裁剪框尺寸 = 基础适配下图片短边的60%（固定值，不随imageZoom变化）
-    const baseWidth = image.naturalWidth * baseRatio;
-    const baseHeight = image.naturalHeight * baseRatio;
-    const cropBaseSize = Math.min(baseWidth, baseHeight) * 0.6;
-    // 裁剪框按原图比例计算宽高（保持原图比例）
-    const imgRatio = image.naturalWidth / image.naturalHeight;
-    let cropWidthPx, cropHeightPx;
-    if (imgRatio >= 1) {
-        // 横图：宽度为cropBaseSize，高度按比例缩小
-        cropWidthPx = cropBaseSize;
-        cropHeightPx = cropBaseSize / imgRatio;
-    } else {
-        // 竖图：高度为cropBaseSize，宽度按比例缩小
-        cropHeightPx = cropBaseSize;
-        cropWidthPx = cropBaseSize * imgRatio;
-    }
-    const cropLeft = canvas.width / 2 - cropWidthPx / 2;
-    const cropTop = canvas.height / 2 - cropHeightPx / 2;
+    // 裁剪框：由 state.frameRect 决定（拖角等比缩放 / 拖边单独调整），不再每帧写死居中。
+    const cropState = ecommerceRefCropState;
+    if (!cropState.frameRect) ecommerceInitCropFrame();
+    const frame = cropState.frameRect || { left: 0, top: 0, width: 0, height: 0 };
+    const cropWidthPx = frame.width;
+    const cropHeightPx = frame.height;
+    const cropLeft = frame.left;
+    const cropTop = frame.top;
     ecommerceRefCropState.cropRect = { left: cropLeft, top: cropTop, width: cropWidthPx, height: cropHeightPx };
     // 绘制半透明蒙版（裁剪框外区域）
     ctx.save();
@@ -13198,6 +15309,24 @@ function drawEcommerceReferenceCrop() {
     ctx.moveTo(cropLeft, cropTop + cropHeightPx * 2 / 3);
     ctx.lineTo(cropLeft + cropWidthPx, cropTop + cropHeightPx * 2 / 3);
     ctx.stroke();
+    // 8 个拖拽把手：4 角（等比缩放）+ 4 边中点（只裁这一边）
+    ctx.setLineDash([]);
+    const handleSize = 12;
+    const halfHandle = handleSize / 2;
+    ctx.fillStyle = '#fbbf24';
+    for (const [cornerX, cornerY] of [
+        [cropLeft, cropTop],
+        [cropLeft + cropWidthPx, cropTop],
+        [cropLeft, cropTop + cropHeightPx],
+        [cropLeft + cropWidthPx, cropTop + cropHeightPx]
+    ]) {
+        ctx.fillRect(cornerX - halfHandle, cornerY - halfHandle, handleSize, handleSize);
+    }
+    ctx.fillStyle = 'rgba(251,191,36,.9)';
+    ctx.fillRect(cropLeft + cropWidthPx / 2 - 8, cropTop - 2, 16, 4);
+    ctx.fillRect(cropLeft + cropWidthPx / 2 - 8, cropTop + cropHeightPx - 2, 16, 4);
+    ctx.fillRect(cropLeft - 2, cropTop + cropHeightPx / 2 - 8, 4, 16);
+    ctx.fillRect(cropLeft + cropWidthPx - 2, cropTop + cropHeightPx / 2 - 8, 4, 16);
     ctx.restore();
 }
 
@@ -13208,22 +15337,255 @@ function resetEcommerceReferenceCrop() {
     ecommerceRefCropState.imageZoom = 1;
     ecommerceRefCropState.imageOffsetX = 0;
     ecommerceRefCropState.imageOffsetY = 0;
+    // 裁剪框回到默认居中尺寸；下次 draw 按默认规则重建。
+    ecommerceRefCropState.frameRect = null;
+    ecommerceRefCropState.resizing = false;
+    ecommerceRefCropState.activeHandle = '';
     const slider = document.getElementById('ecommerce-ref-crop-scale');
     if (slider) slider.value = '12';
     drawEcommerceReferenceCrop();
 }
 
-function openEcommerceReferenceCrop(itemIndex, refIndex) {
+// ---------- 人工精准匹配：服装参考图裁剪 ----------
+function ecommerceSetCropDialogChrome(chrome = {}) {
+    const title = document.getElementById('ecommerce-ref-crop-title');
+    const hint = document.getElementById('ecommerce-ref-crop-hint');
+    const tip = document.getElementById('ecommerce-ref-crop-tip');
+    const confirm = document.getElementById('ecommerce-ref-crop-confirm');
+    if (title) title.textContent = chrome.title || '裁剪本次重做参考图';
+    if (hint) hint.textContent = chrome.hint || '拖动角点等比缩放，拖动四边单独调整；拖动图片移动位置，滚轮缩放图片。不会修改原文件';
+    if (tip) tip.textContent = chrome.tip || '拖角等比 · 拖边单边 · 拖图片移动 · 回车确认跳下一张 · C键打开裁剪';
+    if (confirm) confirm.textContent = chrome.button || '使用本次裁剪';
+}
+
+// 裁剪结果不再是原图比例时，提示用户出图比例建议手动锁 2:3（不自动改比例控件）。
+function ecommerceWarnNonProportionalCrop(rect) {
+    if (!rect) return;
+    if (Math.abs((rect.width || 0) - (rect.height || 0)) > 0.015) {
+        showToast('本次裁剪已改变原图比例 · 出图比例建议手动锁 2:3（选「自动」会跟随人物动作图）', 'warning');
+    }
+}
+
+// 把裁剪框（画布像素）换算成图片上的归一化坐标，供两个裁剪流程共用。
+function ecommerceCropNormalizedRect() {
+    const state = ecommerceRefCropState;
+    const fit = state.fit;
+    const cropRect = state.cropRect;
+    if (!fit || fit.width <= 0 || fit.height <= 0 || !cropRect) throw new Error('图片尺寸异常');
+    const cropXInImage = (cropRect.left - fit.left) / fit.width;
+    const cropYInImage = (cropRect.top - fit.top) / fit.height;
+    const cropWNorm = cropRect.width / fit.width;
+    const cropHNorm = cropRect.height / fit.height;
+    return {
+        x: Math.max(0, Math.min(Math.max(0, 1 - cropWNorm), cropXInImage)),
+        y: Math.max(0, Math.min(Math.max(0, 1 - cropHNorm), cropYInImage)),
+        width: cropWNorm,
+        height: cropHNorm
+    };
+}
+
+// 把上一张确认过的归一化裁剪框（{x,y,w,h}，相对原图）套到当前图片上。
+// 不同比例的服装图沿用「同一块相对区域」；图片回到基础适配，框直接定位到该区域。
+function ecommerceApplyCropPreset() {
+    const state = ecommerceRefCropState;
+    const preset = state.garmentQueue?.presetRect;
+    const image = state.image;
+    if (!preset || !image || !image.naturalWidth || !image.naturalHeight) return;
+    const canvas = document.getElementById('ecommerce-ref-crop-canvas');
+    const canvasWidth = canvas?.width || 900;
+    const canvasHeight = canvas?.height || 620;
+    state.imageZoom = 1;
+    state.imageOffsetX = 0;
+    state.imageOffsetY = 0;
+    const baseRatio = Math.min(canvasWidth / image.naturalWidth, canvasHeight / image.naturalHeight);
+    const fitWidth = image.naturalWidth * baseRatio;
+    const fitHeight = image.naturalHeight * baseRatio;
+    const fitLeft = (canvasWidth - fitWidth) / 2;
+    const fitTop = (canvasHeight - fitHeight) / 2;
+    const x = Math.max(0, Math.min(1, Number(preset.x) || 0));
+    const y = Math.max(0, Math.min(1, Number(preset.y) || 0));
+    const w = Math.max(0.02, Math.min(1 - x, Number(preset.w) || 0.6));
+    const h = Math.max(0.02, Math.min(1 - y, Number(preset.h) || 0.6));
+    state.frameRect = {
+        left: fitLeft + x * fitWidth,
+        top: fitTop + y * fitHeight,
+        width: w * fitWidth,
+        height: h * fitHeight
+    };
+    const slider = document.getElementById('ecommerce-ref-crop-scale');
+    if (slider) slider.value = '13';
+}
+
+function openEcommerceGarmentCropQueue(refIndex, mode) {
+    const garments = ecommerceState.scanned?.garments || [];
+    const inlineGarment = ecommerceState.inlineGarment;
+    const isInline = !garments.length && !!inlineGarment?.images?.length;
+    const sets = isInline
+        ? [{ path: inlineGarment.path || '', name: inlineGarment.name || '所选图片', images: inlineGarment.images.map(item => item.url || item.path || '') }]
+        : garments.map(garment => ({ path: garment.path, name: garment.name, images: garment.images || [] }));
+    if (!sets.length) return showToast('请先加载并扫描服装参考图', 'error');
+    const items = [];
+    for (const garment of sets) {
+        const sourcePath = garment.images?.[refIndex];
+        if (!sourcePath) return showToast(`「${garment.name}」没有第 ${refIndex + 1} 张参考图，无法逐套裁剪`, 'error');
+        if (mode === 'add' && garment.images.length >= 10) {
+            return showToast(`「${garment.name}」已有10张参考图，无法新增；请改用「替换原来那一张」`, 'error');
+        }
+        items.push({ garmentPath: garment.path, garmentName: garment.name, sourcePath, slot: refIndex + 1 });
+    }
+    ecommerceRefCropState.garmentQueue = { mode, items, index: 0, presetRect: null, isInline };
+    openEcommerceGarmentCrop();
+}
+
+function openEcommerceGarmentCrop() {
+    const queue = ecommerceRefCropState.garmentQueue;
+    const overlay = document.getElementById('ecommerce-ref-crop-overlay');
+    if (!queue || !overlay) return;
+    const entry = queue.items[queue.index];
+    if (!entry) return finishEcommerceGarmentCrop();
+    const total = queue.items.length;
+    const remaining = total - queue.index - 1;
+    ecommerceRefCropState.mode = 'garment';
+    ecommerceSetCropDialogChrome({
+        title: total > 1
+            ? `裁剪服装参考图（第 ${queue.index + 1}/${total} 套 · ${entry.garmentName}）`
+            : `裁剪服装参考图 · ${entry.garmentName}`,
+        hint: '拖动角点等比缩放，拖动四边单独调整；拖动图片移动位置，滚轮缩放图片。确认后直接更新服装文件夹里的这张图',
+        tip: total > 1
+            ? `第 ${entry.slot} 张服装图 · 裁剪位置沿用上一次，可直接连点「确认下一张」`
+            : `第 ${entry.slot} 张服装图 · 拖角等比 · 拖边单边 · 回车确认 · Esc 取消`,
+        button: remaining > 0 ? `确认下一张（还剩 ${remaining} 套）` : '保存裁剪'
+    });
+    ecommerceRefCropState.refIndex = entry.slot - 1;
+    ecommerceRefCropState.advanceAfterConfirm = false;
+    resetEcommerceReferenceCrop();
+    const image = new Image();
+    // 源图若是上一轮裁剪图，后端会自动回溯到备份里的原图再裁，连续裁剪不会损失画质。
+    // 加时间戳绕开 local-image 的浏览器缓存，替换后能立刻看到新图。
+    image.src = ecommerceLocalImageUrl(entry.sourcePath, `&_=${Date.now()}`);
+    image.onload = () => {
+        ecommerceRefCropState.image = image;
+        ecommerceInitCropFrame();
+        ecommerceApplyCropPreset();
+        drawEcommerceReferenceCrop();
+    };
+    image.onerror = () => {
+        closeEcommerceReferenceCrop();
+        ecommerceRefCropState.garmentQueue = null;
+        showToast('服装参考图加载失败，无法裁剪', 'error');
+    };
+    overlay.hidden = false;
+    overlay.setAttribute('aria-hidden', 'false');
+}
+
+async function confirmEcommerceGarmentCrop() {
+    const queue = ecommerceRefCropState.garmentQueue;
+    const entry = queue?.items?.[queue.index];
+    const button = document.getElementById('ecommerce-ref-crop-confirm');
+    if (!queue || !entry || !ecommerceRefCropState.image) return showToast('裁剪图片尚未加载完成', 'error');
+    const previousText = button?.textContent || '保存裁剪';
+    if (button) { button.disabled = true; button.textContent = '正在保存…'; }
+    try {
+        const rect = ecommerceCropNormalizedRect();
+        const data = await ecommerceApi('POST', '/api/ecommerce/crop-garment-reference', {
+            garment_path: entry.garmentPath,
+            source: entry.sourcePath,
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            mode: queue.mode,
+            slot: entry.slot
+        });
+        queue.presetRect = { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+        ecommerceWarnNonProportionalCrop(rect);
+        // 覆盖是原地改写同一个文件，推进版本号让所有缩略图/预览重新取图。
+        ecommerceBumpImageCache();
+        if (queue.isInline) {
+            const images = ecommerceState.inlineGarment?.images || [];
+            if (queue.mode === 'replace' && images[entry.slot - 1]) {
+                images[entry.slot - 1] = { ...images[entry.slot - 1], url: data.path, path: data.path };
+            } else {
+                images.push({ url: data.path, path: data.path, name: data.filename });
+            }
+            saveEcommerceDraft();
+            renderEcommerceGarmentPreview();
+        }
+        queue.index += 1;
+        if (queue.index < queue.items.length) {
+            openEcommerceGarmentCrop();
+            showToast(`已保存第 ${queue.index}/${queue.items.length} 套裁剪`, 'success');
+        } else {
+            await finishEcommerceGarmentCrop();
+        }
+    } catch (error) {
+        showToast(`裁剪失败：${error.message}`, 'error');
+        if (button) button.textContent = previousText;
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
+async function finishEcommerceGarmentCrop() {
+    const queue = ecommerceRefCropState.garmentQueue;
+    const total = queue?.items?.length || 0;
+    ecommerceRefCropState.garmentQueue = null;
+    ecommerceRefCropState.mode = 'rerun';
+    closeEcommerceReferenceCrop();
+    ecommerceSetCropDialogChrome();
+    if (queue && !queue.isInline) {
+        try {
+            await refreshEcommerceGarmentsAfterCrop();
+        } catch (error) {
+            showToast(`裁剪已保存，但刷新服装列表失败：${error.message}`, 'error');
+            return;
+        }
+    }
+    // 裁剪直接改写文件夹里的文件（替换=覆盖同名，新增=真实多一张），已匹配的关系按位置保留。
+    document.getElementById('ecommerce-precision-overlay')?.remove();
+    if (ecommerceState.importActions?.actions?.length && (ecommerceState.scanned?.garments || []).length) {
+        openEcommercePrecisionMatching();
+    }
+    if (total) showToast(`已保存 ${total} 套裁剪（服装文件夹已同步更新）`, 'success');
+}
+
+// 裁剪写回服装文件夹后重扫，只更新扫描结果，绝不清空已完成的精准匹配。
+async function refreshEcommerceGarmentsAfterCrop() {
+    const path = document.getElementById('ecommerce-clothing-root')?.value.trim()
+        || ecommerceState.scanned?.path || '';
+    if (!path) return;
+    const generationMode = ecommerceState.importActions?.actions?.length ? 'garment_reference' : 'garment_prompt';
+    const scanned = await ecommerceApi('POST', '/api/ecommerce/scan-clothing-root', {
+        path,
+        keyword: document.getElementById('ecommerce-garment-keyword')?.value.trim() || '',
+        generation_mode: generationMode,
+        precision_matching: !!document.getElementById('ecommerce-precision-matching')?.checked
+    });
+    ecommerceState.scanned = scanned;
+    if (ecommerceState.precisionMatching) {
+        ecommerceState.precisionMatching.source_signature = ecommercePrecisionSourceSignature();
+        ecommerceState.precisionMatching.reference_count = (scanned.garments?.[0]?.images || []).length;
+    }
+    saveEcommerceDraft();
+    updateEcommerceGenerateButton();
+}
+
+function openEcommerceReferenceCrop(itemIndex, refIndex, options = {}) {
     const item = ecommerceRerunState.items[itemIndex];
     const reference = item?.references?.[refIndex];
     const overlay = document.getElementById('ecommerce-ref-crop-overlay');
     if (!reference || !overlay || !reference.url) return showToast('这张参考图无法裁剪', 'error');
+    ecommerceRefCropState.mode = 'rerun';
+    ecommerceRefCropState.garmentQueue = null;
+    ecommerceSetCropDialogChrome();
     ecommerceRefCropState.itemIndex = itemIndex;
     ecommerceRefCropState.refIndex = refIndex;
+    ecommerceRefCropState.advanceAfterConfirm = options.advance !== false;
     resetEcommerceReferenceCrop();
     const image = new Image();
     image.onload = () => {
         ecommerceRefCropState.image = image;
+        ecommerceInitCropFrame();
         drawEcommerceReferenceCrop();
     };
     image.onerror = () => {
@@ -13268,6 +15630,7 @@ async function confirmEcommerceReferenceCropAndNext() {
     }
     // 仅在裁剪成功（或已有裁剪图）时才前进到下一张
     if (cropSucceeded) {
+        if (!state.advanceAfterConfirm) return;
         await advanceEcommerceRerunReference();
     }
 }
@@ -13283,12 +15646,10 @@ async function advanceEcommerceRerunReference() {
         ecommerceToast(`参考图 ${nextCompareIndex}/${refs.length}（按C裁剪，回车跳过）`);
         return;
     }
-    const syncWholeGarment = ecommerceRerunGroupSyncEnabled(item);
-    const targets = ecommerceRerunAdjustmentTargets(item);
-    targets.forEach(entry => ecommerceRerunState.selectedIds.add(entry.id));
+    ecommerceRerunState.selectedIds.add(item.id);
     const compareOverlay = document.getElementById('ecommerce-compare-overlay');
     if (compareOverlay && !compareOverlay.hidden) closeEcommerceImageCompare();
-    advanceEcommerceRerunWorkflow(ecommerceRerunState.activeIndex, syncWholeGarment);
+    advanceEcommerceRerunWorkflow(ecommerceRerunState.activeIndex, 'item');
 }
 
 async function confirmEcommerceReferenceCrop() {
@@ -13299,37 +15660,26 @@ async function confirmEcommerceReferenceCrop() {
     if (!reference || !state.image) return showToast('裁剪图片尚未加载完成', 'error');
     if (button) { button.disabled = true; button.textContent = '正在保存…'; }
     try {
-        // 计算裁剪框在图片上的归一化坐标
-        // 裁剪框是固定的，图片可以缩放和移动
-        const fit = state.fit;
-        const cropRect = state.cropRect;
-        if (!fit || fit.width <= 0 || fit.height <= 0 || !cropRect) throw new Error('图片尺寸异常');
-        // 裁剪框在图片归一化坐标中的位置和尺寸
-        const cropXInImage = (cropRect.left - fit.left) / fit.width;
-        const cropYInImage = (cropRect.top - fit.top) / fit.height;
-        const cropWNorm = cropRect.width / fit.width;
-        const cropHNorm = cropRect.height / fit.height;
-        // 边界约束：确保裁剪框完全在图片内
-        const clampedX = Math.max(0, Math.min(Math.max(0, 1 - cropWNorm), cropXInImage));
-        const clampedY = Math.max(0, Math.min(Math.max(0, 1 - cropHNorm), cropYInImage));
+        // 裁剪框可拖角等比/拖边单边，图片可缩放和移动；归一化计算与服装裁剪共用。
+        const rect = ecommerceCropNormalizedRect();
         const data = await ecommerceApi('POST', '/api/ecommerce/crop-reference', {
             batch_id: ecommerceRerunState.batchId,
             source: reference.path || reference.url,
-            x: clampedX,
-            y: clampedY,
-            width: cropWNorm,
-            height: cropHNorm
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height
         });
-        ecommerceRerunAdjustmentTargets(item).forEach(entry => {
-            const relatedReference = entry.references?.[state.refIndex];
-            if (!relatedReference) return;
-            relatedReference.override_url = data.url;
-            relatedReference.override_path = data.path;
-        });
+        const croppedReference = item.references?.[state.refIndex];
+        if (croppedReference) {
+            croppedReference.override_url = data.url;
+            croppedReference.override_path = data.path;
+        }
         closeEcommerceReferenceCrop();
         renderEcommerceRerunCompare(state.itemIndex);
         const compareOverlay = document.getElementById('ecommerce-compare-overlay');
         if (compareOverlay && !compareOverlay.hidden) updateEcommerceImageCompare();
+        ecommerceWarnNonProportionalCrop(rect);
         showToast('已保存本次重做裁剪；原图未修改', 'success');
     } catch (error) {
         showToast(`裁剪失败：${error.message}`, 'error');
@@ -13338,62 +15688,79 @@ async function confirmEcommerceReferenceCrop() {
     }
 }
 
-function ecommerceCompactWasteModel(model) {
-    const raw = String(model?.model_key || model?.model_id || '').toLowerCase();
-    const platform = String(model?.platform || '').toLowerCase() === 'runninghub' ? 'RH' : String(model?.platform || '').toLowerCase() === 'oaihk' ? 'HK' : String(model?.platform || 'API').slice(0, 3).toUpperCase();
-    let name = 'MODEL';
-    if (raw.includes('n-pro') || (raw.includes('banana') && raw.includes('pro'))) name = 'NBP';
-    else if (raw.includes('g31') || raw.includes('banana/v2')) name = 'NB2';
-    else if (raw.includes('gpt') || raw.includes('g-2')) name = 'GPT2';
-    else name = raw.replace(/[^a-z0-9]+/g, '').slice(0, 7).toUpperCase() || 'MODEL';
-    const channel = ['low-cost','cheap','channel'].includes(String(model?.channel || '').toLowerCase()) ? 'LC' : ['official','flagship'].includes(String(model?.channel || '').toLowerCase()) ? 'OFF' : 'STD';
-    return `${platform}-${name}-${channel}-${String(model?.resolution || '2K').toUpperCase()}`;
+// 裁剪弹窗的确认入口：按当前模式分发给废片重做裁剪或服装参考图裁剪。
+function ecommerceCropConfirmActive() {
+    if (ecommerceRefCropState.mode === 'garment') return confirmEcommerceGarmentCrop();
+    return confirmEcommerceReferenceCrop();
 }
 
-function ecommerceCompactWasteTime(value) {
-    const text = String(value || '').replace('T', ' ');
-    return text.length >= 16 ? text.slice(5, 16) : text;
-}
-
-async function loadEcommerceWasteStats() {
-    const data = await ecommerceApi('GET', '/api/ecommerce/waste-stats?limit=20');
-    const records = data.records || [];
-    const latest = document.getElementById('ecommerce-waste-latest');
-    if (latest) latest.textContent = records.length ? `最近 ${Number(records[0].waste_rate || 0).toFixed(1)}%` : '暂无记录';
-    const list = document.getElementById('ecommerce-waste-list');
-    if (!list) return;
-    const visible = records.slice(0, ecommerceWasteExpanded ? 20 : 5);
-    if (!visible.length) {
-        list.innerHTML = '<div class="ecommerce-empty">扫描一次废片后开始记录模型表现。</div>';
+// 「恢复原图」：服装裁剪走后端删掉 crop-map 覆盖；废片重做裁剪只清本地 override。
+async function ecommerceRestoreReferenceOriginal() {
+    const state = ecommerceRefCropState;
+    const button = document.getElementById('ecommerce-ref-crop-restore');
+    // 服装参考图裁剪
+    if (state.mode === 'garment') {
+        const queue = state.garmentQueue;
+        const entry = queue?.items?.[queue.index];
+        if (!queue || !entry) return;
+        if (queue.isInline) {
+            return showToast('拖入的单张图片没有原图记录，请重新拖入该图片', 'warning');
+        }
+        const previousText = button?.textContent || '恢复原图';
+        if (button) { button.disabled = true; button.textContent = '正在恢复…'; }
+        try {
+            const data = await ecommerceApi('POST', '/api/ecommerce/crop-garment-reference', {
+                garment_path: entry.garmentPath,
+                source: entry.sourcePath,
+                mode: 'reset'
+            });
+            if (!data.restored) {
+                showToast('这张就是原图，无需恢复', 'info');
+                return;
+            }
+            if (data.path) entry.sourcePath = data.path;
+            ecommerceBumpImageCache();
+            const image = new Image();
+            image.onload = () => {
+                state.image = image;
+                ecommerceInitCropFrame();
+                drawEcommerceReferenceCrop();
+            };
+            image.onerror = () => showToast('已恢复原图，但预览加载失败，请关闭弹窗重试', 'warning');
+            image.src = ecommerceLocalImageUrl(entry.sourcePath, `&_=${Date.now()}`);
+            refreshEcommerceGarmentsAfterCrop().catch(error => {
+                showToast(`已恢复原图，但刷新服装列表失败：${error.message}`, 'warning');
+            });
+            showToast('已恢复原图', 'success');
+        } catch (error) {
+            showToast(`恢复原图失败：${error.message}`, 'error');
+        } finally {
+            if (button) { button.disabled = false; button.textContent = previousText; }
+        }
         return;
     }
-    list.innerHTML = `<div class="ecommerce-waste-row is-head"><span>时间 / 批次</span><span>模型</span><span>生成</span><span>删除</span><span>废片率</span><span>费用</span></div>` + visible.map(record => {
-        const modelDetails = (record.model_breakdown || []).map(model => `${model.platform} · ${model.model_key || model.model_id} · ${model.resolution} · ${model.channel}`).join(' / ') || '未记录模型';
-        const models = [...new Set((record.model_breakdown || []).map(ecommerceCompactWasteModel))].join(' / ') || (record.run_code || '旧批次');
-        const rateClass = Number(record.waste_rate || 0) >= 30 ? 'is-high' : Number(record.waste_rate || 0) >= 15 ? 'is-mid' : 'is-low';
-        const batchShort = String(record.batch_name || record.batch_id || '').replace(/^电商批次\s*/, '');
-        return `<div class="ecommerce-waste-row">
-            <span><strong>${ecommerceEscape(ecommerceCompactWasteTime(record.last_scan_at))}</strong><small>批次 ${ecommerceEscape(batchShort)}｜${ecommerceEscape(record.scope_label || '整批')}｜扫${record.scan_count || 1}次</small></span>
-            <span title="${ecommerceEscape(modelDetails)}">${ecommerceEscape(models)}</span>
-            <span>${record.generated || 0}</span><span>${record.current_deleted || 0}</span>
-            <span class="ecommerce-waste-rate ${rateClass}">${Number(record.waste_rate || 0).toFixed(1)}%</span>
-            <span>¥${Number(record.billed_cny || 0).toFixed(2)}</span>
-        </div>`;
-    }).join('');
-    const toggle = document.getElementById('btn-ecommerce-waste-toggle');
-    if (toggle) {
-        toggle.style.display = records.length > 5 ? '' : 'none';
-        toggle.textContent = ecommerceWasteExpanded ? '收起到近5次' : '展开近20次';
+    // 废片重做裁剪：只清掉内存里的裁剪结果，磁盘上没有覆盖记录。
+    const item = ecommerceRerunState.items[state.itemIndex];
+    const reference = item?.references?.[state.refIndex];
+    if (!reference) return;
+    if (!reference.override_url && !reference.override_path) {
+        return showToast('这张就是原图，无需恢复', 'info');
     }
+    delete reference.override_url;
+    delete reference.override_path;
+    const image = new Image();
+    image.onload = () => {
+        state.image = image;
+        ecommerceInitCropFrame();
+        drawEcommerceReferenceCrop();
+    };
+    image.onerror = () => showToast('已恢复原图，但预览加载失败，请关闭弹窗重试', 'warning');
+    image.src = reference.url;
+    renderEcommerceRerunCompare(state.itemIndex);
+    const compareOverlay = document.getElementById('ecommerce-compare-overlay');
+    if (compareOverlay && !compareOverlay.hidden) updateEcommerceImageCompare();
+    showToast('已恢复原图', 'success');
 }
-document.getElementById('btn-ecommerce-waste-toggle')?.addEventListener('click', () => {
-    ecommerceWasteExpanded = !ecommerceWasteExpanded;
-    loadEcommerceWasteStats().catch(e => showToast(`统计加载失败：${e.message}`, 'error'));
-});
-document.getElementById('ecommerce-waste-disclosure')?.addEventListener('toggle', event => {
-    const label = document.getElementById('ecommerce-waste-disclosure-label');
-    if (label) label.textContent = event.currentTarget.open ? '收起' : '展开';
-});
 
 function closeEcommerceImageCompare() {
     const overlay = document.getElementById('ecommerce-compare-overlay');
@@ -13485,6 +15852,8 @@ function applyEcommerceCompareZoom(side, center = false) {
         else if (action === '4') isActive = Math.abs(zoom - 4) < 0.15;
         btn.classList.toggle('is-active', isActive);
     });
+    // 放大到需要看细节时，把压缩预览换回原图。
+    ecommerceUpgradeCompareImage(safeSide);
 }
 
 function scheduleEcommerceCompareZoom(side, center = false) {
@@ -13525,32 +15894,40 @@ function setEcommerceCompareImage(side, url, alt = '') {
     if (!nextUrl) {
         image.dataset.pendingSourceUrl = '';
         image.dataset.sourceUrl = '';
+        image.dataset.loadedUrl = '';
+        image.dataset.upgradingUrl = '';
         image.removeAttribute('src');
         resetEcommerceComparePan(safeSide);
         return;
     }
+    // 原图（4K PNG 动辄十几 MB）解码一次要几百毫秒，逐张翻看就是“翻一张卡一下”。
+    // 先上 1600px 压缩预览（几十 KB、几毫秒），放大到 1.5 倍以上再换回原图看细节。
+    const previewUrl = ecommerceThumbnailUrl(nextUrl, ECOMMERCE_COMPARE_PREVIEW_EDGE);
     if (!sourceChanged) {
         if (image.complete && image.naturalWidth) scheduleEcommerceCompareZoom(safeSide);
+        ecommerceUpgradeCompareImage(safeSide);
         return;
     }
     if (image.dataset.pendingSourceUrl === nextUrl) return;
     image.dataset.pendingSourceUrl = nextUrl;
+    image.dataset.upgradingUrl = '';
     const loader = new Image();
     loader.onload = () => {
         if (image.dataset.pendingSourceUrl !== nextUrl) return;
         image.dataset.pendingSourceUrl = '';
         image.dataset.sourceUrl = nextUrl;
+        image.dataset.loadedUrl = previewUrl;
         resetEcommerceComparePan(safeSide);
         image.onload = () => {
             if (image.dataset.sourceUrl === nextUrl) scheduleEcommerceCompareZoom(safeSide);
         };
-        image.src = nextUrl;
+        image.src = previewUrl;
         if (image.complete && image.naturalWidth) scheduleEcommerceCompareZoom(safeSide);
     };
     loader.onerror = () => {
         if (image.dataset.pendingSourceUrl === nextUrl) image.dataset.pendingSourceUrl = '';
     };
-    loader.src = nextUrl;
+    loader.src = previewUrl;
 }
 
 function ecommerceCompareActionGroups(group = ecommerceGroupCompareState.data) {
@@ -13704,6 +16081,9 @@ function updateEcommerceImageCompare() {
         } else if (result.marked_redo) {
             resultLabel.innerHTML = `⚑ 已标记重做 · 动作${result.action_order || resultIndex + 1} · ${ecommerceEscape(result.action_name || '')}`;
             resultLabel.style.color = '#2563eb';
+        } else if (result.gen_type === 'rf') {
+            resultLabel.innerHTML = `✧ 二次调整 · 动作${result.action_order || resultIndex + 1} · ${ecommerceEscape(result.action_name || '')}`;
+            resultLabel.style.color = '#0e7490';
         } else {
             resultLabel.innerHTML = `AI生成图 · 动作${result.action_order || resultIndex + 1} · ${ecommerceEscape(result.action_name || '')}`;
             resultLabel.style.color = '';
@@ -13790,6 +16170,25 @@ function updateEcommerceImageCompare() {
             markBtn.style.fontWeight = '';
         }
     }
+    // "添加到二次调整"按钮：group 模式下当前这张 AI 图未删除即可加入/移除二次调整队列。
+    const refineBtn = document.getElementById('ecommerce-compare-refine');
+    if (refineBtn) {
+        const currentResult = results[resultIndex];
+        refineBtn.hidden = !groupMode || !currentResult || !!currentResult.deleted;
+        if (currentResult?.refine_redo) {
+            refineBtn.textContent = '✓ 已加入二次调整（点击移除）';
+            refineBtn.style.background = '#0e7490';
+            refineBtn.style.color = '#fff';
+            refineBtn.style.borderColor = '#0e7490';
+            refineBtn.style.fontWeight = '600';
+        } else {
+            refineBtn.textContent = '✧ 添加到二次调整';
+            refineBtn.style.background = '';
+            refineBtn.style.color = '#0e7490';
+            refineBtn.style.borderColor = '#a5f3fc';
+            refineBtn.style.fontWeight = '';
+        }
+    }
     // 标红当前结果面板（软删除/已删除状态）
     const resultPane = document.querySelector('.ecommerce-compare-pane-results');
     if (resultPane) {
@@ -13854,29 +16253,45 @@ function updateEcommerceImageCompare() {
     }
     const thumbs = document.getElementById('ecommerce-compare-thumbnails');
     if (thumbs) {
-        thumbs.innerHTML = refs.map((entry, i) => {
-            const isBad = !groupMode && entry._isBadPhoto;
-            const thumbUrl = entry.override_url || entry.url || '';
-            const label = isBad ? '废' : (groupMode ? `${i + 1}` : `${i}`);
-            return `<button type="button" data-ref-index="${i}" class="${i === index ? 'is-active' : ''} ${isBad ? 'is-bad-photo' : ''}" title="${isBad ? '废片（已删除的AI图）' : `参考图${label}`}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(thumbUrl, 180))}" alt="${isBad ? '废片' : `参考${label}`}"><span>${label}</span></button>`;
-        }).join('');
-        thumbs.querySelectorAll('button').forEach(btn => btn.addEventListener('click', e => {
-            e.stopPropagation();
-            if (groupMode) ecommerceGroupCompareState.refIndex = Number(btn.dataset.refIndex);
-            else ecommerceRerunState.compareRefIndex = Number(btn.dataset.refIndex);
-            updateEcommerceImageCompare();
-        }));
+        // 图片集合没变时只切换选中态。原来每次点缩略图都重建整条 innerHTML，
+        // 等于把 10 张 4K 图的缩略图全部重新解码一遍，点一下卡一下就是这么来的。
+        const refSignature = refs.map(entry => `${entry.override_url || entry.url || ''}|${entry._isBadPhoto ? 'bad' : ''}`).join('~');
+        if (thumbs.dataset.signature !== refSignature) {
+            thumbs.dataset.signature = refSignature;
+            thumbs.innerHTML = refs.map((entry, i) => {
+                const isBad = !groupMode && entry._isBadPhoto;
+                const thumbUrl = entry.override_url || entry.url || '';
+                const label = isBad ? '废' : (groupMode ? `${i + 1}` : `${i}`);
+                return `<button type="button" data-ref-index="${i}" class="${isBad ? 'is-bad-photo' : ''}" title="${isBad ? '废片（已删除的AI图）' : `参考图${label}`}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(thumbUrl, 180))}" alt="${isBad ? '废片' : `参考${label}`}" loading="lazy" decoding="async"><span>${label}</span></button>`;
+            }).join('');
+            thumbs.querySelectorAll('button').forEach(btn => btn.addEventListener('click', e => {
+                e.stopPropagation();
+                if (groupMode) ecommerceGroupCompareState.refIndex = Number(btn.dataset.refIndex);
+                else ecommerceRerunState.compareRefIndex = Number(btn.dataset.refIndex);
+                updateEcommerceImageCompare();
+            }));
+        }
+        thumbs.querySelectorAll('button').forEach(btn => {
+            btn.classList.toggle('is-active', Number(btn.dataset.refIndex) === index);
+        });
     }
     const resultThumbs = document.getElementById('ecommerce-compare-result-thumbnails');
     if (resultThumbs) {
         resultThumbs.hidden = !groupMode;
+        // 同参考图条：只在图片集合/状态真的变了才重建，否则只切选中态。
+        const resultSignature = groupMode
+            ? results.map(entry => [
+                entry.url || '', entry.deleted ? 'd' : '', entry.marked_redo ? 'm' : '',
+                entry.recoverable ? 'r' : '', entry.gen_type || '', entry.action_order || ''
+            ].join('|')).join('~')
+            : '';
+        if (resultThumbs.dataset.signature !== resultSignature) {
+        resultThumbs.dataset.signature = resultSignature;
         resultThumbs.innerHTML = groupMode ? results.map((entry, i) => {
             const classes = [];
-            if (i === resultIndex) classes.push('is-active');
             if (entry.deleted) classes.push('is-deleted');
             if (entry.marked_redo) classes.push('is-marked-redo');
             if (entry.recoverable) classes.push('is-recoverable');
-            if (ecommerceGroupCompareState.selectedResultKeys?.has(ecommerceResultSelectionKey(entry))) classes.push('is-selected');
             let label, title;
             if (entry.deleted && entry.recoverable) {
                 label = `回${entry.action_order || i + 1}`;
@@ -13887,11 +16302,15 @@ function updateEcommerceImageCompare() {
             } else if (entry.marked_redo) {
                 label = `标${entry.action_order || i + 1}`;
                 title = '已标记为待重做（原图保留）';
+            } else if (entry.gen_type === 'rf') {
+                classes.push('is-refine');
+                label = `✧${entry.action_order || i + 1}`;
+                title = '二次调整生成的新图（紧跟源图之后）';
             } else {
                 label = `${entry.action_order || i + 1}`;
                 title = '保留候选图';
             }
-            return `<button type="button" data-result-index="${i}" class="${classes.join(' ')}" title="${ecommerceEscape(title)}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(entry.url || '', 180))}" alt="动作${entry.action_order || i + 1}"><span>${label}</span></button>`;
+            return `<button type="button" data-result-index="${i}" class="${classes.join(' ')}" title="${ecommerceEscape(title)}"><img src="${ecommerceEscape(ecommerceThumbnailUrl(entry.url || '', 180))}" alt="动作${entry.action_order || i + 1}" loading="lazy" decoding="async"><span>${label}</span></button>`;
         }).join('') : '';
         resultThumbs.querySelectorAll('button').forEach(button => button.addEventListener('click', event => {
             event.stopPropagation();
@@ -13920,6 +16339,16 @@ function updateEcommerceImageCompare() {
             ecommerceGroupCompareState.candidateIndex = index;
             updateEcommerceImageCompare();
         }));
+        }
+        // 选中态每次都要跟上（框选/多选后不会重建 DOM，只切 class）。
+        if (groupMode) {
+            const selectedKeys = ecommerceGroupCompareState.selectedResultKeys;
+            resultThumbs.querySelectorAll('button[data-result-index]').forEach(button => {
+                const i = Number(button.dataset.resultIndex);
+                button.classList.toggle('is-active', i === resultIndex);
+                button.classList.toggle('is-selected', !!selectedKeys?.has(ecommerceResultSelectionKey(results[i])));
+            });
+        }
         if (resultThumbs.dataset.selectionHandlersBound !== '1') {
         resultThumbs.dataset.selectionHandlersBound = '1';
         let marqueeStart = null;
@@ -14365,20 +16794,16 @@ async function replaceEcommerceCompareReference(file) {
         const response = await fetch('/api/ecommerce/upload-temp-image', { method: 'POST', body: formData });
         const data = await response.json().catch(() => ({}));
         if (!response.ok || !data.url) throw new Error(data.error || '上传失败');
-        ecommerceRerunAdjustmentTargets(item).forEach(entry => {
-            const relatedReference = entry.references?.[refIndex];
-            if (!relatedReference) return;
-            if (!relatedReference.original_url) {
-                relatedReference.original_url = relatedReference.url;
-                relatedReference.original_path = relatedReference.path;
-            }
-            relatedReference.url = data.url;
-            relatedReference.path = data.path;
-            relatedReference.temporary_url = data.url;
-            relatedReference.temporary_path = data.path;
-            relatedReference.override_url = '';
-            relatedReference.override_path = '';
-        });
+        if (!reference.original_url) {
+            reference.original_url = reference.url;
+            reference.original_path = reference.path;
+        }
+        reference.url = data.url;
+        reference.path = data.path;
+        reference.temporary_url = data.url;
+        reference.temporary_path = data.path;
+        reference.override_url = '';
+        reference.override_path = '';
         renderEcommerceRerunCompare(itemIndex);
         updateEcommerceImageCompare();
         showToast('已临时替换当前服装参考图；原文件未修改，仅本次重做使用', 'success');
@@ -14394,20 +16819,16 @@ function restoreEcommerceCompareReference() {
     const item = ecommerceRerunState.items[itemIndex];
     const reference = item?.references?.[refIndex];
     if (!reference) return;
-    ecommerceRerunAdjustmentTargets(item).forEach(entry => {
-        const relatedReference = entry.references?.[refIndex];
-        if (!relatedReference) return;
-        if (relatedReference.original_url) {
-            relatedReference.url = relatedReference.original_url;
-            relatedReference.path = relatedReference.original_path;
-        }
-        relatedReference.override_url = '';
-        relatedReference.override_path = '';
-        delete relatedReference.temporary_url;
-        delete relatedReference.temporary_path;
-        delete relatedReference.original_url;
-        delete relatedReference.original_path;
-    });
+    if (reference.original_url) {
+        reference.url = reference.original_url;
+        reference.path = reference.original_path;
+    }
+    reference.override_url = '';
+    reference.override_path = '';
+    delete reference.temporary_url;
+    delete reference.temporary_path;
+    delete reference.original_url;
+    delete reference.original_path;
     renderEcommerceRerunCompare(itemIndex);
     updateEcommerceImageCompare();
     showToast('已恢复服装原始参考图', 'success');
@@ -14468,12 +16889,13 @@ async function scanEcommerceRerun() {
         ecommerceRerunState.items = (data.items || []).map(item => restoreEcommerceRerunEdits(item));
         ecommerceRerunState.activeIndex = -1;
         ecommerceRerunState.selectedIds = new Set(ecommerceRerunState.items.map(item => item.id));
-        ecommerceRerunState.groupSyncByGarment = new Map();
-        ecommerceRerunState.bulkPrompt = '';
+        // 扫描不清空用户已填写的批量提示词：点「扫描废片」或「添加到二次调整」
+        // 都会自动触发扫描，之前这里无条件重置，导致填好的提示词被静默清掉，
+        // 提交时变成空提示词=拿原提示词重生成一遍，看起来像“改了提示词没生效”。
         const firstModel = ecommerceRerunState.items[0]?.original_model || {};
-        const validPlatform = ['runninghub', 'oaihk'].includes(firstModel.platform) ? firstModel.platform : 'runninghub';
+        const validPlatform = ['runninghub', 'oaihk', 'pptoken', 'apiyi'].includes(firstModel.platform) ? firstModel.platform : 'runninghub';
         ecommerceRerunState.bulkPlatform = validPlatform;
-        const bulkKeys = validPlatform === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : ECOMMERCE_RERUN_HK_MODEL_KEYS;
+        const bulkKeys = validPlatform === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : validPlatform === 'pptoken' ? Object.keys(PPTOKEN_MODELS) : validPlatform === 'apiyi' ? Object.keys(APIYI_MODELS) : ECOMMERCE_RERUN_HK_MODEL_KEYS;
         ecommerceRerunState.bulkModelKey = bulkKeys.includes(firstModel.model_key) ? firstModel.model_key : bulkKeys[0];
         ecommerceRerunState.bulkRatio = firstModel.aspect_ratio || 'auto';
         const total = ecommerceRerunState.items.length;
@@ -14488,11 +16910,20 @@ async function scanEcommerceRerun() {
             showToast(`检测到${incompleteTotal}个动作结果数量不足，已单独保留为生成不完整状态，不会自动重复提交扣费`, 'warning');
         }
         renderEcommerceRerunList();
+        // 逐套验片的进度数字也要跟着刷新：删除/标记重做/二次调整都会改变「缺失张数」，
+        // 这里直接复用本次扫描结果（单组扫描时数据不全，退回整批重扫一次）。
+        const folderContainer = document.getElementById('ecommerce-result-folders');
+        if (folderContainer && ecommerceState.detail && ecommerceState.detail.id === batchId) {
+            await refreshEcommerceFolderStatusCounts(
+                folderContainer,
+                ecommerceState.detail,
+                resultPath ? null : (data.items || [])
+            );
+        }
         // “缺失废片”与“已经重做成功的图片”是两类数据。扫描完缺失项后，
         // 单独加载持久化重做批次，让已完成图片即使刷新页面也仍可验片。
         await loadEcommerceRerunBatches();
         await recoverLatestEcommerceRerunBatch();
-        await loadEcommerceWasteStats();
         await loadEcommerceFinalExportStatus(false);
     } catch (e) {
         if (summary) summary.textContent = `扫描失败：${e.message}`;
@@ -14513,9 +16944,59 @@ function bindEcommerceRerunProgressActions(scope = document) {
     }
 }
 
+// 把「逐套客片对比」里当前这张AI图加入二次调整队列：走同一套废片扫描与
+// 废片重做链路，扫描后在废片列表最后以青色标记出现；唯一区别是递交时只用
+// 这张AI图作为唯一参考图，不送模特/服装参考图。
+async function addEcommerceCurrentToRefine() {
+    const group = ecommerceGroupCompareState.data;
+    const actionGroup = ecommerceCurrentActionGroup();
+    const results = actionGroup?.results || [];
+    const result = results[ecommerceGroupCompareState.candidateIndex];
+    if (!group || !result) return showToast('当前没有可二次调整的AI图', 'error');
+    if (result.deleted) return showToast('已删除的图不能二次调整，请先恢复或找回', 'error');
+    const batchId = group.batch_id || ecommerceState.currentBatchId || ecommerceRerunState.batchId;
+    if (!batchId) return showToast('找不到这张图所属的批次', 'error');
+    const sourcePath = result.path || '';
+    if (!sourcePath) return showToast('这张图没有可用的本地文件', 'error');
+    const removing = !!result.refine_redo;
+    try {
+        const resp = await ecommerceApi('POST', '/api/ecommerce/refine-redo', {
+            action: removing ? 'remove' : 'add',
+            batch_id: batchId,
+            garment_id: group.garment_id,
+            action_order: result.action_order || 0,
+            source_path: sourcePath
+        });
+        if (!resp.ok && resp.error) throw new Error(resp.error);
+        result.refine_redo = !removing;
+        result.refine_id = removing ? '' : (resp.refine_id || result.refine_id || '');
+        ecommerceGroupCompareState.hadChanges = true;
+        updateEcommerceImageCompare();
+        showToast(removing
+            ? '已从二次调整移除'
+            : '✓ 已加入二次调整；扫描废片后会在第4栏废片列表最后出现', removing ? 'info' : 'success');
+        // 立刻重扫一次，让这张图马上出现在废片列表里，不用手动再点扫描。
+        if (ecommerceRerunState.batchId || ecommerceState.currentBatchId) {
+            scanEcommerceRerun().catch(() => {});
+        }
+    } catch (e) {
+        showToast(`${removing ? '移除' : '加入'}二次调整失败：${e.message}`, 'error');
+    }
+}
+
 function renderEcommerceRerunList() {
     const list = document.getElementById('ecommerce-rerun-list');
     if (!list) return;
+    // 第4栏只放“废片列表 + 全选/已选计数”；平台/模型/并发/提示词等批量参数留在第3栏。
+    const params = document.getElementById('ecommerce-rerun-bulk-params');
+    // 勾选/取消勾选会整段重绘，这里保留滚动位置：否则用户逐张核对时每点一下都跳回顶部。
+    const prevListScroll = list.scrollTop;
+    const rerunCard = list.closest('.ecommerce-card-rerun');
+    const prevCardScroll = rerunCard ? rerunCard.scrollTop : 0;
+    const restoreScroll = () => {
+        if (rerunCard && prevCardScroll) rerunCard.scrollTop = prevCardScroll;
+        if (prevListScroll) list.scrollTop = prevListScroll;
+    };
     const items = ecommerceRerunState.items;
     if (!items.length) {
         const last = ecommerceRerunState.bulkProgress || {};
@@ -14529,68 +17010,114 @@ function renderEcommerceRerunList() {
                 <small>暂停不会取消已经提交且可能已扣费的任务</small>
             </div>
         </div>` : '';
-        list.innerHTML = `<div class="ecommerce-empty">没有废片，所有动作图都已补齐${last.total ? `<br><small>上次重做：成功${last.success || 0}张，失败${last.failed || 0}张</small>` : ''}</div>${progressHtml}`;
-        bindEcommerceRerunProgressActions();
+        list.innerHTML = `<div class="ecommerce-empty">没有废片，所有动作图都已补齐${last.total ? `<br><small>上次重做：成功${last.success || 0}张，失败${last.failed || 0}张</small>` : ''}</div>`;
+        if (params) params.innerHTML = progressHtml || '<div class="ecommerce-empty">没有待重做的废片。</div>';
+        bindEcommerceRerunProgressActions(params || document);
+        restoreScroll();
         return;
     }
-    const grouped = new Map();
-    items.forEach((item, index) => {
-        if (!grouped.has(item.garment_id)) grouped.set(item.garment_id, []);
-        grouped.get(item.garment_id).push({ item, index });
-    });
-    const selectedCount = items.filter(item => ecommerceRerunState.selectedIds.has(item.id)).length;
+    // 二次调整项统一集中排在废片列表最后，并用独立青色配色区分（用户要求：
+    // 二次标记重生成的图全部排在一起、排在最后，且一眼能看出是二次调整的）。
+    // 分组顺序与「下一张 / 下一套」共用同一份定义，避免两处顺序漂移。
+    const { normal: grouped, refine: refineGrouped } = ecommerceRerunDisplayGroups();
+    const refineCount = [...refineGrouped.values()].reduce((total, entries) => total + entries.length, 0);
+    const selectedItems = items.filter(item => ecommerceRerunState.selectedIds.has(item.id));
+    const selectedCount = selectedItems.length;
+    // 选中项里有多少张带了单张提示词：这些图会用各自的单张提示词（而不是批量提示词），
+    // 但无论用哪个，递交时都会追加在原提示词之后，换装指令不会丢。必须在提交前
+    // 明确告知，否则看不出实际用了什么提示词。
+    // 二次调整的提示词是它自己专用的（整条替换、不受批量提示词影响），不参与这里的统计。
+    const singlePromptSelected = selectedItems.filter(item => String(item.rerun_prompt || '').trim() && !item.refine_redo).length;
+    const refineSelectedCount = selectedItems.filter(item => item.refine_redo).length;
     const progress = ecommerceRerunState.bulkProgress || {};
     const bulkModels = ecommerceRerunModelOptions(ecommerceRerunState.bulkPlatform || 'runninghub', ecommerceRerunState.bulkModelKey);
-    const groupsHtml = [...grouped.entries()].map(([garmentId, entries]) => {
-        const groupChecked = entries.every(({ item }) => ecommerceRerunState.selectedIds.has(item.id));
-        const markedCount = entries.filter(({ item }) => item.marked_redo).length;
-        const deletedCount = entries.length - markedCount;
-        const groupLabel = markedCount > 0 && deletedCount > 0
-            ? `${deletedCount}张废片 + ${markedCount}张标记重做｜本组全选`
-            : markedCount > 0
-                ? `${markedCount}张标记重做｜本组全选`
-                : `${entries.length}张废片｜本组全选`;
-        const rows = entries.map(({ item, index }) => {
-            const thumb = item.target_action_url
-                ? `<img class="ecommerce-rerun-thumb ecommerce-rerun-open-compare" src="${ecommerceEscape(ecommerceThumbnailUrl(item.target_action_url, 120))}" alt="动作参考图" title="原始动作参考图；点击进入调整" loading="lazy" decoding="async">`
-                : '<span class="ecommerce-rerun-thumb" style="display:grid;place-items:center;color:#98a2b3;">无备份</span>';
-            const typeBadge = item.marked_redo
+
+    const renderRow = ({ item, index }) => {
+        const thumb = item.target_action_url
+            ? `<img class="ecommerce-rerun-thumb ecommerce-rerun-open-compare" src="${ecommerceEscape(ecommerceThumbnailUrl(item.target_action_url, 120))}" alt="${item.refine_redo ? '二次调整源图' : '动作参考图'}" title="${item.refine_redo ? '用于二次调整的那张AI图；点击进入调整' : '原始动作参考图；点击进入调整'}" loading="lazy" decoding="async">`
+            : '<span class="ecommerce-rerun-thumb" style="display:grid;place-items:center;color:#98a2b3;">无备份</span>';
+        const typeBadge = item.refine_redo
+            ? '<span class="ecommerce-rerun-type-badge is-refine" title="二次调整：递交时只用这一张AI图作为唯一参考图，不再送模特/服装参考图">✧ 二次调整</span>'
+            : item.marked_redo
                 ? '<span class="ecommerce-rerun-type-badge is-marked" title="标记重做：原图保留，重做后替换">⚑ 标记</span>'
                 : item.also_marked_redo
                     ? '<span class="ecommerce-rerun-type-badge is-waste" title="这张图同时被删除和手动标记，已合并为一个重做任务">✕废片 + ⚑标记</span>'
-                : '<span class="ecommerce-rerun-type-badge is-waste" title="废片：原图已删除">✕ 废片</span>';
-            // 抽卡模式：显示缺几张需要重做（samples_per_action > 1 时）
-            const samplesPerAction = parseInt(item.samples_per_action, 10) || 1;
-            const actualCount = parseInt(item.actual_count, 10) || 0;
-            const missingCount = parseInt(item.missing_count, 10) || 1;
-            const countBadge = samplesPerAction > 1
-                ? `<span class="ecommerce-rerun-count-badge" title="抽卡${samplesPerAction}张/动作 · 现存${actualCount}张 · 需补${missingCount}张">抽卡 ${actualCount}/${samplesPerAction} → 补${missingCount}</span>`
-                : '';
-            return `<div class="ecommerce-rerun-item ${index === ecommerceRerunState.activeIndex ? 'is-active' : ''} ${item.marked_redo ? 'is-marked-redo' : ''}" data-index="${index}">
-                <input type="checkbox" class="ecommerce-rerun-item-select" aria-label="选择这张${item.marked_redo ? '标记重做' : '废片'}" ${ecommerceRerunState.selectedIds.has(item.id) ? 'checked' : ''}>
-                <span class="ecommerce-rerun-index">${index + 1}</span>
-                <span class="ecommerce-rerun-name" title="${ecommerceEscape(item.garment_path || '')}">动作${item.action_order}</span>
-                <span class="ecommerce-rerun-action">${ecommerceEscape(item.action_name || '')}</span>
-                ${typeBadge}
-                ${countBadge}
-                ${thumb}
-                <button class="btn btn-outline btn-compact ecommerce-rerun-pick" type="button">调整参考图</button>
-            </div>`;
-        }).join('');
+                    : '<span class="ecommerce-rerun-type-badge is-waste" title="废片：原图已删除">✕ 废片</span>';
+        // 抽卡模式：显示缺几张需要重做（samples_per_action > 1 时）
+        const samplesPerAction = parseInt(item.samples_per_action, 10) || 1;
+        const actualCount = parseInt(item.actual_count, 10) || 0;
+        const missingCount = parseInt(item.missing_count, 10) || 1;
+        const countBadge = samplesPerAction > 1
+            ? `<span class="ecommerce-rerun-count-badge" title="抽卡${samplesPerAction}张/动作 · 现存${actualCount}张 · 需补${missingCount}张">${actualCount}/${samplesPerAction}→补${missingCount}</span>`
+            : '';
+        // 单张提示词会静默顶掉批量提示词，必须在列表上直接暴露，否则看不出这几张没用批量版。
+        const singlePrompt = String(item.rerun_prompt || '').trim();
+        const singlePromptBadge = singlePrompt
+            ? (item.refine_redo
+                ? `<span class="ecommerce-rerun-prompt-badge" title="这张是二次调整，已单独保存提示词（${singlePrompt.length} 字）；批次大提示词不会覆盖它">单张</span>`
+                : `<span class="ecommerce-rerun-prompt-badge" title="这张已单独保存提示词（${singlePrompt.length} 字），批量重做时它会追加到原提示词之后（换装指令不会丢）；勾选「统一使用批量提示词」可忽略">单张</span>`)
+            : '';
+        const rowClass = item.refine_redo ? 'is-refine-redo' : (item.marked_redo ? 'is-marked-redo' : '');
+        const rowType = item.refine_redo ? '二次调整' : (item.marked_redo ? '标记重做' : '废片');
+        // 动作名多数时候就是动作号本身（"5"），重复显示只是白占一列；只有真正有意义的名字才跟在动作号后面。
+        const actionName = String(item.action_name || '').trim();
+        const actionLabel = `动作${item.action_order}${actionName && !/^\d+$/.test(actionName) ? ` · ${actionName}` : ''}`;
+        // 整行都可点（含缩略图）直接进入第5栏，所以不再单独放「调整参考图」按钮。
+        return `<div class="ecommerce-rerun-item ${index === ecommerceRerunState.activeIndex ? 'is-active' : ''} ${rowClass}" data-index="${index}" title="点击进入第5栏调整参考图与提示词｜${rowType}">
+            <input type="checkbox" class="ecommerce-rerun-item-select" aria-label="选择这张${rowType}" ${ecommerceRerunState.selectedIds.has(item.id) ? 'checked' : ''}>
+            <span class="ecommerce-rerun-index">${index + 1}</span>
+            <span class="ecommerce-rerun-name" title="${ecommerceEscape(item.garment_path || '')}">${ecommerceEscape(actionLabel)}</span>
+            ${typeBadge}
+            ${countBadge}
+            ${singlePromptBadge}
+            ${thumb}
+        </div>`;
+    };
+
+    const renderGroupSection = (garmentId, entries, isRefineGroup) => {
+        const groupChecked = entries.every(({ item }) => ecommerceRerunState.selectedIds.has(item.id));
+        let groupLabel;
+        if (isRefineGroup) {
+            groupLabel = `${entries.length}张二次调整｜本组全选`;
+        } else {
+            const markedCount = entries.filter(({ item }) => item.marked_redo).length;
+            const deletedCount = entries.length - markedCount;
+            groupLabel = markedCount > 0 && deletedCount > 0
+                ? `${deletedCount}废 + ${markedCount}标｜本组全选`
+                : markedCount > 0
+                    ? `${markedCount}张标记｜本组全选`
+                    : `${deletedCount}张｜本组全选`;
+        }
+        const rows = entries.map(renderRow).join('');
         const firstItem = entries[0].item;
         const groupResultPath = firstItem?.result_path || '';
         const groupGarmentPath = firstItem?.garment_path || '';
-        return `<section class="ecommerce-rerun-group" data-garment-id="${ecommerceEscape(garmentId)}" data-result-path="${ecommerceEscape(groupResultPath)}" data-garment-path="${ecommerceEscape(groupGarmentPath)}">
-            <label class="ecommerce-rerun-group-head"><input type="checkbox" class="ecommerce-rerun-group-select" ${groupChecked ? 'checked' : ''}><strong>${ecommerceEscape(firstItem?.garment_name || '')}</strong><span>${groupLabel}</span></label>
-            <button class="btn btn-outline btn-compact ecommerce-rerun-folder-open" type="button" title="在访达中打开 ${ecommerceEscape(groupResultPath || groupGarmentPath)}">📁 打开文件夹</button>
+        return `<section class="ecommerce-rerun-group${isRefineGroup ? ' is-refine' : ''}" data-garment-id="${ecommerceEscape(garmentId)}" data-result-path="${ecommerceEscape(groupResultPath)}" data-garment-path="${ecommerceEscape(groupGarmentPath)}">
+            <div class="ecommerce-rerun-group-bar">
+                <label class="ecommerce-rerun-group-head"><input type="checkbox" class="ecommerce-rerun-group-select" ${groupChecked ? 'checked' : ''}><strong>${ecommerceEscape(firstItem?.garment_name || '')}</strong><span>${groupLabel}</span></label>
+                <button class="btn btn-outline btn-compact ecommerce-rerun-folder-open" type="button" title="在访达中打开 ${ecommerceEscape(groupResultPath || groupGarmentPath)}">📁</button>
+            </div>
             ${rows}
         </section>`;
-    }).join('');
-    list.innerHTML = `<div class="ecommerce-rerun-bulk-bar">
-        <div class="ecommerce-rerun-bulk-select"><label><input type="checkbox" id="ecommerce-rerun-select-all" ${selectedCount === items.length ? 'checked' : ''}> 全选</label><strong id="ecommerce-rerun-selected-count">已选 ${selectedCount}/${items.length}</strong></div>
+    };
+
+    const groupsHtml = [...grouped.entries()]
+        .map(([garmentId, entries]) => renderGroupSection(garmentId, entries, false))
+        .join('');
+    // 二次调整项：按服装分组后整体追加到列表末尾，带独立分隔条与青色样式。
+    const refineHtml = refineCount
+        ? `<div class="ecommerce-rerun-refine-divider" title="二次调整的图只用那张 AI 图作为参考图"><span>✧ 二次调整（${refineCount}）</span></div>`
+            + [...refineGrouped.entries()].map(([garmentId, entries]) => renderGroupSection(garmentId, entries, true)).join('')
+        : '';
+    list.innerHTML = `<div class="ecommerce-rerun-select-bar">
+        <label><input type="checkbox" id="ecommerce-rerun-select-all" ${selectedCount === items.length ? 'checked' : ''}> 全选</label>
+        <strong id="ecommerce-rerun-selected-count">已选 ${selectedCount}/${items.length}</strong>
+    </div>${groupsHtml}${refineHtml}`;
+    if (params) params.innerHTML = `<div class="ecommerce-rerun-bulk-bar">
         <div class="ecommerce-rerun-bulk-model">
-            <select id="ecommerce-rerun-bulk-platform"><option value="runninghub" ${ecommerceRerunState.bulkPlatform === 'runninghub' ? 'selected' : ''}>RH</option><option value="oaihk" ${ecommerceRerunState.bulkPlatform === 'oaihk' ? 'selected' : ''}>HK</option></select>
+            <select id="ecommerce-rerun-bulk-platform"><option value="runninghub" ${ecommerceRerunState.bulkPlatform === 'runninghub' ? 'selected' : ''}>RH</option><option value="oaihk" ${ecommerceRerunState.bulkPlatform === 'oaihk' ? 'selected' : ''}>HK</option><option value="pptoken" ${ecommerceRerunState.bulkPlatform === 'pptoken' ? 'selected' : ''}>PPT</option><option value="apiyi" ${ecommerceRerunState.bulkPlatform === 'apiyi' ? 'selected' : ''}>API易</option></select>
             <select id="ecommerce-rerun-bulk-model">${bulkModels}</select>
+            <select id="ecommerce-rerun-bulk-resolution" title="与第一栏一致：选择几K">${['1k','2k','4k'].map(step => `<option value="${step}" ${step === (ecommerceRerunState.bulkResolution || '4k') ? 'selected' : ''}>${step.toUpperCase()}</option>`).join('')}</select>
             <select id="ecommerce-rerun-bulk-ratio">${ECOMMERCE_RERUN_RATIOS.map(ratio => `<option value="${ratio}" ${ratio === ecommerceRerunState.bulkRatio ? 'selected' : ''}>${ratio === 'auto' ? '自动' : ratio}</option>`).join('')}</select>
         </div>
         <div class="ecommerce-rerun-bulk-execution">
@@ -14600,12 +17127,27 @@ function renderEcommerceRerunList() {
             <small id="ecommerce-rerun-concurrency-hint">1–100；每张按批次/服装/动作身份归档，不按返回顺序归属</small>
         </div>
         <div class="ecommerce-shared-prompt-templates" data-ecommerce-prompt-template-target="#ecommerce-rerun-bulk-prompt">
+            <button type="button" class="ecommerce-shared-prompt-toggle" title="折叠/展开模板区，给提示词输入框让出高度">▾</button>
             <span class="ecommerce-shared-prompt-label">共用提示词模板</span>
-            <div class="ecommerce-shared-prompt-list"></div>
-            <select class="ecommerce-shared-prompt-more"><option value="">更多模板…</option></select>
-            <button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button>
+            <div class="ecommerce-shared-prompt-body">
+                <div class="ecommerce-shared-prompt-list"></div>
+                <select class="ecommerce-shared-prompt-more"><option value="">更多模板…</option></select>
+                <button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button>
+            </div>
         </div>
-        <textarea id="ecommerce-rerun-bulk-prompt" placeholder="批量新提示词；留空时复用原提示词，填写后完整替换原提示词">${ecommerceEscape(ecommerceRerunState.bulkPrompt || '')}</textarea>
+        <textarea id="ecommerce-rerun-bulk-prompt" placeholder="批量新提示词；留空时复用原提示词，填写后追加到原提示词之后（换装指令不会丢）">${ecommerceEscape(ecommerceRerunState.bulkPrompt || '')}</textarea>
+        <div class="ecommerce-rerun-prompt-guard">
+            <label title="勾选后，本次批量重做里除二次调整以外的每一张都使用上面的批量提示词，忽略在第5栏单独保存过的提示词；二次调整不受影响"><input type="checkbox" id="ecommerce-rerun-ignore-single-prompt" ${ecommerceRerunState.bulkIgnoreSinglePrompt ? 'checked' : ''}> 统一使用批量提示词（忽略单张，二次调整除外）</label>
+            <small id="ecommerce-rerun-single-prompt-hint" class="${singlePromptSelected && !ecommerceRerunState.bulkIgnoreSinglePrompt ? 'is-warning' : ''}">${[
+                singlePromptSelected
+                    ? (ecommerceRerunState.bulkIgnoreSinglePrompt
+                        ? `已选中 ${singlePromptSelected} 张带单张提示词，本次将全部改用批量提示词（二次调整除外）`
+                        : `已选中 ${singlePromptSelected} 张带单张提示词，这几张会用各自的单张提示词（都追加在原提示词之后）`)
+                    : '本次选中项没有单张提示词，普通废片/标记重做都使用批量提示词',
+                refineSelectedCount ? `另有 ${refineSelectedCount} 张二次调整，各自用自己的提示词，批量大提示词不覆盖` : ''
+            ].filter(Boolean).join('；')}</small>
+            ${singlePromptSelected ? '<button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-clear-single-prompt" title="把普通废片/标记重做的单张提示词清空，之后都会使用批量提示词；二次调整的提示词不会被清">清除单张提示词（不含二次调整）</button>' : ''}
+        </div>
         <button type="button" class="btn btn-primary btn-compact" id="btn-ecommerce-rerun-bulk" ${selectedCount ? '' : 'disabled'}>批量重做已选 ${selectedCount} 张</button>
         <div class="ecommerce-rerun-progress" id="ecommerce-rerun-progress" ${progress.active || progress.total ? '' : 'hidden'}>
             <div><span id="ecommerce-rerun-progress-label">${progress.paused ? '已暂停提交' : progress.active ? '正在重做' : '上次重做'} ${progress.completed || 0}/${progress.total || 0}</span><span id="ecommerce-rerun-progress-counts">成功${progress.success || 0} · 失败${progress.failed || 0}</span></div>
@@ -14616,8 +17158,8 @@ function renderEcommerceRerunList() {
                 <small>暂停不会取消已经提交且可能已扣费的任务</small>
             </div>
         </div>
-    </div>${groupsHtml}`;
-    renderEcommerceRerunPromptTemplates(list);
+    </div>`;
+    renderEcommerceRerunPromptTemplates(params || list);
     list.querySelector('#ecommerce-rerun-select-all')?.addEventListener('change', event => {
         ecommerceRerunState.selectedIds = event.target.checked ? new Set(items.map(item => item.id)) : new Set();
         renderEcommerceRerunList();
@@ -14649,8 +17191,12 @@ function renderEcommerceRerunList() {
     });
     list.querySelectorAll('.ecommerce-rerun-group-select').forEach(input => input.addEventListener('change', event => {
         event.stopPropagation();
-        const groupId = event.currentTarget.closest('.ecommerce-rerun-group').dataset.garmentId;
-        items.filter(item => item.garment_id === groupId).forEach(item => {
+        // 同一套服装可能同时有普通废片组和二次调整组，必须只勾选本 section 内的行，
+        // 否则点普通组的全选会把该服装的二次调整项一起勾上（反之亦然）。
+        const section = event.currentTarget.closest('.ecommerce-rerun-group');
+        [...(section?.querySelectorAll('.ecommerce-rerun-item[data-index]') || [])].forEach(row => {
+            const item = items[Number(row.dataset.index)];
+            if (!item) return;
             if (event.currentTarget.checked) ecommerceRerunState.selectedIds.add(item.id);
             else ecommerceRerunState.selectedIds.delete(item.id);
         });
@@ -14663,47 +17209,85 @@ function renderEcommerceRerunList() {
         else ecommerceRerunState.selectedIds.delete(item.id);
         renderEcommerceRerunList();
     }));
-    list.querySelector('#ecommerce-rerun-bulk-prompt')?.addEventListener('input', event => { ecommerceRerunState.bulkPrompt = event.target.value; });
-    list.querySelector('#ecommerce-rerun-bulk-platform')?.addEventListener('change', event => {
-        ecommerceRerunState.bulkPrompt = list.querySelector('#ecommerce-rerun-bulk-prompt')?.value || '';
+    const paramsQuery = sel => params?.querySelector(sel);
+    paramsQuery('#ecommerce-rerun-bulk-prompt')?.addEventListener('input', event => { ecommerceRerunState.bulkPrompt = event.target.value; });
+    paramsQuery('#ecommerce-rerun-ignore-single-prompt')?.addEventListener('change', event => {
+        ecommerceRerunState.bulkIgnoreSinglePrompt = event.target.checked;
+        renderEcommerceRerunList();
+        // 第5栏的提示文案也要跟着开关变化，否则会显示过期的“会顶掉批量提示词”。
+        if (ecommerceRerunState.activeIndex >= 0) renderEcommerceRerunCompare(ecommerceRerunState.activeIndex);
+        showToast(event.target.checked
+            ? '本次批量重做将统一使用批量提示词（二次调整除外，仍用各自的提示词）'
+            : '已恢复：带单张提示词的普通废片仍优先使用单张版本', 'info');
+    });
+    paramsQuery('#btn-ecommerce-rerun-clear-single-prompt')?.addEventListener('click', () => {
+        // 二次调整的提示词是必填且专用的，清掉会让整批递交失败，这里排除掉。
+        const targets = ecommerceRerunState.items.filter(item => !item.refine_redo && String(item.rerun_prompt || '').trim());
+        if (!targets.length) return renderEcommerceRerunList();
+        if (!confirm(`清除全部 ${targets.length} 张普通废片/标记重做的单张提示词？\n\n清除后这些图都会使用批量提示词；二次调整的提示词不会被清。已在第5栏输入的提示词会丢失。`)) return;
+        targets.forEach(item => {
+            item.rerun_prompt = '';
+            // 只清提示词，保留这一张的参考图改动，避免误伤第5栏刚调好的参考图。
+            const edit = ecommerceRerunState.pendingEdits.get(item.id);
+            if (edit) edit.rerun_prompt = '';
+        });
+        renderEcommerceRerunList();
+        renderEcommerceRerunCompare(ecommerceRerunState.activeIndex);
+        showToast(`已清除 ${targets.length} 张的单张提示词（二次调整已保留）`, 'success');
+    });
+    paramsQuery('#ecommerce-rerun-bulk-platform')?.addEventListener('change', event => {
+        ecommerceRerunState.bulkPrompt = paramsQuery('#ecommerce-rerun-bulk-prompt')?.value || '';
         ecommerceRerunState.bulkPlatform = event.target.value;
-        ecommerceRerunState.bulkModelKey = (event.target.value === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : ECOMMERCE_RERUN_HK_MODEL_KEYS)[0];
+        ecommerceRerunState.bulkModelKey = Object.keys(ecommerceRerunModelCatalog(event.target.value))[0] || '';
         renderEcommerceRerunList();
     });
-    list.querySelector('#ecommerce-rerun-bulk-model')?.addEventListener('change', event => { ecommerceRerunState.bulkModelKey = event.target.value; });
-    list.querySelector('#ecommerce-rerun-bulk-ratio')?.addEventListener('change', event => { ecommerceRerunState.bulkRatio = event.target.value; });
-    list.querySelector('#ecommerce-rerun-draw-count')?.addEventListener('change', event => {
+    paramsQuery('#ecommerce-rerun-bulk-model')?.addEventListener('change', event => {
+        ecommerceRerunState.bulkModelKey = event.target.value;
+        syncEcommerceRerunResolution(params);
+    });
+    paramsQuery('#ecommerce-rerun-bulk-resolution')?.addEventListener('change', event => { ecommerceRerunState.bulkResolution = event.target.value; });
+    // 首次渲染时按平台/模型同步几K下拉（HK 的分辨率写在模型名里，隐藏该下拉）。
+    syncEcommerceRerunResolution(params);
+    paramsQuery('#ecommerce-rerun-bulk-ratio')?.addEventListener('change', event => { ecommerceRerunState.bulkRatio = event.target.value; });
+    paramsQuery('#ecommerce-rerun-draw-count')?.addEventListener('change', event => {
         ecommerceRerunState.bulkDrawCount = Math.max(1, Math.min(10, Number(event.target.value) || 1));
         updateRerunConcurrencyHint();
     });
     const updateRerunConcurrencyHint = () => {
         const selectedEntries = ecommerceRerunState.items.filter(item => ecommerceRerunState.selectedIds.has(item.id));
         const currentSelected = selectedEntries.length;
-        const inputVal = Math.max(1, Math.min(100, Number(list.querySelector('#ecommerce-rerun-concurrency')?.value) || 1));
+        const inputVal = Math.max(1, Math.min(100, Number(paramsQuery('#ecommerce-rerun-concurrency')?.value) || 1));
         const effective = Math.min(inputVal, Math.max(1, currentSelected));
-        const drawCount = Math.max(1, Math.min(10, Number(list.querySelector('#ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
-        const paidCount = selectedEntries.reduce((total, entry) => total + (entry.item.marked_redo ? drawCount : Math.max(drawCount, Number(entry.item.recommended_count) || 1)), 0);
-        const hint = list.querySelector('#ecommerce-rerun-concurrency-hint');
+        const drawCount = Math.max(1, Math.min(10, Number(paramsQuery('#ecommerce-rerun-draw-count')?.value) || ecommerceRerunState.bulkDrawCount || 1));
+        const paidCount = selectedEntries.reduce((total, entry) => total + (entry.marked_redo ? drawCount : Math.max(drawCount, Number(entry.recommended_count) || 1)), 0);
+        const hint = paramsQuery('#ecommerce-rerun-concurrency-hint');
+        const platformLimit = ecommerceRerunState.bulkPlatform === 'runninghub'
+            ? 'RH企业线路官方上限100'
+            : ecommerceRerunState.bulkPlatform === 'apiyi'
+                ? 'API易同步出图，4K超时600秒；限流时自动重试'
+                : ecommerceRerunState.bulkPlatform === 'pptoken'
+                    ? 'PPT未公布固定上限，限流时自动重试'
+                    : 'HK未公布固定上限，限流时自动重试';
         if (hint) hint.textContent = currentSelected
-            ? `实际并发${effective}；已选${currentSelected}项 × 每项${drawCount}张，预计付费${paidCount}张；${ecommerceRerunState.bulkPlatform === 'runninghub' ? 'RH企业线路官方上限100' : 'HK未公布固定上限，限流时自动重试'}`
+            ? `实际并发${effective}；已选${currentSelected}项 × 每项${drawCount}张，预计付费${paidCount}张；${platformLimit}`
             : '请先勾选要重做的废片';
     };
-    list.querySelector('#ecommerce-rerun-concurrency')?.addEventListener('change', event => {
+    paramsQuery('#ecommerce-rerun-concurrency')?.addEventListener('change', event => {
         ecommerceRerunState.bulkConcurrency = Math.max(1, Math.min(100, Number(event.target.value) || 1));
         event.target.value = String(ecommerceRerunState.bulkConcurrency);
         updateRerunConcurrencyHint();
     });
-    list.querySelector('#ecommerce-rerun-concurrency')?.addEventListener('input', updateRerunConcurrencyHint);
-    list.querySelector('#btn-ecommerce-rerun-auto-concurrency')?.addEventListener('click', () => {
+    paramsQuery('#ecommerce-rerun-concurrency')?.addEventListener('input', updateRerunConcurrencyHint);
+    paramsQuery('#btn-ecommerce-rerun-auto-concurrency')?.addEventListener('click', () => {
         ecommerceRerunState.bulkConcurrency = Math.max(1, Math.min(100, selectedCount || 1));
-        const input = list.querySelector('#ecommerce-rerun-concurrency');
+        const input = paramsQuery('#ecommerce-rerun-concurrency');
         if (input) input.value = String(ecommerceRerunState.bulkConcurrency);
         updateRerunConcurrencyHint();
         showToast(`已按待重做数量设为 ${ecommerceRerunState.bulkConcurrency} 并发`, 'success');
     });
     updateRerunConcurrencyHint();
-    list.querySelector('#btn-ecommerce-rerun-bulk')?.addEventListener('click', bulkRegenerateEcommerceSelected);
-    bindEcommerceRerunProgressActions(list);
+    paramsQuery('#btn-ecommerce-rerun-bulk')?.addEventListener('click', bulkRegenerateEcommerceSelected);
+    bindEcommerceRerunProgressActions(params || list);
     list.querySelectorAll('.ecommerce-rerun-item').forEach(row => {
         row.addEventListener('click', event => {
             if (event.target.closest('input')) return;
@@ -14718,33 +17302,64 @@ function renderEcommerceRerunList() {
         e.stopPropagation();
         openEcommerceImageCompare(Number(e.currentTarget.closest('.ecommerce-rerun-item').dataset.index), 1);
     }));
+    restoreScroll();
 }
 
 const ECOMMERCE_RERUN_RH_MODEL_KEYS = [
+    'rhart-image-g-2.5/flare/image-to-image', 'rhart-image-g-2.5/sunburst/image-to-image',
+    'rhart-image-g-2.5-official-token/flare/edit', 'rhart-image-g-2.5-official-token/sunburst/edit',
     'seedream-v5-pro/image-to-image-2k', 'seedream-v5-pro/image-to-image-1k',
-    'rhart-image-n-g31-flash/image-to-image-2k', 'rhart-image-n-g31-flash/image-to-image-4k',
-    'rhart-image-n-g31-flash-official/image-to-image-2k', 'rhart-image-n-g31-flash-official/image-to-image-4k',
-    'rhart-image-n-pro/edit-2k', 'rhart-image-n-pro/edit-4k',
+    'rhart-image-n-g31-flash/image-to-image', 'rhart-image-n-pro/edit',
     'rhart-image-g-2/image-to-image-2k', 'rhart-image-g-2/image-to-image-4k',
     'rhart-image-g-2-official/image-to-image-2k', 'rhart-image-g-2-official/image-to-image-4k',
-    'rhart-image-g-2-medium/image-to-image-2k', 'rhart-image-g-2-medium/image-to-image-4k',
-    'rhart-image-n-pro-official/edit-ultra-4k'
+    'rhart-image-g-2-medium/image-to-image-2k', 'rhart-image-g-2-medium/image-to-image-4k'
 ];
 const ECOMMERCE_RERUN_HK_MODEL_KEYS = [
+    'gpt-image-2.5-flare/4k', 'gpt-image-2.5-sunburst/4k',
     'fal-ai/banana/v3.1/flash', 'fal-ai/banana/v3.1/flash/2k', 'fal-ai/banana/v3.1/flash/4k',
     'fal-ai/banana/v2', 'fal-ai/banana/v2/2k', 'fal-ai/banana/v2/4k',
     'gpt-image-2', 'gpt-image-2/2k', 'gpt-image-2/4k'
 ];
 const ECOMMERCE_RERUN_RATIOS = ['auto','3:4','4:3','2:3','3:2','1:1','9:16','16:9','4:5','5:4','21:9'];
 
+// 废片重做的模型目录与第一栏（主出图）完全一致：同一份 catalog，不再用
+// 另一套 ECOMMERCE_RERUN_*_MODEL_KEYS 过滤，避免两处模型列表不同步。
+function ecommerceRerunModelCatalog(platform) {
+    if (platform === 'runninghub') return RH_MODELS;
+    if (platform === 'pptoken') return PPTOKEN_MODELS;
+    if (platform === 'apiyi') return APIYI_MODELS;
+    return OAIHK_MODELS;
+}
+
 function ecommerceRerunModelOptions(platform, selected) {
-    const catalog = platform === 'runninghub' ? RH_MODELS : OAIHK_MODELS;
-    const keys = platform === 'runninghub' ? ECOMMERCE_RERUN_RH_MODEL_KEYS : ECOMMERCE_RERUN_HK_MODEL_KEYS;
-    return keys.filter(key => catalog[key]).map(key => {
+    const catalog = ecommerceRerunModelCatalog(platform);
+    return Object.keys(catalog).filter(key => catalog[key]).map(key => {
         const model = catalog[key];
-        const label = `${model.shortName || model.name || key}${model.price ? `｜${model.price}` : ''}`;
+        const label = `${model.name || model.shortName || key}${model.price ? `｜${model.price}` : ''}`;
         return `<option value="${ecommerceEscape(key)}" ${key === selected ? 'selected' : ''}>${ecommerceEscape(label)}</option>`;
     }).join('');
+}
+
+// 与第一栏一致：只有把分辨率写进模型名的平台（HK）才隐藏几K下拉。
+function syncEcommerceRerunResolution(scope = document) {
+    const select = scope.querySelector?.('#ecommerce-rerun-bulk-resolution')
+        || document.getElementById('ecommerce-rerun-bulk-resolution');
+    const platformSelect = scope.querySelector?.('#ecommerce-rerun-bulk-platform')
+        || document.getElementById('ecommerce-rerun-bulk-platform');
+    if (!select || !platformSelect) return;
+    const platform = platformSelect.value || 'runninghub';
+    const embedded = platform === 'oaihk';
+    select.style.display = embedded ? 'none' : '';
+    const model = ecommerceRerunModelCatalog(platform)[
+        (scope.querySelector?.('#ecommerce-rerun-bulk-model') || document.getElementById('ecommerce-rerun-bulk-model'))?.value || ''
+    ];
+    // 模型自带固定分辨率（如 Seedream 5.0 Pro 1K/2K）时锁死下拉，避免发出矛盾参数。
+    if (model && model.fixedResolution) {
+        select.value = model.fixedResolution;
+        select.disabled = true;
+    } else {
+        select.disabled = embedded;
+    }
 }
 
 function updateEcommerceRerunProgress() {
@@ -14997,8 +17612,42 @@ async function bulkRegenerateEcommerceSelected() {
     if (!modelKey) return showToast('请选择批量重做模型', 'error');
     const modelLabel = document.getElementById('ecommerce-rerun-bulk-model')?.selectedOptions?.[0]?.textContent || modelKey;
     const paidCallTotal = selectedItems.reduce((total, item) => total + (item.marked_redo ? drawCount : Math.max(drawCount, Number(item.recommended_count) || 1)), 0);
-    if (!confirm(`确定批量重做 ${selectedItems.length} 项？\n\n平台/模型：${platform === 'runninghub' ? 'RH' : 'HK'} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${Math.min(concurrency, selectedItems.length)}\n每项生成：${drawCount}张\n\n预计付费生图 ${paidCallTotal} 张。刷新页面后也可以继续或验片。`)) return;
-    const config = { prompt, platform, modelKey, ratio, drawCount };
+    // 单张提示词会顶掉批量提示词（仅对这几张），但两者都会追加在原提示词之后，
+    // 且用户点确定时看不到。这里把实际会用到单张提示词的张数直接写进确认框。
+    const ignoreSinglePrompt = !!document.getElementById('ecommerce-rerun-ignore-single-prompt')?.checked;
+    const singlePromptCount = selectedItems.filter(item => String(item.rerun_prompt || '').trim() && !item.refine_redo).length;
+    const refineCount = selectedItems.filter(item => item.refine_redo).length;
+    const maskedItems = selectedItems.filter(item => item.refine_redo && String(item.rerun_mask_data_url || '').trim());
+    const promptScope = [
+        ignoreSinglePrompt
+            ? `提示词：普通废片/标记重做全部使用批量提示词${singlePromptCount ? `（已忽略 ${singlePromptCount} 张的单张提示词）` : ''}`
+            : (singlePromptCount
+                ? `提示词：其中 ${singlePromptCount} 张普通废片用各自的单张提示词，其余用批量提示词`
+                : '提示词：普通废片/标记重做全部使用批量提示词'),
+        '以上新提示词都会追加在原提示词之后（换装指令保留）',
+        refineCount ? `二次调整 ${refineCount} 张：各自用自己的提示词整条替换，批量大提示词不覆盖` : '',
+        maskedItems.length ? `局部重绘 ${maskedItems.length} 张：只重画涂抹到的区域，其余画面保持不变` : ''
+    ].filter(Boolean).join('；');
+    // 二次调整必须单独填写新提示词：不能沿用原提示词，也不能与批量提示词相同。
+    const refineNeedingPrompt = selectedItems.filter(item => {
+        if (!item.refine_redo) return false;
+        const own = String(item.rerun_prompt || '').trim();
+        const original = String(item.original_prompt || '').trim();
+        if (!own) return true;
+        if (original && own === original) return true;
+        if (prompt && own === prompt) return true;
+        return false;
+    });
+    if (refineNeedingPrompt.length) {
+        const first = refineNeedingPrompt[0];
+        return showToast(`二次调整必须单独填写新提示词：${first.garment_name}·动作${first.action_order} 还没改提示词（不能沿用原提示词，也不能与批量提示词相同）`, 'error');
+    }
+    if (!confirm(`确定批量重做 ${selectedItems.length} 项？\n\n平台/模型：${({ runninghub: 'RH', oaihk: 'HK', pptoken: 'PPT', apiyi: 'API易' })[platform] || platform} · ${modelLabel}\n比例：${ratio === 'auto' ? '自动' : ratio}\n并发：${Math.min(concurrency, selectedItems.length)}\n每项生成：${drawCount}张\n${promptScope}\n\n预计付费生图 ${paidCallTotal} 张。刷新页面后也可以继续或验片。`)) return;
+    // 蒙版只有 API易 官转通道认；选了别的平台会静默退化成整图重做，先说清楚。
+    if (maskedItems.length && platform !== 'apiyi') {
+        if (!confirm(`其中有 ${maskedItems.length} 张设了局部重绘蒙版，但本次平台是 ${({ runninghub: 'RH', oaihk: 'HK', pptoken: 'PPT' })[platform] || platform}，蒙版不会生效，这些图会按整图重做。\n\n仍要继续吗？`)) return;
+    }
+    const config = { prompt, platform, modelKey, ratio, drawCount, ignoreSinglePrompt };
     const queueItems = selectedItems.map(item => ecommerceBuildRerunQueuePayload(item, config));
     const invalid = selectedItems.find((item, index) => !['target_only', 'garment_prompt'].includes(item.generation_mode) && !queueItems[index].reference_images.length);
     if (invalid) return showToast(`${invalid.garment_name}·动作${invalid.action_order}没有可用服装参考图`, 'error');
@@ -15029,13 +17678,24 @@ function renderEcommerceRerunCompare(index) {
     setEcommerceRerunAdjustPanelVisible(true, true);
     const existing = host.querySelector('.ecommerce-rerun-compare');
     const targetOnly = ['target_only', 'garment_prompt'].includes(item.generation_mode);
-    const syncWholeGarment = ecommerceRerunGroupSyncEnabled(item);
-    const hasNextInGarment = ecommerceRerunState.items.some((entry, itemIndex) => itemIndex > index && entry.garment_id === item.garment_id);
-    const workflowButtonLabel = syncWholeGarment
-        ? '应用本套并下一套 →'
-        : (hasNextInGarment ? '保存当前并下一张 →' : '保存当前并下一套 →');
+    // 动作名多数时候就是动作号本身，重复显示无意义；只有真正有意义的名字才跟在动作号后面。
+    const rawActionName = String(item.action_name || '').trim();
+    const actionNameSuffix = rawActionName && !/^\d+$/.test(rawActionName) ? ` · ${rawActionName}` : '';
     const sourceReferenceLabel = item.generation_mode === 'garment_prompt' ? '原始服装图' : '原始目标图';
     const targetAction = ecommerceRerunTargetActionSource(item);
+    // 二次调整自带一组「＋ 添加参考图」（最多6张），与这一张的提示词配套使用。
+    const isRefine = !!item.refine_redo;
+    const refineRefs = isRefine ? (item.refine_references || []) : [];
+    const refineRefsHtml = refineRefs.map((ref, i) => {
+        // 上传接口给的是 local-image URL；如果只有 URL 没有本地路径，就直接用它，避免被再包一层。
+        const raw = String(ref.path || ref.url || '');
+        const url = ref.path || !raw ? ecommerceLocalImageUrl(raw) : raw;
+        return `<div class="ecommerce-rerun-ref is-refine" data-refine-index="${i}">
+            <img class="ecommerce-rerun-open-refine-ref" src="${ecommerceEscape(ecommerceThumbnailUrl(url, 220))}" alt="参考图${i + 1}" title="单击放大查看；右上角 × 可移除" loading="lazy" decoding="async">
+            <span class="ecommerce-rerun-ref-state">参考${i + 1}</span>
+            <button type="button" class="ecommerce-rerun-ref-remove" data-refine-index="${i}" title="移除这张参考图">×</button>
+        </div>`;
+    }).join('');
     const allReferencesSelected = (item.references || []).length > 0 && (item.references || []).every(ref => ref.selected !== false);
     const refs = (item.references || []).map((ref, i) => {
         const url = ref.override_url || ref.url;
@@ -15043,17 +17703,18 @@ function renderEcommerceRerunCompare(index) {
             <img class="ecommerce-rerun-open-ref" src="${ecommerceEscape(ecommerceThumbnailUrl(url || '', 220))}" alt="参考${i + 1}" title="${targetOnly ? '点击放大，与AI生成图对比' : '点击放大，与AI生成图对比；放大后可裁剪或临时换图'}" loading="lazy" decoding="async">
             ${targetOnly ? `<span class="ecommerce-rerun-ref-state">${sourceReferenceLabel}</span>` : `<label class="ecommerce-rerun-ref-check"><input type="checkbox" class="ecommerce-rerun-ref-use" ${ref.selected === false ? '' : 'checked'}>使用${ref.is_detail ? '·细节' : ''}</label>`}
             ${ref.override_url ? '<span class="ecommerce-rerun-ref-state">已裁剪</span>' : ref.temporary_url ? '<span class="ecommerce-rerun-ref-state">临时图</span>' : ''}
+            ${targetOnly ? '' : `<button type="button" class="ecommerce-rerun-ref-crop" data-ref-index="${i}" title="同比例裁剪这张服装参考图（只作用于本次重做，不改原图）">裁剪</button>`}
         </div>`;
     }).join('');
     const compare = document.createElement('div');
     compare.className = 'ecommerce-rerun-compare';
     compare.innerHTML = `
         <div class="ecommerce-rerun-compare-head">
-            <strong>重新调整参考图重做 · ${ecommerceEscape(item.garment_name)} · 动作${item.action_order}</strong>
-            <div class="ecommerce-rerun-system-actions"><label class="ecommerce-rerun-sync-choice">同步本套 <select class="ecommerce-rerun-sync-select"><option value="no" ${syncWholeGarment ? '' : 'selected'}>否（逐张调整）</option><option value="yes" ${syncWholeGarment ? 'selected' : ''}>是（整套共用）</option></select></label><button type="button" class="btn btn-outline btn-compact ecommerce-preview-bad">系统预览废片</button><button type="button" class="btn btn-outline btn-compact ecommerce-preview-refs">系统预览参考组</button></div>
+            <strong title="${ecommerceEscape(`${item.garment_name} · 动作${item.action_order}${actionNameSuffix}`)}">${ecommerceEscape(item.garment_name)} · 动作${item.action_order}${ecommerceEscape(actionNameSuffix)}</strong>
+            <div class="ecommerce-rerun-system-actions">${item.bad_photo_url ? '<button type="button" class="btn btn-outline btn-compact ecommerce-preview-bad" title="打开大图对比（可缩放、翻页），成品图不再单独占一列">⚖ 对比成品图</button>' : ''}<button type="button" class="btn btn-outline btn-compact ecommerce-preview-refs">系统预览参考组</button></div>
         </div>
-        <p class="ecommerce-rerun-adjust-hint">${syncWholeGarment ? '已选择“同步本套”：参考图勾选、裁剪、换图、细节图和提示词会同步给本套全部废片。' : `已选择“逐张调整”：参考图支持1～9张，所有修改只影响当前图片；保存后继续本套下一张。`}</p>
-        <div class="ecommerce-rerun-reference-toolbar"><strong>服装参考图</strong><button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-toggle-refs">${allReferencesSelected ? '全不选' : '全选'}</button><small>默认全选；再次点击可全部取消</small></div>
+        <p class="ecommerce-rerun-adjust-hint">${item.refine_redo ? '二次调整：只作用于当前这一张；用下方按钮选「下一张 / 下一套 / 同步全部」。' : '参考图支持1～9张，所有修改只影响当前图片；保存后继续下一张。'}</p>
+        <div class="ecommerce-rerun-reference-toolbar"><strong>服装参考图</strong><button type="button" class="btn btn-outline btn-compact" id="btn-ecommerce-rerun-toggle-refs">${allReferencesSelected ? '全不选' : '全选'}</button><small>${allReferencesSelected ? '默认全选；再次点击可全部取消' : '默认只勾选本次生成用过的那张；可自行增删'}</small></div>
         <div class="ecommerce-rerun-compare-grid">
             <div class="ecommerce-rerun-compare-col ecommerce-rerun-target-col">
                 <h4>本次动作参考图（单击放大；拖入或双击替换）</h4>
@@ -15064,25 +17725,37 @@ function renderEcommerceRerunCompare(index) {
                 </div>
             </div>
             <div class="ecommerce-rerun-compare-col">
-                <h4>AI生成图（废片缓存）</h4>
-                ${item.bad_photo_url ? `<img class="ecommerce-rerun-compare-img" src="${ecommerceEscape(ecommerceThumbnailUrl(item.bad_photo_url, 720))}" alt="废片">` : '<div class="ecommerce-empty" style="padding:14px;">无备份（可能未走批量生成）</div>'}
-            </div>
-            <div class="ecommerce-rerun-compare-col">
-                <h4>${targetOnly ? `${sourceReferenceLabel}（点击放大对比）` : '服装参考图（点击任意一张进入大图对比、裁剪或临时换图）'}</h4>
-                <div class="ecommerce-rerun-refs">${refs}</div>
-                ${targetOnly ? '' : `<button type="button" class="btn btn-outline btn-compact ecommerce-rerun-add-detail" ${item.references.length >= 9 ? 'disabled' : ''}>＋ 添加局部细节图</button>`}
+                <h4>${isRefine ? '本次参考图（最多6张，配合下方提示词使用）' : (targetOnly ? `${sourceReferenceLabel}（点击放大对比）` : '服装参考图（点击任意一张进入大图对比、裁剪或临时换图）')}</h4>
+                <div class="ecommerce-rerun-refs">${isRefine ? refineRefsHtml : refs}</div>
+                ${isRefine
+                    ? `<button type="button" class="btn btn-outline btn-compact ecommerce-rerun-add-refine-ref" ${refineRefs.length >= 6 ? 'disabled' : ''} title="${refineRefs.length >= 6 ? '最多添加 6 张参考图' : '添加参考图，和这一张的提示词一起送上去'}">＋ 添加参考图（${refineRefs.length}/6）</button>`
+                    : (targetOnly ? '' : `<button type="button" class="btn btn-outline btn-compact ecommerce-rerun-add-detail" ${item.references.length >= 9 ? 'disabled' : ''}>＋ 添加局部细节图</button>`)}
             </div>
         </div>
         <div class="ecommerce-shared-prompt-templates" data-ecommerce-prompt-template-target=".ecommerce-rerun-prompt">
+            <button type="button" class="ecommerce-shared-prompt-toggle" title="折叠/展开模板区，给提示词输入框让出高度">▾</button>
             <span class="ecommerce-shared-prompt-label">共用提示词模板</span>
-            <div class="ecommerce-shared-prompt-list"></div>
-            <select class="ecommerce-shared-prompt-more"><option value="">更多模板…</option></select>
-            <button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button>
+            <div class="ecommerce-shared-prompt-body">
+                <div class="ecommerce-shared-prompt-list"></div>
+                <select class="ecommerce-shared-prompt-more"><option value="">更多模板…</option></select>
+                <button type="button" class="btn btn-outline btn-compact ecommerce-shared-prompt-save">＋ 存为模板</button>
+            </div>
         </div>
-        <textarea class="ecommerce-rerun-prompt" placeholder="可选：这一张的新提示词；优先于批量提示词并完整替换原提示词，都留空则复用原提示词">${ecommerceEscape(item.rerun_prompt || '')}</textarea>
+        <textarea class="ecommerce-rerun-prompt" placeholder="${item.refine_redo ? '二次调整必须填写新提示词（不能留空、不能沿用原提示词，也不受批量大提示词影响）' : '可选：这一张的新提示词；填写后追加到原提示词之后（换装指令不会丢），留空则使用批量提示词'}">${ecommerceEscape(item.rerun_prompt || '')}</textarea>
+        ${String(item.rerun_prompt || '').trim() ? `<p class="ecommerce-rerun-prompt-owner ${item.refine_redo ? '' : 'is-warning'}" title="${item.refine_redo ? '二次调整只认这个输入框；批次大提示词不会覆盖它' : '单张提示词会追加到原提示词之后，是单独的输入框，不是批量框'}">${item.refine_redo ? `这一张的二次调整提示词（${String(item.rerun_prompt).trim().length} 字）` : `这一张已单独设置提示词（${String(item.rerun_prompt).trim().length} 字）`}${item.refine_redo ? '；批次大提示词不会覆盖它' : (ecommerceRerunState.bulkIgnoreSinglePrompt ? '；当前已勾选「统一使用批量提示词」，本次批量重做会忽略它' : '，批量重做时它会追加在批量提示词之后')}</p>` : ''}
+        ${isRefine ? `<div class="ecommerce-rerun-mask ${item.rerun_mask_data_url ? 'has-mask' : ''}">
+            <div class="ecommerce-rerun-mask-head">
+                <strong>局部重绘</strong>
+                <button type="button" class="btn btn-outline btn-compact ecommerce-rerun-mask-edit" title="用画笔涂抹要重画的区域；只有涂抹到的部分会被改，其余画面保持不变">${item.rerun_mask_data_url ? '重画蒙版' : '✎ 涂抹要改的区域'}</button>
+                ${item.rerun_mask_data_url ? '<button type="button" class="btn btn-outline btn-compact ecommerce-rerun-mask-clear" title="移除蒙版，这张图恢复成整图重做">移除蒙版</button>' : ''}
+            </div>
+            <small>涂哪里改哪里：只有涂抹区域被重画，脸/背景/其他服装细节保持不动。<b>仅 API易 官转（GPT-Image）通道生效</b>，选其他平台时会退化成整图重做。</small>
+            ${item.rerun_mask_data_url ? `<img class="ecommerce-rerun-mask-thumb" src="${ecommerceEscape(item.rerun_mask_preview_url || item.rerun_mask_data_url)}" alt="局部重绘蒙版预览" title="红色为会被重画的区域；点击可重画">` : ''}
+        </div>` : ''}
         <div class="ecommerce-rerun-actions">
-            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-adjustments">保存调整并勾选这一张</button>
-            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-next-group" style="background:#16a34a;border-color:#16a34a;">${workflowButtonLabel}</button>
+            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-next-item" title="保存这一张的提示词/参考图，然后跳到列表里的下一张">保存调整下一张 →</button>
+            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-next-garment" style="background:#16a34a;border-color:#16a34a;" title="把这一张的提示词同步给本套其他待重做图片（不复制参考图），然后跳到下一套">保存调整下一套 →</button>
+            <button class="btn btn-primary btn-compact" type="button" id="btn-ecommerce-rerun-save-sync-all" style="background:#0891b2;border-color:#0891b2;" title="把这一张的提示词写入本次全部二次调整的图片（普通废片/标记重做不受影响）">保存调整，同步全部二次调整</button>
             <button class="btn btn-outline btn-compact" type="button" id="btn-ecommerce-rerun-cancel-item" title="误删会恢复原图；手动标记会撤销标记">取消这一张重做</button>
             <button class="btn btn-outline btn-compact" type="button" id="btn-ecommerce-rerun-cancel-garment" title="取消并恢复本套当前扫描出的全部待重做图片">取消本套全部重做</button>
         </div>`;
@@ -15102,31 +17775,22 @@ function renderEcommerceRerunCompare(index) {
     const groupProgress = document.getElementById('ecommerce-rerun-adjust-group-progress');
     const itemProgress = document.getElementById('ecommerce-rerun-adjust-item-progress');
     if (groupProgress) groupProgress.textContent = `第 ${currentGroupIdx + 1}/${allGarmentIds.length} 套 · ${item.garment_name}`;
-    if (itemProgress) itemProgress.textContent = `本套第 ${currentItemInGarment + 1}/${sameGarmentItems.length} 张 · ${item.action_name || `动作${item.action_order}`}`;
-    const groupInfo = compare.querySelector('.ecommerce-rerun-compare-head strong');
-    if (groupInfo && allGarmentIds.length > 1) {
-        groupInfo.textContent = `重新调整参考图重做 · ${item.garment_name} · 动作${item.action_order} · 第${currentGroupIdx + 1}/${allGarmentIds.length} 组`;
-    }
-    compare.querySelector('.ecommerce-rerun-sync-select')?.addEventListener('change', event => {
-        const enabled = event.target.value === 'yes';
-        ecommerceRerunState.groupSyncByGarment.set(item.garment_id, enabled);
-        if (enabled) {
-            ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id).forEach(entry => {
-                if (entry === item) return;
-                entry.references = ecommerceCloneRerunReferences(item.references);
-                entry.rerun_prompt = item.rerun_prompt || '';
-            });
-            showToast('已开启同步：当前设置已应用到本套其他废片', 'success');
-        } else {
-            showToast('已关闭同步：之后的调整只影响当前图片', 'info');
-        }
-        renderEcommerceRerunCompare(index);
-    });
-    compare.querySelector('.ecommerce-preview-bad')?.addEventListener('click', () => openEcommerceSystemPreview([item.bad_photo_path]));
+    if (itemProgress) itemProgress.textContent = `本套第 ${currentItemInGarment + 1}/${sameGarmentItems.length} 张 · 动作${item.action_order}`;
+    // 标题保持一行：套数/张数进度由上方进度条承担，这里不再重复拼长句，避免窄栏被挤成竖排。
+    compare.querySelector('.ecommerce-preview-bad')?.addEventListener('click', () => openEcommerceImageCompare(index, 0));
     compare.querySelector('.ecommerce-preview-refs')?.addEventListener('click', () => openEcommerceSystemPreview(
         (item.references || []).filter(ref => ref.selected !== false).map(ref => ref.override_path || ref.path)
     ));
-    compare.querySelector('.ecommerce-rerun-compare-img[alt="废片"]')?.addEventListener('click', () => openEcommerceImageCompare(index, 0));
+    const openMaskEditor = () => openEcommerceRerunMaskEditor(index);
+    compare.querySelector('.ecommerce-rerun-mask-edit')?.addEventListener('click', openMaskEditor);
+    compare.querySelector('.ecommerce-rerun-mask-thumb')?.addEventListener('click', openMaskEditor);
+    compare.querySelector('.ecommerce-rerun-mask-clear')?.addEventListener('click', () => {
+        item.rerun_mask_data_url = '';
+        item.rerun_mask_preview_url = '';
+        rememberEcommerceRerunEdits(item);
+        renderEcommerceRerunCompare(index);
+        showToast('已移除局部重绘蒙版，这张图恢复为整图重做', 'info');
+    });
     const targetActionCard = compare.querySelector('.ecommerce-rerun-target-action');
     let targetActionPreviewTimer = null;
     targetActionCard?.addEventListener('click', event => {
@@ -15165,22 +17829,27 @@ function renderEcommerceRerunCompare(index) {
     compare.querySelectorAll('.ecommerce-rerun-open-ref').forEach(img => img.addEventListener('click', e => {
         openEcommerceImageCompare(index, Number(e.currentTarget.closest('.ecommerce-rerun-ref').dataset.refIndex) + 1);
     }));
+    // 缩略图上直接进裁剪：回车只保存并关闭，不跳下一张参考图
+    compare.querySelectorAll('.ecommerce-rerun-ref-crop').forEach(btn => btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const refIndex = Number(e.currentTarget.closest('.ecommerce-rerun-ref').dataset.refIndex);
+        ecommerceRerunState.activeIndex = index;
+        ecommerceRerunState.compareRefIndex = refIndex + 1;
+        openEcommerceReferenceCrop(index, refIndex, { advance: false });
+    }));
     compare.querySelector('.ecommerce-rerun-prompt')?.addEventListener('input', event => {
-        ecommerceRerunAdjustmentTargets(item).forEach(entry => { entry.rerun_prompt = event.target.value; });
+        item.rerun_prompt = event.target.value;
     });
     compare.querySelectorAll('.ecommerce-rerun-ref-use').forEach(input => input.addEventListener('change', () => {
         const refIndex = Number(input.closest('.ecommerce-rerun-ref').dataset.refIndex);
-        ecommerceRerunAdjustmentTargets(item).forEach(entry => {
-            if (entry.references?.[refIndex]) entry.references[refIndex].selected = input.checked;
-        });
+        if (item.references?.[refIndex]) item.references[refIndex].selected = input.checked;
     }));
     compare.querySelector('#btn-ecommerce-rerun-toggle-refs')?.addEventListener('click', event => {
         event.stopPropagation();
         const refs = item.references || [];
         const shouldSelectAll = refs.some(reference => reference.selected === false);
-        ecommerceRerunAdjustmentTargets(item).forEach(entry => {
-            (entry.references || []).forEach(reference => { reference.selected = shouldSelectAll; });
-        });
+        refs.forEach(reference => { reference.selected = shouldSelectAll; });
         renderEcommerceRerunCompare(index);
     });
     compare.querySelector('#btn-ecommerce-rerun-cancel-item')?.addEventListener('click', () => cancelEcommerceRerunItems([item], false));
@@ -15202,12 +17871,10 @@ function renderEcommerceRerunCompare(index) {
                     const res = await fetch('/api/ecommerce/upload-temp-image', { method: 'POST', body: formData });
                     const data = await res.json().catch(() => ({}));
                     if (!res.ok || !data.url) throw new Error(data.error || '上传失败');
-                    ecommerceRerunAdjustmentTargets(item).forEach(entry => {
-                        entry.references = entry.references || [];
-                        if (entry.references.length < 9 && !entry.references.some(ref => (ref.override_url || ref.url) === data.url)) {
-                            entry.references.push({ url: data.url, path: data.path, override_url: '', override_path: '', selected: true, is_detail: true });
-                        }
-                    });
+                    item.references = item.references || [];
+                    if (item.references.length < 9 && !item.references.some(ref => (ref.override_url || ref.url) === data.url)) {
+                        item.references.push({ url: data.url, path: data.path, override_url: '', override_path: '', selected: true, is_detail: true });
+                    }
                 } catch (error) {
                     showToast(`细节图上传失败：${error.message}`, 'error');
                 }
@@ -15216,36 +17883,117 @@ function renderEcommerceRerunCompare(index) {
         };
         input.click();
     });
-    compare.querySelector('#btn-ecommerce-rerun-save-adjustments')?.addEventListener('click', () => {
-        const referenceImages = (item.references || []).filter(reference => reference.selected !== false);
-        if (!targetOnly && !referenceImages.length) return showToast('请至少保留一张服装参考图', 'error');
-        item.rerun_prompt = compare.querySelector('.ecommerce-rerun-prompt')?.value.trim() || '';
-        rememberEcommerceRerunEdits(item);
-        ecommerceRerunState.selectedIds.add(item.id);
-        closeEcommerceRerunAdjustPanel(true);
-        showToast('已保存本次参考图调整并勾选该废片；点击上方批量重做才会扣费', 'success');
+    // 二次调整「＋ 添加参考图」：最多 6 张，只作用于当前这一张，和它的提示词一起送上去。
+    compare.querySelector('.ecommerce-rerun-add-refine-ref')?.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.multiple = true;
+        input.onchange = async () => {
+            item.refine_references = item.refine_references || [];
+            const files = [...(input.files || [])].slice(0, Math.max(0, 6 - item.refine_references.length));
+            if (!files.length) return;
+            let added = 0;
+            for (const file of files) {
+                try {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    formData.append('batch_id', ecommerceRerunState.batchId);
+                    const res = await fetch('/api/ecommerce/upload-temp-image', { method: 'POST', body: formData });
+                    const data = await res.json().catch(() => ({}));
+                    if (!res.ok || !data.url) throw new Error(data.error || '上传失败');
+                    if (item.refine_references.length >= 6) break;
+                    if (!item.refine_references.some(ref => (ref.url || ref.path) === data.url)) {
+                        item.refine_references.push({ url: data.url, path: data.path, name: file.name || '' });
+                        added += 1;
+                    }
+                } catch (error) {
+                    showToast(`参考图上传失败：${error.message}`, 'error');
+                }
+            }
+            rememberEcommerceRerunEdits(item);
+            renderEcommerceRerunCompare(index);
+            if (added) showToast(`已添加 ${added} 张参考图（${item.refine_references.length}/6）`, 'success');
+        };
+        input.click();
     });
-    // 根据“同步本套”选择，跳到本套下一张或下一套。
-    compare.querySelector('#btn-ecommerce-rerun-save-next-group')?.addEventListener('click', () => {
-        const referenceImages = (item.references || []).filter(reference => reference.selected !== false);
-        if (!targetOnly && !referenceImages.length) return showToast('请至少保留一张服装参考图', 'error');
-        const promptValue = compare.querySelector('.ecommerce-rerun-prompt')?.value.trim() || '';
-        const syncEnabled = ecommerceRerunGroupSyncEnabled(item);
-        const sameGroupItems = ecommerceRerunState.items.filter(i => i.garment_id === item.garment_id);
+    compare.querySelectorAll('.ecommerce-rerun-ref-remove').forEach(btn => btn.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        const refIndex = Number(event.currentTarget.dataset.refineIndex);
+        const refs = item.refine_references || [];
+        if (!Number.isInteger(refIndex) || refIndex < 0 || refIndex >= refs.length) return;
+        refs.splice(refIndex, 1);
+        rememberEcommerceRerunEdits(item);
+        renderEcommerceRerunCompare(index);
+        showToast(`已移除参考图（${refs.length}/6）`, 'success');
+    }));
+    compare.querySelectorAll('.ecommerce-rerun-open-refine-ref').forEach(img => img.addEventListener('click', event => {
+        const refIndex = Number(event.currentTarget.closest('.ecommerce-rerun-ref')?.dataset.refineIndex);
+        const ref = (item.refine_references || [])[refIndex];
+        if (ref) openEcommerceSystemPreview([ref.path || ref.url]);
+    }));
+    const readPanelPrompt = () => {
+        const value = compare.querySelector('.ecommerce-rerun-prompt')?.value.trim() ?? String(item.rerun_prompt || '').trim();
+        const bulkPrompt = document.getElementById('ecommerce-rerun-bulk-prompt')?.value || '';
+        const problem = ecommerceRerunPromptProblem(item, value, bulkPrompt);
+        if (problem) {
+            showToast(`${item.garment_name}·动作${item.action_order}：${problem}`, 'error');
+            return null;
+        }
+        return value;
+    };
+    const requireReference = () => {
+        if (targetOnly) return true;
+        if ((item.references || []).some(reference => reference.selected !== false)) return true;
+        showToast('请至少保留一张服装参考图', 'error');
+        return false;
+    };
+    // 「保存调整下一张 →」：逐张微调提示词，保存后自动切到列表里的下一张（可跨套）。
+    compare.querySelector('#btn-ecommerce-rerun-save-next-item')?.addEventListener('click', () => {
+        if (!requireReference()) return;
+        const promptValue = readPanelPrompt();
+        if (promptValue === null) return;
         item.rerun_prompt = promptValue;
         rememberEcommerceRerunEdits(item);
-        if (syncEnabled) {
-            sameGroupItems.forEach(entry => {
-                entry.rerun_prompt = promptValue;
-                entry.references = ecommerceCloneRerunReferences(item.references);
-                rememberEcommerceRerunEdits(entry);
-                ecommerceRerunState.selectedIds.add(entry.id);
-            });
-            showToast(`已把当前设置同步到本套${sameGroupItems.length}张废片`, 'success');
-        } else {
-            ecommerceRerunState.selectedIds.add(item.id);
+        ecommerceRerunState.selectedIds.add(item.id);
+        advanceEcommerceRerunWorkflow(index, 'item');
+    });
+    // 「保存调整下一套 →」：本套其余待重做图片共用这一个提示词（只同步提示词，不复制参考图），然后跳到下一套。
+    compare.querySelector('#btn-ecommerce-rerun-save-next-garment')?.addEventListener('click', () => {
+        if (!requireReference()) return;
+        const promptValue = readPanelPrompt();
+        if (promptValue === null) return;
+        item.rerun_prompt = promptValue;
+        rememberEcommerceRerunEdits(item);
+        ecommerceRerunState.selectedIds.add(item.id);
+        const sameGroupItems = ecommerceRerunState.items.filter(entry => entry.garment_id === item.garment_id && entry.id !== item.id);
+        sameGroupItems.forEach(entry => {
+            entry.rerun_prompt = promptValue;
+            rememberEcommerceRerunEdits(entry);
+            ecommerceRerunState.selectedIds.add(entry.id);
+        });
+        if (sameGroupItems.length) {
+            showToast(`已把提示词同步给本套另外 ${sameGroupItems.length} 张待重做图片`, 'success');
         }
-        advanceEcommerceRerunWorkflow(index, syncEnabled);
+        advanceEcommerceRerunWorkflow(index, 'garment');
+    });
+    // 「保存调整，同步全部二次调整」：把这一张的提示词写入本次全部二次调整的图，不影响普通废片/标记重做。
+    compare.querySelector('#btn-ecommerce-rerun-save-sync-all')?.addEventListener('click', () => {
+        if (!requireReference()) return;
+        const promptValue = readPanelPrompt();
+        if (promptValue === null) return;
+        item.rerun_prompt = promptValue;
+        rememberEcommerceRerunEdits(item);
+        ecommerceRerunState.selectedIds.add(item.id);
+        const refineItems = ecommerceRefineRerunItems();
+        refineItems.forEach(entry => {
+            entry.rerun_prompt = promptValue;
+            rememberEcommerceRerunEdits(entry);
+            ecommerceRerunState.selectedIds.add(entry.id);
+        });
+        showToast(`已把这条提示词写入全部 ${refineItems.length} 张二次调整图片`, 'success');
+        renderEcommerceRerunCompare(index);
     });
 }
 
@@ -15349,8 +18097,17 @@ async function exportEcommerceFinalProducts(confirmedOnly = false) {
         const openButton = document.getElementById('btn-ecommerce-final-export-open');
         if (openButton) openButton.hidden = !ecommerceLastFinalExportPath;
         const host = document.getElementById('ecommerce-final-export-status');
-        if (host) host.textContent = `已导出 ${result.file_count} 张成品图 + ${result.reference_file_count || 0} 张服装参考图到：${result.path}`;
-        showToast(result.message || `最终成品导出完成：${result.file_count}张`, 'success');
+        const missingRefs = result.missing_reference_garments || [];
+        if (host) {
+            host.textContent = `已导出 ${result.file_count} 张成品图 + ${result.reference_file_count || 0} 张服装参考图到：${result.path}`
+                + (missingRefs.length ? `（⚠ 有 ${missingRefs.length} 套服装实拍图没找到、未导出）` : '');
+        }
+        if (missingRefs.length) {
+            const missingText = missingRefs.map(item => `${item.garment_name}（缺${item.missing}张）`).join('、');
+            showToast(`导出完成，但这些套的服装实拍图没找到、未导出：${missingText}。请用「🔗 链接新位置」重链后重新导出`, 'warning');
+        } else {
+            showToast(result.message || `最终成品导出完成：${result.file_count}张`, 'success');
+        }
     } catch (error) {
         showToast(`最终成品导出失败：${error.message}`, 'error');
     } finally {
@@ -15407,6 +18164,8 @@ document.getElementById('btn-ecommerce-rerun-expand')?.addEventListener('click',
     const card = document.querySelector('.ecommerce-card-rerun');
     if (!card) return;
     const expanded = card.classList.toggle('is-expanded');
+    // “放大验片”同时放大第4栏废片列表，左右并排铺满窗口，方便逐张核对。
+    document.querySelector('.ecommerce-card-wastelist')?.classList.toggle('is-expanded', expanded);
     document.body.classList.toggle('ecommerce-rerun-expanded', expanded);
     event.currentTarget.textContent = expanded ? '退出放大' : '放大验片';
 });
@@ -15432,11 +18191,363 @@ document.getElementById('ecommerce-rerun-batch-select')?.addEventListener('chang
     // 清空列表 UI
     const rerunList = document.getElementById('ecommerce-rerun-list');
     if (rerunList) rerunList.innerHTML = '<div class="ecommerce-empty">点击「扫描废片」开始</div>';
+    const rerunParams = document.getElementById('ecommerce-rerun-bulk-params');
+    if (rerunParams) rerunParams.innerHTML = '<div class="ecommerce-empty">扫描废片后，这里会显示批量重做的平台、模型、并发与提示词参数。</div>';
     const rerunSummary = document.getElementById('ecommerce-rerun-summary');
     if (rerunSummary) rerunSummary.textContent = '';
     await refreshEcommerceBatch();
     await loadEcommerceRerunBatches();
     await loadEcommerceFinalExportStatus(false);
+});
+// 重新链接共用逻辑：选好新位置后，把成品图 / 服装实拍参考图接回台账。
+// target: results（只接成品）| garments（只接实拍图）| both（默认，两类一起接）
+async function runEcommerceRelink({ batchId, target = 'both', garmentId = '', initialDir = '', button = null }) {
+    if (!batchId) return showToast('请先选择要重新链接的批次', 'error');
+    if (ecommerceRerunState.bulkProgress?.active) {
+        return showToast('废片重做仍在运行或暂停中，请先等待完成后再重新链接', 'warning');
+    }
+    let picked = '';
+    try {
+        const pickedResp = await ecommerceApi('POST', '/api/select-folder', { initial_dir: initialDir, memory_key: 'relink' });
+        picked = pickedResp?.path || '';
+    } catch (e) {
+        return showToast(`打开文件夹选择器失败：${e.message}`, 'error');
+    }
+    if (!picked) return;
+    const oldText = button?.textContent || '';
+    if (button) { button.disabled = true; button.textContent = '重新链接中…'; }
+    try {
+        const result = await ecommerceApi(
+            'POST',
+            `/api/ecommerce/batches/${encodeURIComponent(batchId)}/relink-results`,
+            { path: picked, target, garment_id: garmentId }
+        );
+        const relinked = result?.relinked || [];
+        const refs = (result?.garment_refs || []).filter(row => row.status === 'relinked');
+        const parts = [];
+        if (relinked.length) {
+            parts.push(`成品 ${relinked.length} 套：` + relinked.map(row => `${row.garment_name} 找到${row.found}/${row.expected}`).join('，'));
+        }
+        if (refs.length) {
+            parts.push(`实拍图 ${refs.length} 套：` + refs.map(row => `${row.garment_name} 找到${row.found}/${row.expected}`).join('，'));
+        }
+        const missing = [...relinked, ...refs].filter(row => row.missing > 0)
+            .map(row => `${row.garment_name} 还缺${row.missing}`).join('，');
+        const problems = [...(result?.not_found || []), ...(result?.garment_refs || []).filter(row => row.status === 'not_found')]
+            .map(row => `${row.garment_name} 未找到`).join('，');
+        showToast(
+            `${parts.join('；') || '没有找到可重新链接的位置'}${missing ? `；${missing}` : ''}${problems ? `；${problems}` : ''}`,
+            (missing || problems) ? 'warning' : 'success'
+        );
+        // 重新加载批次详情、结果文件夹列表，再重扫一遍废片，让新位置立即生效。
+        ecommerceState.renderCache.folders = '';
+        await refreshEcommerceBatch();
+        await scanEcommerceRerun();
+    } catch (e) {
+        const data = e.data || {};
+        const reasons = [...(data.skipped || []), ...(data.garment_refs || []).filter(row => row.reason)]
+            .map(row => `${row.garment_name}：${row.reason}`).join('；');
+        showToast(
+            data.message || reasons || `重新链接失败：${e.message}`,
+            data.message || reasons ? 'warning' : 'error'
+        );
+    } finally {
+        if (button) { button.disabled = false; button.textContent = oldText; }
+    }
+}
+
+// 局部重绘蒙版编辑器：画笔涂抹「要重画」的区域，导出「白=可重绘、黑=保持」的 RGB PNG。
+// 实测结论：API易 官转只认这种不带 alpha 的写法；OpenAI 官方的 RGBA「透明=可重绘」
+// 会被网关填成纯黑，等于整张重绘，所以这里绝不能按官方约定导出。
+function openEcommerceRerunMaskEditor(index) {
+    const item = ecommerceRerunState.items[index];
+    if (!item || !item.refine_redo) return showToast('只有二次调整的图可以使用局部重绘', 'error');
+    const sourceUrl = ecommerceRerunTargetActionSource(item).url || item.bad_photo_url || '';
+    if (!sourceUrl) return showToast('找不到这张图的源图，无法涂抹蒙版', 'error');
+    document.getElementById('ecommerce-rerun-mask-overlay')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'ecommerce-rerun-mask-overlay';
+    overlay.className = 'ecommerce-mask-overlay';
+    overlay.innerHTML = `
+        <div class="ecommerce-mask-shell">
+            <header>
+                <strong>局部重绘 · 涂抹要改的区域</strong>
+                <span>${ecommerceEscape(`${item.garment_name} · 动作${item.action_order}`)}</span>
+                <button type="button" class="ecommerce-mask-close" title="关闭（不保存）">×</button>
+            </header>
+            <div class="ecommerce-mask-toolbar">
+                <button type="button" class="ecommerce-mask-tool is-active" data-tool="brush">画笔</button>
+                <button type="button" class="ecommerce-mask-tool" data-tool="eraser">橡皮</button>
+                <label class="ecommerce-mask-size-label">笔刷 <input type="range" class="ecommerce-mask-size" min="8" max="600" step="4"><b class="ecommerce-mask-size-value"></b>px</label>
+                <button type="button" class="ecommerce-mask-zoom" data-zoom="-1" title="缩小">−</button>
+                <button type="button" class="ecommerce-mask-zoom" data-zoom="0" title="适应窗口">适应</button>
+                <button type="button" class="ecommerce-mask-zoom" data-zoom="1" title="放大">＋</button>
+                <button type="button" class="ecommerce-mask-clear" title="清空全部涂抹">清空</button>
+                <small>红色 = 会被重画的区域，其余画面保持不动</small>
+            </div>
+            <div class="ecommerce-mask-stage">
+                <div class="ecommerce-mask-canvas-wrap">
+                    <canvas class="ecommerce-mask-photo"></canvas>
+                    <canvas class="ecommerce-mask-paint"></canvas>
+                    <span class="ecommerce-mask-cursor"></span>
+                </div>
+            </div>
+            <footer>
+                <span class="ecommerce-mask-status">正在载入图片…</span>
+                <button type="button" class="btn btn-outline btn-compact ecommerce-mask-cancel">取消</button>
+                <button type="button" class="btn btn-primary btn-compact ecommerce-mask-apply" disabled>应用蒙版</button>
+            </footer>
+        </div>`;
+    document.body.appendChild(overlay);
+
+    const stage = overlay.querySelector('.ecommerce-mask-stage');
+    const wrap = overlay.querySelector('.ecommerce-mask-canvas-wrap');
+    const photoCanvas = overlay.querySelector('.ecommerce-mask-photo');
+    const paintCanvas = overlay.querySelector('.ecommerce-mask-paint');
+    const cursorEl = overlay.querySelector('.ecommerce-mask-cursor');
+    const statusEl = overlay.querySelector('.ecommerce-mask-status');
+    const applyBtn = overlay.querySelector('.ecommerce-mask-apply');
+    const sizeInput = overlay.querySelector('.ecommerce-mask-size');
+    const sizeValue = overlay.querySelector('.ecommerce-mask-size-value');
+
+    const photoCtx = photoCanvas.getContext('2d');
+    const paintCtx = paintCanvas.getContext('2d');
+    let naturalWidth = 0;
+    let naturalHeight = 0;
+    let fitZoom = 1;
+    let zoom = 1;
+    let brushSize = 120;
+    let tool = 'brush';
+    let painting = false;
+    let lastPoint = null;
+    let dirty = false;
+
+    const layout = () => {
+        if (!naturalWidth) return;
+        wrap.style.width = `${Math.round(naturalWidth * zoom)}px`;
+        wrap.style.height = `${Math.round(naturalHeight * zoom)}px`;
+        cursorEl.style.width = `${Math.max(4, brushSize * zoom)}px`;
+        cursorEl.style.height = `${Math.max(4, brushSize * zoom)}px`;
+    };
+    const close = () => {
+        document.removeEventListener('keydown', onKeydown);
+        overlay.remove();
+    };
+    const onKeydown = event => {
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            close();
+        }
+    };
+    const updateStatus = () => {
+        statusEl.textContent = dirty ? '已涂抹，点「应用蒙版」保存' : '尚未涂抹：按住鼠标左键在图上涂出要改的区域';
+        applyBtn.disabled = !dirty;
+    };
+    const setTool = next => {
+        tool = next;
+        overlay.querySelectorAll('.ecommerce-mask-tool').forEach(button => {
+            button.classList.toggle('is-active', button.dataset.tool === next);
+        });
+    };
+    const pointOf = event => {
+        const rect = wrap.getBoundingClientRect();
+        return {
+            x: (event.clientX - rect.left) / zoom,
+            y: (event.clientY - rect.top) / zoom
+        };
+    };
+    const strokeTo = point => {
+        paintCtx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
+        paintCtx.strokeStyle = '#ff2d55';
+        paintCtx.fillStyle = '#ff2d55';
+        paintCtx.lineWidth = brushSize;
+        paintCtx.lineCap = 'round';
+        paintCtx.lineJoin = 'round';
+        if (lastPoint) {
+            paintCtx.beginPath();
+            paintCtx.moveTo(lastPoint.x, lastPoint.y);
+            paintCtx.lineTo(point.x, point.y);
+            paintCtx.stroke();
+        }
+        paintCtx.beginPath();
+        paintCtx.arc(point.x, point.y, brushSize / 2, 0, Math.PI * 2);
+        paintCtx.fill();
+        lastPoint = point;
+    };
+    // 导出：白=可重绘、黑=保持，不带 alpha（这是实测唯一被网关正确识别的写法）。
+    const exportMask = () => {
+        const width = naturalWidth;
+        const height = naturalHeight;
+        const source = paintCtx.getImageData(0, 0, width, height).data;
+        const buffer = document.createElement('canvas');
+        buffer.width = width;
+        buffer.height = height;
+        const bufferCtx = buffer.getContext('2d');
+        const out = bufferCtx.createImageData(width, height);
+        let painted = 0;
+        for (let i = 0; i < source.length; i += 4) {
+            const on = source[i + 3] >= 96; // 抗锯齿边缘按半数阈值二值化
+            const value = on ? 255 : 0;
+            out.data[i] = value;
+            out.data[i + 1] = value;
+            out.data[i + 2] = value;
+            out.data[i + 3] = 255;
+            if (on) painted += 1;
+        }
+        if (!painted) return null;
+        bufferCtx.putImageData(out, 0, 0);
+        // 顺带压一张「原图 + 红色涂抹区」的小预览，列表里一眼能看出改哪儿。
+        const scale = Math.min(1, 360 / width);
+        const previewCanvas = document.createElement('canvas');
+        previewCanvas.width = Math.max(1, Math.round(width * scale));
+        previewCanvas.height = Math.max(1, Math.round(height * scale));
+        const previewCtx = previewCanvas.getContext('2d');
+        previewCtx.drawImage(photoCanvas, 0, 0, previewCanvas.width, previewCanvas.height);
+        previewCtx.globalAlpha = 0.5;
+        previewCtx.drawImage(paintCanvas, 0, 0, previewCanvas.width, previewCanvas.height);
+        previewCtx.globalAlpha = 1;
+        return {
+            mask: buffer.toDataURL('image/png'),
+            preview: previewCanvas.toDataURL('image/jpeg', 0.72)
+        };
+    };
+
+    overlay.querySelector('.ecommerce-mask-close').addEventListener('click', close);
+    overlay.querySelector('.ecommerce-mask-cancel').addEventListener('click', close);
+    overlay.querySelectorAll('.ecommerce-mask-zoom').forEach(button => {
+        button.addEventListener('click', () => {
+            const step = Number(button.dataset.zoom);
+            zoom = step === 0 ? fitZoom : Math.min(6, Math.max(fitZoom, zoom * (step > 0 ? 1.4 : 1 / 1.4)));
+            layout();
+        });
+    });
+    overlay.querySelector('.ecommerce-mask-clear').addEventListener('click', () => {
+        paintCtx.clearRect(0, 0, naturalWidth, naturalHeight);
+        dirty = false;
+        updateStatus();
+    });
+    overlay.querySelectorAll('.ecommerce-mask-tool').forEach(button => {
+        button.addEventListener('click', () => setTool(button.dataset.tool));
+    });
+    sizeInput.addEventListener('input', () => {
+        brushSize = Number(sizeInput.value) || 120;
+        sizeValue.textContent = String(brushSize);
+        layout();
+    });
+    overlay.querySelector('.ecommerce-mask-apply').addEventListener('click', () => {
+        const result = exportMask();
+        if (!result) return showToast('还没有涂抹任何区域，先在图上涂出要重画的部分', 'error');
+        item.rerun_mask_data_url = result.mask;
+        item.rerun_mask_preview_url = result.preview;
+        rememberEcommerceRerunEdits(item);
+        close();
+        renderEcommerceRerunCompare(index);
+        showToast('已应用局部重绘蒙版：只有涂抹区域会被重画', 'success');
+    });
+
+    wrap.addEventListener('pointerdown', event => {
+        if (!naturalWidth || event.button !== 0) return;
+        event.preventDefault();
+        painting = true;
+        lastPoint = null;
+        dirty = true;
+        try { wrap.setPointerCapture(event.pointerId); } catch (e) { /* 部分浏览器不支持捕获 */ }
+        strokeTo(pointOf(event));
+        updateStatus();
+    });
+    wrap.addEventListener('pointermove', event => {
+        const rect = wrap.getBoundingClientRect();
+        cursorEl.style.left = `${event.clientX - rect.left}px`;
+        cursorEl.style.top = `${event.clientY - rect.top}px`;
+        cursorEl.style.opacity = naturalWidth ? '1' : '0';
+        if (!painting) return;
+        event.preventDefault();
+        strokeTo(pointOf(event));
+    });
+    wrap.addEventListener('pointerleave', () => {
+        cursorEl.style.opacity = '0';
+    });
+    const endStroke = () => {
+        painting = false;
+        lastPoint = null;
+    };
+    wrap.addEventListener('pointerup', endStroke);
+    wrap.addEventListener('pointercancel', endStroke);
+    document.addEventListener('keydown', onKeydown);
+
+    const image = new Image();
+    image.onload = () => {
+        naturalWidth = image.naturalWidth || image.width;
+        naturalHeight = image.naturalHeight || image.height;
+        photoCanvas.width = naturalWidth;
+        photoCanvas.height = naturalHeight;
+        paintCanvas.width = naturalWidth;
+        paintCanvas.height = naturalHeight;
+        photoCtx.drawImage(image, 0, 0);
+        brushSize = Math.max(12, Math.round(Math.min(naturalWidth, naturalHeight) * 0.06));
+        sizeInput.max = String(Math.max(600, Math.round(Math.min(naturalWidth, naturalHeight) * 0.5)));
+        sizeInput.value = String(brushSize);
+        sizeValue.textContent = String(brushSize);
+        const stageRect = stage.getBoundingClientRect();
+        fitZoom = Math.min(
+            1,
+            Math.max(0.02, stageRect.width / naturalWidth),
+            Math.max(0.02, stageRect.height / naturalHeight)
+        );
+        zoom = fitZoom;
+        layout();
+        updateStatus();
+        // 已有蒙版时载入继续编辑：把白/黑还原成「alpha=涂抹区」的显示层。
+        if (item.rerun_mask_data_url) {
+            const maskImage = new Image();
+            maskImage.onload = () => {
+                const buffer = document.createElement('canvas');
+                buffer.width = naturalWidth;
+                buffer.height = naturalHeight;
+                const bufferCtx = buffer.getContext('2d');
+                bufferCtx.drawImage(maskImage, 0, 0, naturalWidth, naturalHeight);
+                const data = bufferCtx.getImageData(0, 0, naturalWidth, naturalHeight);
+                const out = bufferCtx.createImageData(naturalWidth, naturalHeight);
+                for (let i = 0; i < data.data.length; i += 4) {
+                    const on = data.data[i] >= 128; // 白=可重绘
+                    out.data[i] = 255;
+                    out.data[i + 1] = 45;
+                    out.data[i + 2] = 85;
+                    out.data[i + 3] = on ? 255 : 0;
+                }
+                bufferCtx.putImageData(out, 0, 0);
+                paintCtx.globalCompositeOperation = 'source-over';
+                paintCtx.drawImage(buffer, 0, 0);
+                dirty = true;
+                updateStatus();
+            };
+            maskImage.src = item.rerun_mask_data_url;
+        }
+    };
+    image.onerror = () => {
+        statusEl.textContent = '图片载入失败，请关闭后重试';
+    };
+    image.src = sourceUrl;
+}
+
+// 逐套验片行里的「链成片」「链服装图」用这一套所在目录的上一层当起点；
+// 后端会自动往上找到最近一个仍存在的目录（老位置搬走了也不会掉回主目录）。
+function ecommerceRelinkInitialDir(path) {
+    return String(path || '').replace(/\/+$/, '').replace(/\/[^/]+$/, '');
+}
+
+document.getElementById('btn-ecommerce-relink-results')?.addEventListener('click', async event => {
+    const button = event.currentTarget;
+    const select = document.getElementById('ecommerce-rerun-batch-select');
+    const batchId = select?.value || ecommerceRerunState.batchId || ecommerceState.currentBatchId || '';
+    if (!batchId) return showToast('请先选择要重新链接成品位置的批次', 'error');
+    // 用批次里已有的成品目录当初始位置，方便用户直接在附近找到被搬走的文件夹。
+    const detail = ecommerceState.detail || {};
+    const firstResultDir = Object.values(detail.result_dirs || {})[0] || '';
+    const initialDir = detail.final_output_path
+        || (firstResultDir ? firstResultDir.replace(/\/[^/]+\/?$/, '') : '');
+    await runEcommerceRelink({ batchId, target: 'both', initialDir, button });
 });
 document.getElementById('ecommerce-reference-close')?.addEventListener('click', closeEcommerceReferenceReview);
 document.getElementById('ecommerce-reference-overlay')?.addEventListener('click', e => {
@@ -15460,6 +18571,7 @@ document.getElementById('ecommerce-compare-close')?.addEventListener('click', cl
 document.getElementById('ecommerce-compare-delete')?.addEventListener('click', e => { e.stopPropagation(); deleteEcommerceCurrentResult(); });
 document.getElementById('ecommerce-compare-select-final')?.addEventListener('click', e => { e.stopPropagation(); selectEcommerceCurrentFinalProduct(); });
 document.getElementById('ecommerce-compare-mark-redo')?.addEventListener('click', e => { e.stopPropagation(); markEcommerceCurrentRedo(); });
+document.getElementById('ecommerce-compare-refine')?.addEventListener('click', e => { e.stopPropagation(); addEcommerceCurrentToRefine(); });
 document.getElementById('ecommerce-compare-recover')?.addEventListener('click', e => { e.stopPropagation(); recoverEcommerceFromRecycle(); });
 document.getElementById('ecommerce-compare-confirm-group')?.addEventListener('click', e => { e.stopPropagation(); confirmEcommerceGroup(); });
 document.getElementById('ecommerce-compare-unconfirm-group')?.addEventListener('click', e => { e.stopPropagation(); unconfirmEcommerceGroup(); });
@@ -15677,7 +18789,8 @@ document.getElementById('ecommerce-ref-crop-overlay')?.addEventListener('click',
     if (event.target === event.currentTarget) closeEcommerceReferenceCrop();
 });
 document.getElementById('ecommerce-ref-crop-reset')?.addEventListener('click', resetEcommerceReferenceCrop);
-document.getElementById('ecommerce-ref-crop-confirm')?.addEventListener('click', confirmEcommerceReferenceCrop);
+document.getElementById('ecommerce-ref-crop-restore')?.addEventListener('click', ecommerceRestoreReferenceOriginal);
+document.getElementById('ecommerce-ref-crop-confirm')?.addEventListener('click', ecommerceCropConfirmActive);
 document.getElementById('ecommerce-ref-crop-scale')?.addEventListener('input', event => {
     // 滑杆也保留，作为备用控制方式——控制图片缩放
     // 滑杆值15-100映射到0.1-8.0
@@ -15699,30 +18812,126 @@ document.getElementById('ecommerce-ref-crop-canvas')?.addEventListener('wheel', 
         drawEcommerceReferenceCrop();
     }
 }, { passive: false, capture: true });
-// 拖动图片（而非裁剪框）——图片移动，裁剪框固定在中央
+// 裁剪框 8 个拖拽把手：4 角等比缩放、4 边只裁这一边。命中检测用画布像素，容差 14px。
+const ECOMMERCE_CROP_MIN_FRAME_PX = 24;
+const ECOMMERCE_CROP_CURSORS = {
+    nw: 'nwse-resize', se: 'nwse-resize', ne: 'nesw-resize', sw: 'nesw-resize',
+    n: 'ns-resize', s: 'ns-resize', e: 'ew-resize', w: 'ew-resize'
+};
+function ecommerceCropHitHandle(mx, my) {
+    const frame = ecommerceRefCropState.frameRect;
+    if (!frame) return '';
+    const { left, top, width, height } = frame;
+    const right = left + width;
+    const bottom = top + height;
+    const threshold = 14;
+    if (mx < left - threshold || mx > right + threshold || my < top - threshold || my > bottom + threshold) return '';
+    const nearLeft = Math.abs(mx - left) <= threshold;
+    const nearRight = Math.abs(mx - right) <= threshold;
+    const nearTop = Math.abs(my - top) <= threshold;
+    const nearBottom = Math.abs(my - bottom) <= threshold;
+    if (nearLeft && nearTop) return 'nw';
+    if (nearRight && nearTop) return 'ne';
+    if (nearLeft && nearBottom) return 'sw';
+    if (nearRight && nearBottom) return 'se';
+    if (nearTop) return 'n';
+    if (nearBottom) return 's';
+    if (nearLeft) return 'w';
+    if (nearRight) return 'e';
+    return '';
+}
+// 按当前拖拽的把手更新裁剪框：拖角锚定对角等比缩放，拖边只动那一条边。
+function ecommerceResizeCropFrame(handle, dx, dy) {
+    const state = ecommerceRefCropState;
+    const origin = state.origFrameRect;
+    const canvas = document.getElementById('ecommerce-ref-crop-canvas');
+    if (!origin || !canvas) return;
+    const canvasWidth = canvas.width;
+    const canvasHeight = canvas.height;
+    const minSize = ECOMMERCE_CROP_MIN_FRAME_PX;
+    if (handle === 'nw' || handle === 'ne' || handle === 'sw' || handle === 'se') {
+        const dirX = (handle === 'nw' || handle === 'sw') ? -1 : 1;
+        const dirY = (handle === 'nw' || handle === 'ne') ? -1 : 1;
+        const anchorX = dirX < 0 ? origin.left + origin.width : origin.left;
+        const anchorY = dirY < 0 ? origin.top + origin.height : origin.top;
+        const maxScaleX = dirX < 0 ? anchorX / origin.width : (canvasWidth - anchorX) / origin.width;
+        const maxScaleY = dirY < 0 ? anchorY / origin.height : (canvasHeight - anchorY) / origin.height;
+        const maxScale = Math.min(maxScaleX, maxScaleY);
+        const minScale = Math.max(minSize / origin.width, minSize / origin.height);
+        let scale = 1 + (dirX * dx) / origin.width;
+        scale = Math.max(minScale, Math.min(maxScale, scale));
+        state.frameRect = {
+            left: dirX < 0 ? anchorX - origin.width * scale : anchorX,
+            top: dirY < 0 ? anchorY - origin.height * scale : anchorY,
+            width: origin.width * scale,
+            height: origin.height * scale
+        };
+        return;
+    }
+    let left = origin.left;
+    let top = origin.top;
+    let right = origin.left + origin.width;
+    let bottom = origin.top + origin.height;
+    if (handle === 'w') left += dx;
+    if (handle === 'e') right += dx;
+    if (handle === 'n') top += dy;
+    if (handle === 's') bottom += dy;
+    left = Math.max(0, Math.min(right - minSize, left));
+    right = Math.min(canvasWidth, Math.max(left + minSize, right));
+    top = Math.max(0, Math.min(bottom - minSize, top));
+    bottom = Math.min(canvasHeight, Math.max(top + minSize, bottom));
+    state.frameRect = { left, top, width: right - left, height: bottom - top };
+}
+// 拖动：命中把手 → 改裁剪框大小；否则 → 移动图片（裁剪框不动）。
 document.getElementById('ecommerce-ref-crop-canvas')?.addEventListener('pointerdown', event => {
     const state = ecommerceRefCropState;
     if (!state.image) return;
-    state.dragging = true;
+    const point = ecommerceCropPointerCoordinates(event);
+    const handle = point ? ecommerceCropHitHandle(point.x, point.y) : '';
+    if (handle && state.frameRect) {
+        state.resizing = true;
+        state.activeHandle = handle;
+        state.origFrameRect = { ...state.frameRect };
+        state.interactionStartX = point.x;
+        state.interactionStartY = point.y;
+        event.currentTarget.style.cursor = ECOMMERCE_CROP_CURSORS[handle] || 'grab';
+    } else {
+        state.dragging = true;
+        event.currentTarget.classList.add('is-dragging');
+    }
     state.pointerOffsetX = event.clientX;
     state.pointerOffsetY = event.clientY;
     state.dragStartOffsetX = state.imageOffsetX || 0;
     state.dragStartOffsetY = state.imageOffsetY || 0;
     try { event.currentTarget.setPointerCapture(event.pointerId); } catch(e) {}
-    event.currentTarget.classList.add('is-dragging');
 });
 document.getElementById('ecommerce-ref-crop-canvas')?.addEventListener('pointermove', event => {
     const state = ecommerceRefCropState;
-    if (!state.dragging) return;
-    const dx = event.clientX - state.pointerOffsetX;
-    const dy = event.clientY - state.pointerOffsetY;
-    state.imageOffsetX = state.dragStartOffsetX + dx;
-    state.imageOffsetY = state.dragStartOffsetY + dy;
-    drawEcommerceReferenceCrop();
+    const point = ecommerceCropPointerCoordinates(event);
+    if (state.resizing && point) {
+        ecommerceResizeCropFrame(state.activeHandle, point.x - state.interactionStartX, point.y - state.interactionStartY);
+        drawEcommerceReferenceCrop();
+        return;
+    }
+    if (state.dragging) {
+        const dx = event.clientX - state.pointerOffsetX;
+        const dy = event.clientY - state.pointerOffsetY;
+        state.imageOffsetX = state.dragStartOffsetX + dx;
+        state.imageOffsetY = state.dragStartOffsetY + dy;
+        drawEcommerceReferenceCrop();
+        return;
+    }
+    if (!point || !state.frameRect) return;
+    const handle = ecommerceCropHitHandle(point.x, point.y);
+    event.currentTarget.style.cursor = handle ? (ECOMMERCE_CROP_CURSORS[handle] || 'grab') : 'grab';
 });
 ['pointerup', 'pointercancel'].forEach(name => document.getElementById('ecommerce-ref-crop-canvas')?.addEventListener(name, event => {
-    ecommerceRefCropState.dragging = false;
+    const state = ecommerceRefCropState;
+    state.dragging = false;
+    state.resizing = false;
+    state.activeHandle = '';
     event.currentTarget.classList.remove('is-dragging');
+    event.currentTarget.style.cursor = 'grab';
     if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
 }));
 document.addEventListener('keydown', e => {
@@ -15732,8 +18941,9 @@ document.addEventListener('keydown', e => {
         else if (e.key === 'Enter') {
             e.preventDefault();
             e.stopPropagation();
-            // 回车：确认裁剪并跳到下一张参考图
-            confirmEcommerceReferenceCropAndNext();
+            // 回车：废片重做裁剪 → 确认并跳下一张；服装参考图裁剪 → 确认并切下一套
+            if (ecommerceRefCropState.mode === 'garment') ecommerceCropConfirmActive();
+            else confirmEcommerceReferenceCropAndNext();
         }
         return;
     }
@@ -15853,11 +19063,108 @@ function renderAllEcommercePromptTemplateSurfaces() {
     renderEcommerceRerunPromptTemplates(document);
 }
 
+// ===== 存储模板：记住了来源模板就能一键覆盖，不必每次重新命名 =====
+let ecommerceSaveTemplateTarget = null;
+
+function ecommerceBindPromptTemplateSource(target, template) {
+    if (!target) return;
+    if (template?.id) target.dataset.ecommerceTemplateSource = template.id;
+    else delete target.dataset.ecommerceTemplateSource;
+}
+
+function ecommerceBoundPromptTemplate(target) {
+    const id = target?.dataset?.ecommerceTemplateSource || '';
+    if (!id) return null;
+    return (ecommercePromptTemplates.templates || []).find(row => row.id === id) || null;
+}
+
+function openEcommerceSaveTemplateDialog(target) {
+    const select = document.getElementById('ecommerce-save-template-target');
+    const replaceButton = document.getElementById('btn-ecommerce-save-template-replace');
+    if (!target || !select || !replaceButton) return;
+    const promptText = String(target.value || '').trim();
+    if (!promptText) return showToast('当前提示词为空，无法存储为模板', 'error');
+    const templates = ecommercePromptTemplates.templates || [];
+    const hint = document.getElementById('ecommerce-save-template-hint');
+    const lengthLabel = document.getElementById('ecommerce-save-template-length');
+    if (lengthLabel) lengthLabel.textContent = String(promptText.length);
+    ecommerceSaveTemplateTarget = target;
+    const bound = ecommerceBoundPromptTemplate(target);
+    // 没有来源模板时不预选，避免手写提示词被误覆盖到列表第一个模板上。
+    select.innerHTML = (bound || !templates.length ? '' : '<option value="">请选择要替换的模板…</option>')
+        + (templates.length
+            ? templates.map(row => `<option value="${ecommerceEscape(row.id)}">${ecommerceEscape(row.name)}</option>`).join('')
+            : '<option value="">（暂无模板）</option>');
+    if (bound) select.value = bound.id;
+    select.onchange = () => {
+        const picked = templates.find(row => row.id === select.value) || null;
+        replaceButton.disabled = !picked;
+        if (!hint) return;
+        if (!templates.length) {
+            hint.textContent = '还没有可替换的模板，点「另存为新模板」新建一个。';
+        } else if (!picked) {
+            hint.textContent = '请先选择要替换的模板；或点「另存为新模板」新建。';
+        } else if ((picked.prompt || '').trim() === promptText) {
+            hint.textContent = `「${picked.name}」的内容与当前提示词完全相同，无需替换。`;
+        } else {
+            hint.textContent = `会用当前提示词覆盖「${picked.name}」的内容，模板名称和排序位置保持不变。`;
+        }
+    };
+    select.onchange();
+    openModal('modal-ecommerce-save-template');
+}
+
+document.getElementById('btn-ecommerce-save-template-replace')?.addEventListener('click', async () => {
+    const target = ecommerceSaveTemplateTarget;
+    const promptText = String(target?.value || '').trim();
+    const templateId = document.getElementById('ecommerce-save-template-target')?.value || '';
+    const template = (ecommercePromptTemplates.templates || []).find(row => row.id === templateId);
+    if (!template || !promptText) return showToast('请选择要替换的模板', 'error');
+    template.prompt = promptText;
+    if (!await saveEcommercePromptTemplates()) return;
+    ecommerceBindPromptTemplateSource(target, template);
+    closeModal('modal-ecommerce-save-template');
+    renderAllEcommercePromptTemplateSurfaces();
+    showToast(`已用当前提示词替换模板「${template.name}」`, 'success');
+});
+
+document.getElementById('btn-ecommerce-save-template-new')?.addEventListener('click', async () => {
+    const target = ecommerceSaveTemplateTarget;
+    const promptText = String(target?.value || '').trim();
+    if (!promptText) return showToast('当前提示词为空，无法存储为模板', 'error');
+    const inputName = window.prompt('请为这个新模板起个名字：');
+    if (inputName === null) return;
+    const name = inputName.trim() || `模板${(ecommercePromptTemplates.templates || []).length + 1}`;
+    const template = { id: genEcommerceTemplateId(), name, prompt: promptText };
+    ecommercePromptTemplates.templates.unshift(template);
+    if (!await saveEcommercePromptTemplates()) return;
+    ecommerceBindPromptTemplateSource(target, template);
+    closeModal('modal-ecommerce-save-template');
+    renderAllEcommercePromptTemplateSurfaces();
+    showToast(`已另存为新模板「${name}」，三处已同步`, 'success');
+});
+
 function ecommercePromptTargetForSurface(surface) {
     const selector = surface?.dataset?.ecommercePromptTemplateTarget || '';
     if (!selector) return null;
     const scope = surface.closest('.ecommerce-rerun-compare, .ecommerce-rerun-bulk-bar');
     return scope?.querySelector(selector) || document.querySelector(selector);
+}
+
+// 模板区默认折叠（展开会挤掉提示词输入框的高度）；用户可展开，状态跨刷新保留。
+const ECOMMERCE_PROMPT_TEMPLATE_COLLAPSE_KEY = 'ecommerce_prompt_templates_collapsed';
+
+function ecommercePromptTemplatesCollapsed() {
+    try {
+        const saved = localStorage.getItem(ECOMMERCE_PROMPT_TEMPLATE_COLLAPSE_KEY);
+        // 默认折叠：模板区展开会挤掉提示词输入框的高度，用户需要时自己展开。
+        return saved === null ? true : saved === '1';
+    } catch (_e) { return true; }
+}
+
+function ecommerceSetPromptTemplatesCollapsed(collapsed) {
+    try { localStorage.setItem(ECOMMERCE_PROMPT_TEMPLATE_COLLAPSE_KEY, collapsed ? '1' : '0'); } catch (_e) {}
+    renderAllEcommercePromptTemplateSurfaces();
 }
 
 function renderEcommerceRerunPromptTemplates(root = document) {
@@ -15867,6 +19174,15 @@ function renderEcommerceRerunPromptTemplates(root = document) {
     surfaces.forEach(surface => {
         const list = surface.querySelector('.ecommerce-shared-prompt-list');
         const more = surface.querySelector('.ecommerce-shared-prompt-more');
+        // 折叠开关：只在用户主动折叠时隐藏模板体，避免长期占掉提示词输入框的高度。
+        const collapsed = ecommercePromptTemplatesCollapsed();
+        surface.classList.toggle('is-collapsed', collapsed);
+        const toggle = surface.querySelector('.ecommerce-shared-prompt-toggle');
+        if (toggle) {
+            toggle.textContent = collapsed ? '▸' : '▾';
+            toggle.title = collapsed ? '展开模板区' : '折叠模板区，给提示词输入框让出高度';
+            toggle.onclick = () => ecommerceSetPromptTemplatesCollapsed(!collapsed);
+        }
         const templates = ecommercePromptTemplates.templates || [];
         const visible = templates.slice(0, 8);
         const hidden = templates.slice(8);
@@ -15883,6 +19199,7 @@ function renderEcommerceRerunPromptTemplates(root = document) {
                     const target = ecommercePromptTargetForSurface(surface);
                     if (!template || !target) return;
                     target.value = template.prompt || '';
+                    ecommerceBindPromptTemplateSource(target, template);
                     target.dispatchEvent(new Event('input', { bubbles: true }));
                     target.focus();
                     showToast(`已加载模板「${template.name}」`, 'success');
@@ -15906,6 +19223,7 @@ function renderEcommerceRerunPromptTemplates(root = document) {
                 const target = ecommercePromptTargetForSurface(surface);
                 if (template && target) {
                     target.value = template.prompt || '';
+                    ecommerceBindPromptTemplateSource(target, template);
                     target.dispatchEvent(new Event('input', { bubbles: true }));
                     target.focus();
                     showToast(`已加载模板「${template.name}」`, 'success');
@@ -15914,18 +19232,8 @@ function renderEcommerceRerunPromptTemplates(root = document) {
             };
         }
         const saveButton = surface.querySelector('.ecommerce-shared-prompt-save');
-        if (saveButton) saveButton.onclick = async () => {
-            const target = ecommercePromptTargetForSurface(surface);
-            const promptText = target?.value?.trim() || '';
-            if (!promptText) return showToast('当前提示词为空，无法存为模板', 'error');
-            const inputName = window.prompt('请为这个模板起个名字：');
-            if (inputName === null) return;
-            const name = inputName.trim() || `模板${ecommercePromptTemplates.templates.length + 1}`;
-            ecommercePromptTemplates.templates.unshift({ id: genEcommerceTemplateId(), name, prompt: promptText });
-            if (await saveEcommercePromptTemplates()) {
-                renderAllEcommercePromptTemplateSurfaces();
-                showToast(`已存储模板「${name}」，三处已同步`, 'success');
-            }
+        if (saveButton) saveButton.onclick = () => {
+            openEcommerceSaveTemplateDialog(ecommercePromptTargetForSurface(surface));
         };
     });
 }
@@ -16080,16 +19388,8 @@ function renderEcommerceInsertSnippets() {
 }
 
 document.getElementById('btn-ecommerce-save-prompt-template')?.addEventListener('click', () => {
-    const ta = document.getElementById('ecommerce-standard-prompt');
-    const promptText = ta?.value?.trim();
-    if (!promptText) return showToast('提示词为空，无法存储', 'error');
-    const name = window.prompt('请为这个模板起个名字：');
-    if (name === null) return;
-    const templateName = name.trim() || `模板${ecommercePromptTemplates.templates.length + 1}`;
-    ecommercePromptTemplates.templates.unshift({ id: genEcommerceTemplateId(), name: templateName, prompt: promptText });
-    saveEcommercePromptTemplates();
-    renderAllEcommercePromptTemplateSurfaces();
-    showToast(`已存储模板「${templateName}」`, 'success');
+    // 写完后弹窗里可选「储存并替换」（覆盖已选模板）或「另存为新模板」（重新命名）。
+    openEcommerceSaveTemplateDialog(document.getElementById('ecommerce-standard-prompt'));
 });
 
 document.getElementById('btn-ecommerce-add-snippet')?.addEventListener('click', () => {
@@ -16450,14 +19750,19 @@ function updateRhModelParamsInline() {
     // 显示/隐藏分辨率；固定 2K/4K 模型自动锁定对应分辨率
     const resolutionSelect = document.getElementById('cfg-rh-resolution-inline');
     if (resolutionGroup) {
-        resolutionGroup.style.display = model.hasResolution ? 'flex' : 'none';
+        resolutionGroup.style.display = model.hasResolution || model.resolutionOptions ? 'flex' : 'none';
     }
     if (resolutionSelect) {
+        const allowedResolutions = model.fixedResolution
+            ? [model.fixedResolution]
+            : (model.resolutionOptions || ['1k', '2k', '4k']);
         if (model.fixedResolution) {
             resolutionSelect.value = model.fixedResolution;
             resolutionSelect.disabled = true;
         } else {
-            resolutionSelect.disabled = false;
+            if (!allowedResolutions.includes(resolutionSelect.value)) resolutionSelect.value = allowedResolutions[0];
+            [...resolutionSelect.options].forEach(option => { option.hidden = !allowedResolutions.includes(option.value); });
+            resolutionSelect.disabled = allowedResolutions.length <= 1;
         }
     }
 
@@ -16476,7 +19781,8 @@ function updateRhModelParamsInline() {
 document.getElementById('cfg-rh-model-inline')?.addEventListener('change', (e) => {
     updateRhModelParamsInline();
     // 持久化内联模型选择到服务端model_config
-    const modelId = e.target.value;
+    const modelId = normalizeRhModelKey(e.target.value);
+    e.target.value = modelId;
     api('PUT', '/api/model-config', { rh_model: modelId, rh_aspect_ratio: document.getElementById('cfg-rh-aspect-ratio-inline')?.value || '3:4' }).catch(() => {});
     state.modelConfig.rh_model = modelId;
     logAction('config', '切换RH模型', { model: modelId });
@@ -16581,7 +19887,7 @@ document.getElementById('btn-select-folder')?.addEventListener('click', async ()
         showToast('请在弹出的文件夹选择窗口中选择...', 'info');
         // 传入当前队列的下载路径作为初始目录
         const currentPath = document.getElementById('cfg-rh-download-path')?.value || '';
-        const resp = await api('POST', '/api/select-folder', { initial_dir: currentPath });
+        const resp = await api('POST', '/api/select-folder', { initial_dir: currentPath, memory_key: 'download' });
         if (resp.ok && resp.path) {
             if (queueMode === 'multi' && queueData[activeQueue]) {
                 markDownloadPathInputAsOwn('cfg-rh-download-path', resp.path);
@@ -16970,7 +20276,7 @@ document.getElementById('btn-download-all')?.addEventListener('click', async () 
     const defaultDownloadPath = queueMode === 'multi'
         ? getEffectiveQueueDownloadPath(activeQueue)
         : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
-    const picked = await api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath }, 120000, null, true);
+    const picked = await api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath, memory_key: 'download' }, 120000, null, true);
     if (!picked?.ok || !picked.path) { showToast('已取消下载', 'info'); return; }
     const currentDownloadPath = picked.path;
     let count = 0;
@@ -17016,7 +20322,7 @@ document.getElementById('btn-download-checked')?.addEventListener('click', async
     const defaultDownloadPath = queueMode === 'multi'
         ? getEffectiveQueueDownloadPath(activeQueue)
         : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
-    const picked = await api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath }, 120000, null, true);
+    const picked = await api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath, memory_key: 'download' }, 120000, null, true);
     if (!picked?.ok || !picked.path) { showToast('已取消下载', 'info'); return; }
     const currentDownloadPath = picked.path;
     let count = 0;
@@ -17095,7 +20401,7 @@ document.getElementById('btn-download-to-folder')?.addEventListener('click', asy
         const initialDir = queueMode === 'multi'
             ? getEffectiveQueueDownloadPath(activeQueue)
             : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
-        const resp = await api('POST', '/api/select-folder', { initial_dir: initialDir }, 120000, null, true);
+        const resp = await api('POST', '/api/select-folder', { initial_dir: initialDir, memory_key: 'download' }, 120000, null, true);
         if (!resp?.ok || !resp.path) {
             showToast('已取消另存', 'info');
             return;
@@ -17168,10 +20474,12 @@ let viewerState = {
     scale: 1,
     dragging: false,
     dragStartX: 0, dragStartY: 0,
-    dragOffX: 0, dragOffY: 0
+    dragOffX: 0, dragOffY: 0,
+    mode: 'generic',
+    spacePan: false
 };
 
-function openImageViewer(images, startIndex = 0) {
+function openImageViewer(images, startIndex = 0, options = {}) {
     if (!images || images.length === 0) return;
     viewerState.images = images.map((img, i) => ({
         url: img.url || img,
@@ -17180,6 +20488,7 @@ function openImageViewer(images, startIndex = 0) {
         sourceItem: img.sourceItem || null,
         sourceCheckbox: img.sourceCheckbox || null
     }));
+    viewerState.mode = options.mode || 'generic';
     viewerState.currentIndex = startIndex || 0;
     viewerState.scale = 1;
     viewerState.offsetX = 0;
@@ -17241,9 +20550,14 @@ function loadViewerImage() {
     const counter = document.getElementById('viewer-counter');
     if (counter) counter.textContent = `${viewerState.currentIndex + 1}/${viewerState.images.length}`;
     const check = document.getElementById('viewer-check');
-    if (check) check.checked = viewerState.images[viewerState.currentIndex].checked;
+    if (check) {
+        check.checked = viewerState.images[viewerState.currentIndex].checked;
+        if (check.parentElement) check.parentElement.style.display = viewerState.mode === 'idphoto' ? 'none' : 'flex';
+    }
     const fname = document.getElementById('viewer-filename');
-    if (fname) fname.textContent = viewerState.images[viewerState.currentIndex].filename;
+    if (fname) fname.textContent = viewerState.mode === 'idphoto' ? '' : viewerState.images[viewerState.currentIndex].filename;
+    const help = document.getElementById('viewer-help');
+    if (help) help.textContent = viewerState.mode === 'idphoto' ? '滚轮缩放 | 按住左键拖动 | 空格＋左键拖动' : '点击图片区域退出 | 滚轮缩放 | 拖动平移';
 }
 
 function drawViewerCanvas() {
@@ -17293,6 +20607,7 @@ function drawViewerCanvas() {
             viewerState.dragStartY = e.clientY;
             viewerState.dragOffX = viewerState.offsetX;
             viewerState.dragOffY = viewerState.offsetY;
+            if (viewerState.mode === 'idphoto') e.preventDefault();
             canvas.style.cursor = 'grabbing';
         }
     });
@@ -17312,8 +20627,8 @@ function drawViewerCanvas() {
         viewerState.dragging = false;
         const c = document.getElementById('viewer-canvas');
         if (c) c.style.cursor = 'grab';
-        // 左键点击（非拖动）→ 退出查看器
-        if (e.button === 0 && !hasDragged && mouseDownPos) {
+        // 普通图片查看器点击退出；证件照查看器保留在大图中，便于连续检查。
+        if (viewerState.mode !== 'idphoto' && e.button === 0 && !hasDragged && mouseDownPos) {
             const dx = Math.abs(e.clientX - mouseDownPos.x);
             const dy = Math.abs(e.clientY - mouseDownPos.y);
             if (dx < 5 && dy < 5) {
@@ -17362,7 +20677,10 @@ function drawViewerCanvas() {
         if (viewerVisible) {
             if (e.key === 'ArrowLeft') { document.getElementById('viewer-prev')?.click(); e.preventDefault(); }
             if (e.key === 'ArrowRight') { document.getElementById('viewer-next')?.click(); e.preventDefault(); }
-            if (e.key === ' ') {
+            if (e.key === ' ' && viewerState.mode === 'idphoto') {
+                viewerState.spacePan = true;
+                e.preventDefault();
+            } else if (e.key === ' ') {
                 const check = document.getElementById('viewer-check');
                 if (check) { check.checked = !check.checked; check.dispatchEvent(new Event('change')); }
                 e.preventDefault();
@@ -17407,6 +20725,9 @@ function drawViewerCanvas() {
                 }
             }
         }
+    });
+    document.addEventListener('keyup', (e) => {
+        if (e.key === ' ' && viewerState.mode === 'idphoto') viewerState.spacePan = false;
     });
 })();
 
@@ -18776,7 +22097,7 @@ function buildApiResultCardElement(item, index) {
         const defaultDownloadPath = queueMode === 'multi'
             ? getEffectiveQueueDownloadPath(activeQueue)
             : (cleanDownloadPath(document.getElementById('cfg-rh-download-path')?.value) || getGlobalDownloadPath());
-        api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath }, 120000, null, true)
+        api('POST', '/api/select-folder', { initial_dir: defaultDownloadPath, memory_key: 'download' }, 120000, null, true)
             .then(resp => {
                 if (!resp?.ok || !resp.path) { showToast('已取消下载', 'info'); return; }
                 return downloadImage(item.url, item.filename, resp.path);
@@ -22213,7 +25534,7 @@ function buildManualDownloadFilename(item, prefix, idx = 0) {
 
 async function pickManualDownloadFolder(qi) {
     const initialDir = getEffectiveSplitDownloadPath(qi) || '~/Downloads/AI生图/';
-    const resp = await api('POST', '/api/select-folder', { initial_dir: initialDir }, 120000, null, true);
+    const resp = await api('POST', '/api/select-folder', { initial_dir: initialDir, memory_key: 'split-download' }, 120000, null, true);
     if (!resp?.ok || !resp.path) return null;
     return resp.path;
 }
@@ -22842,7 +26163,7 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-split-select-folder')?.addEventListener('click', async () => {
         try {
             const currentPath = getEffectiveSplitDownloadPath(activeSplitQueue);
-            const resp = await api('POST', '/api/select-folder', { initial_dir: currentPath });
+            const resp = await api('POST', '/api/select-folder', { initial_dir: currentPath, memory_key: 'split-download' });
             if (resp && resp.path) {
                 markDownloadPathInputAsOwn('split-cfg-download-path', resp.path);
                 splitQueueData[activeSplitQueue].downloadPath = resp.path;
@@ -23109,6 +26430,7 @@ window.addEventListener('beforeunload', () => {
 
 // 等页面控件和电商模块都完成挂载后再恢复一次，避免初始化顺序覆盖草稿。
 window.addEventListener('DOMContentLoaded', () => {
+    bindRememberedPathInputs();
     setTimeout(() => {
         if (typeof restoreEcommerceDraft === 'function') restoreEcommerceDraft();
     }, 0);
